@@ -20,13 +20,34 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 struct Tab {
+    /// Some(name) for the pinned app tabs in the sidebar (ai, music, ...); None for tabs you made.
+    app: Option<&'static str>,
     root: Node,
     focus: PaneId,
     zoom: bool,
 }
 
+/// The sidebar's app list, nest style: (app, icon, label, key).
+pub const SIDEBAR: &[(&str, &str, &str, &str)] = &[
+    ("ai", "ai", "ai", "F1"),
+    ("music", "music", "music", "F2"),
+    ("system", "system", "system", "F3"),
+    ("files", "files", "files", "F4"),
+    ("notes", "notes", "notes", "F5"),
+    ("storage", "storage", "storage", "F6"),
+    ("terminal", "term", "terminal", "F7"),
+];
+
+#[derive(Clone, Copy)]
+enum SideHit {
+    App(&'static str),
+    Tab(usize),
+    NewTab,
+}
+
 #[derive(Clone)]
 enum Cmd {
+    App(&'static str),
     Open(&'static str, Place),
     Theme(String),
     SplitRight,
@@ -64,7 +85,9 @@ pub struct App {
     // geometry from the last draw, for the mouse
     inner: Vec<(PaneId, Rect)>,
     outer: Vec<(PaneId, Rect)>,
-    tab_hits: Vec<(Rect, usize)>,
+    side_hits: Vec<(Rect, SideHit)>,
+    side_area: Option<(PaneId, Rect)>,
+    sidebar: bool,
     body: Rect,
     drag: Option<(Vec<bool>, Dir, Rect)>,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -91,14 +114,21 @@ impl App {
             last_tick: HashMap::new(),
             inner: vec![],
             outer: vec![],
-            tab_hits: vec![],
+            side_hits: vec![],
+            side_area: None,
+            sidebar: true,
             body: Rect::default(),
             drag: None,
             _watcher: None,
         };
         app._watcher = watch_omarchy(tx);
-        let first = panes::open(&app.config.startup, &app.config).unwrap_or_else(|| Box::new(panes::home::Home::new()));
-        app.new_tab(first);
+        let startup = app.config.startup.clone();
+        if SIDEBAR.iter().any(|a| a.0 == startup) {
+            app.goto_app(SIDEBAR.iter().find(|a| a.0 == startup).unwrap().0);
+        } else {
+            let first = panes::open(&startup, &app.config).unwrap_or_else(|| Box::new(panes::home::Home::new()));
+            app.new_tab(first);
+        }
         app
     }
 
@@ -111,8 +141,32 @@ impl App {
 
     fn new_tab(&mut self, p: Box<dyn Pane>) {
         let id = self.add(p);
-        self.tabs.push(Tab { root: Node::Leaf(id), focus: id, zoom: false });
+        self.tabs.push(Tab { app: None, root: Node::Leaf(id), focus: id, zoom: false });
         self.cur = self.tabs.len() - 1;
+    }
+
+    /// Show an app's tab, creating it the first time (like nest's F1-F6).
+    fn goto_app(&mut self, name: &'static str) {
+        if let Some(i) = self.tabs.iter().position(|t| t.app == Some(name)) {
+            self.cur = i;
+            return;
+        }
+        let Some(p) = panes::open(name, &self.config) else {
+            self.notify(format!("{name} isn't available"));
+            return;
+        };
+        let id = self.add(p);
+        // app tabs stay in sidebar order, ahead of your own tabs
+        let order = |a: Option<&str>| a.and_then(|n| SIDEBAR.iter().position(|s| s.0 == n)).unwrap_or(usize::MAX);
+        let me = order(Some(name));
+        let at = self.tabs.iter().position(|t| order(t.app) > me).unwrap_or(self.tabs.len());
+        self.tabs.insert(at, Tab { app: Some(name), root: Node::Leaf(id), focus: id, zoom: false });
+        self.cur = at;
+    }
+
+    /// Tabs you made (not the pinned apps), with their index in self.tabs.
+    fn user_tabs(&self) -> Vec<usize> {
+        (0..self.tabs.len()).filter(|&i| self.tabs[i].app.is_none()).collect()
     }
 
     fn tab(&mut self) -> &mut Tab {
@@ -174,7 +228,7 @@ impl App {
                 // last pane in the tab: drop the tab
                 self.tabs.remove(ti);
                 if self.tabs.is_empty() {
-                    self.new_tab(Box::new(panes::home::Home::new()));
+                    self.goto_app("ai");
                 }
                 self.cur = self.cur.min(self.tabs.len() - 1);
             }
@@ -372,6 +426,19 @@ impl App {
         if k.modifiers.contains(KeyModifiers::ALT) && self.alt_cmd(k) {
             return;
         }
+        if let KeyCode::F(n) = k.code {
+            if (1..=7).contains(&n) && k.modifiers.is_empty() {
+                self.goto_app(SIDEBAR[n as usize - 1].0);
+                return;
+            }
+            if n == 8 {
+                // play/pause from anywhere, if the music app is open
+                if let Some(id) = self.tabs.iter().find(|t| t.app == Some("music")).map(|t| t.focus) {
+                    self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), cx));
+                }
+                return;
+            }
+        }
         let id = self.focused();
         let used = self.with_pane(id, |p, cx| p.key(k, cx)).unwrap_or(false);
         if !used && !self.panes.get(&id).map(|p| p.is_terminal()).unwrap_or(false) {
@@ -400,10 +467,11 @@ impl App {
                 'n' => self.run_cmd(Cmd::Open("terminal", Place::Split)),
                 '1'..='9' => {
                     let i = c as usize - '1' as usize;
-                    if i < self.tabs.len() {
-                        self.cur = i;
+                    if let Some(&t) = self.user_tabs().get(i) {
+                        self.cur = t;
                     }
                 }
+                's' => self.sidebar = !self.sidebar,
                 'p' => self.open_palette(),
                 'z' => self.run_cmd(Cmd::Zoom),
                 'w' => self.run_cmd(Cmd::Close),
@@ -474,6 +542,7 @@ impl App {
     fn run_cmd(&mut self, c: Cmd) {
         let from = self.focused();
         match c {
+            Cmd::App(name) => self.goto_app(name),
             Cmd::Open(name, place) => match panes::open(name, &self.config) {
                 Some(p) => self.open(p, place, from),
                 None => self.notify(format!("{name} isn't installed")),
@@ -503,9 +572,12 @@ impl App {
     // ------------------------------------------------------------------ palette
     fn open_palette(&mut self) {
         let mut items: Vec<(String, Cmd)> = vec![];
+        for &(name, icon, label, key) in SIDEBAR {
+            items.push((format!("{}go to {label}  {key}", ui::lead(icon)), Cmd::App(name)));
+        }
         for &(name, _, icon, label) in APPS {
             if available(name) {
-                items.push((format!("{}open {label}", ui::lead(icon)), Cmd::Open(name, Place::Split)));
+                items.push((format!("{}split: open {label} beside this", ui::lead(icon)), Cmd::Open(name, Place::Split)));
             }
         }
         for &(name, _, icon, label) in APPS {
@@ -584,8 +656,12 @@ impl App {
     fn mouse(&mut self, m: MouseEvent) {
         let pos = Position { x: m.column, y: m.row };
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-            if let Some(&(_, i)) = self.tab_hits.iter().find(|(r, _)| r.contains(pos)) {
-                self.cur = i;
+            if let Some(&(_, hit)) = self.side_hits.iter().find(|(r, _)| r.contains(pos)) {
+                match hit {
+                    SideHit::App(a) => self.goto_app(a),
+                    SideHit::Tab(i) => self.cur = i,
+                    SideHit::NewTab => self.new_tab(Box::new(panes::home::Home::new())),
+                }
                 return;
             }
             // a split divider: start dragging
@@ -623,6 +699,13 @@ impl App {
                 return;
             }
         }
+        // the current app's own sidebar section
+        if let Some((id, r)) = self.side_area {
+            if r.contains(pos) {
+                self.with_pane(id, |p, cx| p.side_mouse(m, r, cx));
+                return;
+            }
+        }
         // pane under the cursor
         let Some(&(id, _)) = self.outer.iter().find(|(_, r)| r.contains(pos)) else { return };
         let inner = self.inner.iter().find(|(i, _)| *i == id).map(|x| x.1).unwrap_or_default();
@@ -639,9 +722,14 @@ impl App {
         if !matches!(t.bg, ratatui::style::Color::Reset) {
             f.render_widget(ratatui::widgets::Block::default().style(Style::default().bg(t.bg)), area);
         }
-        let bar = Rect { height: 1, ..area };
-        self.body = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
-        self.draw_bar(f, bar, &t);
+        let side_w = if self.sidebar && area.width >= 70 { (area.width / 5).clamp(26, 36) } else { 0 };
+        let side = Rect { width: side_w, ..area };
+        self.body = Rect { x: area.x + side_w, width: area.width - side_w, ..area };
+        self.side_hits.clear();
+        self.side_area = None;
+        if side_w > 0 {
+            self.draw_sidebar(f, side, &t);
+        }
 
         let tab = &self.tabs[self.cur];
         let mut rects = vec![];
@@ -672,6 +760,7 @@ impl App {
                 let _ = tx.send(Event::Tick);
             }
         }
+        self.draw_toast(f, area, &t);
         if let Some(p) = &self.palette {
             self.draw_palette(f, area, p, &t);
         }
@@ -680,44 +769,106 @@ impl App {
         }
     }
 
-    fn draw_bar(&mut self, f: &mut Frame, bar: Rect, t: &Theme) {
+    /// nest's sidebar: the apps (F1-F7), your own tabs, then the current app's own section.
+    fn draw_sidebar(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
         let time = self.start.elapsed().as_secs_f64();
-        let mut spans: Vec<Span> = vec![Span::raw(" ")];
-        let name = format!("{}oriel", ui::lead("window"));
+        let cur_app = self.tabs[self.cur].app;
+        let title = format!("{}oriel", ui::lead("window"));
+        let sub = cur_app.unwrap_or("tabs");
+        let inner = ui::frame(f, area, &title, Some(sub), false, t);
         if t.animated {
-            for (i, c) in name.chars().enumerate() {
-                spans.push(Span::styled(c.to_string(), Style::default().fg(theme::rainbow(i, time)).add_modifier(Modifier::BOLD)));
+            // rainbow the title over the frame's plain one
+            let spans: Vec<Span> = format!(" {title} ").chars().enumerate()
+                .map(|(i, c)| Span::styled(c.to_string(), Style::default().fg(theme::rainbow(i, time)).add_modifier(Modifier::BOLD)))
+                .collect();
+            f.render_widget(Paragraph::new(Line::from(spans)), Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: 1 });
+        }
+        // clock in the top border, right side
+        let clock = format!(" {} ", clock());
+        let cw = clock.chars().count() as u16;
+        if area.width > cw + 12 {
+            f.render_widget(Paragraph::new(Span::styled(clock, ui::muted(t))), Rect { x: area.right() - cw - 2, y: area.y, width: cw, height: 1 });
+        }
+        let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), y: inner.y + 1, height: inner.height.saturating_sub(1) };
+        let mut y = inner.y;
+        for &(name, icon, label, key) in SIDEBAR {
+            if y >= inner.bottom() {
+                break;
             }
-        } else {
-            spans.push(Span::styled(name, ui::bold_accent(t)));
-        }
-        spans.push(Span::raw("  "));
-        let mut x = bar.x + spans.iter().map(|s| s.width() as u16).sum::<u16>();
-        self.tab_hits.clear();
-        for (i, tab) in self.tabs.iter().enumerate() {
-            let title = self.panes.get(&tab.focus).map(|p| format!("{}{}", ui::lead(p.icon()), ui::fit(&p.title(), 18))).unwrap_or_default();
-            let label = format!(" {} {}{} ", i + 1, title, if tab.zoom { " [z]" } else { "" });
-            let w = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
-            let style = if i == self.cur {
-                Style::default().fg(t.accent).add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else {
-                Style::default().fg(t.muted)
+            let r = Rect { y, height: 1, ..inner };
+            let on = cur_app == Some(name);
+            let badge = self.tabs.iter().find(|tb| tb.app == Some(name)).and_then(|tb| self.panes.get(&tb.focus)).and_then(|p| p.badge());
+            let right = match &badge {
+                Some(b) => format!("{}  {key}", ui::fit(b, (inner.width as usize).saturating_sub(label.len() + 8).max(1))),
+                None => key.to_string(),
             };
-            self.tab_hits.push((Rect { x, y: bar.y, width: w, height: 1 }, i));
-            x += w + 1;
-            spans.push(Span::styled(label, style));
-            spans.push(Span::raw(" "));
+            ui::side_row(f, r, icon, label, &right, on, t);
+            self.side_hits.push((r, SideHit::App(name)));
+            y += 1;
         }
-        f.render_widget(Paragraph::new(Line::from(spans)), bar);
-        // right side: prefix hint, notice, clock
-        let right = if self.prefix_armed {
-            Line::from(vec![Span::styled(" prefix ", Style::default().fg(t.accent).add_modifier(Modifier::REVERSED | Modifier::BOLD)), Span::styled(" | - split · hjkl move · x close · z zoom · c tab · t theme · ? ", ui::muted(t))])
+        // your own tabs
+        y += 1;
+        if y < inner.bottom() {
+            ui::rule(f, Rect { y, height: 1, ..inner }, t);
+            y += 1;
+        }
+        let user = self.user_tabs();
+        for (n, &i) in user.iter().enumerate() {
+            if y >= inner.bottom() {
+                break;
+            }
+            let tb = &self.tabs[i];
+            let (icon, title) = self.panes.get(&tb.focus).map(|p| (p.icon(), p.title())).unwrap_or(("term", String::new()));
+            let panes = { let mut l = vec![]; tb.root.leaves(&mut l); l.len() };
+            let right = if panes > 1 { format!("{panes} panes  alt {}", n + 1) } else { format!("alt {}", n + 1) };
+            let r = Rect { y, height: 1, ..inner };
+            ui::side_row(f, r, icon, &title, &right, i == self.cur, t);
+            self.side_hits.push((r, SideHit::Tab(i)));
+            y += 1;
+        }
+        if y < inner.bottom() {
+            let r = Rect { y, height: 1, ..inner };
+            ui::side_row(f, r, "tab", "new tab", "alt t", false, t);
+            self.side_hits.push((r, SideHit::NewTab));
+            y += 1;
+        }
+        // the current app's own section
+        if let Some(_) = cur_app {
+            y += 1;
+            if y < inner.bottom() {
+                ui::rule(f, Rect { y, height: 1, ..inner }, t);
+                y += 1;
+            }
+            if y + 1 < inner.bottom() {
+                let r = Rect { y: y + 1, height: inner.bottom() - y - 1, ..inner };
+                let id = self.tabs[self.cur].focus;
+                let mut actions = vec![];
+                if let Some(p) = self.panes.get_mut(&id) {
+                    let mut cx = Cx { id, theme: t, config: &self.config, tx: &self.tx, actions: &mut actions, focused: false, time };
+                    p.side(f, r, &mut cx);
+                }
+                self.side_area = Some((id, r));
+                if !actions.is_empty() {
+                    self.apply(id, actions);
+                }
+            }
+        }
+    }
+
+    /// Prefix hint / notices, bottom-right over everything.
+    fn draw_toast(&self, f: &mut Frame, area: Rect, t: &Theme) {
+        let (text, key) = if self.prefix_armed {
+            (" | - split · hjkl move · x close · z zoom · c tab · t theme · ? help ".to_string(), true)
         } else if let Some((n, _)) = &self.notice {
-            Line::from(Span::styled(format!("{n}  "), ui::accent(t)))
+            (format!(" {n} "), false)
         } else {
-            Line::from(Span::styled(format!("{}{}  ", ui::lead("clock"), clock()), ui::muted(t)))
+            return;
         };
-        f.render_widget(Paragraph::new(right).right_aligned(), bar);
+        let w = (unicode_width::UnicodeWidthStr::width(text.as_str()) as u16 + 10).min(area.width);
+        let r = Rect { x: area.right().saturating_sub(w + 1), y: area.bottom().saturating_sub(4), width: w, height: 3 };
+        f.render_widget(ratatui::widgets::Clear, r);
+        let inner = ui::frame(f, r, if key { "prefix" } else { "oriel" }, None, true, t);
+        f.render_widget(Paragraph::new(Span::styled(text, ui::accent(t))), inner);
     }
 
     fn draw_palette(&self, f: &mut Frame, area: Rect, p: &Palette, t: &Theme) {
@@ -747,7 +898,10 @@ fn draw_help(f: &mut Frame, area: Rect, t: &Theme, c: &Config) {
         ("alt shift ←↑↓→".into(), "resize the pane"),
         ("alt n · alt enter".into(), "new terminal (splits the pane)"),
         ("alt p".into(), "palette: open apps, themes, everything"),
-        ("alt 1-9 · alt t".into(), "go to tab · new tab"),
+        ("F1-F7".into(), "ai · music · system · files · notes · storage · terminal"),
+        ("F8".into(), "play / pause music from anywhere"),
+        ("alt 1-9 · alt t".into(), "go to one of your tabs · new tab"),
+        ("alt s".into(), "hide / show the sidebar"),
         ("alt z · alt w".into(), "zoom pane · close pane"),
         (format!("{pre} then"), ""),
         ("  | or \\  ·  - ".into(), "split right · split down"),
@@ -818,4 +972,35 @@ fn watch_omarchy(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
     .ok()?;
     w.watch(&dir, RecursiveMode::NonRecursive).ok()?;
     Some(w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    /// Whole-screen snapshot: `cargo test app_snapshot -- --nocapture`, then `pwsh tools\snap.ps1 target\snap\app-<name>.html`.
+    fn snap(app: &mut App, name: &str) -> String {
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        crate::testkit::save_html(term.backend().buffer(), &format!("target/snap/app-{name}.html"));
+        let buf = term.backend().buffer();
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>().trim_end().to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn app_snapshot() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "oriel".into();
+        let mut app = App::new(cfg, tx);
+        println!("{}", snap(&mut app, "ai"));
+        for (i, name) in ["music", "system", "files", "notes", "storage"].iter().enumerate() {
+            app.goto_app(SIDEBAR[i + 1].0);
+            let s = snap(&mut app, name);
+            assert!(s.contains("oriel"));
+        }
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        println!("{}", snap(&mut app, "home"));
+    }
 }

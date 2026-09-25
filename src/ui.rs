@@ -182,6 +182,46 @@ pub fn key_hint<'a>(key: &'a str, what: &'a str, t: &Theme) -> Vec<Span<'a>> {
     ]
 }
 
+/// nest's hint line: "esc stop · ctrl+r regenerate · F1 ai" in the muted colour, keys a touch brighter.
+/// Draws on the last row of `area` and returns the rect above it.
+pub fn hint_line(f: &mut Frame, area: Rect, hints: &[(&str, &str)], t: &Theme) -> Rect {
+    if area.height < 2 {
+        return area;
+    }
+    let row = Rect { y: area.bottom() - 1, height: 1, ..area };
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (k, what)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(t.muted)));
+        }
+        spans.push(Span::styled(k.to_string(), Style::default().fg(t.fg).add_modifier(Modifier::BOLD)));
+        if !what.is_empty() {
+            spans.push(Span::styled(format!(" {what}"), Style::default().fg(t.muted)));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), row);
+    Rect { height: area.height - 1, ..area }
+}
+
+/// A sidebar-style list row: icon, label, right-aligned hint (like "F1" or a count). `on` = current.
+pub fn side_row(f: &mut Frame, r: Rect, icon: &str, label: &str, right: &str, on: bool, t: &Theme) {
+    let rw = unicode_width::UnicodeWidthStr::width(right) as u16;
+    let lead = lead(icon);
+    let style = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default() };
+    let left_w = r.width.saturating_sub(rw + 1) as usize;
+    let text = fit(&format!("{lead}{label}"), left_w);
+    let spans = vec![
+        Span::styled(format!("{text:<left_w$}"), style),
+        Span::styled(right.to_string(), if on { style } else { Style::default().fg(t.muted) }),
+    ];
+    f.render_widget(Paragraph::new(Line::from(spans)), r);
+}
+
+/// A thin horizontal rule in the frame colour.
+pub fn rule(f: &mut Frame, r: Rect, t: &Theme) {
+    f.render_widget(Paragraph::new(Span::styled("─".repeat(r.width as usize), Style::default().fg(t.frame))), Rect { height: 1, ..r });
+}
+
 pub fn fg(c: Color) -> Style {
     Style::default().fg(c)
 }

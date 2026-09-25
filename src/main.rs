@@ -5,6 +5,7 @@ mod config;
 mod layout;
 mod pane;
 mod panes;
+mod testkit;
 mod theme;
 mod ui;
 

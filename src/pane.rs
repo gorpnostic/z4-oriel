@@ -108,4 +108,13 @@ pub trait Pane {
     fn is_terminal(&self) -> bool {
         false
     }
+    /// This app's own section of the left sidebar, under the app list (nest style): the chat list, playlists,
+    /// places, sort options... `area` is the space left in the sidebar. Only called for app tabs.
+    fn side(&mut self, _f: &mut Frame, _area: Rect, _cx: &mut Cx) {}
+    /// Mouse event inside the side section (screen coordinates; `area` is the side section's rect).
+    fn side_mouse(&mut self, _ev: MouseEvent, _area: Rect, _cx: &mut Cx) {}
+    /// Short live status shown next to the app's name in the sidebar, e.g. "▶ song" or "12%".
+    fn badge(&self) -> Option<String> {
+        None
+    }
 }

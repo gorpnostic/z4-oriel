@@ -12,7 +12,7 @@ pub struct Config {
     pub shell: String,
     /// Prefix key for tmux-style bindings, e.g. "ctrl+space", "ctrl+b", "ctrl+a".
     pub prefix: String,
-    /// What the first tab shows: "home" (launcher), "terminal", or any app name.
+    /// What oriel opens on: an app ("ai", "music", "terminal"...) or "home".
     pub startup: String,
     pub ai: AiConfig,
     pub music: MusicConfig,
@@ -50,7 +50,7 @@ impl Default for Config {
             theme: String::new(),
             shell: String::new(),
             prefix: "ctrl+space".into(),
-            startup: "home".into(),
+            startup: "ai".into(),
             ai: AiConfig::default(),
             music: MusicConfig::default(),
         }
