@@ -890,8 +890,15 @@ pub(crate) mod tests {
         let mut k = Kit::new();
         let mut p = Files::new(dirs::home_dir());
         k.render(&mut p, 150, 44);
-        k.wait_wake(&mut p, 2000); // the drive scan can be slow while other tests run
-        let s = k.render_side(&mut p, 30, 20);
+        // the drive scan runs as a second step and can be slow while the rest of the suite runs: wait for it
+        let mut s = String::new();
+        for _ in 0..40 {
+            k.wait_wake(&mut p, 250);
+            s = k.render_side(&mut p, 30, 20);
+            if !cfg!(windows) || s.contains("C: drive") {
+                break;
+            }
+        }
         println!("{s}");
         assert!(s.contains("home"));
         if cfg!(windows) {
