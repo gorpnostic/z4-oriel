@@ -76,6 +76,9 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | `alt z` · `alt w` · `alt s` | zoom a pane · close it · hide the sidebar |
 | double-click a tab | rename it (also right-click → rename, or `ctrl+space` then `,`) |
 | right-click | menu: split, zoom, rename, new tab, close |
+| drag | select text in any pane; it's copied when you let go (shift+drag in programs that use the mouse) |
+| lt v | paste an image from the clipboard into Claude Code, Codex or the chat (saved as a file and pasted as its path). Windows Terminal keeps ctrl v for text, so use lt v there |
+| × / middle-click | close a pane (top-right of its frame) or one of your tabs (in the sidebar) |
 | `ctrl+space` then `\|` `-` `x` `?` | tmux-style: split right, split down, close, list all keys |
 
 Each app shows its own keys along its bottom edge. The mouse works everywhere: click to focus, drag a divider to

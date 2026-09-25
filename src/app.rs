@@ -73,6 +73,30 @@ enum Cmd {
     Quit,
 }
 
+/// A mouse selection inside one pane.
+#[derive(Clone, Copy)]
+struct Sel {
+    pane: PaneId,
+    area: Rect,
+    a: Position,
+    b: Position,
+    active: bool,
+}
+
+impl Sel {
+    /// start and end in reading order
+    fn ordered(&self) -> (Position, Position) {
+        if (self.a.y, self.a.x) <= (self.b.y, self.b.x) { (self.a, self.b) } else { (self.b, self.a) }
+    }
+    fn contains(&self, x: u16, y: u16) -> bool {
+        let (s, e) = self.ordered();
+        if y < s.y || y > e.y || x < self.area.x || x >= self.area.right() {
+            return false;
+        }
+        !(y == s.y && x < s.x) && !(y == e.y && x > e.x)
+    }
+}
+
 /// Right-click menu.
 struct CtxMenu {
     x: u16,
@@ -122,6 +146,10 @@ pub struct App {
     sidebar: bool,
     body: Rect,
     drag: Option<(Vec<bool>, Dir, Rect)>,
+    /// mouse text selection: which pane, its inner rect, anchor and far end (screen cells), dragging yet?
+    sel: Option<Sel>,
+    /// copy the selection after the next draw (the text comes from the drawn frame)
+    copy_pending: bool,
     /// the × buttons drawn on pane frames this frame
     pane_close: Vec<(Rect, PaneId)>,
     /// where the mouse is (for hover highlights)
@@ -168,6 +196,8 @@ impl App {
             sidebar: true,
             body: Rect::default(),
             drag: None,
+            sel: None,
+            copy_pending: false,
             pane_close: vec![],
             hover: Position { x: u16::MAX, y: u16::MAX },
             _watcher: None,
@@ -620,6 +650,18 @@ impl App {
             Event::Wake(id) => {
                 self.with_pane(id, |p, cx| p.poll(cx));
             }
+            Event::Clipboard(id, got, key) => match got {
+                Some(paths) => {
+                    let text = crate::clip::paste_form(&paths);
+                    self.with_pane(id, |p, cx| p.paste(&text, cx));
+                    let what = if paths.len() == 1 && paths[0].ends_with(".png") && paths[0].contains("paste-") { "image".to_string() } else { format!("{} file{}", paths.len(), if paths.len() == 1 { "" } else { "s" }) };
+                    self.notify(format!("pasted {what} as a path · Claude Code and Codex attach it"));
+                }
+                // nothing image-like: the program gets its own key (so e.g. Claude's own alt+v still works)
+                None => {
+                    self.with_pane(id, |p, cx| p.key(key, cx));
+                }
+            },
             Event::ThemeFilesChanged => {
                 if self.theme.name == "omarchy" {
                     std::thread::sleep(Duration::from_millis(150)); // let omarchy finish swapping files
@@ -664,6 +706,22 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) {
+        self.sel = None;
+        if self.onboard.is_none() && self.palette.is_none() && self.renaming.is_none() && self.ctx.is_none() && !self.prefix_armed {
+            let v = matches!(k.code, KeyCode::Char('v') | KeyCode::Char('V'));
+            let alt = k.modifiers.contains(KeyModifiers::ALT) && !k.modifiers.contains(KeyModifiers::CONTROL);
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT);
+            if v && (alt || ctrl) {
+                // paste an image: windows terminal keeps ctrl+v for text, so alt+v is the reliable one there
+                let id = self.focused();
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let got = crate::clip::grab_image();
+                    let _ = tx.send(Event::Clipboard(id, got, k));
+                });
+                return;
+            }
+        }
         if self.onboard.is_some() {
             let probe = self.probe();
             let (used, out) = self.onboard.as_mut().unwrap().key(k, &probe);
@@ -1112,9 +1170,36 @@ impl App {
                 return;
             }
         }
+        // dragging out a text selection
+        if let (Some(sel), MouseEventKind::Drag(MouseButton::Left)) = (&mut self.sel, m.kind) {
+            let r = sel.area;
+            let b = Position { x: pos.x.clamp(r.x, r.right().saturating_sub(1)), y: pos.y.clamp(r.y, r.bottom().saturating_sub(1)) };
+            if b != sel.a || sel.active {
+                sel.active = true;
+                sel.b = b;
+                return;
+            }
+        }
+        if let MouseEventKind::Up(MouseButton::Left) = m.kind {
+            if self.sel.map(|s| s.active).unwrap_or(false) {
+                self.copy_pending = true; // copied right after the next draw, from what's on screen
+                return;
+            }
+            self.sel = None;
+        }
         // pane under the cursor
         let Some(&(id, _)) = self.outer.iter().find(|(_, r)| r.contains(pos)) else { return };
         let inner = self.inner.iter().find(|(i, _)| *i == id).map(|x| x.1).unwrap_or_default();
+        // a left press inside a pane anchors a possible selection (programs that use the mouse themselves keep
+        // it unless shift is held; windows terminal does its own selection on shift+drag anyway)
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            let wants = self.panes.get(&id).map(|p| p.wants_mouse()).unwrap_or(false);
+            if inner.contains(pos) && (!wants || m.modifiers.contains(KeyModifiers::SHIFT)) {
+                self.sel = Some(Sel { pane: id, area: inner, a: pos, b: pos, active: false });
+            } else {
+                self.sel = None;
+            }
+        }
         if let MouseEventKind::Down(_) = m.kind {
             self.tab().focus = id;
         }
@@ -1178,6 +1263,41 @@ impl App {
                 let tx = self.tx.clone();
                 self.apply(id, actions);
                 let _ = tx.send(Event::Tick);
+            }
+        }
+        if let Some(sel) = self.sel.filter(|s| s.active) {
+            if self.outer.iter().any(|(id, _)| *id == sel.pane) {
+                let buf = f.buffer_mut();
+                let (s, e) = sel.ordered();
+                let mut text = String::new();
+                for y in s.y..=e.y.min(sel.area.bottom().saturating_sub(1)) {
+                    let mut line = String::new();
+                    for x in sel.area.x..sel.area.right() {
+                        if !sel.contains(x, y) {
+                            continue;
+                        }
+                        if let Some(c) = buf.cell_mut(Position { x, y }) {
+                            line.push_str(c.symbol());
+                            let st = c.style().add_modifier(Modifier::REVERSED);
+                            c.set_style(st);
+                        }
+                    }
+                    if !text.is_empty() || y > s.y {
+                        text.push('\n');
+                    }
+                    text.push_str(line.trim_end());
+                }
+                if self.copy_pending {
+                    self.copy_pending = false;
+                    let text = text.trim_end_matches('\n').to_string();
+                    if !text.trim().is_empty() {
+                        crate::clip::copy(&text);
+                        let n = text.chars().count();
+                        self.notice = Some((format!("copied {n} character{}", if n == 1 { "" } else { "s" }), Instant::now()));
+                    }
+                }
+            } else {
+                self.sel = None;
             }
         }
         self.draw_toast(f, area, &t);
@@ -1379,6 +1499,8 @@ fn draw_help(f: &mut Frame, area: Rect, t: &Theme, c: &Config) {
         ("alt s".into(), "hide / show the sidebar"),
         ("alt z · alt w".into(), "zoom pane · close pane"),
         ("right-click".into(), "menu: split, zoom, rename, close"),
+        ("drag".into(), "select text in any pane: it's copied when you let go (shift+drag in apps that use the mouse)"),
+        ("alt v".into(), "paste a clipboard image (or copied files) into Claude Code, Codex or the chat, as a path"),
         ("click ×".into(), "close a pane (top-right of its frame) or a tab (in the sidebar); middle-click a tab too"),
         ("double-click a tab".into(), "rename it (or prefix then ,)"),
         (format!("{pre} then"), ""),
@@ -1653,6 +1775,46 @@ mod tests {
         let (r, _) = app.side_hits.iter().copied().find(|(_, h)| matches!(h, SideHit::Tab(_))).unwrap();
         click(&mut app, r.x + 3, r.y, MouseButton::Middle);
         assert_eq!(app.tabs.len(), n - 1, "middle-click closed the tab");
+    }
+
+    #[test]
+    fn app_select_copy_and_image_paste() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "ultra".into();
+        let mut app = App::new(cfg, tx);
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        let mut term = Terminal::new(TestBackend::new(150, 42)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        // find the tagline on screen and drag across it
+        let text_at = |term: &Terminal<TestBackend>| -> Vec<String> {
+            let b = term.backend().buffer();
+            (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>()).collect()
+        };
+        let lines = text_at(&term);
+        let (row, line) = lines.iter().enumerate().find(|(_, l)| l.contains("a window onto everything")).unwrap();
+        let col = line.find("a window").unwrap();
+        let col = line[..col].chars().count() as u16;
+        let ev = |app: &mut App, kind, x, y| app.mouse(MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE });
+        ev(&mut app, MouseEventKind::Down(MouseButton::Left), col, row as u16);
+        ev(&mut app, MouseEventKind::Drag(MouseButton::Left), col + 7, row as u16);
+        ev(&mut app, MouseEventKind::Up(MouseButton::Left), col + 7, row as u16);
+        term.draw(|f| app.draw(f)).unwrap();
+        crate::testkit::save_html(term.backend().buffer(), "target/snap/app-select.html");
+        let b = term.backend().buffer();
+        assert!(b[(col, row as u16)].modifier.contains(Modifier::REVERSED), "selection highlighted");
+        assert_eq!(app.notice.as_ref().map(|n| n.0.clone()).unwrap_or_default(), "copied 8 characters", "'a window' copied");
+        // a key clears it
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.sel.is_none());
+        // a clipboard image lands in the chat composer as a path
+        app.goto_app("ai");
+        term.draw(|f| app.draw(f)).unwrap();
+        let id = app.focused();
+        app.handle(Event::Clipboard(id, Some(vec!["C:/tmp/paste-1.png".into()]), KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT)));
+        let s = text_at({ term.draw(|f| app.draw(f)).unwrap(); &term }).join("\n");
+        assert!(s.contains("C:/tmp/paste-1.png"), "path pasted into the composer");
+        assert!(app.notice.as_ref().unwrap().0.contains("pasted image"));
     }
 
     #[test]

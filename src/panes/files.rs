@@ -808,7 +808,7 @@ pub(crate) mod tests {
 
     fn settle(k: &mut Kit, p: &mut Files) {
         k.render(p, 150, 44); // starts the workers
-        k.wait_wake(p, 400);
+        k.wait_wake(p, 1500); // generous: the whole suite runs in parallel
     }
 
     #[test]

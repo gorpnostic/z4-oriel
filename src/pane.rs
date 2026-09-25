@@ -17,6 +17,9 @@ pub enum Event {
     Wake(PaneId),
     ThemeFilesChanged,
     Tick,
+    /// The clipboard image grab (alt+v / ctrl+v) finished: paste these paths into the pane, or, if the clipboard
+    /// had no image, hand it the key it was pressed with.
+    Clipboard(PaneId, Option<Vec<String>>, crossterm::event::KeyEvent),
 }
 
 /// What a pane can ask the app to do.

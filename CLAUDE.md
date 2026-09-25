@@ -10,3 +10,4 @@
   user's desktop is in use.
 - Release: `pwsh tools\release.ps1` (patch) / `-Minor`. GitHub Actions builds Linux + Windows; `oriel update`
   fetches it.
+- Tests must be silent and local: no audio out loud, no scans of the real disk, no real clipboard changes in the normal run. Anything that touches the real machine is `#[ignore]` (opt-in).

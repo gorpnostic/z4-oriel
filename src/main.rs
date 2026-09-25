@@ -1,6 +1,7 @@
 //! oriel — a fast terminal workspace: tabs, tmux-style split panes, and built-in apps.
 
 mod app;
+mod clip;
 mod config;
 mod font;
 mod layout;

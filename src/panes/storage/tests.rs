@@ -50,6 +50,7 @@ fn opened(k: &Kit) -> usize {
 }
 
 #[test]
+#[ignore] // scans this machine's real disk (slow, flaky under load): cargo test storage_cleanup_real_scan_snapshot -- --ignored
 fn storage_cleanup_real_scan_snapshot() {
     let mut k = Kit::new();
     let mut p = Storage::new();

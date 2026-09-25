@@ -1074,6 +1074,7 @@ mod tests {
     /// Plays the first song for about a second at low volume, then stops. Skips when there's no music or no
     /// audio device (CI, headless Linux).
     #[test]
+    #[ignore] // plays real audio out loud: cargo test music_plays_a_song -- --ignored
     fn music_plays_a_song() {
         let mut k = Kit::new();
         let state = Arc::new(Mutex::new(State { volume: 0.12, ..State::default() }));

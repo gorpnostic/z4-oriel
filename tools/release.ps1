@@ -7,6 +7,9 @@ param([string]$Version = "", [switch]$Minor, [switch]$Major)
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
 if (git status --porcelain) { throw "commit or stash your changes first" }
+# no release with failing tests
+cargo test
+if (\) { throw "tests failed - not releasing" }
 # every release ships fresh README screenshots
 pwsh -NoProfile -File tools\screenshots.ps1
 if ($LASTEXITCODE) { throw "screenshots failed" }
