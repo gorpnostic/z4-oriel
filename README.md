@@ -25,7 +25,11 @@ curl -fsSL https://raw.githubusercontent.com/gorpnostic/z4-oriel/master/install.
 irm https://raw.githubusercontent.com/gorpnostic/z4-oriel/master/install.ps1 | iex
 ```
 
-Then run `oriel`. To update later, run `oriel update`.
+Then run `oriel`. The first run walks you through a short setup (theme, icons, music and notes folders, your
+default AI) and an optional one-minute tour. Replay it any time with `oriel --tour` or from the palette. To update
+later, run `oriel update`.
+
+<p align="center"><img src="docs/screenshot-welcome.png" width="70%" alt="the welcome screen"></p>
 
 Icons need a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Omarchy ships one. On Windows, pick "Cascadia
 Mono NF" in Windows Terminal (Settings › Profiles › Appearance).
