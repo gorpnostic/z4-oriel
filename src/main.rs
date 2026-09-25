@@ -45,6 +45,11 @@ fn main() -> anyhow::Result<()> {
             };
             std::process::exit(status.map(|s| s.code().unwrap_or(1)).unwrap_or(1));
         }
+        Some("--mcp-approve") => {
+            // the approval bridge Claude Code starts for /perms ask (see panes/chat/approve.rs)
+            panes::chat::approve::serve_stdio(args.get(1).map(String::as_str).unwrap_or(""), args.get(2).map(String::as_str).unwrap_or(""));
+            return Ok(());
+        }
         Some("--config") => {
             println!("{}", config::path().display());
             return Ok(());
