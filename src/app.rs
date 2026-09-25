@@ -929,7 +929,7 @@ fn clock() -> String {
 }
 
 /// Seconds east of UTC, asked once from the OS.
-fn local_offset_secs() -> i64 {
+pub(crate) fn local_offset_secs() -> i64 {
     use std::sync::OnceLock;
     static OFF: OnceLock<i64> = OnceLock::new();
     *OFF.get_or_init(|| {

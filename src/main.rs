@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod font;
 mod layout;
 mod pane;
 mod panes;

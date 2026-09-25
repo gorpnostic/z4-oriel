@@ -56,6 +56,8 @@ const ICONS: &[(&str, &str, &str)] = &[
     ("video", "\u{F022B}", "vid"),
     ("archive", "\u{F0225}", "zip"),
     ("up", "\u{F0737}", ".."),     // md-arrow_up_bold... folder up
+    ("new", "\u{F1412}", "+"),     // md-chat_plus_outline
+    ("you", "\u{F0004}", ""),      // md-account
 ];
 
 pub const ICON_NAMES: &[&str] = &["term", "ai", "claude", "robot", "music", "system", "files", "notes", "storage", "home"];
