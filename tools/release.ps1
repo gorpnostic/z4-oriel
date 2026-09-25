@@ -16,7 +16,7 @@ if (-not $Version) {
 }
 $toml = [regex]::Replace($toml, '(?m)^version\s*=\s*"[^"]+"', "version = `"$Version`"", 1)
 [IO.File]::WriteAllText((Resolve-Path Cargo.toml), $toml)
-cargo build --release   # refreshes Cargo.lock with the new version (the workflow builds with --locked)
+cargo update --workspace --offline   # just refreshes Cargo.lock with the new version (the workflow builds with --locked)
 git add Cargo.toml Cargo.lock
 git commit -m "release v$Version"
 git tag "v$Version"

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 pub const PROVIDERS: &[(&str, &str, &str)] = &[
     // id, label, what
-    ("wren", "Wren", "the from-scratch model on Leif's GPU (research, memory, modes)"),
+    ("wren", "Wren", "your local Wren model (research, memory, modes)"),
     ("claude", "Claude Code", "Claude Code CLI, works in the chat's folder"),
     ("codex", "Codex", "OpenAI Codex CLI, works in the chat's folder"),
     ("ollama", "Ollama", "a local model pulled into Ollama"),
@@ -24,8 +24,45 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
     ("anthropic", "Anthropic API", "Claude over the API (needs a key)"),
 ];
 
+/// Which AIs this machine can actually use, in the order the default is picked from. Wren only counts where
+/// it's installed (its local server answers, or its ~/.wren folder exists) — it lives on its owner's PC.
+pub fn available(cfg: &AiConfig) -> Vec<&'static str> {
+    let reach = |url: &str| -> bool {
+        let hostport = url.split("//").nth(1).unwrap_or(url).split('/').next().unwrap_or("");
+        use std::net::ToSocketAddrs;
+        hostport
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.next())
+            .map(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(150)).is_ok())
+            .unwrap_or(false)
+    };
+    let local = |url: &str| url.contains("127.0.0.1") || url.contains("localhost");
+    let mut out = vec![];
+    let wren_home = dirs::home_dir().map(|h| h.join(".wren").is_dir()).unwrap_or(false);
+    if cfg.provider == "wren" || wren_home || cfg.wren_urls.iter().any(|u| local(u) && reach(u)) {
+        out.push("wren");
+    }
+    if which("claude").is_some() {
+        out.push("claude");
+    }
+    if which("codex").is_some() {
+        out.push("codex");
+    }
+    if which("ollama").is_some() || reach(&cfg.ollama_url) {
+        out.push("ollama");
+    }
+    if key(&cfg.openai_key, "OPENAI_API_KEY").is_some() || (!cfg.openai_url.contains("api.openai.com") && reach(&cfg.openai_url)) {
+        out.push("openai");
+    }
+    if key(&cfg.anthropic_key, "ANTHROPIC_API_KEY").is_some() {
+        out.push("anthropic");
+    }
+    out
+}
+
 pub fn label(id: &str) -> &'static str {
-    PROVIDERS.iter().find(|p| p.0 == id).map(|p| p.1).unwrap_or("Wren")
+    PROVIDERS.iter().find(|p| p.0 == id).map(|p| p.1).unwrap_or("no AI")
 }
 
 pub enum Ev {
@@ -61,7 +98,8 @@ pub fn start(req: Request, stop: Arc<AtomicBool>, send: impl Fn(Ev) + Send + 'st
             "ollama" => ollama(&req, &stop, &send),
             "openai" => openai(&req, &stop, &send),
             "anthropic" => anthropic(&req, &stop, &send),
-            _ => wren(&req, &stop, &send),
+            "wren" => wren(&req, &stop, &send),
+            _ => Err("no AI is set up: install Claude Code or Codex, run Ollama, or add a key with /key openai <key>".into()),
         };
         if let Err(e) = r {
             send(Ev::Error(e));
@@ -177,7 +215,7 @@ fn wren(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Strin
             Ok(true)
         });
     }
-    Err(format!("{last_err} — is Wren's server running? (python -m wren.web in C:\\Code\\ai\\wren)"))
+    Err(format!("{last_err} — is Wren's server running? (`python -m wren.web` in the wren folder)"))
 }
 
 // ------------------------------------------------------------------ http APIs

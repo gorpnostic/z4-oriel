@@ -98,6 +98,7 @@ pub struct Chat {
     once_research: bool,
     keys: HashMap<String, String>,
     info: Vec<String>,
+    avail: Vec<&'static str>,
     confirm_delete: bool,
     side_hits: Vec<(Rect, SideItem)>,
     side_scroll: usize,
@@ -115,7 +116,13 @@ impl Chat {
     pub fn new(cfg: &crate::config::Config) -> Self {
         let chats = store::load_all();
         let memory = std::fs::read_to_string(memory_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let provider = if cfg.ai.provider.is_empty() { "wren".to_string() } else { cfg.ai.provider.clone() };
+        let avail = providers::available(&cfg.ai);
+        // the configured AI if this machine has it, else the first one it does have
+        let provider = if !cfg.ai.provider.is_empty() && avail.contains(&cfg.ai.provider.as_str()) {
+            cfg.ai.provider.clone()
+        } else {
+            avail.first().map(|s| s.to_string()).unwrap_or_else(|| "none".into())
+        };
         Chat {
             chats,
             chat: store::Chat::new(&provider),
@@ -134,6 +141,7 @@ impl Chat {
             once_research: false,
             keys: HashMap::new(),
             info: vec![],
+            avail,
             confirm_delete: false,
             side_hits: vec![],
             side_scroll: 0,
@@ -306,7 +314,16 @@ impl Chat {
                 } else {
                     let mut a = arg.split_whitespace();
                     let id = a.next().unwrap_or("wren").to_lowercase();
-                    if providers::PROVIDERS.iter().any(|p| p.0 == id) {
+                    if providers::PROVIDERS.iter().any(|p| p.0 == id) && !self.avail.contains(&id.as_str()) {
+                        self.info.push(format!("{} isn't set up on this computer", providers::label(&id)));
+                        self.info.push(match id.as_str() {
+                            "wren" => "  wren runs on its owner's PC (its server on 127.0.0.1:5237)".into(),
+                            "claude" => "  install Claude Code: npm i -g @anthropic-ai/claude-code, then run `claude` once to sign in".into(),
+                            "codex" => "  install Codex: npm i -g @openai/codex, then `codex login`".into(),
+                            "ollama" => "  install Ollama from ollama.com and pull a model (ollama pull llama3.2)".into(),
+                            _ => format!("  add a key: /key {id} <key>"),
+                        });
+                    } else if providers::PROVIDERS.iter().any(|p| p.0 == id) {
                         let model = a.next().map(String::from);
                         self.chat.provider = Some(id.clone());
                         self.chat.model = model.clone();
@@ -399,6 +416,14 @@ impl Chat {
                         }
                         crate::config::save(&c);
                         self.keys.insert(p.to_string(), key.to_string());
+                        let id: &'static str = if p == "openai" { "openai" } else { "anthropic" };
+                        if !self.avail.contains(&id) {
+                            self.avail.push(id);
+                        }
+                        if self.provider_of() == "none" {
+                            self.provider = id.to_string();
+                            self.chat.provider = Some(id.to_string());
+                        }
                         cx.notify(format!("{p} key saved"));
                     }
                     _ => self.info.push("/key openai <key> · /key anthropic <key>  (saved in oriel's config file)".into()),
@@ -480,7 +505,11 @@ impl Chat {
     fn arg_options(&self, cmd: &str) -> Vec<(String, String)> {
         let pairs = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
         match cmd {
-            "/model" => providers::PROVIDERS.iter().map(|(id, label, what)| (id.to_string(), format!("{label} — {what}"))).collect(),
+            "/model" => providers::PROVIDERS
+                .iter()
+                .filter(|(id, ..)| self.avail.contains(id) || *id != "wren") // wren only where it's installed
+                .map(|(id, label, what)| (id.to_string(), if self.avail.contains(id) { format!("{label} — {what}") } else { format!("{label} — not set up here") }))
+                .collect(),
             "/mode" => pairs(&[("fast", "quick and simpler"), ("balanced", "the default"), ("smart", "slower: 2 drafts, the best is kept")]),
             "/perms" => pairs(&[
                 ("edits", "edit files in the chat's folder (default)"),
@@ -642,6 +671,31 @@ impl Chat {
     fn draw_hero(&mut self, f: &mut Frame, area: Rect, cx: &Cx) {
         let t = cx.theme;
         let p = self.provider_of();
+        if p == "none" {
+            let logo = crate::font::render("oriel");
+            let lw = logo.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+            let lines = [
+                "no AI is set up on this computer yet. Any one of these works:",
+                "  › Claude Code   npm i -g @anthropic-ai/claude-code, then run `claude` once",
+                "  › Codex         npm i -g @openai/codex, then `codex login`",
+                "  › Ollama        ollama.com, then `ollama pull llama3.2` (free, runs locally)",
+                "  › an API key    /key openai <key>  or  /key anthropic <key>",
+                "then restart oriel, or pick it with /model",
+            ];
+            let y0 = area.y + area.height.saturating_sub(8 + 2 + lines.len() as u16) / 2;
+            if area.width > lw + 2 && area.height >= 8 + 2 + lines.len() as u16 {
+                let x = area.x + (area.width - lw) / 2;
+                for (r, l) in logo.iter().enumerate() {
+                    f.render_widget(Paragraph::new(Span::styled(l.clone(), ui::accent(t))), Rect { x, y: y0 + r as u16, width: lw, height: 1 });
+                }
+            }
+            let tx = area.x + area.width.saturating_sub(78) / 2;
+            for (i, l) in lines.iter().enumerate() {
+                let style = if i == 0 { Style::default().add_modifier(Modifier::BOLD) } else { ui::muted(t) };
+                f.render_widget(Paragraph::new(Span::styled(*l, style)), Rect { x: tx, y: y0 + 10 + i as u16, width: area.width.saturating_sub(tx - area.x), height: 1 });
+            }
+            return;
+        }
         let word = match p.as_str() {
             "claude" => "claude",
             "codex" => "codex",
@@ -1152,6 +1206,17 @@ mod tests {
         c.input.clear();
         c.cursor = 0;
         println!("{}", k.render_side(&mut c, 32, 24));
+    }
+
+    #[test]
+    fn chat_no_ai() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.provider = "none".into();
+        c.chat.provider = None;
+        let s = k.render_html(&mut c, 130, 40, "target/snap/chat-none.html");
+        assert!(s.contains("no AI is set up"));
+        println!("available here: {:?}", providers::available(&k.config.ai));
     }
 
     /// Talks to Wren's real server if it's up; skipped otherwise. `cargo test chat_wren_live -- --ignored --nocapture`
