@@ -392,7 +392,7 @@ impl App {
     /// Sleep until the soonest thing that needs a redraw without an event.
     fn next_deadline(&self) -> Duration {
         let mut d = Duration::from_secs(30);
-        if self.theme.animated {
+        if self.theme.animated || self.onboard.as_ref().map(|o| o.animating()).unwrap_or(false) {
             d = d.min(Duration::from_millis(125));
         }
         if let Some((_, t)) = &self.notice {
@@ -1528,7 +1528,7 @@ mod tests {
     fn app_onboarding_flow() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut cfg = Config::default();
-        cfg.theme = "oriel".into();
+        cfg.theme = "ultra".into(); // what a first run looks like
         let mut app = App::new(cfg, tx);
         app.start_tour();
         let key = |app: &mut App, c: KeyCode| app.key(KeyEvent::new(c, KeyModifiers::NONE));

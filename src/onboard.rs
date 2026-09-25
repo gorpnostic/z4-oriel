@@ -270,6 +270,11 @@ impl Onboard {
         self.stage = Stage::Music { input, found };
     }
 
+    /// The welcome animates (ultra's rainbow) even when the app theme doesn't.
+    pub fn animating(&self) -> bool {
+        matches!(self.stage, Stage::Welcome)
+    }
+
     pub fn is_modal(&self) -> bool {
         !matches!(self.stage, Stage::Tour { .. })
     }
@@ -445,7 +450,8 @@ impl Onboard {
     pub fn draw(&mut self, f: &mut Frame, area: Rect, t: &Theme, time: f64) {
         self.hits.clear();
         let (n, title) = match &self.stage {
-            Stage::Welcome => return self.draw_welcome(f, area, t, time),
+            // the welcome is always ultra, whatever theme is set
+            Stage::Welcome => return self.draw_welcome(f, area, &theme::get("ultra"), time),
             Stage::Tour { step, .. } => {
                 let step = *step;
                 return self.draw_tour(f, area, t, step);
