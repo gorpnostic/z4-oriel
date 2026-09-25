@@ -1,5 +1,5 @@
 //! storage: drives, smart cleanup, a big-folder explorer, installed apps (uninstall), a curated "get apps" catalog
-//! (storage/catalog.rs) and package search/installs — a port of nest's storage app (wren/storage_view.py).
+//! (storage/catalog.rs) and package search/installs.
 //!
 //! Safety rules:
 //!   * nothing is deleted, uninstalled or installed without an in-app y/esc confirmation naming the exact target

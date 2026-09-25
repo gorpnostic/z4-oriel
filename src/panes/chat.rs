@@ -729,10 +729,7 @@ impl Chat {
             ];
             let y0 = area.y + area.height.saturating_sub(8 + 2 + lines.len() as u16) / 2;
             if area.width > lw + 2 && area.height >= 8 + 2 + lines.len() as u16 {
-                let x = area.x + (area.width - lw) / 2;
-                for (r, l) in logo.iter().enumerate() {
-                    f.render_widget(Paragraph::new(Span::styled(l.clone(), ui::accent(t))), Rect { x, y: y0 + r as u16, width: lw, height: 1 });
-                }
+                ui::big_logo(f, &logo, area.x + (area.width - lw) / 2, y0, t, cx.time);
             }
             let tx = area.x + area.width.saturating_sub(78) / 2;
             for (i, l) in lines.iter().enumerate() {
@@ -759,15 +756,7 @@ impl Chat {
         let y0 = area.y + area.height.saturating_sub(block_h) / 2;
         let mut y = y0;
         if area.width > lw + 2 && area.height >= block_h {
-            let x = area.x + (area.width - lw) / 2;
-            for (r, l) in logo.iter().enumerate() {
-                let spans: Vec<Span> = if t.animated {
-                    l.chars().enumerate().map(|(i, c)| Span::styled(c.to_string(), Style::default().fg(crate::theme::rainbow(i, cx.time)))).collect()
-                } else {
-                    vec![Span::styled(l.clone(), Style::default().fg(t.accent))]
-                };
-                f.render_widget(Paragraph::new(Line::from(spans)), Rect { x, y: y + r as u16, width: lw, height: 1 });
-            }
+            ui::big_logo(f, &logo, area.x + (area.width - lw) / 2, y, t, cx.time);
             y += 10;
         }
         let tx = area.x + area.width.saturating_sub(lw.max(40)) / 2;

@@ -21,12 +21,9 @@ pub struct Config {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct AiConfig {
-    /// AI for new chats: "wren", "claude", "codex", "ollama", "openai", "anthropic". Empty = the first one this
-    /// computer has (wren only counts where it's installed).
+    /// AI for new chats: "claude", "codex", "ollama", "openai", "anthropic". Empty = the first one this
+    /// computer has.
     pub provider: String,
-    /// Wren server(s), tried in order: the local one first, then the public page.
-    pub wren_urls: Vec<String>,
-    pub wren_mode: String,
     pub ollama_url: String,
     pub ollama_model: String,
     /// Any OpenAI-compatible endpoint (OpenAI, OpenRouter, LM Studio, llama.cpp server...).
@@ -62,9 +59,6 @@ impl Default for AiConfig {
     fn default() -> Self {
         AiConfig {
             provider: String::new(),
-            // local only: Wren runs on its owner's PC (its public page is for browsers, not other oriels)
-            wren_urls: vec!["http://127.0.0.1:5237".into()],
-            wren_mode: "balanced".into(),
             ollama_url: "http://127.0.0.1:11434".into(),
             ollama_model: "llama3.2".into(),
             openai_url: "https://api.openai.com/v1".into(),
