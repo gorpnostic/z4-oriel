@@ -1,6 +1,7 @@
 //! Drawing, keys and mouse for the storage pane (the state and background work live in storage.rs).
 
-use super::{Kind, Storage, VIEWS, View, human};
+use super::catalog::{self, CATALOG, CATS, Src};
+use super::{Kind, NV, Storage, TOP, VIEWS, View, human};
 use crate::pane::{Cx, Pane};
 use crate::theme::Theme;
 use crate::ui;
@@ -116,8 +117,24 @@ impl Storage {
             View::Cleanup => ("gauge", "cleanup".into()),
             View::Folders => ("files", "big folders".into()),
             View::Apps => ("package", "installed apps".into()),
-            View::Install => ("search", format!("install ({})", if cfg!(windows) { "winget" } else if self.install_via.contains("AUR") { "yay" } else { "pacman" })),
+            View::Catalog => ("cloud", "get apps".into()),
+            View::Install => ("search", format!("search {}", self.search_tool())),
         }
+    }
+
+    fn search_tool(&self) -> &'static str {
+        match self.env.os {
+            catalog::Os::Windows => "winget",
+            catalog::Os::Arch => self.env.aur_helper.unwrap_or("pacman"),
+            _ => "apt",
+        }
+    }
+
+    /// Catalog entries shown on this OS, and how many of them are installed.
+    fn catalog_counts(&self) -> (usize, usize) {
+        let shown = self.cat_count(0);
+        let inst = self.installed.as_ref().map(|inst| (0..CATALOG.len()).filter(|&i| self.picks[i].is_some() && inst.has(&CATALOG[i])).count()).unwrap_or(0);
+        (shown, inst)
     }
 
     fn cleanable(&self) -> u64 {
@@ -131,10 +148,12 @@ impl Storage {
         if self.input {
             return match self.view {
                 View::Install => vec![("enter", "search"), ("esc", "back to the results")],
+                View::Catalog => vec![("type", "to filter"), ("enter", "done (or search, if nothing matches)"), ("esc", "clear")],
                 _ => vec![("type", "to filter"), ("enter", "done"), ("esc", "clear")],
             };
         }
         match self.view {
+            View::Catalog => vec![("enter", "install"), ("tab / 1-9", "category"), ("/", "filter"), ("s", "search for anything else"), ("o", "homepage"), ("r", "recheck")],
             View::Cleanup => vec![("x", "clean the selected item"), ("enter", "review it in files"), ("r", "rescan"), ("tab", "next view")],
             View::Folders => vec![("enter", "open folder"), ("backspace", "up"), ("o", "show in files"), ("r", "rescan")],
             View::Apps => vec![("u", "uninstall"), ("/", "filter"), ("r", "reload"), ("tab", "next view")],
@@ -179,6 +198,7 @@ impl Storage {
     fn draw_box(&self, f: &mut Frame, r: Rect, t: &Theme) {
         let (title, value, ph) = match self.view {
             View::Apps => ("filter", &self.filter, "filter installed apps…   (/)".to_string()),
+            View::Catalog => ("filter", &self.cfilter, format!("filter the catalog…   (/)      not here? press s to search {} for anything", self.search_tool())),
             _ => ("search", &self.query, format!("search {}, press enter…   (/)", self.install_via)),
         };
         let inner = ui::frame(f, r, &format!("{}{title}", ui::lead("search")), None, self.input, t);
@@ -269,6 +289,54 @@ impl Storage {
                 };
                 (cols, rows, empty)
             }
+            View::Catalog => {
+                let show_cat = self.cat == 0 || !self.cfilter.trim().is_empty();
+                let mut cols = vec![col("app", 20), col("what it is", 0)];
+                if show_cat {
+                    cols.push(col("category", 14));
+                }
+                cols.extend([col("via", 8), col("", 12)]);
+                let mut prev = None;
+                let rows = order
+                    .iter()
+                    .map(|&i| {
+                        let e = &CATALOG[i];
+                        // the category label only on the first row of each group
+                        let first = prev != Some(e.cat);
+                        prev = Some(e.cat);
+                        let p = self.picks[i].as_ref().expect("order only lists picked entries");
+                        let inst = self.installed.as_ref().map(|inst| inst.has(e));
+                        let usable = p.install.is_some() || p.src == Src::Web;
+                        let name_st = if usable { plain } else { muted };
+                        let via_st = match p.src {
+                            _ if !usable => muted,
+                            Src::Web => muted,
+                            _ => ui::accent(t),
+                        };
+                        let status = match (&p.missing, inst) {
+                            (Some(m), _) => cell(m.split(" (").next().unwrap_or(m).to_string(), Style::default().fg(AMBER)),
+                            (None, Some(true)) => cell("✓ installed", ui::bold_accent(t)),
+                            (None, None) => cell("…", muted),
+                            (None, Some(false)) if p.src == Src::Web => cell("opens page", muted),
+                            (None, Some(false)) => cell("", muted),
+                        };
+                        let mut row = vec![cell(e.name, name_st), cell(e.desc, muted)];
+                        if show_cat {
+                            row.push(cell(if first { e.cat.label() } else { "" }, muted));
+                        }
+                        row.extend([cell(p.src.label(), via_st), status]);
+                        row
+                    })
+                    .collect();
+                let empty = order.is_empty().then(|| {
+                    if self.cfilter.trim().is_empty() {
+                        format!("nothing in this category is packaged for {}", self.env.os.label())
+                    } else {
+                        format!("no catalog app matches “{}” — press enter to search {} for it", self.cfilter.trim(), self.search_tool())
+                    }
+                });
+                (cols, rows, empty)
+            }
             View::Install => {
                 let cols = if cfg!(windows) {
                     vec![col("name", 0), col("winget id", 40), col("version", 16), col("source", 8)]
@@ -307,9 +375,63 @@ impl Storage {
         }
     }
 
+    /// The catalog's category column: "all" then each category with how many apps it offers here.
+    fn draw_cats(&mut self, f: &mut Frame, r: Rect, focused: bool, t: &Theme) {
+        self.cat_hits.clear();
+        let inner = ui::frame(f, r, "categories", None, false, t);
+        let filtering = !self.cfilter.trim().is_empty();
+        for c in 0..=CATS.len() {
+            let y = inner.y + c as u16;
+            if y >= inner.bottom() {
+                break;
+            }
+            let row = Rect { y, height: 1, ..inner };
+            let label = if c == 0 { "all" } else { CATS[c - 1].label() };
+            let n = self.cat_count(c);
+            let on = self.cat == c && !filtering;
+            let w = row.width as usize;
+            let key = format!("{} ", c + 1);
+            let left = format!(" {key}{label}");
+            let right = format!("{n} ");
+            let pad = w.saturating_sub(unicode_width::UnicodeWidthStr::width(left.as_str()) + right.len());
+            let (base, keyst, numst) = if on {
+                let b = if focused { Style::default().bg(t.frame) } else { Style::default() };
+                (b.fg(t.accent).add_modifier(Modifier::BOLD), b.fg(t.accent), b.fg(t.accent))
+            } else if n == 0 {
+                (ui::muted(t), Style::default().fg(t.frame), Style::default().fg(t.frame))
+            } else {
+                (Style::default(), ui::muted(t), ui::muted(t))
+            };
+            let line = Line::from(vec![
+                Span::styled(format!(" {key}"), keyst),
+                Span::styled(ui::fit(label, w.saturating_sub(right.len() + 4)), base),
+                Span::styled(" ".repeat(pad), base),
+                Span::styled(right, numst),
+            ]);
+            f.render_widget(Paragraph::new(line), row);
+            self.cat_hits.push((row, c));
+        }
+        // how many are installed, under the list
+        let (shown, inst) = self.catalog_counts();
+        let y = inner.y + CATS.len() as u16 + 2;
+        if y < inner.bottom() {
+            let text = match &self.installed {
+                Some(_) => format!(" {inst} of {shown} installed"),
+                None => " checking installed…".into(),
+            };
+            f.render_widget(Paragraph::new(Span::styled(ui::fit(&text, inner.width as usize), ui::muted(t))), Rect { y, height: 1, ..inner });
+        }
+        let hidden = CATALOG.len() - shown;
+        if hidden > 0 && y + 1 < inner.bottom() {
+            let text = format!(" {hidden} not for {}", self.env.os.label());
+            f.render_widget(Paragraph::new(Span::styled(ui::fit(&text, inner.width as usize), Style::default().fg(t.frame))), Rect { y: y + 1, height: 1, ..inner });
+        }
+    }
+
     fn draw_confirm(&self, f: &mut Frame, area: Rect, t: &Theme) {
         let Some(c) = &self.confirm else { return };
-        let w = 84.min(area.width.saturating_sub(4)).max(20);
+        let longest = c.lines.iter().chain([&c.question]).map(|l| unicode_width::UnicodeWidthStr::width(l.as_str())).max().unwrap_or(0) as u16;
+        let w = (longest + 4).max(84).min(area.width.saturating_sub(4)).max(20);
         let h = c.lines.len() as u16 + 6;
         let inner = ui::popup(f, area, w, h, "are you sure?", t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
@@ -353,6 +475,16 @@ impl Pane for Storage {
                 Some(Err(_)) => "couldn't read installed apps".into(),
                 None => "reading installed apps…".into(),
             },
+            View::Catalog => {
+                let (shown, inst) = self.catalog_counts();
+                let what = if self.cfilter.trim().is_empty() {
+                    if self.cat == 0 { "all".to_string() } else { CATS[self.cat - 1].label().to_string() }
+                } else {
+                    format!("“{}”", self.cfilter.trim())
+                };
+                let inst = if self.installed.is_some() { format!("{inst} installed") } else { "checking what's installed…".into() };
+                format!("{shown} popular apps for {} · {what} · {inst} · enter installs (asks first)", self.env.os.label())
+            }
             View::Install => match &self.found {
                 _ if self.searching => format!("searching {} for “{}”…", self.install_via, self.found_q),
                 Some(Ok(v)) => format!("{} results for “{}” · select one and press enter", v.len(), self.found_q),
@@ -379,7 +511,7 @@ impl Pane for Storage {
             self.draw_drives(f, Rect { y, height: card_h, ..body }, t);
             y += card_h + 1;
         }
-        if matches!(self.view, View::Apps | View::Install) && body.bottom() > y + 5 {
+        if matches!(self.view, View::Apps | View::Catalog | View::Install) && body.bottom() > y + 5 {
             self.draw_box(f, Rect { y, height: 3, ..body }, t);
             y += 3;
         }
@@ -395,7 +527,14 @@ impl Pane for Storage {
             let line = Line::from(vec![Span::styled(" biggest files in here: ", ui::bold_accent(t)), Span::styled(names.join("  ·  "), ui::muted(t))]);
             f.render_widget(Paragraph::new(line), Rect { y: bottom + 1, height: 1, ..body });
         }
-        let tr = Rect { x: body.x + 1, y, width: body.width.saturating_sub(2), height: bottom.saturating_sub(y) };
+        let mut tr = Rect { x: body.x + 1, y, width: body.width.saturating_sub(2), height: bottom.saturating_sub(y) };
+        if self.view == View::Catalog && tr.width >= 80 && tr.height >= 4 {
+            let cw = 24;
+            self.draw_cats(f, Rect { x: body.x, width: cw, ..tr }, cx.focused && !self.input, t);
+            tr = Rect { x: body.x + cw + 2, width: tr.width.saturating_sub(cw + 1), ..tr };
+        } else {
+            self.cat_hits.clear();
+        }
         self.draw_table(f, tr, cx.focused, t);
         self.draw_confirm(f, area, t);
     }
@@ -419,6 +558,35 @@ impl Pane for Storage {
                 _ => {}
             }
             return true; // nothing else happens while a question is open
+        }
+        if self.input && self.view == View::Catalog {
+            match key.code {
+                KeyCode::Char(c) => self.cfilter.push(c),
+                KeyCode::Backspace => {
+                    self.cfilter.pop();
+                }
+                KeyCode::Esc => {
+                    self.cfilter.clear();
+                    self.input = false;
+                }
+                KeyCode::Enter => {
+                    self.input = false;
+                    let q = self.cfilter.trim().to_string();
+                    if !q.is_empty() && self.order(View::Catalog).is_empty() {
+                        self.cfilter.clear();
+                        self.search_for(q);
+                    }
+                }
+                KeyCode::Up => self.step(-1),
+                KeyCode::Down => self.step(1),
+                KeyCode::Tab => self.input = false,
+                _ => {}
+            }
+            if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+                self.sel[View::Catalog.i()] = TOP;
+                self.off[View::Catalog.i()] = 0;
+            }
+            return true;
         }
         if self.input {
             let apps = self.view == View::Apps;
@@ -450,41 +618,52 @@ impl Pane for Storage {
             }
             return true;
         }
-        match key.code {
-            KeyCode::Tab => self.set_view(VIEWS[(self.view.i() + 1) % 4]),
-            KeyCode::BackTab => self.set_view(VIEWS[(self.view.i() + 3) % 4]),
-            KeyCode::Char(c @ '1'..='4') => self.set_view(VIEWS[c as usize - '1' as usize]),
-            KeyCode::Up | KeyCode::Char('k') => self.step(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.step(1),
-            KeyCode::PageUp => self.step(-10),
-            KeyCode::PageDown => self.step(10),
-            KeyCode::Home | KeyCode::Char('g') => self.step(-1_000_000),
-            KeyCode::End | KeyCode::Char('G') => self.step(1_000_000),
-            KeyCode::Char('r') => self.rescan(),
-            KeyCode::Char('/') if matches!(self.view, View::Apps | View::Install) => self.input = true,
-            KeyCode::Char('x') if self.view == View::Cleanup => self.ask_clean(cx),
-            KeyCode::Char('u') if self.view == View::Apps => self.ask_uninstall(),
-            KeyCode::Char('o') if self.view == View::Folders => {
-                let p = self.selected().map(|i| self.frows[i].clone()).filter(|r| r.dir).map(|r| r.path).unwrap_or_else(|| self.froot.clone());
-                self.open_files(p, cx);
+        if self.view == View::Catalog {
+            let n = CATS.len();
+            match key.code {
+                // tab walks the categories, then on to the next view (backtab: back out the other side)
+                KeyCode::Tab if self.cat < n => self.set_cat(self.cat + 1),
+                KeyCode::BackTab if self.cat > 0 => self.set_cat(self.cat - 1),
+                KeyCode::Right | KeyCode::Char('l') => self.set_cat((self.cat + 1) % (n + 1)),
+                KeyCode::Left | KeyCode::Char('h') => self.set_cat((self.cat + n) % (n + 1)),
+                KeyCode::Char(c @ '1'..='9') => self.set_cat(c as usize - '1' as usize),
+                KeyCode::Char('s') => self.search_for(self.cfilter.trim().to_string()),
+                KeyCode::Char('o') => {
+                    if let Some(i) = self.selected() {
+                        self.open_url(CATALOG[i].home, cx);
+                    }
+                }
+                KeyCode::Char('i') => self.ask_get(cx),
+                _ => return self.key_common(key, cx),
             }
-            KeyCode::Backspace if self.view == View::Folders => self.up(),
-            KeyCode::Enter => self.enter(cx),
-            _ => return false,
+            return true;
         }
-        true
+        self.key_common(key, cx)
     }
 
-    fn mouse(&mut self, ev: MouseEvent, _area: Rect, _cx: &mut Cx) {
+    fn mouse(&mut self, ev: MouseEvent, _area: Rect, cx: &mut Cx) {
         match ev.kind {
             MouseEventKind::ScrollDown => self.step(3),
             MouseEventKind::ScrollUp => self.step(-3),
             MouseEventKind::Down(MouseButton::Left) if self.confirm.is_none() => {
+                let at = Position { x: ev.column, y: ev.row };
+                if let Some(&(_, c)) = self.cat_hits.iter().find(|(r, _)| r.contains(at)) {
+                    self.set_cat(c);
+                    return;
+                }
                 if let Some((body, off)) = self.table_hit {
-                    if body.contains(Position { x: ev.column, y: ev.row }) {
+                    if body.contains(at) {
                         let pos = off + (ev.row - body.y) as usize;
                         if let Some(&i) = self.order(self.view).get(pos) {
                             self.sel[self.view.i()] = i;
+                            // double-click on a catalog app = enter (which still asks before installing)
+                            let now = std::time::Instant::now();
+                            let double = self.last_click.is_some_and(|(t, j)| j == i && now.duration_since(t).as_millis() < 450);
+                            self.last_click = Some((now, i));
+                            if double && self.view == View::Catalog {
+                                self.last_click = None;
+                                self.ask_get(cx);
+                            }
                         }
                     }
                 }
@@ -514,6 +693,7 @@ impl Pane for Storage {
                     Some(Ok(a)) => a.len().to_string(),
                     _ => String::new(),
                 },
+                View::Catalog => self.cat_count(0).to_string(),
                 _ => String::new(),
             };
             ui::side_row(f, r, icon, &label, &right, v == self.view, cx.theme);
@@ -528,6 +708,40 @@ impl Pane for Storage {
                 self.set_view(v);
             }
         }
+    }
+}
+
+impl Storage {
+    /// Keys every view shares (after the catalog has had first go at tab / digits).
+    fn key_common(&mut self, key: KeyEvent, cx: &mut Cx) -> bool {
+        match key.code {
+            KeyCode::Tab => self.set_view(VIEWS[(self.view.i() + 1) % NV]),
+            KeyCode::BackTab => {
+                self.set_view(VIEWS[(self.view.i() + NV - 1) % NV]);
+                if self.view == View::Catalog {
+                    self.set_cat(CATS.len()); // coming back in from the right: the last category
+                }
+            }
+            KeyCode::Char(c @ '1'..='5') => self.set_view(VIEWS[c as usize - '1' as usize]),
+            KeyCode::Up | KeyCode::Char('k') => self.step(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.step(1),
+            KeyCode::PageUp => self.step(-10),
+            KeyCode::PageDown => self.step(10),
+            KeyCode::Home | KeyCode::Char('g') => self.step(-1_000_000),
+            KeyCode::End | KeyCode::Char('G') => self.step(1_000_000),
+            KeyCode::Char('r') => self.rescan(),
+            KeyCode::Char('/') if matches!(self.view, View::Apps | View::Catalog | View::Install) => self.input = true,
+            KeyCode::Char('x') if self.view == View::Cleanup => self.ask_clean(cx),
+            KeyCode::Char('u') if self.view == View::Apps => self.ask_uninstall(),
+            KeyCode::Char('o') if self.view == View::Folders => {
+                let p = self.selected().map(|i| self.frows[i].clone()).filter(|r| r.dir).map(|r| r.path).unwrap_or_else(|| self.froot.clone());
+                self.open_files(p, cx);
+            }
+            KeyCode::Backspace if self.view == View::Folders => self.up(),
+            KeyCode::Enter => self.enter(cx),
+            _ => return false,
+        }
+        true
     }
 }
 

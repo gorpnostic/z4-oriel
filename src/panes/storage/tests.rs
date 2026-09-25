@@ -248,7 +248,7 @@ fn storage_install_confirm_then_terminal() {
     let mut p = Storage::new();
     quiet(&mut p, &k);
     fake(&mut p);
-    k.key(&mut p, KeyCode::Char('4'));
+    k.key(&mut p, KeyCode::Char('5'));
     assert!(p.input, "install view starts in the search box");
     k.typ(&mut p, "ripgrep");
     assert_eq!(p.query, "ripgrep");
@@ -353,4 +353,229 @@ fn storage_parse_sizes() {
     assert_eq!(scan::parse_size("12 KiB"), Some(12 << 10));
     assert_eq!(super::human(15 << 30), "15.0 GB");
     assert_eq!(super::human(900), "900 B");
+}
+
+// ------------------------------------------------------------------ get apps (catalog)
+
+use super::catalog::{self, CATALOG, Env, Os, Src};
+
+fn env(os: Os, aur: Option<&'static str>, flatpak: bool, npm: bool) -> Env {
+    Env { os, aur_helper: aur, flatpak, npm }
+}
+
+fn idx(name: &str) -> usize {
+    CATALOG.iter().position(|e| e.name == name).unwrap_or_else(|| panic!("{name} not in the catalog"))
+}
+
+/// A catalog pane on a pretend OS with a pretend "installed" list, so nothing real is queried.
+fn catalog_pane(k: &Kit, e: Env, installed: &[&str]) -> Storage {
+    let via = match e.os { Os::Windows => "winget", Os::Arch => "pacman + AUR", _ => "pacman" };
+    let mut p = Storage::with_env(e, via);
+    quiet(&mut p, k);
+    fake(&mut p);
+    let mut inst = catalog::Installed::default();
+    for i in installed {
+        inst.ids.insert(i.to_lowercase());
+    }
+    inst.names.push("discord".into()); // an ARP-only row, matched by name
+    p.installed = Some(inst);
+    p
+}
+
+#[test]
+fn storage_catalog_snapshot() {
+    let mut k = Kit::new();
+    let mut p = catalog_pane(&k, env(Os::Windows, None, false, true), &["winget:Valve.Steam", "winget:Git.Git", "npm:@anthropic-ai/claude-code", "winget:OBSProject.OBSStudio"]);
+    k.key(&mut p, KeyCode::Char('4'));
+    assert_eq!(p.view, View::Catalog);
+    assert!(!p.input, "the catalog opens on the list, not the box");
+    let out = k.render_html(&mut p, 150, 44, "target/snap/storage-catalog.html");
+    println!("{out}\n{:?}", p.subtitle());
+    assert!(out.contains("categories") && out.contains("creative") && out.contains("utilities"));
+    assert!(out.contains("OBS Studio") && out.contains("✓ installed"));
+    // Linux-only apps are hidden on Windows
+    assert!(!out.contains("btop") && !out.contains("Lutris"));
+    let side = k.render_side(&mut p, 34, 8);
+    println!("{side}");
+    assert!(side.contains("get apps"));
+    // category 2 = gaming
+    k.key(&mut p, KeyCode::Char('3'));
+    let out = k.render_html(&mut p, 150, 44, "target/snap/storage-catalog-gaming.html");
+    println!("{out}");
+    assert!(out.contains("Steam") && out.contains("Playnite") && !out.contains("OBS Studio"));
+    let d = idx("Discord");
+    assert!(p.installed.as_ref().unwrap().has(&CATALOG[d]), "ARP name match");
+}
+
+#[test]
+fn storage_catalog_arch_snapshot() {
+    let mut k = Kit::new();
+    let mut p = catalog_pane(&k, env(Os::Arch, Some("yay"), true, false), &["pkg:firefox", "pkg:btop", "flatpak:com.spotify.Client"]);
+    k.key(&mut p, KeyCode::Char('4'));
+    let out = k.render_html(&mut p, 150, 44, "target/snap/storage-catalog-arch.html");
+    println!("{out}\n{:?}", p.subtitle());
+    assert!(out.contains("pacman") && out.contains("aur"));
+    assert!(!out.contains("PowerToys"), "Windows-only apps are hidden on Arch");
+    // npm CLIs show up muted with the reason when npm is missing
+    k.key(&mut p, KeyCode::Char('5')); // ai
+    let out = k.render_html(&mut p, 150, 44, "target/snap/storage-catalog-arch-ai.html");
+    println!("{out}");
+    assert!(out.contains("Claude Code") && out.contains("needs npm"));
+    let cc = idx("Claude Code");
+    p.sel[View::Catalog.i()] = cc;
+    k.key(&mut p, KeyCode::Enter);
+    assert!(p.confirm.is_none(), "nothing to confirm without npm");
+    assert!(k.notices().iter().any(|n| n.contains("needs npm")));
+    assert!(p.launched.is_empty());
+}
+
+#[test]
+fn storage_catalog_install_needs_confirmation() {
+    let mut k = Kit::new();
+    let mut p = catalog_pane(&k, env(Os::Windows, None, false, true), &[]);
+    k.key(&mut p, KeyCode::Char('4'));
+    // first row of "all" is OBS Studio
+    assert_eq!(p.selected(), Some(idx("OBS Studio")));
+    k.key(&mut p, KeyCode::Char('j'));
+    assert_eq!(p.selected(), Some(idx("Blender")));
+    k.key(&mut p, KeyCode::Enter);
+    let c = p.confirm.as_ref().expect("asks first");
+    assert_eq!(c.question, "install Blender?");
+    assert!(c.lines.iter().any(|l| l.contains("winget install --id BlenderFoundation.Blender -e --accept-package-agreements")));
+    let out = k.render_html(&mut p, 150, 44, "target/snap/storage-catalog-confirm.html");
+    println!("{out}");
+    k.key(&mut p, KeyCode::Char('j')); // ignored while asking
+    k.key(&mut p, KeyCode::Esc);
+    assert!(p.confirm.is_none() && p.launched.is_empty());
+    k.key(&mut p, KeyCode::Enter);
+    k.key(&mut p, KeyCode::Char('y'));
+    assert_eq!(p.launched, vec!["term: winget install --id BlenderFoundation.Blender -e --accept-package-agreements --accept-source-agreements".to_string()]);
+    // o opens the homepage (recorded only)
+    k.key(&mut p, KeyCode::Char('o'));
+    assert_eq!(p.launched.last().map(String::as_str), Some("open: https://www.blender.org"));
+    // DaVinci Resolve has no package: enter opens its download page, nothing to install
+    p.sel[View::Catalog.i()] = idx("DaVinci Resolve");
+    k.key(&mut p, KeyCode::Enter);
+    assert!(p.confirm.is_none());
+    assert!(p.launched.last().unwrap().starts_with("open: https://www.blackmagicdesign.com"));
+}
+
+#[test]
+fn storage_catalog_mouse_and_categories() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut k = Kit::new();
+    let mut p = catalog_pane(&k, env(Os::Windows, None, false, true), &[]);
+    k.key(&mut p, KeyCode::Char('4'));
+    k.render(&mut p, 150, 44);
+    let click = |x: u16, y: u16| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: crossterm::event::KeyModifiers::NONE };
+    let area = ratatui::layout::Rect::new(0, 0, 150, 44);
+    // click the "ai" category row
+    let (r, _) = *p.cat_hits.iter().find(|(_, c)| *c == 4).unwrap();
+    k.mouse(&mut p, click(r.x + 3, r.y), area);
+    assert_eq!(p.cat, 4);
+    k.render(&mut p, 150, 44);
+    // single click on the second table row selects, a second click on it asks to install
+    let (body, off) = p.table_hit.unwrap();
+    let second = p.order(View::Catalog)[off + 1];
+    k.mouse(&mut p, click(body.x + 2, body.y + 1), area);
+    assert_eq!(p.selected(), Some(second));
+    assert!(p.confirm.is_none());
+    k.mouse(&mut p, click(body.x + 2, body.y + 1), area);
+    assert!(p.confirm.is_some(), "double-click asks");
+    k.key(&mut p, KeyCode::Char('n'));
+    assert!(p.launched.is_empty());
+    // tab walks categories, then leaves for the search view; backtab comes back to the last category
+    p.set_cat(catalog::CATS.len());
+    k.key(&mut p, KeyCode::Tab);
+    assert_eq!(p.view, View::Install);
+    p.input = false;
+    k.key(&mut p, KeyCode::BackTab);
+    assert_eq!((p.view, p.cat), (View::Catalog, catalog::CATS.len()));
+    // the filter searches every category
+    k.key(&mut p, KeyCode::Char('/'));
+    k.typ(&mut p, "vpn");
+    let names: Vec<&str> = p.order(View::Catalog).iter().map(|&i| CATALOG[i].name).collect();
+    println!("{names:?}");
+    assert!(names.contains(&"Mullvad VPN") && names.contains(&"Proton VPN"));
+    k.key(&mut p, KeyCode::Esc);
+    assert!(p.cfilter.is_empty());
+}
+
+#[test]
+fn storage_catalog_picks_per_os() {
+    let pk = |name: &str, e: &Env| catalog::pick(&CATALOG[idx(name)], e);
+    let arch = env(Os::Arch, Some("paru"), true, true);
+    let arch_bare = env(Os::Arch, None, false, false);
+    let deb = env(Os::Debian, None, true, false);
+    let win = env(Os::Windows, None, false, false);
+    // pacman first, AUR through the helper
+    assert_eq!(pk("Firefox", &arch).unwrap().install, Some(Cmd::new("sudo", &["pacman", "-S", "--needed", "firefox"])));
+    assert_eq!(pk("Brave", &arch).unwrap().install, Some(Cmd::new("paru", &["-S", "brave-bin"])));
+    // no helper: flatpak, and with no flatpak either: say what's missing
+    assert_eq!(pk("Brave", &env(Os::Arch, None, true, false)).unwrap().src, Src::Flatpak);
+    let b = pk("Brave", &arch_bare).unwrap();
+    assert!(b.install.is_none() && b.missing.as_deref().unwrap().contains("yay or paru"));
+    // several packages in one field
+    assert_eq!(pk("Node.js LTS", &deb).unwrap().install, Some(Cmd::new("sudo", &["apt", "install", "nodejs", "npm"])));
+    assert_eq!(pk("Spotify", &deb).unwrap().install, Some(Cmd::new("flatpak", &["install", "-y", "flathub", "com.spotify.Client"])));
+    // hidden where there's nothing
+    assert!(pk("PowerToys", &arch).is_none());
+    assert!(pk("btop", &win).is_none());
+    // website fallback
+    assert_eq!(pk("Tailscale", &deb).unwrap().src, Src::Web);
+    assert_eq!(pk("DaVinci Resolve", &win).unwrap().src, Src::Web);
+    // npm
+    let npm = env(Os::Linux, None, false, true);
+    assert!(pk("Codex", &npm).unwrap().install.unwrap().text().ends_with("npm i -g @openai/codex")); // cmd /c on Windows
+    assert!(pk("Codex", &win).unwrap().missing.is_some());
+    // every entry has a name, description, homepage, and at least one way in
+    for e in CATALOG {
+        assert!(!e.name.is_empty() && !e.desc.is_empty() && e.home.starts_with("https://"), "{}", e.name);
+        assert!(e.web || [e.winget, e.pacman, e.aur, e.apt, e.flatpak, e.npm].iter().any(|s| !s.is_empty()), "{}", e.name);
+    }
+}
+
+#[test]
+fn storage_catalog_parsers() {
+    assert_eq!(catalog::distro("NAME=\"Omarchy\"\nID=omarchy\nID_LIKE=arch\n"), Os::Arch);
+    assert_eq!(catalog::distro("ID=arch\n"), Os::Arch);
+    assert_eq!(catalog::distro("ID=pop\nID_LIKE=\"ubuntu debian\"\n"), Os::Debian);
+    assert_eq!(catalog::distro("ID=fedora\n"), Os::Linux);
+    let list = "   - \r   \\ \r\nName                 Id                                      Version     Available  Source\n\
+                -----------------------------------------------------------------------------------------------\n\
+                Discord              ARP\\User\\X64\\Discord                     1.0.9258\n\
+                Git                  Git.Git                                 2.55.0.3               winget\n\
+                Steam                Valve.Steam                             2.10.91.91             winget\n";
+    let (ids, names) = catalog::parse_winget_list(list);
+    assert_eq!(ids, vec!["Git.Git", "Valve.Steam"]);
+    assert_eq!(names, vec!["discord"]);
+    let npm = "C:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\nC:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\nC:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\pnpm\n";
+    assert_eq!(catalog::parse_npm_ls(npm), vec!["@anthropic-ai/claude-code", "pnpm"]);
+    // whole-word name matching: "git" is not "github desktop"
+    let mut inst = catalog::Installed::default();
+    inst.names = vec!["github desktop".into()];
+    assert!(!inst.has(&CATALOG[idx("Git")]));
+    inst.names = vec!["python 3.13.1 (64-bit)".into()];
+    assert!(inst.has(&CATALOG[idx("Python")]));
+}
+
+/// Reads this machine's real installed list (winget list / pacman -Qq …, read-only) and snapshots the
+/// catalog with it: `cargo test storage_catalog_live -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn storage_catalog_live() {
+    let mut k = Kit::new();
+    let mut p = Storage::new();
+    quiet(&mut p, &k);
+    p.refresh_drives();
+    k.key(&mut p, KeyCode::Char('4'));
+    for _ in 0..300 {
+        k.wait_wake(&mut p, 100);
+        if p.installed.is_some() && p.drives.is_some() {
+            break;
+        }
+    }
+    let out = k.render_html(&mut p, 150, 44, "target/snap/storage-catalog-live.html");
+    println!("{out}\n{:?}", p.subtitle());
+    assert!(p.installed.is_some());
 }
