@@ -39,6 +39,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     let (tx, rx) = mpsc::channel();
+    // drop keystrokes typed before oriel started (e.g. the Enter that launched it)
+    while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+        let _ = crossterm::event::read();
+    }
     let input_tx = tx.clone();
     std::thread::spawn(move || {
         while let Ok(ev) = crossterm::event::read() {

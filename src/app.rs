@@ -287,6 +287,12 @@ impl App {
     }
 
     fn handle(&mut self, ev: Event) {
+        if let (Some(path), Event::Input(e)) = (std::env::var_os("ORIEL_LOG"), &ev) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{:>8.3} {:?}", self.start.elapsed().as_secs_f64(), e);
+            }
+        }
         match ev {
             Event::Input(CEvent::Key(k)) if k.kind != KeyEventKind::Release => self.key(k),
             Event::Input(CEvent::Mouse(m)) => self.mouse(m),
@@ -390,6 +396,8 @@ impl App {
             KeyCode::Down => self.move_focus(0, 1),
             KeyCode::Enter => self.run_cmd(Cmd::Open("terminal", Place::Split)),
             KeyCode::Char(c) => match c.to_ascii_lowercase() {
+                // alt+n too: Windows Terminal keeps alt+enter for fullscreen
+                'n' => self.run_cmd(Cmd::Open("terminal", Place::Split)),
                 '1'..='9' => {
                     let i = c as usize - '1' as usize;
                     if i < self.tabs.len() {
@@ -737,7 +745,7 @@ fn draw_help(f: &mut Frame, area: Rect, t: &Theme, c: &Config) {
     let rows: Vec<(String, &str)> = vec![
         ("alt ←↑↓→".into(), "move between panes"),
         ("alt shift ←↑↓→".into(), "resize the pane"),
-        ("alt enter".into(), "new terminal (splits the pane)"),
+        ("alt n · alt enter".into(), "new terminal (splits the pane)"),
         ("alt p".into(), "palette: open apps, themes, everything"),
         ("alt 1-9 · alt t".into(), "go to tab · new tab"),
         ("alt z · alt w".into(), "zoom pane · close pane"),

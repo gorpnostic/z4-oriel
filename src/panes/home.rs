@@ -84,7 +84,7 @@ impl Pane for Home {
         // bindings
         let pre = cx.config.prefix.replace("ctrl+", "ctrl-");
         let lines = vec![
-            Line::from([ui::key_hint("alt ←↑↓→", "move", t), ui::key_hint("alt enter", "new terminal", t), ui::key_hint("alt p", "palette", t)].concat()),
+            Line::from([ui::key_hint("alt ←↑↓→", "move", t), ui::key_hint("alt n", "new terminal", t), ui::key_hint("alt p", "palette", t)].concat()),
             Line::from([ui::key_hint("alt 1-9", "tabs", t), ui::key_hint("alt t", "new tab", t), ui::key_hint("alt z", "zoom", t), ui::key_hint("alt w", "close", t)].concat()),
             Line::from([ui::key_hint(&pre, "then | - split · hjkl move · ? help", t)].concat()),
         ];
@@ -115,6 +115,8 @@ impl Pane for Home {
             }
             KeyCode::Down | KeyCode::Right | KeyCode::Tab => self.sel = (self.sel + 1) % apps.len(),
             KeyCode::Up | KeyCode::Left | KeyCode::BackTab => self.sel = (self.sel + apps.len() - 1) % apps.len(),
+            // the Enter that started oriel can arrive as a fresh keypress; don't let it open an app
+            KeyCode::Enter if cx.time < 0.6 => {}
             KeyCode::Enter => self.launch(apps[self.sel], cx),
             _ => return false,
         }
