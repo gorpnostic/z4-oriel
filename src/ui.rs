@@ -1,0 +1,187 @@
+//! Shared drawing: the rounded frame with its title set into the border (the nest look), icons, the logo,
+//! and small helpers every pane uses.
+
+use crate::theme::{Theme, rainbow};
+use ratatui::{
+    Frame,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// false = plain-text fallbacks for terminals without a Nerd Font.
+pub static NERD: AtomicBool = AtomicBool::new(true);
+
+// Nerd Font (Material Design) codepoints, from github.com/ryanoasis/nerd-fonts glyphnames.json
+const ICONS: &[(&str, &str, &str)] = &[
+    ("oriel", "\u{F05A8}", "*"),   // md-white_balance_sunny... replaced below by window
+    ("window", "\u{F05AF}", "#"),  // md-window_maximize
+    ("term", "\u{F018D}", ">"),    // md-console
+    ("ai", "\u{F0674}", "*"),      // md-creation (sparkles)
+    ("wren", "\u{F15C6}", "~"),    // md-bird
+    ("music", "\u{F075A}", "~"),   // md-music
+    ("system", "\u{F061A}", "#"),  // md-chip
+    ("files", "\u{F0256}", "/"),   // md-folder_outline
+    ("notes", "\u{F0387}", "="),   // md-note... (music_note in nest; notebook here)
+    ("storage", "\u{F02CA}", "%"), // md-harddisk
+    ("home", "\u{F02DC}", "@"),    // md-home
+    ("theme", "\u{F03D8}", "&"),   // md-palette
+    ("play", "\u{F040A}", ">"),
+    ("pause", "\u{F03E4}", "||"),
+    ("prev", "\u{F04AE}", "|<"),
+    ("next", "\u{F04AD}", ">|"),
+    ("shuffle", "\u{F049F}", "shuf"),
+    ("repeat", "\u{F0456}", "rep"),
+    ("volume", "\u{F057E}", "vol"),
+    ("search", "\u{F0349}", "?"),
+    ("gauge", "\u{F029A}", "#"),
+    ("chart", "\u{F0128}", "#"),
+    ("clock", "\u{F0150}", ""),
+    ("robot", "\u{F06A9}", "@"),
+    ("cloud", "\u{F0163}", "@"),
+    ("claude", "\u{F0674}", "*"),
+    ("split", "\u{F0E4D}", "|"),   // md-view_split_vertical... fallback bar
+    ("close", "\u{F0156}", "x"),   // md-close
+    ("tab", "\u{F04E9}", "+"),     // md-tab
+    ("quit", "\u{F0206}", "q"),    // md-exit_to_app
+    ("package", "\u{F03D3}", "pkg"),
+    ("trash", "\u{F01B4}", "del"),
+    ("file", "\u{F0214}", "-"),    // md-file
+    ("doc", "\u{F0219}", "-"),     // md-file_document
+    ("code", "\u{F0169}", "<>"),   // md-code_braces
+    ("image", "\u{F021F}", "img"),
+    ("audio", "\u{F0223}", "aud"),
+    ("video", "\u{F022B}", "vid"),
+    ("archive", "\u{F0225}", "zip"),
+    ("up", "\u{F0737}", ".."),     // md-arrow_up_bold... folder up
+];
+
+pub const ICON_NAMES: &[&str] = &["term", "ai", "claude", "robot", "music", "system", "files", "notes", "storage", "home"];
+
+pub fn icon(name: &str) -> &'static str {
+    let nerd = NERD.load(Ordering::Relaxed);
+    ICONS.iter().find(|i| i.0 == name).map(|i| if nerd { i.1 } else { i.2 }).unwrap_or("")
+}
+
+/// Icon + space, or nothing.
+pub fn lead(name: &str) -> String {
+    let g = icon(name);
+    if g.is_empty() { String::new() } else { format!("{g} ") }
+}
+
+/// The nest-style frame: rounded hairline border, bold title set into the top edge, optional subtitle in the
+/// bottom-right. Returns the inner rect.
+pub fn frame(f: &mut Frame, area: Rect, title: &str, subtitle: Option<&str>, focused: bool, t: &Theme) -> Rect {
+    let border = if focused { t.accent } else { t.frame };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Line::from(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(if focused { t.accent } else { t.muted }).add_modifier(Modifier::BOLD),
+        )));
+    if let Some(s) = subtitle {
+        block = block.title_bottom(Line::from(Span::styled(format!(" {s} "), Style::default().fg(t.muted))).right_aligned());
+    }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
+}
+
+/// A centered floating box (palette, dialogs). Clears what's under it.
+pub fn popup(f: &mut Frame, screen: Rect, w: u16, h: u16, title: &str, t: &Theme) -> Rect {
+    let w = w.min(screen.width.saturating_sub(4));
+    let h = h.min(screen.height.saturating_sub(2));
+    let r = Rect { x: screen.x + (screen.width - w) / 2, y: screen.y + (screen.height.saturating_sub(h)) / 3, width: w, height: h };
+    f.render_widget(Clear, r);
+    frame(f, r, title, None, true, t)
+}
+
+pub fn muted(t: &Theme) -> Style {
+    Style::default().fg(t.muted)
+}
+pub fn accent(t: &Theme) -> Style {
+    Style::default().fg(t.accent)
+}
+pub fn bold_accent(t: &Theme) -> Style {
+    Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+}
+
+/// Truncate to `w` display columns with an ellipsis.
+pub fn fit(s: &str, w: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut used = 0;
+    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= w {
+        return s.to_string();
+    }
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if used + cw + 1 > w {
+            break;
+        }
+        out.push(c);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+
+pub fn human_bytes(n: u64) -> String {
+    let mut v = n as f64;
+    for unit in ["B", "K", "M", "G", "T"] {
+        if v < 1024.0 || unit == "T" {
+            return if unit == "B" { format!("{v:.0}{unit}") } else { format!("{v:.1}{unit}") };
+        }
+        v /= 1024.0;
+    }
+    unreachable!()
+}
+
+// ------------------------------------------------------------------ logo
+// Omarchy-style block letters (from nest's font.py: 8 rows, 3-wide stems).
+const O: [&str; 8] = ["  ▄█████▄ ", " ███   ███", " ███   ███", " ███   ███", " ███   ███", " ███   ███", " ███   ███", "  ▀█████▀ "];
+const R: [&str; 8] = ["  ▄███████", " ███   ███", " ███   ███", "▄███▄▄▄██▀", "▀███▀▀▀▀  ", "██████████", " ███   ███", " ███   █▀ "];
+const I: [&str; 8] = [" ▄█▄", " ███", " ███", " ███", " ███", " ███", " ███", " █▀ "];
+const E: [&str; 8] = ["  ▄███████", " ███   ███", " ███   █▀ ", "▄███▄▄▄   ", "▀███▀▀▀   ", " ███   █▄ ", " ███   ███", " █████████"];
+const L: [&str; 8] = [" ▄█      ", " ███     ", " ███     ", " ███     ", " ███     ", " ███   █▄", " ███   ███", " █████████"];
+
+pub fn logo_lines() -> Vec<String> {
+    (0..8).map(|r| [O[r], R[r], I[r], E[r], L[r]].join(" ")).collect()
+}
+
+/// Draw the big logo centered in `area` (skips it if there's no room). Rainbow on animated themes.
+pub fn logo(f: &mut Frame, area: Rect, t: &Theme, time: f64) -> u16 {
+    let lines = logo_lines();
+    let w = lines[0].chars().count() as u16;
+    if area.width < w + 2 || area.height < 9 {
+        let p = Paragraph::new(Line::from(Span::styled("oriel", bold_accent(t)))).centered();
+        f.render_widget(p, Rect { height: 1, ..area });
+        return 1;
+    }
+    let x = area.x + (area.width - w) / 2;
+    for (r, line) in lines.iter().enumerate() {
+        let spans: Vec<Span> = if t.animated {
+            line.chars().enumerate().map(|(i, c)| Span::styled(c.to_string(), Style::default().fg(rainbow(i, time)))).collect()
+        } else {
+            vec![Span::styled(line.clone(), Style::default().fg(t.accent))]
+        };
+        f.render_widget(Paragraph::new(Line::from(spans)), Rect { x, y: area.y + r as u16, width: w, height: 1 });
+    }
+    8
+}
+
+pub fn key_hint<'a>(key: &'a str, what: &'a str, t: &Theme) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(key, Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {what}   "), Style::default().fg(t.muted)),
+    ]
+}
+
+pub fn fg(c: Color) -> Style {
+    Style::default().fg(c)
+}
