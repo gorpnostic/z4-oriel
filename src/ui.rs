@@ -61,6 +61,11 @@ const ICONS: &[(&str, &str, &str)] = &[
 
 pub const ICON_NAMES: &[&str] = &["term", "ai", "claude", "robot", "music", "system", "files", "notes", "storage", "home"];
 
+/// The Nerd Font glyph regardless of the plain-icons setting (for the "can you see these?" check).
+pub fn icon_nerd(name: &str) -> &'static str {
+    ICONS.iter().find(|i| i.0 == name).map(|i| i.1).unwrap_or("")
+}
+
 pub fn icon(name: &str) -> &'static str {
     let nerd = NERD.load(Ordering::Relaxed);
     ICONS.iter().find(|i| i.0 == name).map(|i| if nerd { i.1 } else { i.2 }).unwrap_or("")

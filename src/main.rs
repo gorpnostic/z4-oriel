@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod font;
 mod layout;
+mod onboard;
 mod pane;
 mod panes;
 mod testkit;
@@ -57,6 +58,7 @@ fn main() -> anyhow::Result<()> {
             println!("{}", config::path().display());
             return Ok(());
         }
+        Some("--tour") => {}
         Some(app) => cfg.startup = app.to_string(),
         None => {}
     }
@@ -77,7 +79,11 @@ fn main() -> anyhow::Result<()> {
 
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    let tour = args.first().map(String::as_str) == Some("--tour");
     let mut app = app::App::new(cfg, tx);
+    if tour {
+        app.start_tour();
+    }
     let res = app.run(&mut terminal, rx);
     let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();

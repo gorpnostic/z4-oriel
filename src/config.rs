@@ -14,6 +14,10 @@ pub struct Config {
     pub prefix: String,
     /// What oriel opens on: an app ("ai", "music", "terminal"...) or "home".
     pub startup: String,
+    /// true = plain-text icons (for terminals without a Nerd Font)
+    pub plain_icons: bool,
+    /// Where notes live (plain .md files); empty = oriel's data folder.
+    pub notes_folder: String,
     pub ai: AiConfig,
     pub music: MusicConfig,
 }
@@ -49,6 +53,8 @@ impl Default for Config {
             shell: String::new(),
             prefix: "ctrl+space".into(),
             startup: "ai".into(),
+            plain_icons: false,
+            notes_folder: String::new(),
             ai: AiConfig::default(),
             music: MusicConfig::default(),
         }
@@ -104,6 +110,9 @@ pub fn load() -> Config {
 }
 
 pub fn save(c: &Config) {
+    if cfg!(test) {
+        return; // tests never touch the real config
+    }
     let _ = std::fs::create_dir_all(dir());
     if let Ok(s) = toml::to_string_pretty(c) {
         let _ = std::fs::write(path(), s);

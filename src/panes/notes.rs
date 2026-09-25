@@ -64,7 +64,11 @@ impl Notes {
         return Self::open_in(std::path::absolute("target/test-scratch/notes-app").unwrap_or_default(), None);
         #[cfg(not(test))]
         {
-            Self::open_in(crate::config::data_dir().join("notes"), None)
+            {
+                let custom = crate::config::load().notes_folder;
+                let dir = if custom.trim().is_empty() { crate::config::data_dir().join("notes") } else { std::path::PathBuf::from(custom.trim()) };
+                Self::open_in(dir, None)
+            }
         }
     }
 

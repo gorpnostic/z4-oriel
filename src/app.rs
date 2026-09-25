@@ -58,6 +58,7 @@ enum Cmd {
     App(&'static str),
     Rename,
     CloseTab(usize),
+    Tour,
     Open(&'static str, Place),
     Theme(String),
     SplitRight,
@@ -122,6 +123,10 @@ pub struct App {
     /// renaming tab i: the text typed so far
     renaming: Option<(usize, String)>,
     ctx: Option<CtxMenu>,
+    /// first-run welcome, setup and tour
+    onboard: Option<crate::onboard::Onboard>,
+    ctx_seen: usize,
+    palette_seen: usize,
     last_click: Option<(Instant, u16, u16)>,
     /// agents' last known activity, and the ones that finished while you weren't looking
     agent_state: HashMap<PaneId, Activity>,
@@ -134,7 +139,7 @@ pub struct App {
 impl App {
     pub fn new(config: Config, tx: Sender<Event>) -> App {
         let theme = theme::get(&config.theme);
-        ui::NERD.store(std::env::var("ORIEL_PLAIN").is_err(), std::sync::atomic::Ordering::Relaxed);
+        ui::NERD.store(std::env::var("ORIEL_PLAIN").is_err() && !config.plain_icons, std::sync::atomic::Ordering::Relaxed);
         let mut app = App {
             panes: HashMap::new(),
             tabs: vec![],
@@ -160,12 +165,18 @@ impl App {
             _watcher: None,
             renaming: None,
             ctx: None,
+            onboard: None,
+            ctx_seen: 0,
+            palette_seen: 0,
             last_click: None,
             agent_state: HashMap::new(),
             tags: HashMap::new(),
             done: Default::default(),
         };
         app._watcher = watch_omarchy(tx);
+        if !cfg!(test) && !crate::onboard::done_before() {
+            app.onboard = Some(crate::onboard::Onboard::new(&app.theme.name, &app.config));
+        }
         let startup = app.config.startup.clone();
         if SIDEBAR.iter().any(|a| a.0 == startup) {
             app.goto_app(SIDEBAR.iter().find(|a| a.0 == startup).unwrap().0);
@@ -209,6 +220,60 @@ impl App {
     }
 
     /// Tabs you made (not the pinned apps), with their index in self.tabs.
+    /// Replay the welcome + tour (palette "take the tour", `oriel --tour`).
+    pub fn start_tour(&mut self) {
+        self.onboard = Some(crate::onboard::Onboard::new(&self.theme.name, &self.config));
+    }
+
+    fn probe(&self) -> crate::onboard::Probe {
+        let t = &self.tabs[self.cur];
+        let mut l = vec![];
+        t.root.leaves(&mut l);
+        crate::onboard::Probe {
+            app: t.app,
+            user_tabs: self.user_tabs().len(),
+            panes_in_tab: l.len(),
+            focus: t.focus,
+            palette_open: self.palette.is_some(),
+            tab_named: t.app.is_none() && t.name.is_some(),
+            ctx_seen: self.ctx_seen,
+            palette_seen: self.palette_seen,
+        }
+    }
+
+    fn onboard_out(&mut self, out: crate::onboard::Out) {
+        use crate::onboard::Out;
+        match out {
+            Out::None => {}
+            Out::Theme(name, save) => self.set_theme(&name, save),
+            Out::Icons(nerd) => {
+                ui::NERD.store(nerd, std::sync::atomic::Ordering::Relaxed);
+                self.config.plain_icons = !nerd;
+                config::save(&self.config);
+            }
+            Out::MusicFolder(p) => {
+                self.config.music.folders = vec![p];
+                config::save(&self.config);
+            }
+            Out::NotesFolder(p) => {
+                self.config.notes_folder = p;
+                config::save(&self.config);
+            }
+            Out::Defaults { startup, provider } => {
+                self.config.startup = startup;
+                if !provider.is_empty() {
+                    self.config.ai.provider = provider;
+                }
+                config::save(&self.config);
+            }
+            Out::Finished => {
+                self.onboard = None;
+                crate::onboard::mark_done();
+                self.notify(format!("{}welcome to oriel · ? for keys · alt p for everything", ui::lead("window")));
+            }
+        }
+    }
+
     fn user_tabs(&self) -> Vec<usize> {
         (0..self.tabs.len()).filter(|&i| self.tabs[i].app.is_none()).collect()
     }
@@ -312,6 +377,11 @@ impl App {
             }
             self.reap();
             self.track_agents();
+            if self.onboard.is_some() {
+                let probe = self.probe();
+                let out = self.onboard.as_mut().unwrap().check(&probe);
+                self.onboard_out(out);
+            }
             if self.quit {
                 break;
             }
@@ -435,6 +505,7 @@ impl App {
     }
 
     fn ctx_open(&mut self, x: u16, y: u16, items: Vec<(String, Cmd)>) {
+        self.ctx_seen += 1;
         self.ctx = Some(CtxMenu { x, y, items, sel: 0, rect: Rect::default() });
     }
 
@@ -585,6 +656,14 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) {
+        if self.onboard.is_some() {
+            let probe = self.probe();
+            let (used, out) = self.onboard.as_mut().unwrap().key(k, &probe);
+            self.onboard_out(out);
+            if used {
+                return;
+            }
+        }
         if let Some((i, mut text)) = self.renaming.take() {
             match k.code {
                 KeyCode::Enter => {
@@ -796,6 +875,7 @@ impl App {
                 self.notify(if n { "nerd font icons" } else { "plain icons (no nerd font)" });
             }
             Cmd::Help => self.help = true,
+            Cmd::Tour => self.start_tour(),
             Cmd::Quit => self.quit = true,
         }
     }
@@ -828,8 +908,10 @@ impl App {
         }
         items.push(("toggle nerd font icons".into(), Cmd::Icons));
         items.push(("key bindings".into(), Cmd::Help));
+        items.push((format!("{}take the tour", ui::lead("window")), Cmd::Tour));
         items.push((format!("{}quit oriel", ui::lead("quit")), Cmd::Quit));
         self.palette = Some(Palette { query: String::new(), sel: 0, items, theme_before: self.theme.name.clone() });
+        self.palette_seen += 1;
     }
 
     fn palette_matches(p: &Palette) -> Vec<usize> {
@@ -887,6 +969,14 @@ impl App {
 
     // ------------------------------------------------------------------ mouse
     fn mouse(&mut self, m: MouseEvent) {
+        if self.onboard.is_some() {
+            let probe = self.probe();
+            let (used, out) = self.onboard.as_mut().unwrap().mouse(m, &probe);
+            self.onboard_out(out);
+            if used {
+                return;
+            }
+        }
         let pos = Position { x: m.column, y: m.row };
         // an open right-click menu takes the mouse first
         if let Some(menu) = &mut self.ctx {
@@ -1075,6 +1165,9 @@ impl App {
         }
         if self.help {
             draw_help(f, area, &t, &self.config);
+        }
+        if let Some(ob) = &mut self.onboard {
+            ob.draw(f, area, &t, self.start.elapsed().as_secs_f64());
         }
     }
 
@@ -1429,6 +1522,55 @@ mod tests {
         app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Right), column: r.x + 5, row: r.y + 5, modifiers: KeyModifiers::NONE });
         let s = snap(&mut app, "ctx");
         assert!(s.contains("split right") && s.contains("rename tab"));
+    }
+
+    #[test]
+    fn app_onboarding_flow() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "oriel".into();
+        let mut app = App::new(cfg, tx);
+        app.start_tour();
+        let key = |app: &mut App, c: KeyCode| app.key(KeyEvent::new(c, KeyModifiers::NONE));
+        let mut term = Terminal::new(TestBackend::new(150, 42)).unwrap();
+        let mut shot = |app: &mut App, name: &str| -> String {
+            term.draw(|f| app.draw(f)).unwrap();
+            crate::testkit::save_html(term.backend().buffer(), &format!("target/snap/onboard-{name}.html"));
+            let b = term.backend().buffer();
+            (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        };
+        assert!(shot(&mut app, "welcome").contains("take the tour"));
+        key(&mut app, KeyCode::Enter);
+        assert!(shot(&mut app, "theme").contains("pick a look"));
+        key(&mut app, KeyCode::Down); // live preview
+        key(&mut app, KeyCode::Enter);
+        assert!(shot(&mut app, "icons").contains("little pictures"));
+        key(&mut app, KeyCode::Char('y'));
+        assert!(shot(&mut app, "music").contains("your music"));
+        key(&mut app, KeyCode::Enter);
+        assert!(shot(&mut app, "notes").contains("your notes"));
+        key(&mut app, KeyCode::Enter);
+        assert!(shot(&mut app, "defaults").contains("open oriel on"));
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Enter);
+        assert!(shot(&mut app, "ais").contains("your AIs"));
+        key(&mut app, KeyCode::Enter); // into the tour
+        assert!(shot(&mut app, "tour1").contains("switch apps"));
+        // doing the thing moves the tour on
+        key(&mut app, KeyCode::F(4));
+        let p = app.probe();
+        let out = app.onboard.as_mut().unwrap().check(&p);
+        app.onboard_out(out);
+        assert!(shot(&mut app, "tour2").contains("back to chat"));
+        key(&mut app, KeyCode::F(1));
+        let p = app.probe();
+        let out = app.onboard.as_mut().unwrap().check(&p);
+        app.onboard_out(out);
+        assert!(shot(&mut app, "tour3").contains("the palette"));
+        // end it
+        key(&mut app, KeyCode::F(11));
+        assert!(app.onboard.is_none());
+        let _ = rx;
     }
 
     #[test]

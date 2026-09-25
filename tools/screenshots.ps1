@@ -11,10 +11,13 @@ cargo test agents_snapshots_board_form_diff
 if ($LASTEXITCODE) { throw "agents snapshot test failed" }
 cargo test ais_snapshots
 if ($LASTEXITCODE) { throw "ais snapshot test failed" }
+cargo test app_onboarding_flow
+if ($LASTEXITCODE) { throw "onboarding snapshot test failed" }
+Copy-Item target\snap\onboard-welcome.html docs\screenshot-welcome.html -Force
 Copy-Item target\snap\agents-board.html docs\screenshot-agents.html -Force
 Copy-Item target\snap\ais-overview.html docs\screenshot-ais.html -Force
 
-foreach ($n in 'hero', 'agent', 'agents', 'ais', 'system', 'apps') {
+foreach ($n in 'hero', 'agent', 'agents', 'ais', 'system', 'apps', 'welcome') {
     pwsh -NoProfile -File tools\snap.ps1 "docs\screenshot-$n.html" -Width 1380 -Height 860 | Out-Null
     if (-not (Test-Path "docs\screenshot-$n.png")) { throw "screenshot-$n.png wasn't made" }
 }
