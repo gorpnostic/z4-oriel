@@ -2,7 +2,7 @@
 //! second after you stop typing. ctrl+e flips to a rendered preview, ctrl+n makes a note, ctrl+d deletes one
 //! (after a y). The sidebar lists every note, newest first; a note's title is its first line.
 //!
-//! First run: if the notes folder is empty, nest's notes (~/.wren/notes/*.md) are copied in. Never moved.
+//! open_in can seed an empty notes folder by copying .md files from another folder (never moving them).
 
 mod editor;
 mod md;
@@ -64,9 +64,7 @@ impl Notes {
         return Self::open_in(std::path::absolute("target/test-scratch/notes-app").unwrap_or_default(), None);
         #[cfg(not(test))]
         {
-            let dir = crate::config::data_dir().join("notes");
-            let nest = dirs::home_dir().map(|h| h.join(".wren").join("notes"));
-            Self::open_in(dir, nest)
+            Self::open_in(crate::config::data_dir().join("notes"), None)
         }
     }
 
@@ -548,7 +546,7 @@ mod tests {
 
     fn nest_fixture(name: &str) -> PathBuf {
         let src = scratch(name);
-        std::fs::write(src.join("memory.md"), "# memory\n\nThings Wren remembers about you. Edit freely: one fact per line starting with \"- \".\n\n- The user's name is Leif.\n").unwrap();
+        std::fs::write(src.join("ideas.md"), "# ideas\n\nThings to try this week. One per line starting with \"- \".\n\n- Learn a new chord.\n").unwrap();
         std::fs::write(src.join("20260923-184214-edb2.md"), WELCOME).unwrap();
         src
     }
@@ -559,8 +557,8 @@ mod tests {
         let dir = scratch("notes-import");
         let p = Notes::open_in(dir.clone(), Some(src.clone()));
         assert_eq!(p.list.len(), 2);
-        assert!(src.join("memory.md").exists(), "nest's notes are copied, not moved");
-        assert!(dir.join("memory.md").exists());
+        assert!(src.join("ideas.md").exists(), "nest's notes are copied, not moved");
+        assert!(dir.join("ideas.md").exists());
         assert!(dir.join(IMPORTED).exists());
         drop(p);
         // delete everything: nest's notes don't come back, a fresh note appears instead
@@ -578,13 +576,13 @@ mod tests {
         let dir = scratch("notes-edit");
         let mut k = Kit::new();
         let mut p = Notes::open_in(dir.clone(), Some(src));
-        // open "memory" like the screenshot
-        let mi = p.list.iter().position(|m| m.id == "memory").unwrap();
+        // open the imported note
+        let mi = p.list.iter().position(|m| m.id == "ideas").unwrap();
         let id = p.list[mi].id.clone();
         p.open(&id);
         let s = snap(&mut k, &mut p, 150, 44, "target/snap/notes-main.html");
         println!("{s}");
-        assert!(s.contains("# memory") && s.contains("The user's name is Leif."));
+        assert!(s.contains("# ideas") && s.contains("Learn a new chord."));
         assert!(s.contains("new note") && s.contains("ctrl+n"), "sidebar: new note row");
         assert!(s.contains("welcome to notes"), "sidebar: other notes");
         assert!(s.contains("autosaves · ctrl+e edit/preview · ctrl+d delete · ctrl+n new note"));
@@ -599,7 +597,7 @@ mod tests {
         k.poll(&mut p);
         assert!(p.dirty_at.is_none() && p.tick_every().is_none());
         assert!(p.subtitle().unwrap().starts_with("saved "));
-        let disk = std::fs::read_to_string(dir.join("memory.md")).unwrap();
+        let disk = std::fs::read_to_string(dir.join("ideas.md")).unwrap();
         assert!(disk.ends_with("- Likes **fast** tools and `rust`"), "{disk:?}");
 
         // ctrl+left/right, home/end
@@ -612,7 +610,7 @@ mod tests {
         k.key_mod(&mut p, KeyCode::Char('e'), KeyModifiers::CONTROL);
         let s = snap(&mut k, &mut p, 150, 44, "target/snap/notes-preview.html");
         assert!(s.contains("• Likes fast tools and rust"), "rendered bullets/inline:\n{s}");
-        assert!(!s.contains("# memory"), "heading marks hidden in preview");
+        assert!(!s.contains("# ideas"), "heading marks hidden in preview");
         k.key_mod(&mut p, KeyCode::Char('e'), KeyModifiers::CONTROL);
 
         // click places the cursor: row 0 of the text area, column 3
@@ -627,8 +625,8 @@ mod tests {
             let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut cx_actions, focused: true, time: 1.0 };
             p.paste("ABC\r\nDEF", &mut cx);
         }
-        assert_eq!(p.ed.lines[0], "# mABC");
-        assert_eq!(p.ed.lines[1], "DEFemory");
+        assert_eq!(p.ed.lines[0], "# iABC");
+        assert_eq!(p.ed.lines[1], "DEFdeas");
     }
 
     #[test]

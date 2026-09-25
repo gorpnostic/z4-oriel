@@ -20,7 +20,6 @@ const ICONS: &[(&str, &str, &str)] = &[
     ("window", "\u{F05AF}", "#"),  // md-window_maximize
     ("term", "\u{F018D}", ">"),    // md-console
     ("ai", "\u{F0674}", "*"),      // md-creation (sparkles)
-    ("wren", "\u{F15C6}", "~"),    // md-bird
     ("music", "\u{F075A}", "~"),   // md-music
     ("system", "\u{F061A}", "#"),  // md-chip
     ("files", "\u{F0256}", "/"),   // md-folder_outline

@@ -3,7 +3,7 @@
 
 use crate::config::{self, Config};
 use crate::layout::{Dir, Node, PaneId, neighbor, split_rect};
-use crate::pane::{Action, Cx, Event, Pane, Place};
+use crate::pane::{Action, Activity, Cx, Event, Pane, Place};
 use crate::panes::{self, APPS, available};
 use crate::theme::{self, Theme};
 use crate::ui;
@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 struct Tab {
     /// Some(name) for the pinned app tabs in the sidebar (ai, music, ...); None for tabs you made.
     app: Option<&'static str>,
+    /// A name you gave it (herdr style); None = named after its focused pane.
+    name: Option<String>,
     root: Node,
     focus: PaneId,
     zoom: bool,
@@ -48,6 +50,8 @@ enum SideHit {
 #[derive(Clone)]
 enum Cmd {
     App(&'static str),
+    Rename,
+    CloseTab(usize),
     Open(&'static str, Place),
     Theme(String),
     SplitRight,
@@ -58,6 +62,25 @@ enum Cmd {
     Icons,
     Help,
     Quit,
+}
+
+/// Right-click menu.
+struct CtxMenu {
+    x: u16,
+    y: u16,
+    items: Vec<(String, Cmd)>,
+    sel: usize,
+    rect: Rect,
+}
+
+/// A tab's status dot: the loudest of its panes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Dot {
+    None,
+    Idle,
+    Done,
+    Working,
+    Blocked,
 }
 
 struct Palette {
@@ -90,6 +113,13 @@ pub struct App {
     sidebar: bool,
     body: Rect,
     drag: Option<(Vec<bool>, Dir, Rect)>,
+    /// renaming tab i: the text typed so far
+    renaming: Option<(usize, String)>,
+    ctx: Option<CtxMenu>,
+    last_click: Option<(Instant, u16, u16)>,
+    /// agents' last known activity, and the ones that finished while you weren't looking
+    agent_state: HashMap<PaneId, Activity>,
+    done: std::collections::HashSet<PaneId>,
     _watcher: Option<notify::RecommendedWatcher>,
 }
 
@@ -120,6 +150,11 @@ impl App {
             body: Rect::default(),
             drag: None,
             _watcher: None,
+            renaming: None,
+            ctx: None,
+            last_click: None,
+            agent_state: HashMap::new(),
+            done: Default::default(),
         };
         app._watcher = watch_omarchy(tx);
         let startup = app.config.startup.clone();
@@ -141,7 +176,7 @@ impl App {
 
     fn new_tab(&mut self, p: Box<dyn Pane>) {
         let id = self.add(p);
-        self.tabs.push(Tab { app: None, root: Node::Leaf(id), focus: id, zoom: false });
+        self.tabs.push(Tab { app: None, name: None, root: Node::Leaf(id), focus: id, zoom: false });
         self.cur = self.tabs.len() - 1;
     }
 
@@ -160,7 +195,7 @@ impl App {
         let order = |a: Option<&str>| a.and_then(|n| SIDEBAR.iter().position(|s| s.0 == n)).unwrap_or(usize::MAX);
         let me = order(Some(name));
         let at = self.tabs.iter().position(|t| order(t.app) > me).unwrap_or(self.tabs.len());
-        self.tabs.insert(at, Tab { app: Some(name), root: Node::Leaf(id), focus: id, zoom: false });
+        self.tabs.insert(at, Tab { app: Some(name), name: None, root: Node::Leaf(id), focus: id, zoom: false });
         self.cur = at;
     }
 
@@ -267,6 +302,7 @@ impl App {
                 }
             }
             self.reap();
+            self.track_agents();
             if self.quit {
                 break;
             }
@@ -283,7 +319,9 @@ impl App {
         if let Some((_, t)) = &self.notice {
             d = d.min(Duration::from_secs(4).saturating_sub(t.elapsed()) + Duration::from_millis(10));
         }
-        for id in self.visible() {
+        let mut ids = self.visible();
+        ids.extend(self.panes.iter().filter(|(_, p)| p.is_terminal()).map(|(id, _)| *id));
+        for id in ids {
             if let Some(every) = self.panes.get(&id).and_then(|p| p.tick_every()) {
                 let last = self.last_tick.get(&id).copied().unwrap_or(self.start);
                 d = d.min(every.saturating_sub(last.elapsed()));
@@ -300,6 +338,86 @@ impl App {
         let mut l = vec![];
         t.root.leaves(&mut l);
         l
+    }
+
+    /// herdr's sidebar states: notice agents finishing or getting stuck in tabs you aren't looking at.
+    fn track_agents(&mut self) {
+        let cur_leaves = {
+            let mut l = vec![];
+            self.tabs[self.cur].root.leaves(&mut l);
+            l
+        };
+        let mut notes = vec![];
+        for (id, p) in &self.panes {
+            let Some(a) = p.activity() else { continue };
+            let prev = self.agent_state.insert(*id, a);
+            let seen = cur_leaves.contains(id);
+            let tab_no = self.tabs.iter().position(|t| t.root.contains(*id));
+            let where_ = tab_no.map(|i| self.tab_label(i)).unwrap_or_default();
+            if prev == Some(Activity::Working) && a == Activity::Idle && !seen {
+                self.done.insert(*id);
+                notes.push(format!("{} finished · {where_}", p.title()));
+            }
+            if a == Activity::Blocked && prev != Some(Activity::Blocked) && !seen {
+                notes.push(format!("{} needs you · {where_}", p.title()));
+            }
+            if seen {
+                self.done.remove(id);
+            }
+        }
+        self.agent_state.retain(|id, _| self.panes.contains_key(id));
+        self.done.retain(|id| self.panes.contains_key(id));
+        if let Some(n) = notes.pop() {
+            self.notify(n);
+        }
+    }
+
+    fn tab_dot(&self, i: usize) -> Dot {
+        let mut l = vec![];
+        self.tabs[i].root.leaves(&mut l);
+        l.iter()
+            .map(|id| match self.panes.get(id).and_then(|p| p.activity()) {
+                Some(Activity::Blocked) => Dot::Blocked,
+                Some(Activity::Working) => Dot::Working,
+                Some(Activity::Idle) if self.done.contains(id) => Dot::Done,
+                Some(Activity::Idle) => Dot::Idle,
+                None => Dot::None,
+            })
+            .max()
+            .unwrap_or(Dot::None)
+    }
+
+    fn tab_label(&self, i: usize) -> String {
+        let t = &self.tabs[i];
+        if let Some(n) = &t.name {
+            return n.clone();
+        }
+        if let Some(a) = t.app {
+            return a.to_string();
+        }
+        self.panes.get(&t.focus).map(|p| p.title()).unwrap_or_default()
+    }
+
+    fn start_rename(&mut self, i: usize) {
+        if self.tabs[i].app.is_some() {
+            self.notify("app tabs keep their names — make a new tab (alt t) to name one");
+            return;
+        }
+        let cur = self.tab_label(i);
+        self.renaming = Some((i, cur));
+        self.sidebar = true;
+    }
+
+    fn close_tab(&mut self, i: usize) {
+        let mut l = vec![];
+        self.tabs[i].root.leaves(&mut l);
+        for id in l {
+            self.close(id);
+        }
+    }
+
+    fn ctx_open(&mut self, x: u16, y: u16, items: Vec<(String, Cmd)>) {
+        self.ctx = Some(CtxMenu { x, y, items, sel: 0, rect: Rect::default() });
     }
 
     fn reap(&mut self) {
@@ -390,7 +508,9 @@ impl App {
                 }
             }
             Event::Tick => {
-                for id in self.visible() {
+                let mut ids = self.visible();
+                ids.extend(self.panes.iter().filter(|(id, p)| p.is_terminal() && !ids.contains(id)).map(|(id, _)| *id).collect::<Vec<_>>());
+                for id in ids {
                     let due = match self.panes.get(&id).and_then(|p| p.tick_every()) {
                         Some(every) => self.last_tick.get(&id).map(|t| t.elapsed() >= every).unwrap_or(true),
                         None => false,
@@ -424,6 +544,44 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) {
+        if let Some((i, mut text)) = self.renaming.take() {
+            match k.code {
+                KeyCode::Enter => {
+                    let t = text.trim().to_string();
+                    if i < self.tabs.len() {
+                        self.tabs[i].name = if t.is_empty() { None } else { Some(t) };
+                    }
+                }
+                KeyCode::Esc => {}
+                KeyCode::Backspace => {
+                    text.pop();
+                    self.renaming = Some((i, text));
+                }
+                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if text.chars().count() < 40 {
+                        text.push(c);
+                    }
+                    self.renaming = Some((i, text));
+                }
+                _ => self.renaming = Some((i, text)),
+            }
+            return;
+        }
+        if let Some(m) = &mut self.ctx {
+            match k.code {
+                KeyCode::Up => m.sel = m.sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => m.sel = (m.sel + 1).min(m.items.len().saturating_sub(1)),
+                KeyCode::Enter => {
+                    let cmd = m.items.get(m.sel).map(|x| x.1.clone());
+                    self.ctx = None;
+                    if let Some(c) = cmd {
+                        self.run_cmd(c);
+                    }
+                }
+                _ => self.ctx = None,
+            }
+            return;
+        }
         if self.help {
             self.help = false;
             return;
@@ -510,7 +668,9 @@ impl App {
 
     fn prefix_cmd(&mut self, k: KeyEvent) {
         match k.code {
-            KeyCode::Char('|') | KeyCode::Char('\\') | KeyCode::Char('%') => self.run_cmd(Cmd::SplitRight),
+            KeyCode::Char('|') | KeyCode::Char('\\') | KeyCode::Char('%') | KeyCode::Char('v') => self.run_cmd(Cmd::SplitRight),
+            KeyCode::Char(',') => self.run_cmd(Cmd::Rename),
+            KeyCode::Char('&') => self.run_cmd(Cmd::CloseTab(self.cur)),
             KeyCode::Char('-') | KeyCode::Char('"') | KeyCode::Char('_') => self.run_cmd(Cmd::SplitDown),
             KeyCode::Char('x') | KeyCode::Char('w') => self.run_cmd(Cmd::Close),
             KeyCode::Char('z') => self.run_cmd(Cmd::Zoom),
@@ -567,6 +727,12 @@ impl App {
         let from = self.focused();
         match c {
             Cmd::App(name) => self.goto_app(name),
+            Cmd::Rename => self.start_rename(self.cur),
+            Cmd::CloseTab(i) => {
+                if i < self.tabs.len() {
+                    self.close_tab(i);
+                }
+            }
             Cmd::Open(name, place) => match panes::open(name, &self.config) {
                 Some(p) => self.open(p, place, from),
                 None => self.notify(format!("{name} isn't installed")),
@@ -614,6 +780,8 @@ impl App {
         items.push((format!("{}zoom pane", ui::lead("window")), Cmd::Zoom));
         items.push((format!("{}close pane", ui::lead("close")), Cmd::Close));
         items.push((format!("{}new tab", ui::lead("tab")), Cmd::NewTab));
+        items.push((format!("{}rename this tab", ui::lead("tab")), Cmd::Rename));
+        items.push((format!("{}close this tab", ui::lead("close")), Cmd::CloseTab(self.cur)));
         for t in theme::names() {
             items.push((format!("{}theme {t}", ui::lead("theme")), Cmd::Theme(t)));
         }
@@ -679,11 +847,72 @@ impl App {
     // ------------------------------------------------------------------ mouse
     fn mouse(&mut self, m: MouseEvent) {
         let pos = Position { x: m.column, y: m.row };
+        // an open right-click menu takes the mouse first
+        if let Some(menu) = &mut self.ctx {
+            match m.kind {
+                MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                    if menu.rect.contains(pos) {
+                        menu.sel = (m.row.saturating_sub(menu.rect.y + 1) as usize).min(menu.items.len().saturating_sub(1));
+                    }
+                    return;
+                }
+                MouseEventKind::Down(_) => {
+                    let cmd = if menu.rect.contains(pos) && m.row > menu.rect.y && m.row < menu.rect.bottom() - 1 {
+                        menu.items.get((m.row - menu.rect.y - 1) as usize).map(|x| x.1.clone())
+                    } else {
+                        None
+                    };
+                    self.ctx = None;
+                    if let Some(c) = cmd {
+                        self.run_cmd(c);
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+        if let MouseEventKind::Down(MouseButton::Right) = m.kind {
+            if let Some(&(_, SideHit::Tab(i))) = self.side_hits.iter().find(|(r, _)| r.contains(pos)) {
+                self.cur = i;
+                self.ctx_open(m.column, m.row, vec![
+                    (format!("{}rename", ui::lead("tab")), Cmd::Rename),
+                    (format!("{}split right", ui::lead("split")), Cmd::SplitRight),
+                    (format!("{}split down", ui::lead("split")), Cmd::SplitDown),
+                    (format!("{}close tab", ui::lead("close")), Cmd::CloseTab(i)),
+                ]);
+                return;
+            }
+            if let Some(&(id, _)) = self.outer.iter().find(|(_, r)| r.contains(pos)) {
+                let wants = self.panes.get(&id).map(|p| p.wants_mouse()).unwrap_or(false);
+                if !wants || m.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.tab().focus = id;
+                    let mut items = vec![
+                        (format!("{}split right", ui::lead("split")), Cmd::SplitRight),
+                        (format!("{}split down", ui::lead("split")), Cmd::SplitDown),
+                        (format!("{}{}", ui::lead("window"), if self.tabs[self.cur].zoom { "unzoom" } else { "zoom" }), Cmd::Zoom),
+                    ];
+                    if self.tabs[self.cur].app.is_none() {
+                        items.push((format!("{}rename tab", ui::lead("tab")), Cmd::Rename));
+                    }
+                    items.push((format!("{}new tab", ui::lead("tab")), Cmd::NewTab));
+                    items.push((format!("{}close pane", ui::lead("close")), Cmd::Close));
+                    self.ctx_open(m.column, m.row, items);
+                    return;
+                }
+            }
+        }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
             if let Some(&(_, hit)) = self.side_hits.iter().find(|(r, _)| r.contains(pos)) {
+                let double = self.last_click.map(|(t, x, y)| t.elapsed() < Duration::from_millis(400) && x == m.column && y == m.row).unwrap_or(false);
+                self.last_click = Some((Instant::now(), m.column, m.row));
                 match hit {
                     SideHit::App(a) => self.goto_app(a),
-                    SideHit::Tab(i) => self.cur = i,
+                    SideHit::Tab(i) => {
+                        self.cur = i;
+                        if double {
+                            self.start_rename(i);
+                        }
+                    }
                     SideHit::NewTab => self.new_tab(Box::new(panes::home::Home::new())),
                 }
                 return;
@@ -785,6 +1014,21 @@ impl App {
             }
         }
         self.draw_toast(f, area, &t);
+        if let Some(m) = &mut self.ctx {
+            let w = m.items.iter().map(|x| unicode_width::UnicodeWidthStr::width(x.0.as_str())).max().unwrap_or(10) as u16 + 4;
+            let h = m.items.len() as u16 + 2;
+            let x = m.x.min(area.right().saturating_sub(w));
+            let y = if m.y + h > area.bottom() { m.y.saturating_sub(h) } else { m.y };
+            let r = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+            m.rect = r;
+            f.render_widget(ratatui::widgets::Clear, r);
+            let inner = ui::frame(f, r, "", None, true, &t);
+            for (i, (label, _)) in m.items.iter().enumerate() {
+                let on = i == m.sel;
+                let st = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD | Modifier::REVERSED) } else { Style::default() };
+                f.render_widget(Paragraph::new(Span::styled(format!(" {:<width$}", label, width = inner.width.saturating_sub(1) as usize), st)), Rect { y: inner.y + i as u16, height: 1, ..inner });
+            }
+        }
         if let Some(p) = &self.palette {
             self.draw_palette(f, area, p, &t);
         }
@@ -842,11 +1086,31 @@ impl App {
                 break;
             }
             let tb = &self.tabs[i];
-            let (icon, title) = self.panes.get(&tb.focus).map(|p| (p.icon(), p.title())).unwrap_or(("term", String::new()));
+            let icon = self.panes.get(&tb.focus).map(|p| p.icon()).unwrap_or("term");
+            let title = self.tab_label(i);
             let panes = { let mut l = vec![]; tb.root.leaves(&mut l); l.len() };
             let right = if panes > 1 { format!("{panes} panes  alt {}", n + 1) } else { format!("alt {}", n + 1) };
             let r = Rect { y, height: 1, ..inner };
-            ui::side_row(f, r, icon, &title, &right, i == self.cur, t);
+            let dot = self.tab_dot(i);
+            let (glyph, color) = match dot {
+                Dot::Blocked => ("●", t.danger),
+                Dot::Working => (["◐", "◓", "◑", "◒"][(time * 6.0) as usize % 4], t.accent),
+                Dot::Done => ("●", t.good),
+                Dot::Idle => ("○", t.muted),
+                Dot::None => (" ", t.muted),
+            };
+            if let Some((ri, text)) = self.renaming.as_ref().filter(|(ri, _)| *ri == i) {
+                let _ = ri;
+                let line = Line::from(vec![
+                    Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                    Span::styled(format!("{}{}", text, "▏"), Style::default().fg(t.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+                    Span::styled("  enter ok · esc", ui::muted(t)),
+                ]);
+                f.render_widget(Paragraph::new(line), r);
+            } else {
+                f.render_widget(Paragraph::new(Span::styled(glyph, Style::default().fg(color))), Rect { width: 2, ..r });
+                ui::side_row(f, Rect { x: r.x + 2, width: r.width.saturating_sub(2), ..r }, icon, &title, &right, i == self.cur, t);
+            }
             self.side_hits.push((r, SideHit::Tab(i)));
             y += 1;
         }
@@ -927,8 +1191,11 @@ fn draw_help(f: &mut Frame, area: Rect, t: &Theme, c: &Config) {
         ("alt 1-9 · alt t".into(), "go to one of your tabs · new tab"),
         ("alt s".into(), "hide / show the sidebar"),
         ("alt z · alt w".into(), "zoom pane · close pane"),
+        ("right-click".into(), "menu: split, zoom, rename, close"),
+        ("double-click a tab".into(), "rename it (or prefix then ,)"),
         (format!("{pre} then"), ""),
-        ("  | or \\  ·  - ".into(), "split right · split down"),
+        ("  | or v  ·  - ".into(), "split right · split down"),
+        ("  , · &".into(), "rename tab · close tab"),
         ("  h j k l".into(), "move  (H J K L resize)"),
         ("  x · z · c · n/p".into(), "close · zoom · new tab · next/prev tab"),
         ("  a m s f e g".into(), "open ai · music · system · files · notes · storage"),
@@ -1065,6 +1332,55 @@ mod tests {
         }
         term.draw(|f| app.draw(f)).unwrap();
         crate::testkit::save_html(term.backend().buffer(), "docs/screenshot-system.html");
+    }
+
+    #[test]
+    fn app_rename_menu_agents() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "oriel".into();
+        let mut app = App::new(cfg, tx);
+        let key = |app: &mut App, c: KeyCode, m: KeyModifiers| app.key(KeyEvent::new(c, m));
+        // a fake agent: shows Claude's "esc to interrupt", then finishes (clears the screen)
+        let agent: Box<dyn Pane> = if cfg!(windows) {
+            Box::new(crate::panes::term::Term::new("claude", "claude", "pwsh.exe", vec!["-NoProfile".into(), "-Command".into(), "Write-Host '* thinking (esc to interrupt)'; Start-Sleep 3; Clear-Host; Write-Host 'done'; Start-Sleep 60".into()], None))
+        } else {
+            Box::new(crate::panes::term::Term::new("claude", "claude", "sh", vec!["-c".into(), "echo '* thinking (esc to interrupt)'; sleep 3; clear; echo done; sleep 60".into()], None))
+        };
+        app.new_tab(agent);
+        let agent_tab = app.cur;
+        let _ = snap(&mut app, "agent0"); // starts the pty
+        // rename it: prefix then ,
+        key(&mut app, KeyCode::Char(' '), KeyModifiers::CONTROL);
+        key(&mut app, KeyCode::Char(','), KeyModifiers::NONE);
+        for _ in 0..10 { key(&mut app, KeyCode::Backspace, KeyModifiers::NONE); }
+        for c in "refactor".chars() { key(&mut app, KeyCode::Char(c), KeyModifiers::NONE); }
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.tabs[agent_tab].name.as_deref(), Some("refactor"));
+        // watch it work from another tab
+        app.goto_app("ai");
+        let mut saw_working = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(9) {
+            while let Ok(e) = rx.try_recv() { app.handle(e); }
+            app.handle(Event::Tick);
+            app.track_agents();
+            if app.tab_dot(agent_tab) == Dot::Working { saw_working = true; }
+            if saw_working && app.tab_dot(agent_tab) == Dot::Done { break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let s = snap(&mut app, "agents");
+        println!("{}", s.lines().take(16).collect::<Vec<_>>().join("\n"));
+        assert!(saw_working, "never saw the agent working");
+        assert_eq!(app.tab_dot(agent_tab) as u8, Dot::Done as u8, "agent should be done (finished while unseen)");
+        assert!(app.notice.as_ref().map(|n| n.0.contains("finished")).unwrap_or(false));
+        // right-click menu on the pane
+        app.cur = agent_tab;
+        let _ = snap(&mut app, "x");
+        let (_, r) = app.outer[0];
+        app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Right), column: r.x + 5, row: r.y + 5, modifiers: KeyModifiers::NONE });
+        let s = snap(&mut app, "ctx");
+        assert!(s.contains("split right") && s.contains("rename tab"));
     }
 
     #[test]

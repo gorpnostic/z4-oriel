@@ -793,11 +793,11 @@ pub(crate) mod tests {
 
     fn fixture(name: &str) -> PathBuf {
         let d = scratch(name);
-        for sub in ["checkpoints", "data", "train", "wren"] {
+        for sub in ["assets", "docs", "src", "tests"] {
             std::fs::create_dir_all(d.join(sub)).unwrap();
         }
         std::fs::create_dir_all(d.join(".cache")).unwrap();
-        std::fs::write(d.join("README.md"), "# nest (with Wren inside)\n\n**nest** is a terminal hub. Apps sit in a list at the top of the sidebar.\n\n- ai: chat with `Wren`\n- music: your library\n\n## Run it\n\n```powershell\nnest\n```\n").unwrap();
+        std::fs::write(d.join("README.md"), "# demo project\n\n**demo** is a small example app. Everything lives in `src`.\n\n- docs: how it works\n- tests: run them with `cargo test`\n\n## Run it\n\n```powershell\ncargo run\n```\n").unwrap();
         std::fs::write(d.join("main.rs"), "// entry point\nfn main() {\n    let answer = 42;\n    println!(\"hello {answer}\");\n}\n").unwrap();
         std::fs::write(d.join("blob.bin"), [0u8, 1, 2, 3, 0, 255]).unwrap();
         std::fs::write(d.join(".secret"), "shh").unwrap();
@@ -819,11 +819,11 @@ pub(crate) mod tests {
         settle(&mut k, &mut p);
         let s = snap(&mut k, &mut p, 150, 44, "target/snap/files-main.html");
         println!("{s}");
-        assert!(s.contains("checkpoints"), "folders listed");
+        assert!(s.contains("assets"), "folders listed");
         assert!(s.contains("README.md"));
         assert!(!s.contains(".secret"), "dotfiles hidden by default");
         assert!(s.contains("4 folders · 5 files") || s.contains("folders ·"), "folder summary");
-        assert!(s.contains("nest is a terminal hub") || s.contains("**nest** is a terminal hub"), "README previewed");
+        assert!(s.contains("demo is a small example app") || s.contains("**demo** is a small example app"), "README previewed");
         assert!(s.contains("home"), "places in the sidebar");
 
         // move to main.rs: code preview with line numbers
@@ -860,17 +860,17 @@ pub(crate) mod tests {
         assert!(k.render(&mut p, 150, 44).contains(".secret"));
         k.key(&mut p, KeyCode::Char('.'));
         assert!(!k.render(&mut p, 150, 44).contains(".secret"));
-        // into "train", then back up: the folder we came from stays selected
-        let idx = p.shown.iter().position(|&i| p.all[i].name == "train").unwrap() + 1;
+        // into "src", then back up: the folder we came from stays selected
+        let idx = p.shown.iter().position(|&i| p.all[i].name == "src").unwrap() + 1;
         p.select(idx);
         k.key(&mut p, KeyCode::Enter);
         k.wait_wake(&mut p, 300);
-        assert_eq!(p.dir, d.join("train"));
+        assert_eq!(p.dir, d.join("src"));
         assert!(k.render(&mut p, 150, 44).contains("(empty)"));
         k.key(&mut p, KeyCode::Backspace);
         k.wait_wake(&mut p, 300);
         assert_eq!(p.dir, d);
-        assert_eq!(p.sel_entry().map(|e| e.name.as_str()), Some("train"));
+        assert_eq!(p.sel_entry().map(|e| e.name.as_str()), Some("src"));
         // enter on a file focuses the preview; esc gives focus back
         let idx = p.shown.iter().position(|&i| p.all[i].name == "main.rs").unwrap() + 1;
         p.select(idx);
@@ -896,27 +896,6 @@ pub(crate) mod tests {
         assert!(s.contains("home"));
         if cfg!(windows) {
             assert!(s.contains("C: drive"));
-        }
-    }
-
-    /// Side-by-side with nest's reference screenshot (reads C:\Code\ai\wren, writes nothing there).
-    /// cargo test files_snap_wren -- --ignored
-    #[test]
-    #[ignore]
-    fn files_snap_wren() {
-        let d = PathBuf::from(r"C:\Code\ai\wren");
-        if !d.is_dir() {
-            return;
-        }
-        let mut k = Kit::new();
-        let mut p = Files::new(Some(d));
-        settle(&mut k, &mut p);
-        println!("{}", snap(&mut k, &mut p, 150, 44, "target/snap/files-wren.html"));
-        let idx = p.shown.iter().position(|&i| p.all[i].name.ends_with(".py") || p.all[i].name == "pyproject.toml");
-        if let Some(i) = idx {
-            p.select(i + 1);
-            k.wait_wake(&mut p, 400);
-            snap(&mut k, &mut p, 150, 44, "target/snap/files-wren-code.html");
         }
     }
 

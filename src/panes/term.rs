@@ -1,7 +1,7 @@
 //! A real terminal inside a pane: a shell (or any command, e.g. `claude`) on a pseudo-terminal
 //! (ConPTY on Windows, a Unix pty elsewhere), parsed by vt100 and drawn cell by cell.
 
-use crate::pane::{Cx, Pane, Waker};
+use crate::pane::{Activity, Cx, Pane, Waker};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::{
@@ -10,7 +10,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
 };
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 
 pub struct Term {
@@ -24,8 +25,17 @@ pub struct Term {
     size: (u16, u16), // rows, cols
     scroll: usize,    // lines scrolled back (0 = live)
     started: bool,
-    spec: (String, Vec<String>, Option<std::path::PathBuf>),
+    /// ms since `born` when the program last printed something (set by the reader thread)
+    last_output: Arc<AtomicU64>,
+    born: Instant,
+    /// Some once this pane is known to run a coding agent
+    status: Option<Activity>,
+    agent: bool,
+    last_scan: Instant,
 }
+
+/// Programs that are coding agents (by executable name), so their panes get status dots from the start.
+const AGENTS: &[&str] = &["claude", "codex", "opencode", "gemini", "kimi", "aider", "cursor-agent", "copilot", "droid", "amp", "goose"];
 
 impl Term {
     /// `prog` + `args` on a pty, started lazily at the first render (when the pane size is known).
@@ -63,7 +73,14 @@ impl Term {
             size: (24, 80),
             scroll: 0,
             started: false,
-            spec: (prog.to_string(), args, cwd),
+            last_output: Arc::new(AtomicU64::new(0)),
+            born: Instant::now(),
+            status: None,
+            agent: {
+                let words = std::iter::once(prog).chain(args.iter().map(String::as_str));
+                words.map(|w| std::path::Path::new(w).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default()).any(|n| AGENTS.contains(&n.as_str()))
+            },
+            last_scan: Instant::now(),
         }
     }
 
@@ -78,6 +95,7 @@ impl Term {
         let parser = self.parser.clone();
         let writer = self.writer.clone();
         let exited = self.exited.clone();
+        let (last_output, born) = (self.last_output.clone(), self.born);
         std::thread::spawn(move || {
             let mut buf = [0u8; 16384];
             loop {
@@ -94,6 +112,7 @@ impl Term {
                             let _ = writer.lock().unwrap().write_all(format!("\x1b[{};{}R", r + 1, c + 1).as_bytes());
                         }
                         drop(p);
+                        last_output.store(born.elapsed().as_millis() as u64, Ordering::Relaxed);
                         waker.wake();
                     }
                 }
@@ -117,6 +136,51 @@ impl Term {
         self.size = (rows, cols);
         let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
+    }
+}
+
+impl Term {
+    /// Read the bottom of the screen for an agent's tell-tale lines: "esc to interrupt" while it works,
+    /// a permission prompt or question when it's waiting on you.
+    fn scan(&mut self) {
+        let text = {
+            let p = self.parser.lock().unwrap();
+            let s = p.screen();
+            let (_, cols) = s.size();
+            let rows: Vec<String> = s.rows(0, cols).collect();
+            let tail: Vec<&String> = rows.iter().rev().filter(|r| !r.trim().is_empty()).take(14).collect();
+            tail.iter().rev().map(|r| r.to_lowercase()).collect::<Vec<_>>().join("\n")
+        };
+        let working = ["esc to interrupt", "esc to cancel", "ctrl+c to interrupt", "ctrl-c to interrupt"].iter().any(|m| text.contains(m));
+        let blocked = [
+            "do you want to",
+            "do you want me to",
+            "allow this",
+            "allow once",
+            "approve this",
+            "(y/n)",
+            "[y/n]",
+            "❯ 1. yes",
+            "› 1. yes",
+            "press enter to confirm",
+            "waiting for your approval",
+        ]
+        .iter()
+        .any(|m| text.contains(m));
+        if working || blocked {
+            self.agent = true;
+        }
+        if !self.agent {
+            return;
+        }
+        let quiet_ms = (self.born.elapsed().as_millis() as u64).saturating_sub(self.last_output.load(Ordering::Relaxed));
+        self.status = Some(if blocked {
+            Activity::Blocked
+        } else if working || quiet_ms < 1500 {
+            Activity::Working
+        } else {
+            Activity::Idle
+        });
     }
 }
 
@@ -150,6 +214,23 @@ impl Pane for Term {
     }
     fn alive(&self) -> bool {
         !self.exited.load(Ordering::SeqCst)
+    }
+    fn activity(&self) -> Option<Activity> {
+        self.status
+    }
+    fn wants_mouse(&self) -> bool {
+        self.parser.lock().map(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None).unwrap_or(false)
+    }
+    fn tick_every(&self) -> Option<Duration> {
+        // agents get re-checked so "working" turns into "idle/done" when they go quiet
+        if self.agent { Some(Duration::from_millis(400)) } else { None }
+    }
+    fn poll(&mut self, _cx: &mut Cx) {
+        if self.last_scan.elapsed() < Duration::from_millis(200) {
+            return;
+        }
+        self.last_scan = Instant::now();
+        self.scan();
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {

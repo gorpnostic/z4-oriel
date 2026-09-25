@@ -125,4 +125,21 @@ pub trait Pane {
     fn badge(&self) -> Option<String> {
         None
     }
+    /// For panes running a coding agent (Claude Code, Codex...): what it's doing. The app turns Working→Idle
+    /// into "done" for tabs you aren't looking at, and shows it all as status dots in the sidebar (herdr style).
+    fn activity(&self) -> Option<Activity> {
+        None
+    }
+    /// True when the program inside wants mouse events itself (so right-click goes to it, not our menu).
+    fn wants_mouse(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Activity {
+    Idle,
+    Working,
+    /// waiting on you: a permission prompt, a question, (y/n)
+    Blocked,
 }

@@ -1,4 +1,4 @@
-//! Omarchy-style block font (8 rows), generated from nest's wren/font.py.
+//! Omarchy-style block font (8 rows) for the big logos.
 
 pub const GLYPHS: &[(char, [&str; 8])] = &[
     ('A', ["  ▄███████", " ███   ███", " ███   ███", "▄███▄▄▄███", "▀███▀▀▀███", " ███   ███", " ███   ███", " ███   █▀ "]),
