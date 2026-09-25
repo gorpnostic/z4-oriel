@@ -128,12 +128,16 @@ fn needs(cmd: &str) -> &str {
 
 /// The install command to offer on this OS: the first one whose tool exists (`has` = is that tool installed).
 /// Falls back to the first listed command (so the user sees what it would take) with `ready = false`.
-pub fn pick(c: &Cli, os: Os, has: &dyn Fn(&str) -> bool) -> Option<(String, bool)> {
-    let list: Vec<&str> = match os {
+pub fn options(c: &Cli, os: Os) -> Vec<&'static str> {
+    match os {
         Os::Windows => c.win.to_vec(),
         Os::Arch => c.arch.iter().chain(c.unix.iter()).copied().collect(),
         Os::Linux => c.unix.to_vec(),
-    };
+    }
+}
+
+pub fn pick(c: &Cli, os: Os, has: &dyn Fn(&str) -> bool) -> Option<(String, bool)> {
+    let list = options(c, os);
     for cmd in &list {
         let n = needs(cmd);
         if n.is_empty() || has(n) {

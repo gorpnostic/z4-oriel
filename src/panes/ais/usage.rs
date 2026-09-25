@@ -137,7 +137,7 @@ pub fn codex_price(model: &str) -> Option<(f64, f64, f64)> {
 
 /// Friendly model name: "claude-opus-5-5" → "opus 5.5", "claude-haiku-4-5-20251001" → "haiku 4.5".
 pub fn short_model(m: &str) -> String {
-    let m = m.strip_prefix("claude-").unwrap_or(m);
+    let Some(m) = m.strip_prefix("claude-") else { return m.to_string() };
     let parts: Vec<&str> = m.split('-').filter(|p| !(p.len() == 8 && p.chars().all(|c| c.is_ascii_digit()))).collect();
     if parts.len() >= 2 && parts[1..].iter().all(|p| p.chars().all(|c| c.is_ascii_digit())) {
         return format!("{} {}", parts[0], parts[1..].join("."));

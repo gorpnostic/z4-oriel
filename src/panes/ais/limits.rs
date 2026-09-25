@@ -108,7 +108,13 @@ pub fn filter_status(v: &Value, received_at: i64) -> Value {
         o["cost"] = json!({ "total_cost_usd": c });
     }
     if let Some(m) = v.get("model") {
-        o["model"] = json!({ "id": m.get("id"), "display_name": m.get("display_name") });
+        let mut mm = json!({});
+        for k in ["id", "display_name"] {
+            if let Some(x) = m.get(k) {
+                mm[k] = x.clone();
+            }
+        }
+        o["model"] = mm;
     }
     o
 }
@@ -166,7 +172,29 @@ pub fn cli(args: &[String]) -> i32 {
 fn run_chained(cmd: &str, input: &str) -> Option<String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut c = if cfg!(windows) {
+    // Claude Code runs statusLine commands through Git Bash on Windows, so use the same shell when it's there
+    // (not System32\bash.exe: that's the WSL launcher)
+    // (and not WindowsApps\bash.exe, the same launcher's alias) — find Git for Windows' own bash
+    let bash = if cfg!(windows) {
+        let from_git = crate::config::which("git").and_then(|g| Some(g.parent()?.parent()?.join("bin").join("bash.exe")));
+        [Some(std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")), from_git]
+            .into_iter()
+            .flatten()
+            .find(|p| p.is_file())
+            .or_else(|| {
+                crate::config::which("bash").filter(|p| {
+                    let l = p.to_string_lossy().to_lowercase();
+                    !l.contains("system32") && !l.contains("windowsapps")
+                })
+            })
+    } else {
+        None
+    };
+    let mut c = if let Some(b) = bash {
+        let mut c = Command::new(b);
+        c.args(["-c", cmd]);
+        c
+    } else if cfg!(windows) {
         let mut c = Command::new("cmd.exe");
         c.args(["/C", cmd]);
         c

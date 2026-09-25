@@ -276,10 +276,90 @@ impl Ais {
         // everything else, on one line
         let shown = self.card_list();
         let missing: Vec<&str> = CLIS.iter().enumerate().filter(|(i, _)| !shown.contains(i) && self.found[*i].as_ref().is_some_and(|f| !f.installed())).map(|(_, c)| c.name).collect();
+        let mut y = last_y + 1;
+        // the last two weeks across every AI, if there's room for a real chart
+        if self.usage.as_ref().is_some_and(|u| !u.is_empty()) && body.bottom().saturating_sub(y) >= 9 {
+            let h = (body.bottom() - y - 2).min(12);
+            self.draw_trend(f, Rect { y, height: h, ..body }, t);
+            y += h + 1;
+        }
         if !missing.is_empty() {
-            let y = (last_y + 1).min(body.bottom().saturating_sub(1));
+            let y = y.min(body.bottom().saturating_sub(1));
             let text = ui::fit(&missing.join(" · "), body.width.saturating_sub(34) as usize);
             put(f, body, y, vec![s(" also available: ", ui::muted(t)), s(text, Style::default()), s("   → 2 installs", ui::accent(t))]);
+        }
+    }
+
+    /// Column chart of tokens per day, last 14 days, every AI stacked (Claude in the accent colour, the rest in
+    /// the highlight colour), with the day and its API-equivalent cost underneath.
+    fn draw_trend(&self, f: &mut Frame, r: Rect, t: &Theme) {
+        let sums = self.usage.as_deref().unwrap_or(&[]);
+        let mut main = [0u64; 14];
+        let mut other = [0u64; 14];
+        for su in sums {
+            for (k, v) in su.spark.iter().enumerate().take(14) {
+                if su.src == Src::Claude { main[k] += v } else { other[k] += v }
+            }
+        }
+        // cost per day from the daily tables
+        let today = super::util::day_of(now(), self.off);
+        let mut cost = [0f64; 14];
+        for su in sums {
+            for (d, x) in &su.days {
+                let k = d - (today - 13);
+                if (0..14).contains(&k) {
+                    cost[k as usize] += x.cost;
+                }
+            }
+        }
+        let total: u64 = main.iter().sum::<u64>() + other.iter().sum::<u64>();
+        let right = format!("{} tokens · {} API-eq over 14 days", tok(total), money(cost.iter().sum()));
+        let inner = card(f, r, &format!("{}last 14 days", ui::lead("chart")), Some(&right), true, false, t);
+        if inner.height < 4 || inner.width < 28 {
+            return;
+        }
+        let legend_row = other.iter().any(|&v| v > 0);
+        let top = inner.y + legend_row as u16;
+        let rows = (inner.height - 2 - legend_row as u16) as usize;
+        let colw = (inner.width as usize / 14).max(2);
+        let bw = colw.saturating_sub(if colw >= 5 { 2 } else { 1 }).max(1);
+        let max = (0..14).map(|k| main[k] + other[k]).max().unwrap_or(0).max(1);
+        const P: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let other_c = t.shine;
+        for row in 0..rows {
+            let y = top + row as u16;
+            let level = (rows - 1 - row) * 8; // eighths below this cell
+            let mut spans = vec![];
+            for k in 0..14 {
+                let tot = ((main[k] + other[k]) as f64 / max as f64 * (rows * 8) as f64).round() as usize;
+                let m = (main[k] as f64 / max as f64 * (rows * 8) as f64).round() as usize;
+                let fill = tot.saturating_sub(level).min(8);
+                // which series owns the top of this cell
+                let colr = if m > level { t.accent } else { other_c };
+                let ch = if fill == 0 && k as i64 == 13 && level == 0 { '▁' } else { P[fill] };
+                let colr = if fill == 0 { t.frame } else { colr };
+                spans.push(s(ch.to_string().repeat(bw), Style::default().fg(colr)));
+                spans.push(s(" ".repeat(colw - bw), Style::default()));
+            }
+            put(f, inner, y, spans);
+        }
+        let mut days = vec![];
+        let mut costs = vec![];
+        for k in 0..14 {
+            let d = today - 13 + k as i64;
+            let lab = if d == today { "today".to_string() } else { let l = day_label(d); format!("{}{}", &l[..2], l[l.len() - 2..].trim()) };
+            days.push(s(pad(&lab, colw), if d == today { ui::bold_accent(t) } else { ui::muted(t) }));
+            let c = if cost[k] > 0.0 { money(cost[k]) } else { String::new() };
+            costs.push(s(pad(&c, colw), Style::default().fg(crate::theme::mix(t.muted, t.accent, 0.5))));
+        }
+        put(f, inner, inner.bottom() - 2, days);
+        put(f, inner, inner.bottom() - 1, costs);
+        if legend_row {
+            let legend = vec![s("█", ui::accent(t)), s(" Claude  ", ui::muted(t)), s("█", Style::default().fg(other_c)), s(" others", ui::muted(t))];
+            let lw = 18u16;
+            if inner.width > lw {
+                f.render_widget(Paragraph::new(Line::from(legend)), Rect { x: inner.right() - lw, y: inner.y, width: lw, height: 1 });
+            }
         }
     }
 
@@ -287,13 +367,16 @@ impl Ais {
 
     fn draw_install(&mut self, f: &mut Frame, body: Rect, focused: bool, t: &Theme) {
         self.row_hits.clear();
-        let detail_h = 7u16;
-        let tr = Rect { height: body.height.saturating_sub(detail_h + 1), ..body };
-        let inner = card(f, tr, &format!("{}coding CLIs for {}", ui::lead("package"), self.os.label()), Some("✓ = found on this machine"), true, false, t);
+        let detail_h = 10u16.min(body.height / 2);
+        let table_h = (CLIS.len() as u16 + 3).min(body.height.saturating_sub(detail_h + 1));
+        let tr = Rect { height: table_h, ..body };
+        let (inst_n, _) = self.installed_count();
+        let right = format!("{inst_n} of {} found on this machine", CLIS.len());
+        let inner = card(f, tr, &format!("{}coding CLIs for {}", ui::lead("package"), self.os.label()), Some(&right), true, false, t);
         let w = inner.width as usize;
-        let (cv, cs) = (11usize, 22usize);
+        let (cv, cs) = (11usize, 10usize);
         let cn = 16usize;
-        let cd = 30usize.min(w / 4);
+        let cd = 44usize.min(w / 3);
         let ci = w.saturating_sub(2 + cn + cv + cs + cd + 5);
         let head = vec![s(format!("  {}{}{}{}{}", pad("cli", cn + 1), pad("version", cv + 1), pad("signed in", cs + 1), pad("install with", ci + 1), pad("what it is", cd)), Style::default().add_modifier(Modifier::BOLD))];
         put(f, inner, inner.y, head);
@@ -331,7 +414,7 @@ impl Ais {
                 s(pad(c.name, cn + 1), name_st),
                 s(pad(&ver, cv + 1), hi.fg(t.muted)),
                 s(pad(&signed.0, cs + 1), signed.1),
-                s(pad(&how, ci + 1), how_st),
+                s(pad(&ui::fit(&how, ci), ci + 1), how_st),
                 s(pad(c.desc, cd), hi.fg(t.muted)),
             ];
             let row = Rect { y, height: 1, ..inner };
@@ -363,6 +446,11 @@ impl Ais {
         put(f, di, di.y + 2, login);
         put(f, di, di.y + 3, vec![lab("docs"), s(c.docs.to_string(), Style::default()), s("   o opens it", ui::muted(t))]);
         put(f, di, di.y + 4, vec![lab("verify"), s(format!("{} {}", c.bin, c.ver.join(" ")), ui::muted(t))]);
+        let picked = self.picks[sel].as_ref().map(|p| p.0.as_str());
+        let others: Vec<&str> = super::catalog::options(c, self.os).into_iter().filter(|o| Some(*o) != picked).collect();
+        for (k, o) in others.iter().enumerate() {
+            put(f, di, di.y + 5 + k as u16, vec![lab(if k == 0 { "or" } else { "" }), s(ui::fit(o, dw - 10), ui::muted(t))]);
+        }
     }
 
     // ------------------------------------------------------------------ usage
@@ -398,10 +486,10 @@ impl Ais {
 
     fn draw_daily(&mut self, f: &mut Frame, r: Rect, su: &SrcSum, t: &Theme) {
         let priced = su.src.priced();
-        let sub = format!("{} log files · {}", su.files, if priced { "$ = API-equivalent at list prices" } else { "no price table for this one" });
+        let sub = format!("{} log file{} · {}", su.files, if su.files == 1 { "" } else { "s" }, if priced { "$ = API-equivalent at list prices" } else { "no price table for this one" });
         let inner = card(f, r, &format!("{}daily · {}", ui::lead("chart"), su.src.label()), Some(&sub), true, false, t);
         let w = inner.width as usize;
-        let nw = 9usize;
+        let nw = 10usize;
         let dw = 11usize;
         let bw = w.saturating_sub(dw + nw * 6 + 7).min(24);
         let head = format!("{}{}{}{}{}{}{} {}", pad("day", dw), rpad("input", nw), rpad("output", nw), rpad("cache wr", nw), rpad("cache rd", nw), rpad("total", nw), rpad("$", nw), "");
@@ -433,16 +521,16 @@ impl Ais {
         let y = inner.bottom().saturating_sub(1);
         ui::rule(f, Rect { y: y - 1, height: 1, ..inner }, t);
         let a = &su.all;
-        let hit = a.cache_hit().map(|h| format!("   cache hit {h:.0}%")).unwrap_or_default();
+        let hit = a.cache_hit().map(|h| format!("  {h:.0}% cached")).unwrap_or_default();
         put(f, inner, y, vec![
-            s(pad(&format!("{} days", su.days.len()), dw), Style::default().add_modifier(Modifier::BOLD)),
+            s(pad(&format!("{} day{}", su.days.len(), if su.days.len() == 1 { "" } else { "s" }), dw), Style::default().add_modifier(Modifier::BOLD)),
             s(rpad(&tok(a.inp), nw), Style::default()),
             s(rpad(&tok(a.out), nw), Style::default()),
             s(rpad(&tok(a.cw), nw), Style::default()),
             s(rpad(&tok(a.cr), nw), Style::default()),
             s(rpad(&tok(a.tokens()), nw), Style::default().add_modifier(Modifier::BOLD)),
             s(rpad(&if priced { money(a.cost) } else { "—".into() }, nw), ui::bold_accent(t)),
-            s(format!("{hit}   {} requests", a.n), ui::muted(t)),
+            s(format!("{hit} · {} req", a.n), ui::muted(t)),
         ]);
     }
 
@@ -492,7 +580,7 @@ impl Ais {
             for (k, b) in su.blocks.iter().take(bi.height as usize).enumerate() {
                 let day = day_label(super::util::day_of(b.start, self.off));
                 let span = format!("{} {}–{}", day.get(4..).unwrap_or(""), hhmm(b.start, self.off), hhmm(b.end, self.off));
-                let tail = if b.active { format!("active · ends in {}", dur(b.end - n)) } else { String::new() };
+                let tail = if b.active { format!("● {} left", dur(b.end - n)) } else { String::new() };
                 put(f, bi, bi.y + k as u16, vec![
                     s(pad(&span, 20), if b.active { ui::bold_accent(t) } else { Style::default() }),
                     s(rpad(&tok(b.tot.tokens()), 8), ui::muted(t)),
@@ -507,10 +595,10 @@ impl Ais {
 
     fn draw_saver(&mut self, f: &mut Frame, body: Rect, focused: bool, t: &Theme) {
         self.row_hits.clear();
-        let rw = if body.width >= 120 { 56 } else { 0 };
+        let rw = if body.width >= 120 { 60 } else { 0 };
         let left = Rect { width: body.width.saturating_sub(if rw > 0 { rw + 1 } else { 0 }), ..body };
         let matches = self.readouts.as_ref().and_then(|r| r.matches);
-        let ph = ((left.height + 1) / saver::PRESETS.len() as u16).saturating_sub(1).min(11);
+        let ph = ((left.height + 1) / saver::PRESETS.len() as u16).saturating_sub(1).min(12);
         for (k, p) in saver::PRESETS.iter().enumerate() {
             let r = Rect { y: left.y + k as u16 * (ph + 1), height: ph, ..left };
             if r.bottom() > left.bottom() {
@@ -543,19 +631,38 @@ impl Ais {
                 lines.push(vec![s(if first { pad("Codex", 8) } else { " ".repeat(8) }, ui::bold_accent(t)), s(chunk, Style::default())]);
                 first = false;
             }
+            let n = lines.len() as u16;
             for (j, l) in lines.into_iter().enumerate() {
                 put(f, inner, inner.y + j as u16, l);
+            }
+            // what applying it would change, on the selected card
+            if on && inner.height > n + 1 {
+                let msg = match self.preset_delta(p) {
+                    Some((0, 0)) => vec![s("✓ Claude already matches — ", Style::default().fg(t.good)), s("x", ui::bold_accent(t)), s(" still adds the Codex profile", ui::muted(t))],
+                    Some((a, b)) => vec![
+                        s("enter", ui::bold_accent(t)),
+                        s(format!(" changes {a} setting{} + {b} env key{} (diff first) · ", if a == 1 { "" } else { "s" }, if b == 1 { "" } else { "s" }), ui::muted(t)),
+                        s("x", ui::bold_accent(t)),
+                        s(format!(" adds {}", p.profile), ui::muted(t)),
+                    ],
+                    None => vec![],
+                };
+                put(f, inner, inner.bottom() - 1, msg);
             }
         }
         if rw == 0 {
             return;
         }
         let right = Rect { x: left.right() + 1, width: rw, ..body };
-        let nh = right.height.saturating_sub(saver::TIPS.len() as u16 + 3);
+        let tw = rw.saturating_sub(6) as usize;
+        let tips: Vec<Vec<String>> = saver::TIPS.iter().map(|tip| wrap(tip, tw)).collect();
+        let th = (tips.iter().map(|x| x.len()).sum::<usize>() as u16 + 2).min(right.height / 2);
+        let nh = right.height.saturating_sub(th + 1);
         let ri = card(f, Rect { height: nh, ..right }, &format!("{}right now", ui::lead("gauge")), None, true, false, t);
         let mut y = ri.y;
         let w = ri.width as usize;
-        let lab = |x: &str| s(pad(x, 14), ui::muted(t));
+        let lw = 16usize;
+        let lab = |x: &str| s(pad(x, lw), ui::muted(t));
         match &self.readouts {
             None => put(f, ri, y, vec![s("reading your settings…", ui::muted(t))]),
             Some(r) => {
@@ -563,57 +670,88 @@ impl Ais {
                     put(f, ri, y, vec![s(ui::fit(e, w), Style::default().fg(t.danger))]);
                     y += 1;
                 }
-                put(f, ri, y, vec![s("Claude settings.json", Style::default().add_modifier(Modifier::BOLD))]);
+                put(f, ri, y, vec![s("Claude settings.json", Style::default().add_modifier(Modifier::BOLD)), s(format!("   preset: {}", r.matches.unwrap_or("custom")), ui::accent(t))]);
                 y += 1;
                 if r.current.is_empty() {
                     put(f, ri, y, vec![s("  (no settings.json yet)", ui::muted(t))]);
                     y += 1;
                 }
+                let kw = r.current.iter().map(|(k, _)| k.len()).max().unwrap_or(10).min(w / 2) + 2;
                 for (k, v) in &r.current {
-                    put(f, ri, y, vec![s(format!("  {}", pad(k, w.saturating_sub(22))), ui::muted(t)), s(ui::fit(v, 20), Style::default())]);
+                    put(f, ri, y, vec![s(format!("  {}", pad(k, kw)), ui::muted(t)), s(ui::fit(v, w.saturating_sub(kw + 2)), if v == "(not set)" { Style::default().fg(t.frame) } else { Style::default() })]);
                     y += 1;
                 }
-                put(f, ri, y, vec![lab("  preset"), s(r.matches.unwrap_or("custom (no preset matches)").to_string(), ui::accent(t))]);
-                y += 2;
+                y += 1;
                 let md = match r.claude_md {
                     Some((lines, bytes)) => {
                         let warn = lines > 200;
-                        vec![lab("CLAUDE.md"), s(format!("{lines} lines"), if warn { Style::default().fg(AMBER).add_modifier(Modifier::BOLD) } else { Style::default().add_modifier(Modifier::BOLD) }), s(format!(" · ~{} tokens every request{}", tok(bytes as u64 / 4), if warn { " · aim for <200" } else { "" }), ui::muted(t))]
+                        vec![lab("CLAUDE.md"), s(format!("{lines} lines"), if warn { Style::default().fg(AMBER).add_modifier(Modifier::BOLD) } else { Style::default().add_modifier(Modifier::BOLD) }), s(format!(" · ~{} tokens / request{}", tok(bytes as u64 / 4), if warn { " · aim <200" } else { "" }), ui::muted(t))]
                     }
                     None => vec![lab("CLAUDE.md"), s("none (global)", ui::muted(t))],
                 };
                 put(f, ri, y, md);
                 y += 1;
                 let mcp = if r.mcp.is_empty() { "none".to_string() } else { format!("{}: {}", r.mcp.len(), r.mcp.join(", ")) };
-                let mut first = true;
-                for chunk in wrap(&mcp, w.saturating_sub(14)).into_iter().take(3) {
-                    put(f, ri, y, vec![if first { lab("MCP servers") } else { s(" ".repeat(14), Style::default()) }, s(chunk, Style::default())]);
-                    first = false;
+                for (k, chunk) in wrap(&mcp, w.saturating_sub(lw)).into_iter().take(3).enumerate() {
+                    put(f, ri, y, vec![if k == 0 { lab("MCP servers") } else { s(" ".repeat(lw), Style::default()) }, s(chunk, Style::default())]);
                     y += 1;
                 }
                 if r.project_mcp > 0 {
-                    put(f, ri, y, vec![s(" ".repeat(14), Style::default()), s(format!("+ {} projects with their own", r.project_mcp), ui::muted(t))]);
+                    put(f, ri, y, vec![s(" ".repeat(lw), Style::default()), s(format!("+ {} project{} with its own", r.project_mcp, if r.project_mcp == 1 { "" } else { "s" }), ui::muted(t))]);
                     y += 1;
                 }
                 if let Some(h) = self.sum(Src::Claude).and_then(|s| s.week.cache_hit()) {
-                    put(f, ri, y, vec![lab("cache hits"), s(format!("{h:.0}%"), Style::default().add_modifier(Modifier::BOLD)), s(" of Claude input, last 7 days", ui::muted(t))]);
+                    put(f, ri, y, vec![lab("cache hits"), s(format!("{h:.0}%"), Style::default().fg(if h >= 80.0 { t.good } else { AMBER }).add_modifier(Modifier::BOLD)), s(" of Claude input, 7 days", ui::muted(t))]);
                     y += 1;
                 }
                 let prof = if r.codex_profiles.is_empty() { "none".to_string() } else { r.codex_profiles.join(", ") };
-                put(f, ri, y, vec![lab("Codex profiles"), s(ui::fit(&prof, w.saturating_sub(14)), Style::default())]);
+                put(f, ri, y, vec![lab("Codex profiles"), s(ui::fit(&prof, w.saturating_sub(lw)), Style::default())]);
                 y += 1;
                 let sl = match &r.status_line {
-                    Some(c) if c.contains("usage-sink") => s("connected (oriel usage-sink)", Style::default().fg(t.good)),
-                    Some(c) => s(ui::fit(&format!("yours: {c}"), w.saturating_sub(14)), ui::muted(t)),
-                    None => s("not set — c on the overview connects limits", ui::muted(t)),
+                    Some(c) if c.contains("usage-sink") => s("oriel usage-sink ✓", Style::default().fg(t.good)),
+                    Some(c) => s(ui::fit(&format!("yours: {c}"), w.saturating_sub(lw)), ui::muted(t)),
+                    None => s("not set (c on overview)", ui::muted(t)),
                 };
                 put(f, ri, y, vec![lab("status line"), sl]);
             }
         }
-        let ti = card(f, Rect { y: right.y + nh, height: right.height - nh, ..right }, "tips", None, true, false, t);
-        for (k, tip) in saver::TIPS.iter().enumerate() {
-            put(f, ti, ti.y + k as u16, vec![s("• ", ui::accent(t)), s(ui::fit(tip, ti.width as usize - 2), ui::muted(t))]);
+        let ti = card(f, Rect { y: right.y + nh + 1, height: th, ..right }, "tips", None, true, false, t);
+        let mut y = ti.y;
+        for tip in &tips {
+            for (k, l) in tip.iter().enumerate() {
+                put(f, ti, y, vec![s(if k == 0 { "• " } else { "  " }, ui::accent(t)), s(l.clone(), ui::muted(t))]);
+                y += 1;
+            }
         }
+    }
+
+    /// How many settings a preset would change, against the readouts (settings keys, env keys).
+    fn preset_delta(&self, p: &saver::Preset) -> Option<(usize, usize)> {
+        let r = self.readouts.as_ref()?;
+        let cur = |k: &str| r.current.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()).unwrap_or_else(|| "(not set)".into());
+        let keys = p
+            .claude
+            .iter()
+            .filter(|(k, v)| {
+                let want = match v {
+                    saver::V::S(x) => serde_json::json!(x),
+                    saver::V::B(b) => serde_json::json!(b),
+                };
+                cur(k) != want.to_string()
+            })
+            .count();
+        let env = p
+            .env
+            .iter()
+            .filter(|(k, v)| {
+                let now = cur(&format!("env.{k}"));
+                match v {
+                    Some(x) => now != format!("\"{x}\""),
+                    None => now != "(not set)",
+                }
+            })
+            .count();
+        Some((keys, env))
     }
 
     // ------------------------------------------------------------------ popups
@@ -663,14 +801,16 @@ impl Ais {
 
     fn popup(&self, f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, scroll: usize, t: &Theme) {
         let longest = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
-        let w = (longest + 4).clamp(60, area.width.saturating_sub(4).max(20));
-        let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+        let w = (longest + 4).clamp(60, area.width.saturating_sub(4).max(20)).min(area.width);
+        let iw = w.saturating_sub(4).max(1) as usize;
+        // rows after wrapping long lines (commands, paths)
+        let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(iw)).sum();
+        let h = (rows as u16 + 2).min(area.height.saturating_sub(2));
         let inner = ui::popup(f, area, w, h, title, t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
-        let n = inner.height as usize;
-        let scroll = scroll.min(lines.len().saturating_sub(n));
+        let scroll = scroll.min(rows.saturating_sub(inner.height as usize));
         f.render_widget(Clear, inner);
-        f.render_widget(Paragraph::new(lines.into_iter().skip(scroll).take(n).collect::<Vec<_>>()), inner);
+        f.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }).scroll((scroll as u16, 0)), inner);
     }
 
     fn draw_note(&self, f: &mut Frame, area: Rect, t: &Theme) {
@@ -750,7 +890,7 @@ impl Pane for Ais {
         }
         if let Some(st) = &self.first_stats {
             if st.ms > 0 {
-                parts.push(format!("logs read in {:.1}s", st.ms as f64 / 1000.0));
+                parts.push(if st.ms < 1000 { format!("logs read in {} ms", st.ms) } else { format!("logs read in {:.1} s", st.ms as f64 / 1000.0) });
             }
         }
         (!parts.is_empty()).then(|| parts.join(" · "))

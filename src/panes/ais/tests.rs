@@ -285,7 +285,7 @@ fn ais_connect_limits_never_replaces_a_status_line() {
     }
     assert!(a.ask.is_none());
     let n = a.note.as_ref().expect("a note about chaining");
-    assert!(n.lines.iter().any(|l| l.contains("usage-sink --then bash ~/my-status.sh")), "{:?}", n.lines);
+    assert!(n.lines.iter().any(|l| l.contains("usage-sink --then 'bash ~/my-status.sh'")), "{:?}", n.lines);
     std::fs::create_dir_all("target/snap").unwrap();
     k.render_html(&mut a, 150, 44, "target/snap/ais-chain.html");
     assert_eq!(std::fs::read_to_string(p.claude_settings()).unwrap(), mine);
@@ -371,12 +371,24 @@ fn ais_real_usage() {
             s.files,
             s.projects.len()
         );
+        let models: Vec<String> = s.models.iter().map(|(m, t)| format!("{m} {} ${:.2}", util::tok(t.tokens()), t.cost)).collect();
+        println!("             models: {}", models.join(" · "));
     }
     if let Some((t, v)) = usage::codex_limits(&warm) {
         let l = limits::codex_from(t, &v);
         for w in l.windows {
             println!("codex {} {:.0}% (resets in {})", w.label, w.pct, w.resets_at.map(|r| util::dur(r - now())).unwrap_or_default());
         }
+    }
+    // detection (runs `--version` and `codex login status` — read-only)
+    let t0 = std::time::Instant::now();
+    let found: Vec<(&str, Found)> = std::thread::scope(|s| {
+        let hs: Vec<_> = CLIS.iter().map(|c| (c.id, s.spawn(|| catalog::detect(c, &p)))).collect();
+        hs.into_iter().map(|(id, h)| (id, h.join().unwrap())).collect()
+    });
+    println!("detection: {} ms", t0.elapsed().as_millis());
+    for (id, f) in found.iter().filter(|f| f.1.installed()) {
+        println!("  {id:<9} {:<10} signed in: {:?}", f.version.clone().unwrap_or_default(), f.signed);
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }

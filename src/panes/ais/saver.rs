@@ -278,8 +278,12 @@ pub fn edit_settings(text: Option<&str>, changes: &[(&str, Option<Value>)], env:
             diff.push((' ', format!("\"{k}\": {}", show(old))));
             continue;
         }
-        diff.push(('-', format!("\"{k}\": {}", show(old))));
-        diff.push(('+', format!("\"{k}\": {}", show(v.as_ref()))));
+        if old.is_some() {
+            diff.push(('-', format!("\"{k}\": {}", show(old))));
+        }
+        if v.is_some() {
+            diff.push(('+', format!("\"{k}\": {}", show(v.as_ref()))));
+        }
         out = set_member(&out, k, v.as_ref()).ok_or("couldn't edit settings.json safely")?;
         match v {
             Some(v) => want.insert(k.to_string(), v.clone()),
@@ -301,8 +305,12 @@ pub fn edit_settings(text: Option<&str>, changes: &[(&str, Option<Value>)], env:
                 }
                 continue;
             }
-            diff.push(('-', format!("env.{k} = {}", show(old.as_ref()))));
-            diff.push(('+', format!("env.{k} = {}", show(nv.as_ref()))));
+            if old.is_some() {
+                diff.push(('-', format!("env.{k} = {}", show(old.as_ref()))));
+            }
+            if nv.is_some() {
+                diff.push(('+', format!("env.{k} = {}", show(nv.as_ref()))));
+            }
             match nv {
                 Some(x) => new_env.insert(k.to_string(), x),
                 None => new_env.remove(*k),
@@ -328,8 +336,10 @@ pub fn plan_claude(paths: &Paths, p: &Preset) -> Result<Plan, String> {
     let original = std::fs::read_to_string(&target).ok();
     let changes: Vec<(&str, Option<Value>)> = p.claude.iter().map(|(k, v)| (*k, Some(v.json()))).collect();
     let (new_text, diff) = edit_settings(original.as_deref(), &changes, p.env)?;
-    let mut notes = vec![format!("only these keys change; everything else in {} stays byte-for-byte", target.display())];
-    notes.push("a backup is kept next to it (settings.json.oriel-backup-<time>); new Claude sessions pick it up".into());
+    let notes = vec![
+        "only these keys change — every other key (hooks, plugins …) stays byte-for-byte".into(),
+        "a backup is kept next to it (settings.json.oriel-backup-<time>); new Claude sessions pick it up".into(),
+    ];
     Ok(Plan { title: format!("apply {} to Claude Code?", p.name), target, original, new_text, diff, notes, done: format!("Claude Code set to {}", p.name) })
 }
 
@@ -359,7 +369,9 @@ pub fn plan_connect(paths: &Paths) -> Result<Connect, String> {
         if current.contains("usage-sink") {
             return Ok(Connect::Already);
         }
-        let suggestion = if current.is_empty() { cmd } else { format!("{cmd} --then {current}") };
+        // quote their command as one argument when it's safe to (Claude runs statusLine through a shell)
+        let theirs = if current.contains('\'') || !current.contains(' ') { current.clone() } else { format!("'{current}'") };
+        let suggestion = if current.is_empty() { cmd } else { format!("{cmd} --then {theirs}") };
         return Ok(Connect::Chain { current: if current.is_empty() { serde_json::to_string(sl).unwrap_or_default() } else { current }, suggestion });
     }
     let v = json!({ "type": "command", "command": cmd });
