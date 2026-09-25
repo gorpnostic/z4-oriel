@@ -69,10 +69,9 @@ binaries and publishes the release that the installers download (`.github/workfl
 `cargo test` renders the apps off-screen (`src/testkit.rs`). `pwsh tools\snap.ps1 target\snap\<name>.html` turns
 a snapshot into a PNG. Nothing opens on screen.
 
-## Status (2026-09-24)
+## Status (2026-09-25)
 
-- Done: the nest-style shell, splits, terminal panes, the palette, themes with live Omarchy reload, ai chat with
-  six providers, installers, `oriel update`, and the release workflow.
-- Being built now: music, system, files, notes, storage.
-- Not yet tested: on real Linux/Omarchy (it can't be tested here: WSL can't run on this PC), and the first
-  GitHub release.
+- **v0.1.0 released.** Public repo; `install.sh` / `install.ps1` / `oriel update` work (the Windows install and update were tested on the dev PC).
+- **All apps done:** ai chat (6 providers, nest chats imported), music (audio-player library, cover art, spectrum, synced lyrics), system (~1.4 ms per refresh), files, notes (autosave editor), and storage (cleanup, big folders, apps, install).
+- **Linux:** compiles in CI (Ubuntu 22.04 build), but hasn't been run on a real Linux/Omarchy desktop yet. Try it in the Omarchy VM.
+- **Not done:** `.opus` playback (no decoder in symphonia), a now-playing strip in the sidebar outside the music app, and a macOS build.
