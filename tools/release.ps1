@@ -7,6 +7,9 @@ param([string]$Version = "", [switch]$Minor, [switch]$Major)
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
 if (git status --porcelain) { throw "commit or stash your changes first" }
+# every release ships fresh README screenshots
+pwsh -NoProfile -File tools\screenshots.ps1
+if ($LASTEXITCODE) { throw "screenshots failed" }
 $toml = Get-Content Cargo.toml -Raw
 $cur = [regex]::Match($toml, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
 if (-not $Version) {
@@ -17,7 +20,7 @@ if (-not $Version) {
 $toml = [regex]::Replace($toml, '(?m)^version\s*=\s*"[^"]+"', "version = `"$Version`"", 1)
 [IO.File]::WriteAllText((Resolve-Path Cargo.toml), $toml)
 cargo update --workspace --offline   # just refreshes Cargo.lock with the new version (the workflow builds with --locked)
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock docs
 git commit -m "release v$Version"
 git tag "v$Version"
 git push

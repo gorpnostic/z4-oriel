@@ -25,7 +25,7 @@ PNG with headless Chrome. Tests that need a network or a running server are `#[i
 `ORIEL_DATA_DIR=<folder>` runs oriel with a separate profile (chats, notes, memory), which is handy for demos.
 `ORIEL_LOG=<file>` logs every input event.
 
-README screenshots: `cargo test docs_screenshots -- --ignored`, then run `tools/snap.ps1` on `docs/*.html`.
+README screenshots: `pwsh tools/screenshots.ps1` regenerates all of `docs/screenshot-*.png` (demo data only). `tools/release.ps1` runs it on every release, so the GitHub page is always current.
 
 ## Releasing
 
