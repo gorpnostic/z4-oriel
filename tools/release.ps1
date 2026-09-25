@@ -11,7 +11,7 @@ $toml = Get-Content Cargo.toml -Raw
 $cur = [regex]::Match($toml, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
 if (-not $Version) {
     $p = $cur.Split('.') | ForEach-Object { [int]$_ }
-    if ($Major) { $p = @($p[0] + 1, 0, 0) } elseif ($Minor) { $p = @($p[0], $p[1] + 1, 0) } else { $p = @($p[0], $p[1], $p[2] + 1) }
+    if ($Major) { $p = @(($p[0] + 1), 0, 0) } elseif ($Minor) { $p = @($p[0], ($p[1] + 1), 0) } else { $p = @($p[0], $p[1], ($p[2] + 1)) }  # parens: "a, b + 1" would append 1 as a 4th part
     $Version = $p -join '.'
 }
 $toml = [regex]::Replace($toml, '(?m)^version\s*=\s*"[^"]+"', "version = `"$Version`"", 1)
