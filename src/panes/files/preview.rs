@@ -81,14 +81,12 @@ pub fn list_dir(dir: &Path) -> Result<Vec<Entry>, String> {
         let meta = if ft.map(|t| t.is_symlink()).unwrap_or(false) { std::fs::metadata(de.path()).ok() } else { de.metadata().ok() };
         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         let size = meta.as_ref().map(|m| if m.is_dir() { 0 } else { m.len() }).unwrap_or(0);
-        let mut hidden = name.starts_with('.') || SKIP.contains(&name.as_str());
+        let hidden = name.starts_with('.') || SKIP.contains(&name.as_str());
         #[cfg(windows)]
-        {
+        let hidden = hidden || {
             use std::os::windows::fs::MetadataExt;
-            if let Ok(m) = de.metadata() {
-                hidden |= m.file_attributes() & 0x2 != 0; // FILE_ATTRIBUTE_HIDDEN
-            }
-        }
+            de.metadata().map(|m| m.file_attributes() & 0x2 != 0).unwrap_or(false) // FILE_ATTRIBUTE_HIDDEN
+        };
         out.push(Entry { kind: kind_of(&name, is_dir), name, is_dir, size, hidden });
     }
     out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
@@ -507,8 +505,7 @@ pub struct PlaceItem {
     pub path: PathBuf,
 }
 
-/// Sidebar shortcuts: home, desktop, downloads, documents, code, then drives (Windows) or / and mounts (Linux).
-/// May be slow (a sleeping network drive), so it runs on a background thread.
+/// Sidebar shortcuts: home, desktop, downloads, documents, code. Quick.
 pub fn places() -> Vec<PlaceItem> {
     let mut out = vec![];
     if let Some(h) = dirs::home_dir() {
@@ -523,6 +520,12 @@ pub fn places() -> Vec<PlaceItem> {
     if code.is_dir() {
         out.push(PlaceItem { kind: "code", label: "code".into(), path: code });
     }
+    out
+}
+
+/// Drives (Windows) or / and mounted disks (Linux). Can be slow (a sleeping network drive): background only.
+pub fn drives() -> Vec<PlaceItem> {
+    let mut out = vec![];
     #[cfg(windows)]
     for d in b'A'..=b'Z' {
         let root = format!("{}:\\", d as char);

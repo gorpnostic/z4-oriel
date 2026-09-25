@@ -171,7 +171,10 @@ impl Files {
         self.worker = Some(tx);
         let shared = self.shared.clone();
         std::thread::spawn(move || {
-            let p = preview::places();
+            let mut p = preview::places();
+            shared.lock().unwrap().places = Some(p.clone());
+            waker.wake();
+            p.extend(preview::drives());
             shared.lock().unwrap().places = Some(p);
             waker.wake();
         });
@@ -361,6 +364,9 @@ impl Files {
                 let buf = f.buffer_mut();
                 for x in x0.saturating_sub(1)..x1 {
                     buf[(x, y)].set_bg(sel_bg);
+                    if x >= x0 {
+                        buf[(x, y)].set_fg(t.fg); // the dim extension stays readable on the bar
+                    }
                 }
             }
         }
@@ -785,8 +791,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn fixture() -> PathBuf {
-        let d = scratch("files");
+    fn fixture(name: &str) -> PathBuf {
+        let d = scratch(name);
         for sub in ["checkpoints", "data", "train", "wren"] {
             std::fs::create_dir_all(d.join(sub)).unwrap();
         }
@@ -807,7 +813,7 @@ pub(crate) mod tests {
 
     #[test]
     fn files_lists_and_previews() {
-        let d = fixture();
+        let d = fixture("files-list");
         let mut k = Kit::new();
         let mut p = Files::new(Some(d.clone()));
         settle(&mut k, &mut p);
@@ -845,7 +851,7 @@ pub(crate) mod tests {
 
     #[test]
     fn files_navigation_and_hidden() {
-        let d = fixture();
+        let d = fixture("files-nav");
         let mut k = Kit::new();
         let mut p = Files::new(Some(d.clone()));
         settle(&mut k, &mut p);
@@ -883,12 +889,34 @@ pub(crate) mod tests {
     fn files_side_places() {
         let mut k = Kit::new();
         let mut p = Files::new(dirs::home_dir());
-        settle(&mut k, &mut p);
+        k.render(&mut p, 150, 44);
+        k.wait_wake(&mut p, 2000); // the drive scan can be slow while other tests run
         let s = k.render_side(&mut p, 30, 20);
         println!("{s}");
         assert!(s.contains("home"));
         if cfg!(windows) {
             assert!(s.contains("C: drive"));
+        }
+    }
+
+    /// Side-by-side with nest's reference screenshot (reads C:\Code\ai\wren, writes nothing there).
+    /// cargo test files_snap_wren -- --ignored
+    #[test]
+    #[ignore]
+    fn files_snap_wren() {
+        let d = PathBuf::from(r"C:\Code\ai\wren");
+        if !d.is_dir() {
+            return;
+        }
+        let mut k = Kit::new();
+        let mut p = Files::new(Some(d));
+        settle(&mut k, &mut p);
+        println!("{}", snap(&mut k, &mut p, 150, 44, "target/snap/files-wren.html"));
+        let idx = p.shown.iter().position(|&i| p.all[i].name.ends_with(".py") || p.all[i].name == "pyproject.toml");
+        if let Some(i) = idx {
+            p.select(i + 1);
+            k.wait_wake(&mut p, 400);
+            snap(&mut k, &mut p, 150, 44, "target/snap/files-wren-code.html");
         }
     }
 
