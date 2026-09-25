@@ -35,7 +35,7 @@ pub struct Term {
 }
 
 /// Programs that are coding agents (by executable name), so their panes get status dots from the start.
-const AGENTS: &[&str] = &["claude", "codex", "opencode", "gemini", "kimi", "aider", "cursor-agent", "copilot", "droid", "amp", "goose"];
+const AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "aider", "cursor-agent", "copilot", "droid", "amp", "goose"];
 
 impl Term {
     /// `prog` + `args` on a pty, started lazily at the first render (when the pane size is known).

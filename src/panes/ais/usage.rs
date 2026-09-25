@@ -5,7 +5,6 @@
 //!   * Codex        `~/.codex/sessions/**/rollout-*.jsonl` — `token_count` events (last_token_usage per turn),
 //!                  plus the plan limits from the newest event
 //!   * Kimi Code    `~/.kimi-code/sessions/**/wire.jsonl` — StatusUpdate usage records (unverified: no sample)
-//!   * Gemini CLI   `~/.gemini/tmp/*/chats/*.json(l)` — `tokens` objects (unverified)
 //!   * OpenCode     `…/opencode/storage/message/<sid>/msg_*.json` — per-message tokens + its own cost (unverified)
 //!
 //! Only numbers, model names, project names, session ids and timestamps are kept. Prompt and response text is
@@ -22,18 +21,17 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2; // 2: Gemini dropped
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub enum Src {
     Claude,
     Codex,
     Kimi,
-    Gemini,
     OpenCode,
 }
 
-pub const SRCS: [Src; 5] = [Src::Claude, Src::Codex, Src::Kimi, Src::Gemini, Src::OpenCode];
+pub const SRCS: [Src; 4] = [Src::Claude, Src::Codex, Src::Kimi, Src::OpenCode];
 
 impl Src {
     pub fn label(self) -> &'static str {
@@ -41,7 +39,6 @@ impl Src {
             Src::Claude => "Claude Code",
             Src::Codex => "Codex",
             Src::Kimi => "Kimi Code",
-            Src::Gemini => "Gemini CLI",
             Src::OpenCode => "OpenCode",
         }
     }
@@ -51,7 +48,6 @@ impl Src {
             Src::Claude => "claude",
             Src::Codex => "codex",
             Src::Kimi => "kimi",
-            Src::Gemini => "gemini",
             Src::OpenCode => "opencode",
         }
     }
@@ -256,9 +252,6 @@ pub fn discover(paths: &Paths) -> Vec<(Src, PathBuf)> {
     let mut v = vec![];
     walk(&paths.home.join(".kimi-code").join("sessions"), 6, &mut v, &|p| p.file_name().is_some_and(|n| n == "wire.jsonl"));
     add(Src::Kimi, v);
-    let mut v = vec![];
-    walk(&paths.home.join(".gemini").join("tmp"), 4, &mut v, &|p| (ext_is(p, "json") || ext_is(p, "jsonl")) && p.parent().is_some_and(|d| d.file_name().is_some_and(|n| n == "chats")));
-    add(Src::Gemini, v);
     let mut roots = vec![paths.home.join(".local").join("share").join("opencode")];
     if let Some(d) = dirs::data_dir().map(|d| d.join("opencode")).filter(|_| !cfg!(test)) {
         if d != roots[0] {
@@ -459,7 +452,7 @@ fn codex_line(fs: &mut FileState, line: &[u8]) {
     }
 }
 
-// ------------------------------------------------------------------ Kimi / Gemini / OpenCode (by the spec)
+// ------------------------------------------------------------------ Kimi / OpenCode (by the spec)
 
 fn num(v: &serde_json::Value, k: &str) -> u64 {
     v.get(k).and_then(|x| x.as_u64().or_else(|| x.as_f64().map(|f| f as u64))).unwrap_or(0)
@@ -524,31 +517,6 @@ fn kimi_line(fs: &mut FileState, line: &[u8]) {
     let tot = Tot { inp: num(u, "inputOther"), out: num(u, "output"), cw: num(u, "inputCacheCreation"), cr: num(u, "inputCacheRead"), cost: 0.0, n: 1 };
     if tot.tokens() > 0 {
         fs.bump(t, &model, &tot);
-    }
-}
-
-fn gemini_value(fs: &mut FileState, v: &serde_json::Value, depth: usize) {
-    match v {
-        serde_json::Value::Object(m) => {
-            if let Some(tk) = m.get("tokens").filter(|x| x.is_object()) {
-                let input = num(tk, "input");
-                let cached = num(tk, "cached").min(input);
-                let tot = Tot { inp: input - cached, out: num(tk, "output") + num(tk, "thoughts"), cw: 0, cr: cached, cost: 0.0, n: 1 };
-                if tot.tokens() > 0 {
-                    let t = ts_of(v).unwrap_or(fs.last_ts);
-                    let model = m.get("model").and_then(|x| x.as_str()).unwrap_or("gemini").to_string();
-                    fs.bump(t, &model, &tot);
-                }
-                return;
-            }
-            if depth > 0 {
-                for c in m.values() {
-                    gemini_value(fs, c, depth - 1);
-                }
-            }
-        }
-        serde_json::Value::Array(a) if depth > 0 => a.iter().for_each(|c| gemini_value(fs, c, depth - 1)),
-        _ => {}
     }
 }
 
@@ -618,7 +586,7 @@ pub fn parse_file(src: Src, path: &Path, prev: Option<&FileState>) -> Option<Par
     let key = path.to_string_lossy().into_owned();
     let len = std::fs::metadata(path).ok()?.len();
     let mut st = prev.cloned().unwrap_or_else(|| FileState { src: Some(src), ..Default::default() });
-    let whole_file = matches!(src, Src::OpenCode) || (src == Src::Gemini && ext_is(path, "json"));
+    let whole_file = matches!(src, Src::OpenCode);
     let mut reset = false;
     if len < st.off || (whole_file && len != st.off) {
         // rewritten (or a whole-JSON file that changed): start over
@@ -633,10 +601,7 @@ pub fn parse_file(src: Src, path: &Path, prev: Option<&FileState>) -> Option<Par
         let mut buf = vec![];
         f.read_to_end(&mut buf).ok()?;
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf) {
-            match src {
-                Src::OpenCode => opencode_file(&mut st, &v),
-                _ => gemini_value(&mut st, &v, 6),
-            }
+            opencode_file(&mut st, &v);
         }
         st.off = len;
         if st.session.is_empty() {
@@ -673,13 +638,6 @@ pub fn parse_file(src: Src, path: &Path, prev: Option<&FileState>) -> Option<Par
             Src::Kimi => {
                 if contains(&line, b"StatusUpdate") || contains(&line, b"\"usage\"") {
                     kimi_line(&mut st, &line);
-                }
-            }
-            Src::Gemini => {
-                if contains(&line, b"\"tokens\"") {
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) {
-                        gemini_value(&mut st, &v, 4);
-                    }
                 }
             }
             Src::OpenCode => {}

@@ -51,9 +51,6 @@ pub static CLIS: &[Cli] = &[
         win: &["irm https://code.kimi.com/kimi-code/install.ps1 | iex", "npm install -g @moonshot-ai/kimi-code"],
         arch: &[], unix: &["curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash", "npm install -g @moonshot-ai/kimi-code"],
         ver: V, login: Some("kimi login"), cred: Some(".kimi-code/credentials/kimi-code.json"), key_env: None, note: "" },
-    Cli { id: "gemini", name: "Gemini CLI", bin: "gemini", desc: "Google's terminal agent", docs: "https://github.com/google-gemini/gemini-cli",
-        win: &["npm install -g @google/gemini-cli"], arch: &["sudo pacman -S gemini-cli"], unix: &["npm install -g @google/gemini-cli"],
-        ver: V, login: Some("gemini"), cred: Some(".gemini/oauth_creds.json"), key_env: Some("GEMINI_API_KEY"), note: "" },
     Cli { id: "opencode", name: "OpenCode", bin: "opencode", desc: "open-source agent, any provider", docs: "https://opencode.ai/docs",
         win: &["scoop install opencode", "npm install -g opencode-ai"], arch: &["sudo pacman -S opencode"],
         unix: &["curl -fsSL https://opencode.ai/install | bash", "npm install -g opencode-ai"],
@@ -67,7 +64,7 @@ pub static CLIS: &[Cli] = &[
     Cli { id: "cursor", name: "Cursor Agent", bin: "agent", desc: "Cursor's agent outside the editor", docs: "https://cursor.com/cli",
         win: &["irm 'https://cursor.com/install?win32=true' | iex"], arch: &[], unix: &["curl https://cursor.com/install -fsS | bash"],
         ver: V, login: Some("agent login"), cred: None, key_env: None, note: "" },
-    Cli { id: "qwen", name: "Qwen Code", bin: "qwen", desc: "Alibaba's Gemini-CLI fork", docs: "https://github.com/QwenLM/qwen-code",
+    Cli { id: "qwen", name: "Qwen Code", bin: "qwen", desc: "Alibaba's coding agent", docs: "https://github.com/QwenLM/qwen-code",
         win: &["npm install -g @qwen-code/qwen-code"], arch: &["sudo pacman -S qwen-code"], unix: &["npm install -g @qwen-code/qwen-code"],
         ver: V, login: Some("qwen"), cred: None, key_env: None, note: "" },
     Cli { id: "amp", name: "Amp", bin: "amp", desc: "Sourcegraph's agent", docs: "https://ampcode.com/manual",
@@ -228,16 +225,16 @@ mod tests {
         let claude = by_id("claude").unwrap();
         let (cmd, ready) = pick(claude, Os::Windows, &|_| false).unwrap();
         assert!(cmd.starts_with("irm https://claude.ai/install.ps1") && ready);
-        // gemini on Windows is npm-only: without npm it's offered but not ready
-        let gem = by_id("gemini").unwrap();
-        assert_eq!(pick(gem, Os::Windows, &|_| false), Some(("npm install -g @google/gemini-cli".into(), false)));
-        assert_eq!(pick(gem, Os::Windows, &|t| t == "npm").unwrap().1, true);
+        // qwen on Windows is npm-only: without npm it's offered but not ready
+        let qwen = by_id("qwen").unwrap();
+        assert_eq!(pick(qwen, Os::Windows, &|_| false).unwrap().1, false);
+        assert_eq!(pick(qwen, Os::Windows, &|t| t == "npm").unwrap().1, true);
         // Arch: pacman first
         let codex = by_id("codex").unwrap();
         assert_eq!(pick(codex, Os::Arch, &|t| t == "pacman").unwrap().0, "sudo pacman -S openai-codex");
         assert_eq!(pick(codex, Os::Arch, &|t| t == "curl").unwrap().0, "curl -fsSL https://chatgpt.com/codex/install.sh | sh");
         // Amp has nothing for Windows
         assert_eq!(pick(by_id("amp").unwrap(), Os::Windows, &|_| true), None);
-        assert_eq!(CLIS.len(), 13);
+        assert_eq!(CLIS.len(), 12);
     }
 }

@@ -50,6 +50,8 @@ const SECTIONS: &[(usize, &str)] = &[(0, "ai"), (3, "tools")];
 enum SideHit {
     App(&'static str),
     Tab(usize),
+    /// the × on one of your tabs
+    CloseTab(usize),
     NewTab,
 }
 
@@ -120,6 +122,10 @@ pub struct App {
     sidebar: bool,
     body: Rect,
     drag: Option<(Vec<bool>, Dir, Rect)>,
+    /// the × buttons drawn on pane frames this frame
+    pane_close: Vec<(Rect, PaneId)>,
+    /// where the mouse is (for hover highlights)
+    hover: Position,
     /// renaming tab i: the text typed so far
     renaming: Option<(usize, String)>,
     ctx: Option<CtxMenu>,
@@ -162,6 +168,8 @@ impl App {
             sidebar: true,
             body: Rect::default(),
             drag: None,
+            pane_close: vec![],
+            hover: Position { x: u16::MAX, y: u16::MAX },
             _watcher: None,
             renaming: None,
             ctx: None,
@@ -978,6 +986,7 @@ impl App {
             }
         }
         let pos = Position { x: m.column, y: m.row };
+        self.hover = pos;
         // an open right-click menu takes the mouse first
         if let Some(menu) = &mut self.ctx {
             match m.kind {
@@ -1032,7 +1041,19 @@ impl App {
                 }
             }
         }
+        // middle-click a tab in the sidebar: close it
+        if let MouseEventKind::Down(MouseButton::Middle) = m.kind {
+            if let Some(&(_, SideHit::Tab(i) | SideHit::CloseTab(i))) = self.side_hits.iter().find(|(r, _)| r.contains(pos)) {
+                self.close_tab(i);
+                return;
+            }
+        }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            // the × on a pane's frame
+            if let Some(&(_, id)) = self.pane_close.iter().find(|(r, _)| r.contains(pos)) {
+                self.close(id);
+                return;
+            }
             if let Some(&(_, hit)) = self.side_hits.iter().find(|(r, _)| r.contains(pos)) {
                 let double = self.last_click.map(|(t, x, y)| t.elapsed() < Duration::from_millis(400) && x == m.column && y == m.row).unwrap_or(false);
                 self.last_click = Some((Instant::now(), m.column, m.row));
@@ -1044,6 +1065,7 @@ impl App {
                             self.start_rename(i);
                         }
                     }
+                    SideHit::CloseTab(i) => self.close_tab(i),
                     SideHit::NewTab => self.new_tab(Box::new(panes::home::Home::new())),
                 }
                 return;
@@ -1123,8 +1145,11 @@ impl App {
             tab.root.rects(self.body, &mut rects);
         }
         let focus = tab.focus;
+        // a pane can be closed from its frame if it's one of several, or if the tab is one you made
+        let closable = rects.len() > 1 || tab.app.is_none();
         self.outer = rects.clone();
         self.inner.clear();
+        self.pane_close.clear();
         let time = self.start.elapsed().as_secs_f64();
         for (id, r) in rects {
             let Some(p) = self.panes.get(&id) else { continue };
@@ -1132,6 +1157,17 @@ impl App {
             let sub = p.subtitle();
             let inner = ui::frame(f, r, &title, sub.as_deref(), id == focus, &t);
             self.inner.push((id, inner));
+            if closable && r.width > 12 {
+                let b = Rect { x: r.right() - 5, y: r.y, width: 3, height: 1 };
+                let hot = b.contains(self.hover);
+                let style = if hot {
+                    Style::default().fg(t.danger).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default().fg(if id == focus { t.accent } else { t.muted })
+                };
+                f.render_widget(Paragraph::new(Span::styled(" × ", style)), b);
+                self.pane_close.push((b, id));
+            }
             let mut actions = vec![];
             if let Some(p) = self.panes.get_mut(&id) {
                 let mut cx = Cx { id, theme: &t, config: &self.config, tx: &self.tx, actions: &mut actions, focused: id == focus, time };
@@ -1235,6 +1271,7 @@ impl App {
             let panes = { let mut l = vec![]; tb.root.leaves(&mut l); l.len() };
             let right = if panes > 1 { format!("{panes} panes  alt {}", n + 1) } else { format!("alt {}", n + 1) };
             let r = Rect { y, height: 1, ..inner };
+            let xr = Rect { x: r.right().saturating_sub(2), width: 2, ..r };
             let dot = self.tab_dot(i);
             let (glyph, color) = match dot {
                 Dot::Blocked => ("●", t.danger),
@@ -1253,8 +1290,13 @@ impl App {
                 f.render_widget(Paragraph::new(line), r);
             } else {
                 f.render_widget(Paragraph::new(Span::styled(glyph, Style::default().fg(color))), Rect { width: 2, ..r });
-                ui::side_row(f, Rect { x: r.x + 2, width: r.width.saturating_sub(2), ..r }, icon, &title, &right, i == self.cur, t);
+                ui::side_row(f, Rect { x: r.x + 2, width: r.width.saturating_sub(5), ..r }, icon, &title, &right, i == self.cur, t);
+                let hot = xr.contains(self.hover);
+                let style = if hot { Style::default().fg(t.danger).add_modifier(Modifier::BOLD) } else { ui::muted(t) };
+                f.render_widget(Paragraph::new(Span::styled(" ×", style)), xr);
             }
+            // the × first, so a click on it wins over the row
+            self.side_hits.push((xr, SideHit::CloseTab(i)));
             self.side_hits.push((r, SideHit::Tab(i)));
             y += 1;
         }
@@ -1337,6 +1379,7 @@ fn draw_help(f: &mut Frame, area: Rect, t: &Theme, c: &Config) {
         ("alt s".into(), "hide / show the sidebar"),
         ("alt z · alt w".into(), "zoom pane · close pane"),
         ("right-click".into(), "menu: split, zoom, rename, close"),
+        ("click ×".into(), "close a pane (top-right of its frame) or a tab (in the sidebar); middle-click a tab too"),
         ("double-click a tab".into(), "rename it (or prefix then ,)"),
         (format!("{pre} then"), ""),
         ("  | or v  ·  - ".into(), "split right · split down"),
@@ -1571,6 +1614,45 @@ mod tests {
         key(&mut app, KeyCode::F(11));
         assert!(app.onboard.is_none());
         let _ = rx;
+    }
+
+    #[test]
+    fn app_close_buttons() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "ultra".into();
+        let mut app = App::new(cfg, tx);
+        let mut term = Terminal::new(TestBackend::new(150, 42)).unwrap();
+        app.goto_app("ais");
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(app.pane_close.is_empty(), "a lone app pane has no ×");
+        // an install opens a terminal split inside the app's tab
+        let ais = app.focused();
+        let t: Box<dyn Pane> = Box::new(crate::panes::term::Term::shell(&app.config, None));
+        app.apply(ais, vec![Action::Open(t, Place::Split)]);
+        term.draw(|f| app.draw(f)).unwrap();
+        crate::testkit::save_html(term.backend().buffer(), "target/snap/app-close-split.html");
+        assert_eq!(app.pane_close.len(), 2, "both panes of a split get a ×");
+        let (b, id) = app.pane_close.iter().copied().find(|(_, id)| *id != ais).unwrap();
+        let click = |app: &mut App, x: u16, y: u16, btn: MouseButton| app.mouse(MouseEvent { kind: MouseEventKind::Down(btn), column: x, row: y, modifiers: KeyModifiers::NONE });
+        click(&mut app, b.x + 1, b.y, MouseButton::Left);
+        assert!(!app.panes.contains_key(&id), "× closed the terminal");
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(app.pane_close.is_empty() && app.tabs[app.cur].app == Some("ais"), "back to just your AIs");
+        // your own tab: × in the sidebar closes it
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        let n = app.tabs.len();
+        term.draw(|f| app.draw(f)).unwrap();
+        crate::testkit::save_html(term.backend().buffer(), "target/snap/app-close-tab.html");
+        let (xr, _) = app.side_hits.iter().copied().find(|(_, h)| matches!(h, SideHit::CloseTab(_))).expect("× on the tab row");
+        click(&mut app, xr.x + 1, xr.y, MouseButton::Left);
+        assert_eq!(app.tabs.len(), n - 1, "sidebar × closed the tab");
+        // middle-click works too
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        term.draw(|f| app.draw(f)).unwrap();
+        let (r, _) = app.side_hits.iter().copied().find(|(_, h)| matches!(h, SideHit::Tab(_))).unwrap();
+        click(&mut app, r.x + 3, r.y, MouseButton::Middle);
+        assert_eq!(app.tabs.len(), n - 1, "middle-click closed the tab");
     }
 
     #[test]

@@ -458,7 +458,7 @@ impl Ais {
     fn draw_usage(&mut self, f: &mut Frame, body: Rect, t: &Theme) {
         let srcs = self.usage_srcs();
         if srcs.is_empty() {
-            let msg = if self.usage.is_none() { "reading usage logs… (the first read of a big history takes a few seconds; after that only new lines are read)" } else { "no usage logs found — Claude Code, Codex, Kimi, Gemini and OpenCode keep them locally once you use them" };
+            let msg = if self.usage.is_none() { "reading usage logs… (the first read of a big history takes a few seconds; after that only new lines are read)" } else { "no usage logs found — Claude Code, Codex, Kimi and OpenCode keep them locally once you use them" };
             put(f, body, body.y + 1, vec![s(format!(" {msg}"), ui::muted(t))]);
             return;
         }

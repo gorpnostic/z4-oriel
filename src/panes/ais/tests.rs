@@ -183,21 +183,21 @@ fn ais_install_asks_then_opens_a_terminal() {
     let mut a = Ais::with(fixture(&r), false);
     fake_found(&mut a);
     k.key(&mut a, KeyCode::Char('2'));
-    // Gemini CLI (not installed): enter asks first, esc cancels
-    let gi = CLIS.iter().position(|c| c.id == "gemini").unwrap();
+    // OpenCode (not installed): enter asks first, esc cancels
+    let gi = CLIS.iter().position(|c| c.id == "opencode").unwrap();
     for _ in 0..gi {
         k.key(&mut a, KeyCode::Down);
     }
     k.key(&mut a, KeyCode::Enter);
     assert!(matches!(a.ask, Some(Ask::Install { .. })));
     let txt = k.render(&mut a, 150, 44);
-    assert!(txt.contains("install Gemini CLI?"), "{txt}");
+    assert!(txt.contains("install OpenCode?"), "{txt}");
     k.key(&mut a, KeyCode::Esc);
     assert!(a.ask.is_none() && a.launched.is_empty());
     k.key(&mut a, KeyCode::Enter);
     k.key(&mut a, KeyCode::Char('y'));
     assert_eq!(a.launched.len(), 1);
-    assert!(a.launched[0].contains("@google/gemini-cli") || a.launched[0].contains("gemini-cli"), "{:?}", a.launched);
+    assert!(a.launched[0].contains("opencode"), "{:?}", a.launched);
     // sign in on something not installed says so; on Kimi it runs `kimi login` by full path (not on PATH here)
     k.key(&mut a, KeyCode::Char('l'));
     assert_eq!(a.launched.len(), 1);

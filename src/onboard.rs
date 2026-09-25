@@ -571,7 +571,7 @@ impl Onboard {
                     ]));
                 }
                 lines.push(Line::raw(""));
-                lines.push(Line::styled("your AIs (F3) installs Claude Code, Codex, Kimi, Gemini and more with one key,", ui::muted(t)));
+                lines.push(Line::styled("your AIs (F3) installs Claude Code, Codex, Kimi, OpenCode and more with one key,", ui::muted(t)));
                 lines.push(Line::styled("and shows your plan limits and usage.", ui::muted(t)));
                 hints = vec![("enter", "take the tour (about a minute)"), ("s", "skip it")];
             }
