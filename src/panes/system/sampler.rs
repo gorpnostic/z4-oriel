@@ -1,14 +1,14 @@
 //! The system app's background sampling. Everything slow happens here, off the UI thread: sysinfo refreshes
-//! (CPU, memory, disks, network, ~700 processes), the Wren trainer lookup, and `nvidia-smi` on its own thread.
+//! (CPU, memory, disks, network, ~700 processes) and `nvidia-smi` on its own thread.
 //! Each second the sampler publishes an immutable `Snap` behind an `Arc` and wakes the UI, which only swaps the
 //! pointer and draws. Sampling pauses by itself when the UI stops polling (pane hidden) and ends on drop.
 
 use crate::pane::Waker;
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use sysinfo::{
     CpuRefreshKind, DiskRefreshKind, Disks, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate,
     RefreshKind, Uid, UpdateKind, Users,
@@ -16,22 +16,6 @@ use sysinfo::{
 
 /// Seconds of history the sparklines keep.
 pub const HISTORY: usize = 120;
-
-/// Where Wren lives. The training card only shows a `train.py` whose working directory is this folder (other
-/// projects train too), and reads `<root>/checkpoints/progress.json` + `<mode>_log.jsonl`.
-#[cfg(windows)]
-pub const WREN_ROOT: &str = r"C:\Code\ai\wren";
-#[cfg(not(windows))]
-pub const WREN_ROOT: &str = "~/Code/ai/wren";
-
-const TRAIN_MODES: &[&str] = &["pretrain", "sft", "polish", "extend", "web", "topical", "variety", "websight"];
-
-pub fn wren_root() -> PathBuf {
-    match WREN_ROOT.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
-        None => PathBuf::from(WREN_ROOT),
-    }
-}
 
 // ------------------------------------------------------------------ data the UI draws
 
@@ -44,6 +28,13 @@ pub struct Proc {
     pub mem: u64,
     pub threads: u32,
     pub user: Arc<str>,
+    /// Parent pid (0 = none). Only trust it when the parent started before the child (pids get reused).
+    pub ppid: u32,
+    /// Start time in platform units (FILETIME on Windows, seconds on Unix): only compared with each other.
+    pub start: u64,
+    /// I/O bytes per second (Windows: all I/O, as Process Explorer counts it; Linux: /proc/<pid>/io).
+    pub read: f64,
+    pub write: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -53,38 +44,15 @@ pub struct DiskRow {
     pub free: u64,
 }
 
-#[derive(Clone, Debug)]
-pub struct Progress {
-    pub step: u64,
-    pub total: u64,
-    pub loss: f64,
-    pub tok_s: f64,
-    pub eta: f64,
-}
-
-#[derive(Clone, Debug)]
-pub struct Eval {
-    pub step: u64,
-    pub val: f64,
-    pub time: f64,
-}
-
-#[derive(Clone, Debug)]
-pub struct Train {
-    pub mode: String,
-    pub running: bool,
-    pub pid: Option<u32>,
-    pub progress: Option<Progress>,
-    pub evals: Arc<Vec<Eval>>,
-    /// (prompt, output) pairs from the latest eval.
-    pub samples: Arc<Vec<(String, String)>>,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct Snap {
     pub seq: u64,
     pub cpu_hist: VecDeque<f32>,
     pub cores: Vec<f32>,
+    /// Per logical CPU usage history (same length as `cores`).
+    pub core_hist: Vec<VecDeque<f32>>,
+    /// Per logical CPU frequency in MHz (0 = unknown).
+    pub core_mhz: Vec<u64>,
     pub ghz: f64,
     pub ram_used: u64,
     pub ram_total: u64,
@@ -95,7 +63,8 @@ pub struct Snap {
     pub disk_r: VecDeque<f64>,
     pub disk_w: VecDeque<f64>,
     pub procs: Vec<Proc>,
-    pub train: Option<Train>,
+    /// Sum of every process's threads.
+    pub threads: u64,
     /// How long this sample took on the sampler thread.
     pub sample_ms: f64,
 }
@@ -157,7 +126,7 @@ impl Shared {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
-    fn stopped(&self) -> bool {
+    pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
     pub fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -190,8 +159,7 @@ pub struct Sampler {
     nets: Networks,
     users: HashMap<Uid, Arc<str>>,
     user_of: HashMap<u32, Arc<str>>,
-    /// python pid -> Some(mode) if it is Wren's trainer; each python is inspected once.
-    py_seen: HashMap<u32, Option<String>>,
+    #[cfg(windows)]
     last_prune: Instant,
     ncpu: f32,
     hist: Snap,
@@ -200,9 +168,9 @@ pub struct Sampler {
     last_io: Option<(u64, u64)>,
     last_freq: Option<Instant>,
     last_disk_list: Instant,
+    /// pid -> (cpu time, bytes read, bytes written) at the previous sample.
     #[cfg(windows)]
-    prev_cpu: HashMap<u32, u64>,
-    log_cache: Option<(PathBuf, SystemTime, u64, Arc<Vec<Eval>>, Arc<Vec<(String, String)>>)>,
+    prev_cpu: HashMap<u32, (u64, u64, u64)>,
     empty: Arc<str>,
 }
 
@@ -219,7 +187,7 @@ impl Sampler {
             nets: Networks::new_with_refreshed_list(),
             users,
             user_of: HashMap::new(),
-            py_seen: HashMap::new(),
+            #[cfg(windows)]
             last_prune: Instant::now(),
             ncpu,
             hist: Snap::default(),
@@ -230,7 +198,6 @@ impl Sampler {
             last_disk_list: Instant::now(),
             #[cfg(windows)]
             prev_cpu: HashMap::new(),
-            log_cache: None,
             empty: Arc::from(""),
         }
     }
@@ -249,9 +216,16 @@ impl Sampler {
         }
         self.sys.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
         let cores: Vec<f32> = self.sys.cpus().iter().map(|c| c.cpu_usage()).collect();
+        if self.hist.core_hist.len() != cores.len() {
+            self.hist.core_hist = vec![VecDeque::with_capacity(HISTORY); cores.len()];
+        }
+        for (q, &v) in self.hist.core_hist.iter_mut().zip(&cores) {
+            push(q, v);
+        }
+        let core_mhz: Vec<u64> = self.sys.cpus().iter().map(|c| c.frequency()).collect();
         let total = if cores.is_empty() { 0.0 } else { cores.iter().sum::<f32>() / cores.len() as f32 };
         push(&mut self.hist.cpu_hist, total);
-        let freqs: Vec<u64> = self.sys.cpus().iter().map(|c| c.frequency()).filter(|&f| f > 0).collect();
+        let freqs: Vec<u64> = core_mhz.iter().copied().filter(|&f| f > 0).collect();
         let ghz = if freqs.is_empty() { 0.0 } else { freqs.iter().sum::<u64>() as f64 / freqs.len() as f64 / 1000.0 };
         let (ram_used, ram_total) = (self.sys.used_memory(), self.sys.total_memory());
         push(&mut self.hist.ram_hist, if ram_total > 0 { 100.0 * ram_used as f32 / ram_total as f32 } else { 0.0 });
@@ -309,27 +283,26 @@ impl Sampler {
         if self.user_of.len() > procs.len() + 256 {
             let live: std::collections::HashSet<u32> = procs.iter().map(|p| p.pid).collect();
             self.user_of.retain(|k, _| live.contains(k));
-            self.py_seen.retain(|k, _| live.contains(k));
         }
 
-        let train = self.training(&procs);
         let mut s = self.hist.clone();
         s.seq = self.hist.seq + 1;
         self.hist.seq = s.seq;
         s.cores = cores;
+        s.core_mhz = core_mhz;
         s.ghz = ghz;
         s.ram_used = ram_used;
         s.ram_total = ram_total;
         s.disks = disks;
+        s.threads = procs.iter().map(|p| p.threads as u64).sum();
         s.procs = procs;
-        s.train = train;
         s.sample_ms = t0.elapsed().as_secs_f64() * 1000.0;
         s
     }
 
-    /// Every process. Windows: one NtQuerySystemInformation call gives name, threads, working set and CPU time
-    /// for all of them (~5 ms); sysinfo's own per-process CPU refresh opens every process and cost ~80 ms here.
-    /// sysinfo is only asked for the user of processes we haven't seen before.
+    /// Every process. Windows: one NtQuerySystemInformation call gives name, parent, threads, working set, CPU
+    /// time and I/O counters for all of them (~5 ms); sysinfo's own per-process refresh opens every process and
+    /// cost ~80 ms here. sysinfo is only asked for the user of processes we haven't seen before.
     #[cfg(windows)]
     fn processes(&mut self, dt: f64) -> Vec<Proc> {
         let raw = nt::snapshot();
@@ -364,11 +337,14 @@ impl Sampler {
         let mut cpu_now = HashMap::with_capacity(raw.len());
         let mut procs = Vec::with_capacity(raw.len());
         for r in raw {
-            cpu_now.insert(r.pid, r.cpu_time);
+            cpu_now.insert(r.pid, (r.cpu_time, r.read, r.write));
             if r.pid == 0 {
                 continue; // System Idle Process
             }
-            let cpu = self.prev_cpu.get(&r.pid).map(|&c| r.cpu_time.saturating_sub(c) as f64 * scale).unwrap_or(0.0);
+            let (cpu, read, write) = match self.prev_cpu.get(&r.pid) {
+                Some(&(c, rd, wr)) => (r.cpu_time.saturating_sub(c) as f64 * scale, r.read.saturating_sub(rd) as f64 / dt, r.write.saturating_sub(wr) as f64 / dt),
+                None => (0.0, 0.0, 0.0),
+            };
             procs.push(Proc {
                 pid: r.pid,
                 cpu: cpu.min(100.0) as f32,
@@ -376,6 +352,10 @@ impl Sampler {
                 threads: r.threads,
                 user: self.user_of.get(&r.pid).cloned().unwrap_or_else(|| self.empty.clone()),
                 name: r.name,
+                ppid: r.ppid,
+                start: r.create,
+                read,
+                write,
             });
         }
         self.prev_cpu = cpu_now;
@@ -383,11 +363,11 @@ impl Sampler {
     }
 
     #[cfg(not(windows))]
-    fn processes(&mut self, _dt: f64) -> Vec<Proc> {
+    fn processes(&mut self, dt: f64) -> Vec<Proc> {
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_cpu().with_memory().with_user(UpdateKind::OnlyIfNotSet).without_tasks(),
+            ProcessRefreshKind::nothing().with_cpu().with_memory().with_disk_usage().with_user(UpdateKind::OnlyIfNotSet).without_tasks(),
         );
         let mut procs = Vec::with_capacity(self.sys.processes().len());
         for (pid, p) in self.sys.processes() {
@@ -403,7 +383,20 @@ impl Sampler {
                     u
                 }
             };
-            procs.push(Proc { pid, name: p.name().to_string_lossy().into_owned(), cpu: p.cpu_usage() / self.ncpu, mem: p.memory(), threads: proc_threads(pid), user });
+            // read_bytes / written_bytes are what happened since the previous refresh
+            let io = p.disk_usage();
+            procs.push(Proc {
+                pid,
+                name: p.name().to_string_lossy().into_owned(),
+                cpu: p.cpu_usage() / self.ncpu,
+                mem: p.memory(),
+                threads: proc_threads(pid),
+                user,
+                ppid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
+                start: p.start_time(),
+                read: io.read_bytes as f64 / dt,
+                write: io.written_bytes as f64 / dt,
+            });
         }
         procs
     }
@@ -423,89 +416,6 @@ impl Sampler {
             _ => "",
         };
         if well_known.is_empty() { self.empty.clone() } else { Arc::from(well_known) }
-    }
-
-    /// Wren's trainer: a python process running train.py with Wren's folder as its working directory, plus the
-    /// progress file it writes every 20 steps. None when neither is there (the card hides).
-    fn training(&mut self, procs: &[Proc]) -> Option<Train> {
-        let root = wren_root();
-        let pythons: Vec<u32> = procs.iter().filter(|p| p.name.to_ascii_lowercase().starts_with("python")).map(|p| p.pid).collect();
-        // command line + cwd only for pythons we haven't looked at yet
-        let new: Vec<Pid> = pythons.iter().filter(|p| !self.py_seen.contains_key(p)).map(|&p| Pid::from_u32(p)).collect();
-        if !new.is_empty() {
-            self.sys.refresh_processes_specifics(
-                ProcessesToUpdate::Some(&new),
-                false,
-                ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet).with_cwd(UpdateKind::OnlyIfNotSet).without_tasks(),
-            );
-            for pid in &new {
-                let mode = self.sys.process(*pid).and_then(|p| {
-                    let cmd: Vec<String> = p.cmd().iter().map(|c| c.to_string_lossy().replace('\\', "/")).collect();
-                    if !cmd.iter().any(|c| c.ends_with("train.py")) || !p.cwd().is_some_and(|c| same_path(c, &root)) {
-                        return None;
-                    }
-                    Some(cmd.iter().find(|c| TRAIN_MODES.contains(&c.as_str()) || c.starts_with("v2-")).cloned().unwrap_or_else(|| "train".into()))
-                });
-                self.py_seen.insert(pid.as_u32(), mode);
-            }
-        }
-        self.py_seen.retain(|k, _| pythons.contains(k));
-        let found = pythons.iter().find_map(|p| self.py_seen.get(p).cloned().flatten().map(|m| (*p, m)));
-        let ckpt = root.join("checkpoints");
-        let mut progress = None;
-        let mut pmode = None;
-        if let Ok(txt) = std::fs::read_to_string(ckpt.join("progress.json"))
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
-        {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-            if now - v["time"].as_f64().unwrap_or(0.0) <= 300.0 {
-                progress = Some(Progress {
-                    step: v["step"].as_u64().unwrap_or(0),
-                    total: v["total"].as_u64().unwrap_or(0),
-                    loss: v["loss"].as_f64().unwrap_or(0.0),
-                    tok_s: v["tok_s"].as_f64().unwrap_or(0.0),
-                    eta: v["eta"].as_f64().unwrap_or(0.0),
-                });
-                pmode = v["mode"].as_str().map(String::from);
-            }
-        }
-        if found.is_none() && progress.is_none() {
-            return None;
-        }
-        let mode = found.as_ref().map(|f| f.1.clone()).or(pmode).unwrap_or_else(|| "train".into());
-        let (evals, samples) = self.evals(&ckpt.join(format!("{mode}_log.jsonl")));
-        Some(Train { mode, running: found.is_some(), pid: found.map(|f| f.0), progress, evals, samples })
-    }
-
-    /// The eval log (one JSON line every 250 steps), re-read only when the file changes.
-    fn evals(&mut self, path: &Path) -> (Arc<Vec<Eval>>, Arc<Vec<(String, String)>>) {
-        let meta = std::fs::metadata(path).ok();
-        let (mtime, len) = meta.map(|m| (m.modified().unwrap_or(UNIX_EPOCH), m.len())).unwrap_or((UNIX_EPOCH, 0));
-        if let Some((p, t, l, e, s)) = &self.log_cache
-            && p == path
-            && *t == mtime
-            && *l == len
-        {
-            return (e.clone(), s.clone());
-        }
-        let mut evals = vec![];
-        let mut samples = vec![];
-        if let Ok(txt) = std::fs::read_to_string(path) {
-            for line in txt.lines() {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-                let (Some(step), Some(val)) = (v["step"].as_u64(), v["val"].as_f64()) else { continue };
-                evals.push(Eval { step, val, time: v["time"].as_f64().unwrap_or(0.0) });
-                if let Some(arr) = v["samples"].as_array() {
-                    samples = arr
-                        .iter()
-                        .filter_map(|s| Some((s.get(0)?.as_str()?.to_string(), s.get(1)?.as_str()?.to_string())))
-                        .collect();
-                }
-            }
-        }
-        let (e, s) = (Arc::new(evals), Arc::new(samples));
-        self.log_cache = Some((path.to_path_buf(), mtime, len, e.clone(), s.clone()));
-        (e, s)
     }
 }
 
@@ -527,15 +437,6 @@ fn disk_label(mount: &Path) -> String {
     }
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
-    let norm = |p: &Path| {
-        let s = p.to_string_lossy().replace('\\', "/");
-        let s = s.trim_end_matches('/').to_string();
-        if cfg!(windows) { s.to_lowercase() } else { s }
-    };
-    norm(a) == norm(b)
-}
-
 // ------------------------------------------------------------------ Windows process snapshot
 // NtQuerySystemInformation(SystemProcessInformation): every process in one call, what Task Manager does (and what
 // nest's procsnap.py did). No extra crate: ntdll is always there.
@@ -550,6 +451,12 @@ mod nt {
         /// user + kernel time, 100 ns units
         pub cpu_time: u64,
         pub session: u32,
+        pub ppid: u32,
+        /// creation time, FILETIME
+        pub create: u64,
+        /// I/O transfer counters: every byte read / written so far
+        pub read: u64,
+        pub write: u64,
     }
 
     #[repr(C)]
@@ -558,7 +465,7 @@ mod nt {
         _max: u16,
         buf: *const u16,
     }
-    // SYSTEM_PROCESS_INFORMATION (64-bit layout), up to WorkingSetSize
+    // SYSTEM_PROCESS_INFORMATION (64-bit layout), up to the I/O counters; thread records follow it
     #[repr(C)]
     struct Spi {
         next: u32,
@@ -567,13 +474,13 @@ mod nt {
         _hard_faults: u32,
         _threads_hwm: u32,
         _cycle: u64,
-        _create: i64,
+        create: i64,
         user: i64,
         kernel: i64,
         name: UnicodeString,
         _prio: i32,
         pid: usize,
-        _parent: usize,
+        parent: usize,
         _handles: u32,
         session: u32,
         _key: usize,
@@ -582,7 +489,23 @@ mod nt {
         _page_faults: u32,
         _peak_ws: usize,
         ws: usize,
+        _quota_peak_paged: usize,
+        _quota_paged: usize,
+        _quota_peak_nonpaged: usize,
+        _quota_nonpaged: usize,
+        _pagefile: usize,
+        _peak_pagefile: usize,
+        _private_pages: usize,
+        _read_ops: u64,
+        _write_ops: u64,
+        _other_ops: u64,
+        read_bytes: u64,
+        write_bytes: u64,
+        _other_bytes: u64,
     }
+    #[cfg(target_pointer_width = "64")]
+    const _: () = assert!(std::mem::size_of::<Spi>() == 256);
+
     #[link(name = "ntdll")]
     unsafe extern "system" {
         fn NtQuerySystemInformation(class: u32, buf: *mut u8, len: u32, ret: *mut u32) -> i32;
@@ -626,7 +549,18 @@ mod nt {
                 } else {
                     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(e.name.buf, e.name.len as usize / 2) })
                 };
-                out.push(Raw { pid: e.pid as u32, name, threads: e.threads, mem: e.ws as u64, cpu_time: (e.user + e.kernel).max(0) as u64, session: e.session });
+                out.push(Raw {
+                    pid: e.pid as u32,
+                    name,
+                    threads: e.threads,
+                    mem: e.ws as u64,
+                    cpu_time: (e.user + e.kernel).max(0) as u64,
+                    session: e.session,
+                    ppid: e.parent as u32,
+                    create: e.create.max(0) as u64,
+                    read: e.read_bytes,
+                    write: e.write_bytes,
+                });
                 if e.next == 0 {
                     break;
                 }
@@ -708,24 +642,15 @@ fn gpu_loop(shared: Arc<Shared>, waker: Waker) {
 }
 
 pub fn query_gpu() -> GpuState {
-    let mut cmd = std::process::Command::new("nvidia-smi");
-    cmd.args([
+    let args = [
         "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed",
         "--format=csv,noheader,nounits",
-    ])
-    .stdin(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    ];
+    match super::probes::run_cmd("nvidia-smi", &args) {
+        Ok(text) => parse_gpu(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => GpuState::Missing,
+        Err(_) => GpuState::Failed,
     }
-    let out = match cmd.output() {
-        Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return GpuState::Missing,
-        Err(_) => return GpuState::Failed,
-    };
-    parse_gpu(&String::from_utf8_lossy(&out.stdout))
 }
 
 pub fn parse_gpu(text: &str) -> GpuState {
