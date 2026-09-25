@@ -88,7 +88,11 @@ pub fn dir() -> PathBuf {
 
 /// Where apps keep their data (notes, chats, state).
 pub fn data_dir() -> PathBuf {
-    let d = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("oriel");
+    // ORIEL_DATA_DIR: a separate profile (demos, screenshots, testing) — chats, notes and memory live there
+    let d = match std::env::var_os("ORIEL_DATA_DIR") {
+        Some(p) => PathBuf::from(p),
+        None => dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("oriel"),
+    };
     let _ = std::fs::create_dir_all(&d);
     d
 }

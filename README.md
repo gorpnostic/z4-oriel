@@ -1,77 +1,128 @@
+<div align="center">
+
 # oriel
 
-A fast terminal workspace that looks like nest, rebuilt in Rust. A sidebar holds your apps: ai chat, music,
-system, files, notes, storage and terminal. You can also split any tab into tmux-style panes. It's one binary
-that runs on Windows and Linux, and themes itself live from Omarchy.
+**A fast terminal workspace: AI chat, music, system monitor, files, notes and a real terminal, in one window.**
 
-It replaces `nest` (`C:\Code\ai\wren`), the Python/Textual version, which was slow to open and to switch tabs.
+Tabs and tmux-style split panes · mouse-friendly · a single ~9 MB binary for Linux and Windows
+
+[![release](https://img.shields.io/github/v/release/gorpnostic/z4-oriel?color=d4884a)](https://github.com/gorpnostic/z4-oriel/releases/latest)
+[![license](https://img.shields.io/github/license/gorpnostic/z4-oriel?color=6e6e6e)](LICENSE)
+
+![oriel: chatting with Claude Code, chat history in the sidebar](docs/screenshot-chat.png)
+
+</div>
 
 ## Install
 
-Linux (Omarchy/Arch, Ubuntu, …):
+**Linux** (Arch/Omarchy, Ubuntu, Fedora, …)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gorpnostic/z4-oriel/master/install.sh | sh
 ```
-Windows (PowerShell):
+
+**Windows** (PowerShell)
 ```powershell
 irm https://raw.githubusercontent.com/gorpnostic/z4-oriel/master/install.ps1 | iex
 ```
-**Update later:** `oriel update`, which re-runs the installer for the latest release.
 
-Icons need a Nerd Font in the terminal. Omarchy ships one. On Windows, use "Cascadia Mono NF".
+Then run `oriel`. To update later, run `oriel update`.
 
-## Run from source
+Icons need a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Omarchy ships one. On Windows, pick "Cascadia
+Mono NF" in Windows Terminal (Settings › Profiles › Appearance).
 
-```powershell
-cargo run --release            # or: oriel <app>, e.g. oriel music
-```
+## What's inside
+
+Every app lives in the sidebar. Click one, or press its F-key.
+
+| | App | What it does |
+|---|---|---|
+| F1 | **ai** | Chat with Claude Code, Codex, Ollama, any OpenAI-compatible server, or the Anthropic API, all in one place. Coding agents work in a folder you choose. Markdown and code render properly, history is kept, and `/` opens a command menu. |
+| F2 | **music** | Plays your music folder: cover art, a live spectrum, synced lyrics, playlists, shuffle and repeat. `F8` plays/pauses from any app. |
+| F3 | **system** | CPU, GPU (NVIDIA), memory, disks and network with live graphs. A process list you can sort, filter and kill. |
+| F4 | **files** | A folder tree with previews: highlighted code, images drawn in the terminal, READMEs. |
+| F5 | **notes** | Markdown notes that autosave, with a live preview. |
+| F6 | **storage** | Finds what's safe to clean (caches, temp files, trash), what the biggest folders are, and which apps are installed. It can also install new ones. Nothing is deleted without asking. |
+| F7 | **terminal** | A real shell. Split it next to anything. |
+
+<p align="center">
+  <img src="docs/screenshot-system.png" width="49%" alt="system monitor">
+  <img src="docs/screenshot-menu.png" width="49%" alt="the / command menu">
+</p>
 
 ## Using it
 
-The sidebar works like nest's. Click an app or press its F-key. Everything is clickable.
-
 | Key | Does |
 |---|---|
-| `F1`–`F7` | ai · music · system · files · notes · storage · terminal |
-| `F8` | play / pause music from anywhere |
-| `alt t` / click **new tab** | a new tab of your own (it starts on a launcher) |
-| `alt 1-9` | switch between your own tabs |
-| `alt n` | new terminal split beside the current pane (`alt enter` also works outside Windows Terminal, which takes it for fullscreen) |
-| `alt ←↑↓→` / `alt shift ←↑↓→` | move between panes / resize |
-| `alt z` · `alt w` · `alt s` | zoom pane · close pane · hide the sidebar |
-| `alt p` | palette: every app, split, theme, command |
-| `ctrl+space` then `\|` `-` `hjkl` `x` `z` `c` `t` `?` | tmux-style prefix keys (`?` lists them) |
+| `F1`–`F7` | switch apps |
+| `alt p` | the palette: every app, action and theme, searchable |
+| `alt n` | open a terminal beside the current pane |
+| `alt t` / `alt 1-9` | new tab / go to tab |
+| `alt ←↑↓→` | move between panes (`alt shift ←↑↓→` resizes) |
+| `alt z` · `alt w` · `alt s` | zoom a pane · close it · hide the sidebar |
+| `ctrl+space` then `\|` `-` `x` `?` | tmux-style: split right, split down, close, list all keys |
 
-Each app shows its own keys in the hint line at the bottom, like nest did.
+Each app shows its own keys along its bottom edge. The mouse works everywhere: click to focus, drag a divider to
+resize, scroll lists.
 
-**ai:** chat with Wren (through its web server: research, memory, fast/balanced/smart), Claude Code, Codex,
-Ollama, any OpenAI-compatible server, or the Anthropic API. `/model` switches between them. Your nest chats are
-copied in on first run.
+### AI setup
+
+oriel uses whatever you already have and picks the first one it finds:
+
+- **Claude Code**: `npm i -g @anthropic-ai/claude-code`, then run `claude` once to sign in.
+- **Codex**: `npm i -g @openai/codex`, then `codex login`.
+- **Ollama**: install from [ollama.com](https://ollama.com) and `ollama pull llama3.2`. It's free and runs on your machine.
+- **API keys**: `/key openai <key>` or `/key anthropic <key>` in the chat. The OpenAI option works with any
+  compatible server: OpenRouter, LM Studio, llama.cpp…
+
+Switch any time with `/model`. Type `/` to see every command.
 
 ## Themes
 
-`alt p` then type "theme". The palettes come from nest. `terminal` follows the terminal's own colours.
-`omarchy` reads `~/.config/omarchy/current/theme` and recolours live when you switch Omarchy themes. It's the
-default on Omarchy.
+`alt p` → type `theme`. Themes preview live as you move through the list. The built-in ones are oriel, ember,
+ocean, forest, sakura, synthwave, matrix, amber, dracula, mono and ultra (animated). There are also:
 
-## Config
+- **terminal**, which uses your terminal's own colours;
+- **omarchy** (the default on [Omarchy](https://omarchy.org)), which follows your Omarchy theme and recolours
+  instantly when you switch themes.
 
-`oriel --config` prints the path: `%APPDATA%\oriel\config.toml` on Windows, `~/.config/oriel/config.toml` on Linux.
-You can set the theme, shell, prefix key, startup app, AI providers and keys, Wren server URLs, and music folders.
+## Configuration
 
-## Releasing (for Leif)
+`oriel --config` prints where the config file is: `~/.config/oriel/config.toml`, or `%APPDATA%\oriel\config.toml`
+on Windows. Every setting is optional:
 
-`pwsh tools\release.ps1` bumps the version, tags and pushes. GitHub Actions then builds the Linux and Windows
-binaries and publishes the release that the installers download (`.github/workflows/release.yml`).
+```toml
+theme = "omarchy"
+shell = "zsh"                 # terminal panes; default: $SHELL / PowerShell
+prefix = "ctrl+space"         # tmux-style prefix key
+startup = "ai"                # app to open on start
 
-## Testing
+[ai]
+provider = "claude"           # default AI; empty = the first one found
+ollama_model = "llama3.2"
+openai_url = "https://openrouter.ai/api/v1"
+openai_model = "anthropic/claude-sonnet-5"
 
-`cargo test` renders the apps off-screen (`src/testkit.rs`). `pwsh tools\snap.ps1 target\snap\<name>.html` turns
-a snapshot into a PNG. Nothing opens on screen.
+[music]
+folders = ["~/Music"]
+```
 
-## Status (2026-09-25)
+## Build from source
 
-- **v0.1.0 released.** Public repo; `install.sh` / `install.ps1` / `oriel update` work (the Windows install and update were tested on the dev PC).
-- **All apps done:** ai chat (6 providers, nest chats imported), music (audio-player library, cover art, spectrum, synced lyrics), system (~1.4 ms per refresh), files, notes (autosave editor), and storage (cleanup, big folders, apps, install).
-- **Linux:** compiles in CI (Ubuntu 22.04 build), but hasn't been run on a real Linux/Omarchy desktop yet. Try it in the Omarchy VM.
-- **Not done:** `.opus` playback (no decoder in symphonia), a now-playing strip in the sidebar outside the music app, and a macOS build.
+Needs [Rust](https://rustup.rs). On Linux you also need the ALSA headers: `alsa-lib` on Arch, `libasound2-dev` on
+Debian/Ubuntu.
+
+```bash
+git clone https://github.com/gorpnostic/z4-oriel && cd z4-oriel
+cargo run --release
+```
+
+See [docs/DEVELOPING.md](docs/DEVELOPING.md) for tests and releases.
+
+## Uninstall
+
+Delete the binary: `~/.local/bin/oriel` on Linux, `%LOCALAPPDATA%\oriel` on Windows. Settings and chats live in
+`~/.config/oriel` and `~/.local/share/oriel`, or `%APPDATA%\oriel` on Windows.
+
+## License
+
+[MIT](LICENSE)

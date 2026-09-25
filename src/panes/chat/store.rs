@@ -52,6 +52,9 @@ pub fn dir() -> PathBuf {
 }
 
 fn nest_dir() -> Option<PathBuf> {
+    if std::env::var_os("ORIEL_DATA_DIR").is_some() {
+        return None; // a separate profile starts clean
+    }
     Some(dirs::home_dir()?.join(".wren").join("chats"))
 }
 

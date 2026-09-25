@@ -1243,3 +1243,9 @@ mod tests {
         store::delete(&c.chat.id); // don't leave a test chat in the list
     }
 }
+
+#[cfg(test)]
+pub fn demo_now() -> f64 {
+    store::now()
+}
+
