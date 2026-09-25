@@ -2,7 +2,7 @@
 
 # oriel
 
-**A fast terminal workspace: AI chat, music, system monitor, files, notes and a real terminal, in one window.**
+**A fast terminal workspace: AI chat, a multi-agent orchestrator, AI usage and limits, music, a system monitor, files, notes and a real terminal, all in one window.**
 
 Tabs and tmux-style split panes · mouse-friendly · a single ~9 MB binary for Linux and Windows
 
@@ -36,15 +36,24 @@ Every app lives in the sidebar. Click one, or press its F-key.
 
 | | App | What it does |
 |---|---|---|
-| F1 | **ai** | Chat with Claude Code, Codex, Ollama, any OpenAI-compatible server, or the Anthropic API, all in one place. Coding agents show their full live transcript as they work: every file read, edit (as a diff), command and output, plus their todo list ticking off. `/perms ask` makes them ask before each change. History is kept, and `/` opens a command menu. |
-| F2 | **music** | Plays your music folder: cover art, a live spectrum, synced lyrics, playlists, shuffle and repeat. `F8` plays/pauses from any app. |
-| F3 | **system** | A task manager. It has a summary, a process list or tree (sort, filter, kill; per-process disk activity), per-core performance graphs, startup apps, services, network connections by process, and system info. |
-| F4 | **files** | A folder tree with previews: highlighted code, images drawn in the terminal, READMEs. |
-| F5 | **notes** | Markdown notes that autosave, with a live preview. |
-| F6 | **storage** | Frees up space: it finds what's safe to clean (caches, temp files, trash), shows the biggest folders, and uninstalls apps. It also has a catalog of 60+ popular apps (OBS, Steam, Minecraft launchers, VPNs, AI apps, dev tools, browsers…) that installs with one key, using winget, pacman/AUR, apt, flatpak or npm to match your system. Nothing is deleted or installed without asking. |
-| F7 | **terminal** | A real shell. Split it next to anything. |
+| | **ai** | |
+| F1 | **chat** | Chat with Claude Code, Codex, Ollama, any OpenAI-compatible server, or the Anthropic API. Coding agents show their full live transcript as they work: every file read, edit (as a diff), command and output, plus their todo list ticking off. `/perms ask` makes them ask before each change. History is kept, and `/` opens a command menu. |
+| F2 | **agents** | An orchestrator for several coding agents at once. Each task gets its own git worktree and a Claude Code or Codex tab. A board shows todo / running / blocked / review / done, with the cost of each task. You get a notification when an agent needs you, then review its diff (with a conflict check) and squash-merge or discard it. `P` has a lead agent plan the tasks for you. |
+| F3 | **your AIs** | Everything about your AI tools in one place. It shows which coding CLIs are installed and signed in, and installs or signs in to 13 of them with one key: Claude Code, Codex, Kimi, Gemini, OpenCode, Aider, Copilot, Cursor, Qwen, Amp, Droid, Crush and Goose. It also shows your real plan limits with reset countdowns, token use and cost per day, and has token-saver presets. |
+| | **tools** | |
+| F4 | **music** | Plays your music folder: cover art, a live spectrum, synced lyrics, playlists, shuffle and repeat. `F12` plays/pauses from any app. |
+| F5 | **system** | A task manager. It has a summary, a process list or tree (sort, filter, kill; per-process disk activity), per-core performance graphs, startup apps, services, network connections by process, and system info. |
+| F6 | **files** | A folder tree with previews: highlighted code, images drawn in the terminal, READMEs. |
+| F7 | **notes** | Markdown notes that autosave, with a live preview. |
+| F8 | **storage** | Frees up space: it finds what's safe to clean (caches, temp files, trash), shows the biggest folders, and uninstalls apps. It also has a catalog of 60+ popular apps (OBS, Steam, Minecraft launchers, VPNs, AI apps, dev tools, browsers…) that installs with one key, using winget, pacman/AUR, apt, flatpak or npm to match your system. Nothing is deleted or installed without asking. |
+| F9 | **terminal** | A real shell. Split it next to anything. |
 
 ![a Claude Code run: todos, edits as diffs, command output (dracula theme)](docs/screenshot-agent.png)
+
+<p align="center">
+  <img src="docs/screenshot-agents.png" width="49%" alt="the agents board">
+  <img src="docs/screenshot-ais.png" width="49%" alt="your AIs: limits, usage, installs">
+</p>
 
 <p align="center">
   <img src="docs/screenshot-system.png" width="49%" alt="the system app">
@@ -55,7 +64,7 @@ Every app lives in the sidebar. Click one, or press its F-key.
 
 | Key | Does |
 |---|---|
-| `F1`–`F7` | switch apps |
+| `F1`–`F9` | switch apps (`F12` plays/pauses music) |
 | `alt p` | the palette: every app, action and theme, searchable |
 | `alt n` | open a terminal beside the current pane |
 | `alt t` / `alt 1-9` | new tab / go to tab |
