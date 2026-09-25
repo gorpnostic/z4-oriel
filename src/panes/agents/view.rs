@@ -303,8 +303,11 @@ impl Agents {
             Status::Review => Span::styled(format!("took {}", dur(task.finished - task.started)), ui::muted(t)),
             Status::Done => Span::styled(format!("{} {}", task.outcome, crate::panes::files::clock::stamp(task.finished).get(0..6).unwrap_or("")), ui::muted(t)),
         };
-        let follow = if task.followups > 0 { format!(" · +{}", task.followups) } else { String::new() };
-        lines.push(spread(vec![Span::styled(format!("{}{} · {model}{follow}", ui::lead(icon), task.agent), ui::muted(t))], vec![when], w));
+        let mut right = vec![when];
+        if task.followups > 0 {
+            right.insert(0, Span::styled(format!("↻{} ", task.followups), ui::muted(t)));
+        }
+        lines.push(spread(vec![Span::styled(format!("{}{} · {model}", ui::lead(icon), task.agent), ui::muted(t))], right, w));
         // 3-4: what it's doing / asking / the error, and the numbers
         let stat_spans = |t: &Theme| -> Vec<Span<'static>> {
             let mut v = vec![];
@@ -629,7 +632,7 @@ impl Agents {
     fn draw_picker(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
         let Mode::Repo(p) = &self.mode else { return };
-        let h = (self.store.repos.len() as u16 + 9).min(22);
+        let h = (self.store.repos.len() as u16 + 11).min(22);
         let inner = ui::popup(f, area, 78, h, &format!("{}open a repo", ui::lead("files")), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         f.render_widget(Paragraph::new(Span::styled("agents work in git worktrees of a repo — which one?", ui::muted(t))), Rect { height: 1, ..inner });

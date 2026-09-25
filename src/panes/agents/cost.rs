@@ -3,7 +3,7 @@
 
 use serde_json::Value;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -190,7 +190,13 @@ pub fn codex_for_dir(cwd: &Path, since: i64) -> Cost {
             continue;
         }
         let Ok(file) = std::fs::File::open(&f) else { continue };
-        let (dir, c) = codex_lines(BufReader::new(file));
+        // the first line is session_meta with the cwd: skip other folders' sessions without reading them
+        let mut r = BufReader::new(file);
+        let mut first = String::new();
+        if r.read_line(&mut first).is_err() || !norm(&first.replace("\\\\", "\\")).contains(&want) {
+            continue;
+        }
+        let (dir, c) = codex_lines(std::io::Cursor::new(first).chain(r));
         if norm(&dir) == want {
             total.usd += c.usd;
             total.tokens += c.tokens;

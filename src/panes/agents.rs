@@ -220,6 +220,8 @@ pub struct Agents {
     /// true while some task is running: the watcher then wakes the pane every second or so
     active: Arc<AtomicBool>,
     saver: Sender<Vec<u8>>,
+    /// held while tasks.json is written; true once the pane is gone (its final write wins)
+    save_lock: Arc<Mutex<bool>>,
     booted: bool,
     mode: Mode,
     col: usize,
@@ -247,12 +249,17 @@ impl Agents {
         // one writer thread for tasks.json: always writes the newest snapshot, never blocks the UI
         let (saver, srx) = channel::<Vec<u8>>();
         let tasks_path = paths.tasks();
+        let save_lock = Arc::new(Mutex::new(false));
+        let lock = save_lock.clone();
         std::thread::spawn(move || {
             while let Ok(mut data) = srx.recv() {
                 while let Ok(newer) = srx.try_recv() {
                     data = newer;
                 }
-                let _ = store::write_atomic(&tasks_path, &data);
+                let closed = lock.lock().unwrap();
+                if !*closed {
+                    let _ = store::write_atomic(&tasks_path, &data);
+                }
             }
         });
         let mut live = HashMap::new();
@@ -273,6 +280,7 @@ impl Agents {
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(false)),
             saver,
+            save_lock,
             booted: false,
             mode: Mode::Board,
             col: 0,
@@ -437,8 +445,7 @@ impl Agents {
                 let d = crate::panes::files::clock::local(t.started.max(t.created));
                 (d.year, d.month, d.day) == (now.year, now.month, now.day)
             })
-            .map(|t| t.cost_usd)
-            .sum()
+            .fold(0.0, |a, t| a + t.cost_usd)
     }
 
     // ------------------------------------------------------------------ the state machine
@@ -1284,6 +1291,12 @@ pub fn parse_plan(stdout: &str) -> Option<(Vec<(String, String)>, f64)> {
 impl Drop for Agents {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // oriel is quitting: write the newest state now rather than trusting the writer thread to get there
+        let mut closed = self.save_lock.lock().unwrap();
+        if let Ok(j) = serde_json::to_vec_pretty(&self.store) {
+            let _ = store::write_atomic(&self.paths.tasks(), &j);
+        }
+        *closed = true;
     }
 }
 
@@ -1403,6 +1416,9 @@ impl Pane for Agents {
     }
 
     fn mouse(&mut self, ev: MouseEvent, _area: Rect, cx: &mut Cx) {
+        if !matches!(self.mode, Mode::Board | Mode::Diff(_)) {
+            return; // a popup is open: the board under it doesn't take clicks
+        }
         let pos = Position { x: ev.column, y: ev.row };
         let hit = self.hits.iter().rev().find(|(r, _)| r.contains(pos)).map(|h| h.1.clone());
         match (ev.kind, hit) {
@@ -1457,6 +1473,7 @@ impl Pane for Agents {
                     }
                 }
                 Some(Hit::NewTask) if self.repo.is_some() => self.mode = Mode::Form(self.new_form(None)),
+                Some(Hit::Column(c)) if matches!(self.mode, Mode::Board) => self.col = c,
                 _ => {}
             }
         }

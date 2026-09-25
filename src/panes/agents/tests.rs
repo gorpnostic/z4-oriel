@@ -360,8 +360,7 @@ fn agents_snapshots_board_form_diff() {
     let dir = scratch("snap");
     let mut k = Kit::new();
     let mut p = demo(&dir);
-    p.col = 1;
-    p.row[1] = 0;
+    p.col = 2;
     let board = snap(&mut k, &mut p, "board");
     println!("{board}");
     for s in ["TODO", "RUNNING", "REVIEW", "DONE", "BLOCKED", "+212 −40", "$0.61", "Fix pty resize", "master"] {
@@ -402,5 +401,27 @@ fn agents_snapshots_board_form_diff() {
     let diff = snap(&mut k, &mut p, "diff");
     println!("{diff}");
     assert!(diff.contains("merges cleanly") && diff.contains("serde_json::Value") && diff.contains("usage.rs"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn agents_snapshots_empty_and_picker() {
+    let dir = scratch("snap2");
+    let mut k = Kit::new();
+    let mut p = demo(&dir);
+    p.store.tasks.clear();
+    let empty = snap(&mut k, &mut p, "empty");
+    assert!(empty.contains("no tasks yet") && empty.contains("new task"), "{empty}");
+    k.key(&mut p, KeyCode::Char('o'));
+    assert!(matches!(p.mode, Mode::Repo(_)));
+    let picker = snap(&mut k, &mut p, "repo");
+    println!("{picker}");
+    assert!(picker.contains("open a repo") && picker.contains("rnr-drift"));
+    // a path that isn't a repo: an error, the picker stays
+    k.typ(&mut p, &dir.join("nope").display().to_string());
+    k.key(&mut p, KeyCode::Enter);
+    until(&mut k, &mut p, 5000, "checked", |p| matches!(&p.mode, Mode::Repo(pk) if !pk.checking));
+    let Mode::Repo(pk) = &p.mode else { unreachable!() };
+    assert!(pk.err.contains("isn't a folder"), "{}", pk.err);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -182,11 +182,10 @@ pub fn merge_report(mut st: StatusFile, state: &str, hook: &Value, now: i64) -> 
         st.transcript_path = s("transcript_path");
     }
     match state {
-        // SessionStart only tells us where the transcript is; it doesn't change what the agent is doing
+        // a session starting (first run or a follow-up) always has a prompt to work on
         "session" => {
-            if st.state.is_empty() {
-                st.state = "running".into();
-            }
+            st.state = "running".into();
+            st.message.clear();
         }
         "blocked" => {
             let msg = s("message");
