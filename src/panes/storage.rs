@@ -1,5 +1,5 @@
-//! storage: drives, smart cleanup, a big-folder explorer, installed apps (uninstall) and package installs — a port
-//! of nest's storage app (wren/storage_view.py).
+//! storage: drives, smart cleanup, a big-folder explorer, installed apps (uninstall), a curated "get apps" catalog
+//! (storage/catalog.rs) and package search/installs — a port of nest's storage app (wren/storage_view.py).
 //!
 //! Safety rules:
 //!   * nothing is deleted, uninstalled or installed without an in-app y/esc confirmation naming the exact target
@@ -8,6 +8,7 @@
 //!   * sizes are measured on background threads and never follow links/junctions (see storage/scan.rs)
 //!   * under `cargo test` the delete/run paths only record what they would have done
 
+mod catalog;
 mod draw;
 mod scan;
 mod sys;
@@ -30,13 +31,15 @@ enum View {
     Cleanup,
     Folders,
     Apps,
+    Catalog,
     Install,
 }
 
 /// sel value meaning "nothing picked yet: the top row" (it follows the list while sizes re-sort it).
 const TOP: usize = usize::MAX;
 
-const VIEWS: [View; 4] = [View::Cleanup, View::Folders, View::Apps, View::Install];
+const NV: usize = 5;
+const VIEWS: [View; NV] = [View::Cleanup, View::Folders, View::Apps, View::Catalog, View::Install];
 
 impl View {
     fn i(self) -> usize {
@@ -56,6 +59,7 @@ enum Msg {
     FErr(u64, String),
     Apps(Result<Vec<App>, String>),
     Found { g: u64, res: Result<Vec<Found>, String> },
+    Installed(catalog::Installed),
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +75,8 @@ enum Pending {
     Clean(&'static str),
     Uninstall(usize),
     Install(usize),
+    /// a catalog entry (index into catalog::CATALOG)
+    Get(usize),
 }
 
 struct Confirm {
@@ -111,8 +117,8 @@ pub struct Storage {
     started: bool,
     drives: Option<Vec<Drive>>,
     /// per view: the selected item (an index into that view's own list) and the table's scroll offset
-    sel: [usize; 4],
-    off: [usize; 4],
+    sel: [usize; NV],
+    off: [usize; NV],
     // cleanup
     tgen: u64,
     tstop: Arc<AtomicBool>,
@@ -144,13 +150,24 @@ pub struct Storage {
     table_hit: Option<(Rect, usize)>,
     side_hits: Vec<(Rect, View)>,
     install_via: &'static str,
+    // get apps (the catalog)
+    env: catalog::Env,
+    /// per catalog entry: how it installs here (None = not offered on this OS, hidden)
+    picks: Vec<Option<catalog::Pick>>,
+    /// 0 = all, 1.. = catalog::CATS[n - 1]
+    cat: usize,
+    cfilter: String,
+    installed: Option<catalog::Installed>,
+    inst_loading: bool,
+    cat_hits: Vec<(Rect, usize)>,
+    /// last left click on the table: when and which item (double-click installs, after asking)
+    last_click: Option<(Instant, usize)>,
     #[cfg(test)]
     launched: Vec<String>,
 }
 
 impl Storage {
     pub fn new() -> Self {
-        let (tx, rx) = channel();
         let install_via = if cfg!(windows) {
             "winget"
         } else if crate::config::which("yay").is_some() {
@@ -158,14 +175,20 @@ impl Storage {
         } else {
             "pacman"
         };
+        Self::with_env(catalog::Env::detect(), install_via)
+    }
+
+    fn with_env(env: catalog::Env, install_via: &'static str) -> Self {
+        let (tx, rx) = channel();
+        let picks = catalog::CATALOG.iter().map(|e| catalog::pick(e, &env)).collect();
         Storage {
             view: View::Cleanup,
             out: Out { tx, waker: None, last: Arc::new(AtomicU64::new(0)), t0: Instant::now() },
             rx,
             started: false,
             drives: None,
-            sel: [TOP; 4],
-            off: [0; 4],
+            sel: [TOP; NV],
+            off: [0; NV],
             tgen: 0,
             tstop: Arc::new(AtomicBool::new(false)),
             targets: vec![],
@@ -191,6 +214,14 @@ impl Storage {
             table_hit: None,
             side_hits: vec![],
             install_via,
+            env,
+            picks,
+            cat: 0,
+            cfilter: String::new(),
+            installed: None,
+            inst_loading: false,
+            cat_hits: vec![],
+            last_click: None,
             #[cfg(test)]
             launched: vec![],
         }
@@ -316,6 +347,16 @@ impl Storage {
         std::thread::spawn(move || out.send(Msg::Apps(sys::installed_apps()), true));
     }
 
+    /// One background pass over winget list / pacman -Qq / dpkg / flatpak / npm ls, cached until `r`.
+    fn load_installed(&mut self) {
+        if self.inst_loading {
+            return;
+        }
+        self.inst_loading = true;
+        let (env, out) = (self.env.clone(), self.out.clone());
+        std::thread::spawn(move || out.send(Msg::Installed(catalog::installed(&env)), true));
+    }
+
     fn search(&mut self) {
         let q = self.query.trim().to_string();
         if q.is_empty() {
@@ -390,6 +431,10 @@ impl Storage {
                     self.off[View::Install.i()] = 0;
                     self.found = Some(res);
                 }
+                Msg::Installed(i) => {
+                    self.inst_loading = false;
+                    self.installed = Some(i);
+                }
                 _ => {} // from a scan that was replaced
             }
         }
@@ -422,11 +467,40 @@ impl Storage {
                     _ => vec![],
                 }
             }
+            View::Catalog => {
+                let q = self.cfilter.trim().to_lowercase();
+                let cat = self.cat.checked_sub(1).map(|c| catalog::CATS[c]);
+                let mut o: Vec<usize> = (0..catalog::CATALOG.len())
+                    .filter(|&i| self.picks[i].is_some())
+                    .filter(|&i| {
+                        let e = &catalog::CATALOG[i];
+                        if !q.is_empty() {
+                            // a filter searches every category
+                            return format!("{} {} {}", e.name, e.desc, e.cat.label()).to_lowercase().contains(&q);
+                        }
+                        cat.is_none_or(|c| e.cat == c)
+                    })
+                    .collect();
+                o.sort_by_key(|&i| catalog::CATS.iter().position(|&c| c == catalog::CATALOG[i].cat));
+                o
+            }
             View::Install => match &self.found {
                 Some(Ok(f)) => (0..f.len()).collect(),
                 _ => vec![],
             },
         }
+    }
+
+    /// Visible catalog entries in a category (0 = all), ignoring the filter.
+    fn cat_count(&self, c: usize) -> usize {
+        (0..catalog::CATALOG.len()).filter(|&i| self.picks[i].is_some() && (c == 0 || catalog::CATALOG[i].cat == catalog::CATS[c - 1])).count()
+    }
+
+    fn set_cat(&mut self, c: usize) {
+        self.cat = c.min(catalog::CATS.len());
+        self.cfilter.clear();
+        self.sel[View::Catalog.i()] = TOP;
+        self.off[View::Catalog.i()] = 0;
     }
 
     /// The selected item's index in its list, if the list has it.
@@ -452,6 +526,7 @@ impl Storage {
         match v {
             View::Folders if !self.fstarted => self.scan_folder(self.froot.clone()),
             View::Apps if self.apps.is_none() => self.load_apps(),
+            View::Catalog if self.installed.is_none() => self.load_installed(),
             View::Install if self.found.is_none() && !self.searching => self.input = true,
             _ => {}
         }
@@ -462,9 +537,52 @@ impl Storage {
             View::Cleanup => self.scan_targets(),
             View::Folders => self.scan_folder(self.froot.clone()),
             View::Apps => self.load_apps(),
+            View::Catalog => self.load_installed(),
             View::Install => self.search(),
         }
         self.refresh_drives();
+    }
+
+    /// Open a web page in the default browser, off the UI thread.
+    fn open_url(&mut self, url: &str, cx: &mut Cx) {
+        cx.notify(format!("opening {url}"));
+        #[cfg(test)]
+        {
+            self.launched.push(format!("open: {url}"));
+        }
+        #[cfg(not(test))]
+        {
+            let url = url.to_string();
+            std::thread::spawn(move || {
+                #[cfg(windows)]
+                let mut c = {
+                    use std::os::windows::process::CommandExt;
+                    let mut c = std::process::Command::new("rundll32.exe");
+                    c.args(["url.dll,FileProtocolHandler", &url]).creation_flags(0x0800_0000);
+                    c
+                };
+                #[cfg(not(windows))]
+                let mut c = {
+                    let mut c = std::process::Command::new("xdg-open");
+                    c.arg(&url);
+                    c
+                };
+                c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                let _ = c.status();
+            });
+        }
+    }
+
+    /// The catalog's `s`: search the package manager for the filter text (or an empty box to type in).
+    fn search_for(&mut self, q: String) {
+        self.query = q;
+        self.set_view(View::Install);
+        if !self.query.trim().is_empty() {
+            self.input = false;
+            self.search();
+        } else {
+            self.input = true;
+        }
     }
 
     fn open_files(&mut self, p: PathBuf, cx: &mut Cx) {
@@ -539,6 +657,25 @@ impl Storage {
         });
     }
 
+    /// Catalog enter / double-click: ask before installing; a website just opens; a missing tool says so.
+    fn ask_get(&mut self, cx: &mut Cx) {
+        let Some(i) = self.selected().filter(|_| self.view == View::Catalog) else { return };
+        let e = &catalog::CATALOG[i];
+        let Some(p) = self.picks[i].clone() else { return };
+        if p.src == catalog::Src::Web {
+            return self.open_url(e.home, cx);
+        }
+        let Some(c) = &p.install else {
+            cx.notify(format!("{}: {}", e.name, p.missing.as_deref().unwrap_or("can't be installed here")));
+            return;
+        };
+        let mut lines = vec![e.desc.to_string(), String::new(), format!("installs from {} — runs this in a terminal, so you see every prompt:", p.src.label()), format!("  {}", c.text())];
+        if self.installed.as_ref().is_some_and(|inst| inst.has(e)) {
+            lines.push("it looks like it's already installed".into());
+        }
+        self.confirm = Some(Confirm { question: format!("install {}?", e.name), lines, what: Pending::Get(i) });
+    }
+
     fn execute(&mut self, what: Pending, cx: &mut Cx) {
         match what {
             Pending::Clean(id) => {
@@ -560,6 +697,12 @@ impl Storage {
                 let Some(Ok(found)) = &self.found else { return };
                 let f = found[i].clone();
                 self.run_in_terminal(&format!("install {}", f.name), "package", &f.install, cx);
+            }
+            Pending::Get(i) => {
+                let e = &catalog::CATALOG[i];
+                let Some(c) = self.picks[i].as_ref().and_then(|p| p.install.clone()) else { return };
+                self.run_in_terminal(&format!("install {}", e.name), "package", &c, cx);
+                cx.notify(format!("installing {} — press r when it's done to refresh the ✓ marks", e.name));
             }
         }
     }
@@ -623,6 +766,7 @@ impl Storage {
                 }
             }
             View::Apps => self.ask_uninstall(),
+            View::Catalog => self.ask_get(cx),
             View::Install => self.ask_install(),
         }
     }
