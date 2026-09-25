@@ -165,15 +165,31 @@ pub fn logo(f: &mut Frame, area: Rect, t: &Theme, time: f64) -> u16 {
         return 1;
     }
     let x = area.x + (area.width - w) / 2;
-    for (r, line) in lines.iter().enumerate() {
-        let spans: Vec<Span> = if t.animated {
-            line.chars().enumerate().map(|(i, c)| Span::styled(c.to_string(), Style::default().fg(rainbow(i, time)))).collect()
-        } else {
-            vec![Span::styled(line.clone(), Style::default().fg(t.accent))]
-        };
-        f.render_widget(Paragraph::new(Line::from(spans)), Rect { x, y: area.y + r as u16, width: w, height: 1 });
-    }
+    big_logo(f, &lines, x, area.y, t, time);
     8
+}
+
+/// Draw big-font rows at (x, y), shaded top to bottom from the theme accent to its highlight colour; on the
+/// animated theme a soft rainbow drifts across it instead.
+pub fn big_logo(f: &mut Frame, rows: &[String], x: u16, y: u16, t: &Theme, time: f64) {
+    let n = rows.len().max(2) - 1;
+    let area = f.area();
+    for (r, line) in rows.iter().enumerate() {
+        let yy = y + r as u16;
+        if yy >= area.bottom() {
+            break;
+        }
+        let spans: Vec<Span> = if t.animated {
+            line.chars()
+                .enumerate()
+                .map(|(i, c)| Span::styled(c.to_string(), Style::default().fg(crate::theme::rainbow_at((i as f64 + r as f64 * 0.6) * 0.012 - time * 0.05, 0.5))))
+                .collect()
+        } else {
+            vec![Span::styled(line.clone(), Style::default().fg(crate::theme::mix(t.accent, t.shine, r as f32 / n as f32)))]
+        };
+        let w = (line.chars().count() as u16).min(area.right().saturating_sub(x));
+        f.render_widget(Paragraph::new(Line::from(spans)), Rect { x, y: yy, width: w, height: 1 });
+    }
 }
 
 pub fn key_hint<'a>(key: &'a str, what: &'a str, t: &Theme) -> Vec<Span<'a>> {

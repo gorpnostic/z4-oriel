@@ -54,7 +54,7 @@ pub fn hex(s: &str) -> Option<Color> {
     Some(Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
 }
 
-fn mix(a: Color, b: Color, t: f32) -> Color {
+pub fn mix(a: Color, b: Color, t: f32) -> Color {
     match (a, b) {
         (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
             let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
@@ -188,8 +188,13 @@ fn flatten(prefix: &str, v: &toml::Value, out: &mut std::collections::HashMap<St
 
 /// Rainbow colour for character i at time t (seconds) — the ultra theme's drifting logo.
 pub fn rainbow(i: usize, t: f64) -> Color {
-    let h = ((i as f64 * 0.07 - t * 0.6).rem_euclid(1.0)) * 6.0;
-    let (s, v) = (0.55, 1.0);
+    rainbow_at(i as f64 * 0.07 - t * 0.6, 0.55)
+}
+
+/// A point on the rainbow (0..1 wraps) at saturation `s`.
+pub fn rainbow_at(pos: f64, s: f64) -> Color {
+    let h = pos.rem_euclid(1.0) * 6.0;
+    let v = 1.0;
     let c = v * s;
     let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
     let (r, g, b) = match h as u32 {
