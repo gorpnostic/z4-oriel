@@ -31,14 +31,20 @@ struct Tab {
 
 /// The sidebar's app list, nest style: (app, icon, label, key).
 pub const SIDEBAR: &[(&str, &str, &str, &str)] = &[
-    ("ai", "ai", "ai", "F1"),
-    ("music", "music", "music", "F2"),
-    ("system", "system", "system", "F3"),
-    ("files", "files", "files", "F4"),
-    ("notes", "notes", "notes", "F5"),
-    ("storage", "storage", "storage", "F6"),
-    ("terminal", "term", "terminal", "F7"),
+    // ── ai
+    ("ai", "ai", "chat", "F1"),
+    ("agents", "robot", "agents", "F2"),
+    ("ais", "gauge", "your AIs", "F3"),
+    // ── tools
+    ("music", "music", "music", "F4"),
+    ("system", "system", "system", "F5"),
+    ("files", "files", "files", "F6"),
+    ("notes", "notes", "notes", "F7"),
+    ("storage", "storage", "storage", "F8"),
+    ("terminal", "term", "terminal", "F9"),
 ];
+/// Where each sidebar section starts: (index into SIDEBAR, heading).
+const SECTIONS: &[(usize, &str)] = &[(0, "ai"), (3, "tools")];
 
 #[derive(Clone, Copy)]
 enum SideHit {
@@ -609,11 +615,11 @@ impl App {
             return;
         }
         if let KeyCode::F(n) = k.code {
-            if (1..=7).contains(&n) && k.modifiers.is_empty() {
+            if (1..=SIDEBAR.len() as u8).contains(&n) && k.modifiers.is_empty() {
                 self.goto_app(SIDEBAR[n as usize - 1].0);
                 return;
             }
-            if n == 8 {
+            if n == 12 {
                 // play/pause from anywhere, if the music app is open
                 if let Some(id) = self.tabs.iter().find(|t| t.app == Some("music")).map(|t| t.focus) {
                     self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), cx));
@@ -1037,7 +1043,7 @@ impl App {
         }
     }
 
-    /// nest's sidebar: the apps (F1-F7), your own tabs, then the current app's own section.
+    /// The sidebar: the apps in sections (F1-F9), your own tabs, then the current app's own section.
     fn draw_sidebar(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
         let time = self.start.elapsed().as_secs_f64();
         let cur_app = self.tabs[self.cur].app;
@@ -1059,9 +1065,19 @@ impl App {
         }
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), y: inner.y + 1, height: inner.height.saturating_sub(1) };
         let mut y = inner.y;
-        for &(name, icon, label, key) in SIDEBAR {
+        for (idx, &(name, icon, label, key)) in SIDEBAR.iter().enumerate() {
             if y >= inner.bottom() {
                 break;
+            }
+            if let Some((_, heading)) = SECTIONS.iter().find(|(at, _)| *at == idx) {
+                if idx > 0 {
+                    y += 1;
+                }
+                if y + 1 >= inner.bottom() {
+                    break;
+                }
+                f.render_widget(Paragraph::new(Span::styled(format!("── {heading}"), ui::muted(t))), Rect { y, height: 1, ..inner });
+                y += 1;
             }
             let r = Rect { y, height: 1, ..inner };
             let on = cur_app == Some(name);
@@ -1186,8 +1202,9 @@ fn draw_help(f: &mut Frame, area: Rect, t: &Theme, c: &Config) {
         ("alt shift ←↑↓→".into(), "resize the pane"),
         ("alt n · alt enter".into(), "new terminal (splits the pane)"),
         ("alt p".into(), "palette: open apps, themes, everything"),
-        ("F1-F7".into(), "ai · music · system · files · notes · storage · terminal"),
-        ("F8".into(), "play / pause music from anywhere"),
+        ("F1-F3".into(), "ai: chat · agents · your AIs"),
+        ("F4-F9".into(), "tools: music · system · files · notes · storage · terminal"),
+        ("F12".into(), "play / pause music from anywhere"),
         ("alt 1-9 · alt t".into(), "go to one of your tabs · new tab"),
         ("alt s".into(), "hide / show the sidebar"),
         ("alt z · alt w".into(), "zoom pane · close pane"),

@@ -185,7 +185,7 @@ impl Chat {
 
     fn new_chat(&mut self) {
         self.stop();
-        self.persist();
+        self.persist_if_changed();
         self.chat = store::Chat::new(&self.provider_of());
         self.cache.clear();
         self.scroll = 0;
@@ -196,12 +196,25 @@ impl Chat {
         if i >= self.chats.len() {
             return;
         }
+        // by id: saving the chat we're leaving can reorder the list under us
+        let id = self.chats[i].id.clone();
         self.stop();
-        self.persist();
-        self.chat = self.chats[i].clone();
+        self.persist_if_changed();
+        let Some(c) = self.chats.iter().find(|c| c.id == id).cloned() else { return };
+        self.chat = c;
         self.cache.clear();
         self.scroll = 0;
         self.info.clear();
+    }
+
+    /// Save only if it differs from the saved copy — just looking at a chat mustn't bump it to the top.
+    fn persist_if_changed(&mut self) {
+        if let Some(old) = self.chats.iter().find(|c| c.id == self.chat.id) {
+            if serde_json::to_value(old).ok() == serde_json::to_value(&self.chat).ok() {
+                return;
+            }
+        }
+        self.persist();
     }
 
     /// Save the current chat and refresh it in the list.
@@ -430,7 +443,7 @@ impl Chat {
                         "pgup/pgdn or the wheel scroll · ↑ in an empty box recalls your last message",
                         "ctrl+o shows every tool call in full (diffs, output) · click a tool line to open just that one",
                         "/perms ask: Claude Code asks first · y allow · n deny · a always allow that tool",
-                        "F1-F7 apps · F8 play/pause · alt p palette · alt n terminal beside this",
+                        "F1-F9 apps · F12 play/pause · alt p palette · alt n terminal beside this",
                     ]
                     .map(String::from),
                 );
@@ -867,14 +880,14 @@ impl Pane for Chat {
             if has_activity {
                 v.push(("ctrl+o", expand_hint));
             }
-            v.extend([("F2-F7", "apps"), ("F8", "play/pause"), ("alt p", "palette")]);
+            v.extend([("F1-F9", "apps"), ("alt p", "palette")]);
             v
         } else {
             let mut v = vec![("enter", "send"), ("ctrl+r", "regenerate"), ("ctrl+n", "new chat"), ("/", "commands")];
             if has_activity {
                 v.push(("ctrl+o", expand_hint));
             }
-            v.extend([("F2-F7", "apps"), ("F8", "play/pause"), ("alt p", "palette")]);
+            v.extend([("F1-F9", "apps"), ("alt p", "palette")]);
             v
         };
         let area = ui::hint_line(f, area, &hints, t);
@@ -1282,6 +1295,29 @@ mod tests {
         c.input.clear();
         c.cursor = 0;
         println!("{}", k.render_side(&mut c, 32, 24));
+    }
+
+    #[test]
+    fn chat_list_order_stable_when_clicking() {
+        let k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.chats = (0..4)
+            .map(|i| {
+                let mut ch = store::Chat::new("claude");
+                ch.id = format!("t{i}");
+                ch.title = format!("chat {i}");
+                ch.updated = 1000.0 - i as f64;
+                ch.messages.push(store::Msg { role: "user".into(), content: format!("hi {i}"), ..Default::default() });
+                ch
+            })
+            .collect();
+        let order = |c: &Chat| c.chats.iter().map(|x| x.id.clone()).collect::<Vec<_>>();
+        let before = order(&c);
+        for i in [2, 0, 3, 1, 2] {
+            c.open_chat(i);
+            assert_eq!(c.chat.id, format!("t{i}"), "clicking row {i} opens that chat");
+            assert_eq!(order(&c), before, "just opening chats must not reorder the list");
+        }
     }
 
     #[test]

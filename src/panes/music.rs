@@ -845,7 +845,7 @@ impl Pane for Music {
             return false;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // F8 sends a space to this pane from anywhere: when we aren't the focused pane it's always play/pause
+        // F12 sends a space to this pane from anywhere: when we aren't the focused pane it's always play/pause
         if self.searching && cx.focused {
             match key.code {
                 KeyCode::Esc => {
