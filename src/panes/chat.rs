@@ -1,6 +1,10 @@
-//! The ai app, nest style: chat list in the sidebar, messages (your words in boxes on the right, replies with a
-//! header and markdown on the left), the big logo on a new chat, a composer with a / command menu.
+//! The ai app: chat list in the sidebar, messages (your words in boxes on the right, replies with a header and
+//! markdown on the left), the big logo on a new chat, a composer with a / command menu. Coding agents (Claude
+//! Code, Codex) show their whole transcript live: every tool call, diffs, command output, todos, subagents.
 
+mod activity;
+mod agent;
+pub mod approve;
 mod md;
 pub mod providers;
 mod store;
@@ -16,7 +20,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,16 +30,9 @@ use unicode_width::UnicodeWidthStr;
 const COMMANDS: &[(&str, &str, &str)] = &[
     ("/new", "", "start a new chat"),
     ("/retry", "", "regenerate the last reply"),
-    ("/model", "<ai> [model]", "switch AI: wren, claude, codex, ollama, openai, anthropic"),
-    ("/mode", "<fast|balanced|smart>", "wren: fast = quick + simpler · smart = slower, 2 drafts, best kept"),
+    ("/model", "<ai> [model]", "switch AI: claude, codex, ollama, openai, anthropic"),
     ("/cwd", "<folder>", "folder Claude Code / Codex work in for this chat"),
-    ("/perms", "<ask|edits|full|read>", "what agents may do: edits (default), full, read-only, ask"),
-    ("/memory", "", "what wren remembers about you"),
-    ("/remember", "<fact>", "tell wren something to remember"),
-    ("/forget", "<text>", "forget memories containing <text>"),
-    ("/best", "", "wren: rewrite the last reply in smart mode (2 drafts, best kept)"),
-    ("/research", "<question>", "wren: look it up on the web first, then answer"),
-    ("/web", "<on|off>", "wren: allow web lookups (on by default)"),
+    ("/perms", "<ask|edits|full|read>", "what agents may do: edits (default), full, read-only, ask first"),
     ("/key", "<openai|anthropic> <key>", "save an API key"),
     ("/note", "", "save the last reply to notes"),
     ("/save", "", "export this chat as a markdown file"),
@@ -46,7 +43,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/music", "", "go to the music app"),
     ("/sidebar", "", "hide / show the sidebar"),
     ("/icons", "", "nerd font icons on / off"),
-    ("/info", "", "what's running: AI, model, folder, memory"),
+    ("/info", "", "what's running: AI, model, folder"),
     ("/delete", "", "delete this chat"),
     ("/help", "", "keys and commands"),
     ("/quit", "", "quit oriel"),
@@ -64,7 +61,7 @@ struct MenuItem {
 
 const SUGGESTIONS: &[&str] = &["explain how rainbows form", "give me 3 tips for better sleep", "code a snake game in html", "what is a python function?"];
 
-const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+use activity::SPIN;
 const VERBS: &[&str] = &["thinking", "pondering", "noodling", "brewing", "untangling", "scheming", "percolating", "tinkering"];
 
 struct Stream {
@@ -72,6 +69,7 @@ struct Stream {
     inbox: Arc<Mutex<Vec<Ev>>>,
     status: String,
     started: Instant,
+    tokens: u64,
 }
 
 #[derive(Clone)]
@@ -88,15 +86,20 @@ pub struct Chat {
     scroll: usize, // lines up from the bottom; 0 = follow the end
     stream: Option<Stream>,
     menu_sel: usize,
-    cache: HashMap<usize, (u64, Vec<Line<'static>>)>,
-    memory: Vec<String>,
+    cache: HashMap<usize, (u64, Vec<Line<'static>>, Vec<(usize, String)>)>,
     provider: String,
-    mode: String,
     perms: String,
-    web: bool,
-    once_mode: Option<String>,
-    once_research: bool,
     keys: HashMap<String, String>,
+    /// ctrl+o: every call shows its full diff / output.
+    expanded: bool,
+    /// Calls clicked open (closed, when expanded).
+    open: HashSet<String>,
+    /// Screen row -> call id, for clicks.
+    tool_hits: Vec<(u16, String)>,
+    /// Claude Code waiting for a yes/no (/perms ask), oldest first.
+    asks: VecDeque<approve::Ask>,
+    /// Tools the user said "always" to, for this session.
+    always: HashSet<String>,
     info: Vec<String>,
     avail: Vec<&'static str>,
     confirm_delete: bool,
@@ -108,14 +111,9 @@ pub struct Chat {
     offset: i64,
 }
 
-fn memory_path() -> PathBuf {
-    crate::config::data_dir().join("memory.json")
-}
-
 impl Chat {
     pub fn new(cfg: &crate::config::Config) -> Self {
         let chats = store::load_all();
-        let memory = std::fs::read_to_string(memory_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let avail = providers::available(&cfg.ai);
         // the configured AI if this machine has it, else the first one it does have
         let provider = if !cfg.ai.provider.is_empty() && avail.contains(&cfg.ai.provider.as_str()) {
@@ -132,14 +130,14 @@ impl Chat {
             stream: None,
             menu_sel: 0,
             cache: HashMap::new(),
-            memory,
             provider,
-            mode: if cfg.ai.wren_mode.is_empty() { "balanced".into() } else { cfg.ai.wren_mode.clone() },
             perms: "edits".into(),
-            web: true,
-            once_mode: None,
-            once_research: false,
             keys: HashMap::new(),
+            expanded: false,
+            open: HashSet::new(),
+            tool_hits: vec![],
+            asks: VecDeque::new(),
+            always: HashSet::new(),
             info: vec![],
             avail,
             confirm_delete: false,
@@ -152,8 +150,12 @@ impl Chat {
         }
     }
 
+    /// The chat's AI, or the current default when it used one oriel doesn't have (an old chat).
     fn provider_of(&self) -> String {
-        self.chat.provider.clone().unwrap_or_else(|| self.provider.clone())
+        match &self.chat.provider {
+            Some(p) if providers::is_known(p) => p.clone(),
+            _ => self.provider.clone(),
+        }
     }
 
     /// Where CLI agents run: the chat's folder, else where oriel started — never the home folder itself (on
@@ -179,12 +181,6 @@ impl Chat {
             return w;
         }
         d
-    }
-
-    fn save_memory(&self) {
-        if let Ok(s) = serde_json::to_string_pretty(&self.memory) {
-            let _ = std::fs::write(memory_path(), s);
-        }
     }
 
     fn new_chat(&mut self) {
@@ -221,9 +217,11 @@ impl Chat {
     fn stop(&mut self) {
         if let Some(s) = self.stream.take() {
             s.stop.store(true, Ordering::SeqCst);
+            self.asks.clear(); // unanswered approvals become a no
             if let Some(m) = self.chat.messages.last_mut() {
                 if m.role == "assistant" {
-                    if m.content.trim().is_empty() {
+                    activity::settle(&mut m.parts, "stopped");
+                    if m.content.trim().is_empty() && m.parts.is_empty() {
                         m.content = "(stopped)".into();
                     }
                     m.note = Some(format!("{} · stopped", m.note.clone().unwrap_or_default()).trim_start_matches(" · ").to_string());
@@ -243,7 +241,7 @@ impl Chat {
                 self.chat.cwd = Some(self.launch_dir.to_string_lossy().to_string());
             }
         }
-        self.chat.messages.push(store::Msg { role: "user".into(), content: text, model: None, note: None, steps: vec![] });
+        self.chat.messages.push(store::Msg { role: "user".into(), content: text, ..Default::default() });
         self.start_reply(cx);
     }
 
@@ -251,7 +249,7 @@ impl Chat {
     fn start_reply(&mut self, cx: &mut Cx) {
         let provider = self.provider_of();
         let messages: Vec<(String, String)> = self.chat.messages.iter().map(|m| (m.role.clone(), m.content.clone())).collect();
-        self.chat.messages.push(store::Msg { role: "assistant".into(), content: String::new(), model: Some(provider.clone()), note: None, steps: vec![] });
+        self.chat.messages.push(store::Msg { role: "assistant".into(), model: Some(provider.clone()), ..Default::default() });
         self.info.clear();
         self.scroll = 0;
         let stop = Arc::new(AtomicBool::new(false));
@@ -264,15 +262,11 @@ impl Chat {
             cfg.anthropic_key = k.clone();
         }
         let req = providers::Request {
-            web: self.web,
-            research: std::mem::take(&mut self.once_research),
             provider: provider.clone(),
             model: self.chat.model.clone(),
             messages,
             cwd: self.workdir(),
             perms: self.perms.clone(),
-            mode: self.once_mode.take().unwrap_or_else(|| self.mode.clone()),
-            memory: self.memory.clone(),
             state: self.chat.state.clone(),
             cfg,
         };
@@ -281,7 +275,7 @@ impl Chat {
             ib.lock().unwrap().push(ev);
             waker.wake();
         });
-        self.stream = Some(Stream { stop, inbox, status: String::new(), started: Instant::now() });
+        self.stream = Some(Stream { stop, inbox, status: String::new(), started: Instant::now(), tokens: 0 });
     }
 
     fn retry(&mut self, cx: &mut Cx) {
@@ -313,11 +307,10 @@ impl Chat {
                     }
                 } else {
                     let mut a = arg.split_whitespace();
-                    let id = a.next().unwrap_or("wren").to_lowercase();
+                    let id = a.next().unwrap_or("claude").to_lowercase();
                     if providers::PROVIDERS.iter().any(|p| p.0 == id) && !self.avail.contains(&id.as_str()) {
                         self.info.push(format!("{} isn't set up on this computer", providers::label(&id)));
                         self.info.push(match id.as_str() {
-                            "wren" => "  wren runs on its owner's PC (its server on 127.0.0.1:5237)".into(),
                             "claude" => "  install Claude Code: npm i -g @anthropic-ai/claude-code, then run `claude` once to sign in".into(),
                             "codex" => "  install Codex: npm i -g @openai/codex, then `codex login`".into(),
                             "ollama" => "  install Ollama from ollama.com and pull a model (ollama pull llama3.2)".into(),
@@ -332,14 +325,6 @@ impl Chat {
                     } else {
                         self.info.push(format!("no AI called {id} — try /model"));
                     }
-                }
-            }
-            "/mode" => {
-                if ["fast", "balanced", "smart"].contains(&arg.as_str()) {
-                    self.mode = arg.clone();
-                    cx.notify(format!("wren mode: {arg}"));
-                } else {
-                    self.info.push("/mode fast · balanced · smart".into());
                 }
             }
             "/cwd" => {
@@ -357,53 +342,11 @@ impl Chat {
                     self.perms = arg.clone();
                     cx.notify(format!("agent permissions: {arg}"));
                 } else {
-                    self.info.push("/perms edits (default: edit files in the folder) · full (anything) · read (read-only) · ask (refuse what needs approval)".into());
+                    self.info.push("/perms edits (default: edit files in the folder) · full (anything) · read (read-only) · ask (Claude Code asks you before edits and commands; Codex: read-only)".into());
                 }
-            }
-            "/memory" => {
-                if self.memory.is_empty() {
-                    self.info.push("wren doesn't remember anything yet. Tell it things like \"my name is …\" or use /remember".into());
-                } else {
-                    self.info.push("wren remembers:".into());
-                    for m in &self.memory {
-                        self.info.push(format!("  • {m}"));
-                    }
-                }
-            }
-            "/remember" if !arg.is_empty() => {
-                self.memory.push(arg.clone());
-                self.save_memory();
-                cx.notify("remembered");
-            }
-            "/forget" if !arg.is_empty() => {
-                let before = self.memory.len();
-                let a = arg.to_lowercase();
-                self.memory.retain(|m| !m.to_lowercase().contains(&a));
-                self.save_memory();
-                cx.notify(format!("forgot {} memor{}", before - self.memory.len(), if before - self.memory.len() == 1 { "y" } else { "ies" }));
             }
             "/theme" if !arg.is_empty() => cx.act(Action::SetTheme(arg)),
             "/theme" => cx.act(Action::Palette("theme ".into())),
-            "/best" => {
-                if self.provider_of() == "wren" {
-                    self.once_mode = Some("smart".into());
-                    self.retry(cx);
-                } else {
-                    self.info.push("/best is wren's smart mode; other AIs: /retry".into());
-                }
-            }
-            "/research" if !arg.is_empty() => {
-                self.once_research = true;
-                self.send(arg, cx);
-            }
-            "/web" => {
-                self.web = match arg.as_str() {
-                    "on" => true,
-                    "off" => false,
-                    _ => !self.web,
-                };
-                cx.notify(format!("web lookups {}", if self.web { "on" } else { "off" }));
-            }
             "/key" => {
                 let mut a = arg.split_whitespace();
                 match (a.next(), a.next()) {
@@ -457,7 +400,7 @@ impl Chat {
                     let path = dir.join(format!("{}.md", name.trim()));
                     let mut md = format!("# {}\n\n", self.chat.title);
                     for m in &self.chat.messages {
-                        let who = if m.role == "user" { "you".to_string() } else { providers::label(m.model.as_deref().unwrap_or("wren")).to_lowercase() };
+                        let who = if m.role == "user" { "you".to_string() } else { providers::label(m.model.as_deref().unwrap_or("ai")).to_lowercase() };
                         md.push_str(&format!("**{who}:**\n\n{}\n\n", m.content));
                     }
                     match std::fs::write(&path, md) {
@@ -476,12 +419,8 @@ impl Chat {
             "/info" => {
                 let p = self.provider_of();
                 self.info.push(format!("oriel {} · {} ({})", env!("CARGO_PKG_VERSION"), providers::label(&p), self.chat.model.clone().unwrap_or("default model".into())));
-                if p == "wren" {
-                    self.info.push(format!("  wren mode {} · web lookups {} · servers: {}", self.mode, if self.web { "on" } else { "off" }, cx.config.ai.wren_urls.join(", ")));
-                } else {
-                    self.info.push(format!("  works in {} · permissions {}", self.workdir().display(), self.perms));
-                }
-                self.info.push(format!("  {} memories · {} saved chats · config: {}", self.memory.len(), self.chats.len(), crate::config::path().display()));
+                self.info.push(format!("  works in {} · permissions {}", self.workdir().display(), self.perms));
+                self.info.push(format!("  {} saved chats · config: {}", self.chats.len(), crate::config::path().display()));
             }
             "/delete" => self.confirm_delete = true,
             "/help" => {
@@ -489,6 +428,8 @@ impl Chat {
                     [
                         "enter send · esc stop · ctrl+r regenerate · ctrl+n new chat · ctrl+d delete chat",
                         "pgup/pgdn or the wheel scroll · ↑ in an empty box recalls your last message",
+                        "ctrl+o shows every tool call in full (diffs, output) · click a tool line to open just that one",
+                        "/perms ask: Claude Code asks first · y allow · n deny · a always allow that tool",
                         "F1-F7 apps · F8 play/pause · alt p palette · alt n terminal beside this",
                     ]
                     .map(String::from),
@@ -501,23 +442,20 @@ impl Chat {
         }
     }
 
-    /// Choices for a command's argument (what nest listed after `/model `, `/theme `...).
+    /// Choices for a command's argument (what gets listed after `/model `, `/theme `...).
     fn arg_options(&self, cmd: &str) -> Vec<(String, String)> {
         let pairs = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
         match cmd {
             "/model" => providers::PROVIDERS
                 .iter()
-                .filter(|(id, ..)| self.avail.contains(id) || *id != "wren") // wren only where it's installed
                 .map(|(id, label, what)| (id.to_string(), if self.avail.contains(id) { format!("{label} — {what}") } else { format!("{label} — not set up here") }))
                 .collect(),
-            "/mode" => pairs(&[("fast", "quick and simpler"), ("balanced", "the default"), ("smart", "slower: 2 drafts, the best is kept")]),
             "/perms" => pairs(&[
                 ("edits", "edit files in the chat's folder (default)"),
                 ("full", "anything, never asks"),
                 ("read", "read-only"),
-                ("ask", "refuse whatever would need approval"),
+                ("ask", "Claude Code asks you first (y / n / a)"),
             ]),
-            "/web" => pairs(&[("on", "wren may look things up"), ("off", "answer from what it knows")]),
             "/key" => pairs(&[("openai", "OpenAI-compatible key"), ("anthropic", "Anthropic API key")]),
             "/theme" => crate::theme::names().into_iter().map(|n| (n.clone(), if n == "omarchy" { "follows your Omarchy theme".into() } else if n == "terminal" { "your terminal's own colours".into() } else { String::new() })).collect(),
             "/cwd" => {
@@ -579,24 +517,26 @@ impl Chat {
     }
 
     // ------------------------------------------------------------ drawing helpers
-    fn msg_lines(&mut self, i: usize, width: usize, cx: &Cx) -> Vec<Line<'static>> {
+    /// A message's lines, plus (line index, call id) for each tool line in it.
+    fn msg_lines(&mut self, i: usize, width: usize, cx: &Cx) -> (Vec<Line<'static>>, Vec<(usize, String)>) {
         let t = cx.theme;
         let m = &self.chat.messages[i];
         let streaming_last = self.stream.is_some() && i + 1 == self.chat.messages.len();
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            (m.content.len(), m.note.as_deref().unwrap_or(""), m.steps.len(), width, streaming_last, t.name.as_str()).hash(&mut h);
+            (m.content.len(), m.note.as_deref().unwrap_or(""), m.steps.len(), m.parts.len(), width, streaming_last, t.name.as_str()).hash(&mut h);
             h.finish()
         };
         if !streaming_last {
-            if let Some((k, lines)) = self.cache.get(&i) {
+            if let Some((k, lines, hits)) = self.cache.get(&i) {
                 if *k == key {
-                    return lines.clone();
+                    return (lines.clone(), hits.clone());
                 }
             }
         }
         let mut out: Vec<Line<'static>> = vec![];
+        let mut hits: Vec<(usize, String)> = vec![];
         if m.role == "user" {
             // a box on the right with "you" set into its top border
             let max_w = (width * 7 / 10).max(20);
@@ -623,10 +563,9 @@ impl Chat {
             }
             out.push(Line::from(vec![Span::raw(pad), Span::styled(format!("╰{}╯", "─".repeat(box_w - 2)), frame)]));
         } else {
-            let who = m.model.clone().unwrap_or_else(|| "wren".into());
-            let icon = if who == "wren" { "wren" } else { "ai" };
+            let who = m.model.clone().unwrap_or_default();
             out.push(Line::from(vec![
-                Span::styled(ui::lead(icon), Style::default().fg(t.accent)),
+                Span::styled(ui::lead("ai"), Style::default().fg(t.accent)),
                 Span::styled(providers::label(&who).to_lowercase(), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
             ]));
             out.push(Line::raw(""));
@@ -653,7 +592,10 @@ impl Chat {
             if !m.steps.is_empty() && !m.content.is_empty() {
                 out.push(Line::raw(""));
             }
-            if !m.content.is_empty() {
+            if !m.parts.is_empty() {
+                let view = activity::View { expanded: self.expanded, open: &self.open, live: streaming_last, time: cx.time };
+                activity::render(&m.parts, width, t, &view, &mut out, &mut hits);
+            } else if !m.content.is_empty() {
                 out.extend(md::render(&m.content, width.saturating_sub(1), "  ", t));
             }
             if let Some(n) = &m.note {
@@ -663,7 +605,110 @@ impl Chat {
         }
         out.push(Line::raw(""));
         if !streaming_last {
-            self.cache.insert(i, (key, out.clone()));
+            self.cache.insert(i, (key, out.clone(), hits.clone()));
+        }
+        (out, hits)
+    }
+
+    /// Pinned above the composer while a reply streams: a pending approval, the live status line
+    /// ("⠹ Editing src/app.rs… (12s · ↓ 1.2k tokens · esc to stop)") and the agent's todo progress.
+    fn pinned_lines(&self, width: usize, cx: &Cx) -> Vec<Line<'static>> {
+        let t = cx.theme;
+        let mut out: Vec<Line<'static>> = vec![];
+        let Some(s) = &self.stream else { return out };
+        let muted = ui::muted(t);
+        let m = self.chat.messages.last();
+        let parts: &[store::Part] = m.map(|m| m.parts.as_slice()).unwrap_or(&[]);
+        out.push(Line::raw(""));
+        // ---- an approval prompt
+        if let Some(a) = self.asks.front() {
+            let bar = Span::styled("  ▌ ", Style::default().fg(t.shine));
+            let mut head = vec![
+                bar.clone(),
+                Span::styled("allow ", Style::default().fg(t.shine).add_modifier(Modifier::BOLD)),
+                Span::styled(a.label.clone(), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            ];
+            if !a.target.is_empty() {
+                head.push(Span::raw(" "));
+                head.push(Span::styled(ui::fit(&a.target, width.saturating_sub(20 + a.label.len())), Style::default().fg(t.fg)));
+            }
+            head.push(Span::styled(" ?", Style::default().fg(t.shine).add_modifier(Modifier::BOLD)));
+            if self.asks.len() > 1 {
+                head.push(Span::styled(format!("  (+{} more)", self.asks.len() - 1), muted));
+            }
+            out.push(Line::from(head));
+            let dup = a.body.len() == 1 && agent::split_line(&a.body[0]).2 == a.target;
+            let show = if dup { 0 } else { a.body.len().min(6) };
+            for l in &a.body[..show] {
+                let (k, _, text) = agent::split_line(l);
+                let style = match k {
+                    '+' => Style::default().fg(t.good),
+                    '-' => Style::default().fg(t.danger),
+                    '>' => Style::default().fg(t.fg),
+                    _ => muted,
+                };
+                let mark = if matches!(k, '+' | '-') { format!("{k} ") } else { String::new() };
+                out.push(Line::from(vec![bar.clone(), Span::styled(format!("  {mark}{}", ui::fit(text, width.saturating_sub(10))), style)]));
+            }
+            if a.body.len() > show && !dup {
+                out.push(Line::from(vec![bar.clone(), Span::styled(format!("  … {} more lines", a.body.len() - show), muted)]));
+            }
+            out.push(Line::from(vec![
+                bar,
+                Span::styled("y", ui::bold_accent(t)),
+                Span::styled(" allow  ", muted),
+                Span::styled("n", ui::bold_accent(t)),
+                Span::styled(" deny  ", muted),
+                Span::styled("a", ui::bold_accent(t)),
+                Span::styled(format!(" always allow {} in this chat  ", a.label), muted),
+                Span::styled("esc", ui::bold_accent(t)),
+                Span::styled(" stop", muted),
+            ]));
+            out.push(Line::raw(""));
+        }
+        // ---- the status line
+        let e = s.started.elapsed();
+        let spin = SPIN[(e.as_millis() / 100) as usize % SPIN.len()];
+        let action = if !self.asks.is_empty() {
+            "waiting for you".to_string()
+        } else if let Some(a) = activity::current_action(parts) {
+            a
+        } else if m.map(|m| !m.content.is_empty()).unwrap_or(false) {
+            "writing".into()
+        } else {
+            VERBS[(e.as_secs() / 3) as usize % VERBS.len()].to_string()
+        };
+        let mut meta = vec![agent::human_ms(e.as_millis() as u64 / 1000 * 1000)];
+        if s.tokens > 0 {
+            meta.push(format!("↓ {} tokens", agent::human_tokens(s.tokens)));
+        }
+        if !s.status.is_empty() && parts.is_empty() {
+            meta.push(s.status.clone());
+        }
+        meta.push("esc to stop".into());
+        let act = ui::fit(&format!("{}…", activity::capitalize(&action)), width.saturating_sub(40).max(20));
+        out.push(Line::from(vec![
+            Span::styled(format!("  {spin} "), ui::accent(t)),
+            Span::styled(act, Style::default().fg(t.shine).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" ({})", meta.join(" · ")), muted),
+        ]));
+        // ---- todo progress: "3/7 done · now: writing tests" and the items around the current one
+        if let Some(items) = activity::todos(parts).filter(|v| !v.is_empty()) {
+            let done = items.iter().filter(|x| x.status == "completed").count();
+            let cur = items.iter().position(|x| x.status == "in_progress");
+            let mut line = vec![Span::styled("    └  ", muted), Span::styled(format!("{done}/{} done", items.len()), Style::default().fg(t.good))];
+            if let Some(c) = cur {
+                let it = &items[c];
+                let now = if it.active.is_empty() { &it.text } else { &it.active };
+                line.push(Span::styled(" · now: ", muted));
+                line.push(Span::styled(ui::fit(now, width.saturating_sub(30)), Style::default().fg(t.fg)));
+            }
+            out.push(Line::from(line));
+            let keep = 5.min(items.len());
+            let first = cur.unwrap_or(done.min(items.len() - 1)).saturating_sub(1).min(items.len() - keep);
+            for it in &items[first..first + keep] {
+                out.push(activity::todo_row(it, "       ", width, t));
+            }
         }
         out
     }
@@ -702,12 +747,11 @@ impl Chat {
             "ollama" => "ollama",
             "openai" => "openai",
             "anthropic" => "claude",
-            _ => "wren",
+            _ => "oriel",
         };
         let logo = crate::font::render(word);
         let lw = logo.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
         let info = match p.as_str() {
-            "wren" => format!("wren · {} mode · research + memory", self.mode),
             "claude" | "codex" => format!("{} · {} · works in {} ({})", providers::label(&p).to_lowercase(), self.chat.model.clone().unwrap_or("default".into()), self.workdir().display(), self.perms),
             _ => format!("{} · {}", providers::label(&p).to_lowercase(), self.chat.model.clone().unwrap_or("default".into())),
         };
@@ -756,7 +800,6 @@ impl Pane for Chat {
         let p = self.provider_of();
         let mut s = providers::label(&p).to_lowercase();
         match p.as_str() {
-            "wren" => s.push_str(&format!(" · {}", self.mode)),
             "claude" | "codex" => s.push_str(&format!(" · {} · {} · {}", self.chat.model.clone().unwrap_or("default".into()), ui::fit(&self.workdir().to_string_lossy(), 40), self.perms)),
             _ => s.push_str(&format!(" · {}", self.chat.model.clone().unwrap_or("default".into()))),
         }
@@ -773,19 +816,20 @@ impl Pane for Chat {
         let Some(s) = &mut self.stream else { return };
         let evs: Vec<Ev> = std::mem::take(&mut *s.inbox.lock().unwrap());
         let mut finished = false;
-        let mut save_mem = false;
         for ev in evs {
             let Some(m) = self.chat.messages.last_mut() else { break };
             match ev {
-                Ev::Token(t) => m.content.push_str(&t),
+                Ev::Token(t) => activity::push_text(m, &t),
+                Ev::Thinking { text, tokens } => activity::push_thinking(m, &text, tokens),
+                Ev::Tool(tool) => activity::upsert_tool(m, tool),
+                Ev::Todos(items) => activity::set_todos(m, items),
+                Ev::Usage(n) => s.tokens = n,
                 Ev::Status(st) => s.status = st,
-                Ev::Step(l, st, d) => {
-                    // a step with the same label updates in place (running -> done)
-                    if let Some(x) = m.steps.iter_mut().find(|x| x.0 == l) {
-                        x.1 = st;
-                        x.2 = d;
+                Ev::Ask(a) => {
+                    if self.always.contains(&a.tool) {
+                        let _ = a.reply.send(approve::Decision::Allow);
                     } else {
-                        m.steps.push((l, st, d));
+                        self.asks.push_back(a);
                     }
                 }
                 Ev::State(k, v) => {
@@ -795,25 +839,16 @@ impl Pane for Chat {
                         o.insert(field.to_string(), serde_json::Value::String(v));
                     }
                 }
-                Ev::Done { note, sources, memory } => {
-                    let mut n = note.unwrap_or_default();
-                    if !sources.is_empty() {
-                        let list: Vec<String> = sources.iter().take(4).map(|(t, _)| ui::fit(t, 36)).collect();
-                        n = format!("{n} · sources: {}", list.join(" · ")).trim_start_matches(" · ").to_string();
-                    }
-                    if !n.is_empty() {
+                Ev::Done { note } => {
+                    activity::settle(&mut m.parts, "done");
+                    if let Some(n) = note.filter(|n| !n.is_empty()) {
                         m.note = Some(n);
-                    }
-                    if let Some(mem) = memory {
-                        if mem != self.memory {
-                            self.memory = mem;
-                            save_mem = true;
-                        }
                     }
                     finished = true;
                 }
                 Ev::Error(e) => {
-                    if m.content.trim().is_empty() {
+                    activity::settle(&mut m.parts, "stopped");
+                    if m.content.trim().is_empty() && m.parts.is_empty() {
                         m.content = format!("⚠ {e}");
                     } else {
                         m.note = Some(format!("⚠ {e}"));
@@ -822,11 +857,9 @@ impl Pane for Chat {
                 }
             }
         }
-        if save_mem {
-            self.save_memory();
-        }
         if finished {
             self.stream = None;
+            self.asks.clear();
             self.persist();
             let _ = cx;
         }
@@ -834,20 +867,43 @@ impl Pane for Chat {
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
-        let hints: &[(&str, &str)] = if self.confirm_delete {
-            &[("y", "delete this chat"), ("esc", "keep it")]
+        let has_activity = self.chat.messages.iter().any(|m| !m.parts.is_empty());
+        let expand_hint = if self.expanded { "collapse" } else { "expand tools" };
+        let hints: Vec<(&str, &str)> = if self.confirm_delete {
+            vec![("y", "delete this chat"), ("esc", "keep it")]
+        } else if !self.asks.is_empty() {
+            vec![("y", "allow"), ("n", "deny"), ("a", "always allow"), ("esc", "stop")]
         } else if self.stream.is_some() {
-            &[("esc", "stop"), ("F2-F7", "apps"), ("F8", "play/pause"), ("alt p", "palette")]
+            let mut v = vec![("esc", "stop")];
+            if has_activity {
+                v.push(("ctrl+o", expand_hint));
+            }
+            v.extend([("F2-F7", "apps"), ("F8", "play/pause"), ("alt p", "palette")]);
+            v
         } else {
-            &[("enter", "send"), ("ctrl+r", "regenerate"), ("ctrl+n", "new chat"), ("/", "commands"), ("F2-F7", "apps"), ("F8", "play/pause"), ("alt p", "palette")]
+            let mut v = vec![("enter", "send"), ("ctrl+r", "regenerate"), ("ctrl+n", "new chat"), ("/", "commands")];
+            if has_activity {
+                v.push(("ctrl+o", expand_hint));
+            }
+            v.extend([("F2-F7", "apps"), ("F8", "play/pause"), ("alt p", "palette")]);
+            v
         };
-        let area = ui::hint_line(f, area, hints, t);
+        let area = ui::hint_line(f, area, &hints, t);
         if area.height < 5 {
             return;
         }
         let comp = Rect { y: area.bottom() - 3, height: 3, ..area };
-        let body = Rect { height: area.height - 3, ..area };
-        let body = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };
+        let above = Rect { height: area.height - 3, ..area };
+        let above = Rect { x: above.x + 1, width: above.width.saturating_sub(2), ..above };
+        // what's pinned above the composer while an agent works: an approval prompt, the status line, the todos
+        let mut pinned = self.pinned_lines(above.width as usize, cx);
+        pinned.truncate((above.height as usize).saturating_sub(3));
+        let ph = pinned.len() as u16;
+        let body = Rect { height: above.height - ph, ..above };
+        if ph > 0 {
+            f.render_widget(Paragraph::new(pinned), Rect { y: body.bottom(), height: ph, ..above });
+        }
+        self.tool_hits.clear();
 
         // ---- messages (or the hero on a new chat)
         if self.chat.messages.is_empty() && self.info.is_empty() {
@@ -855,24 +911,12 @@ impl Pane for Chat {
         } else {
             let width = body.width as usize;
             let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+            let mut hits: Vec<(usize, String)> = vec![];
             for i in 0..self.chat.messages.len() {
-                lines.extend(self.msg_lines(i, width, cx));
-            }
-            if let Some(s) = &self.stream {
-                let last_empty = self.chat.messages.last().map(|m| m.content.is_empty()).unwrap_or(true);
-                if last_empty {
-                    // drop the trailing blank of the empty reply and show the spinner under its header
-                    lines.pop();
-                    let e = s.started.elapsed();
-                    let spin = SPIN[(e.as_millis() / 100) as usize % SPIN.len()];
-                    let verb = VERBS[(e.as_secs() / 3) as usize % VERBS.len()];
-                    let status = if s.status.is_empty() { String::new() } else { format!(" · {}", s.status) };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {spin} "), ui::accent(t)),
-                        Span::styled(format!("{verb}…"), Style::default().fg(t.shine)),
-                        Span::styled(format!("{status} · {}s", e.as_secs()), ui::muted(t)),
-                    ]));
-                }
+                let (l, h) = self.msg_lines(i, width, cx);
+                let off = lines.len();
+                hits.extend(h.into_iter().map(|(n, id)| (n + off, id)));
+                lines.extend(l);
             }
             for l in &self.info {
                 lines.extend(md::wrap(vec![Span::styled(l.clone(), ui::muted(t))], width, "  ", "    "));
@@ -881,6 +925,7 @@ impl Pane for Chat {
             let max_scroll = lines.len().saturating_sub(h);
             self.scroll = self.scroll.min(max_scroll);
             let start = max_scroll - self.scroll;
+            self.tool_hits = hits.into_iter().filter(|(n, _)| *n >= start && *n < start + h).map(|(n, id)| (body.y + (n - start) as u16, id)).collect();
             let visible: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
             f.render_widget(Paragraph::new(visible), body);
             if max_scroll > 0 {
@@ -974,8 +1019,42 @@ impl Pane for Chat {
             }
             return true;
         }
+        // an approval Claude Code is waiting on takes y / n / a first
+        if let Some(a) = self.asks.front() {
+            let d = match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => Some(approve::Decision::Allow),
+                KeyCode::Char('n') | KeyCode::Char('N') if !ctrl => Some(approve::Decision::Deny),
+                KeyCode::Char('a') | KeyCode::Char('A') if !ctrl => {
+                    self.always.insert(a.tool.clone());
+                    Some(approve::Decision::Allow)
+                }
+                _ => None,
+            };
+            if let Some(d) = d {
+                if let Some(a) = self.asks.pop_front() {
+                    let _ = a.reply.send(d);
+                }
+                // "always" also answers the ones already queued for that tool
+                if let Some(tool) = self.asks.front().map(|a| a.tool.clone()) {
+                    if self.always.contains(&tool) {
+                        while let Some(a) = self.asks.front() {
+                            if !self.always.contains(&a.tool) {
+                                break;
+                            }
+                            let _ = self.asks.pop_front().map(|a| a.reply.send(approve::Decision::Allow));
+                        }
+                    }
+                }
+                return true;
+            }
+        }
         let items = self.menu();
         match k.code {
+            KeyCode::Char('o') if ctrl => {
+                self.expanded = !self.expanded;
+                self.open.clear();
+                self.cache.clear();
+            }
             KeyCode::Char('n') if ctrl => self.new_chat(),
             KeyCode::Char('r') if ctrl => self.retry(cx),
             KeyCode::Char('d') if ctrl => {
@@ -1107,6 +1186,14 @@ impl Pane for Chat {
             MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
             MouseEventKind::Down(MouseButton::Left) => {
                 let pos = Position { x: ev.column, y: ev.row };
+                // a tool line: open / close just that call
+                if let Some((_, id)) = self.tool_hits.iter().find(|(y, _)| *y == ev.row).cloned() {
+                    if !self.open.remove(&id) {
+                        self.open.insert(id);
+                    }
+                    self.cache.clear();
+                    return;
+                }
                 if self.chat.messages.is_empty() {
                     if let Some((_, s)) = self.hero_hits.iter().find(|(r, _)| r.contains(pos)).cloned() {
                         self.send(s, cx);
@@ -1181,13 +1268,13 @@ mod tests {
         let mut c = Chat::new(&k.config);
         println!("{}", k.render_html(&mut c, 130, 40, "target/snap/chat-hero.html"));
         // a canned conversation (no network) to check the message layout
-        c.chat.messages.push(store::Msg { role: "user".into(), content: "what's a good name for a terminal app?".into(), model: None, note: None, steps: vec![] });
+        c.chat.messages.push(store::Msg { role: "user".into(), content: "what's a good name for a terminal app?".into(), ..Default::default() });
         c.chat.messages.push(store::Msg {
             role: "assistant".into(),
             content: "A few ideas:\n\n- **oriel** — a window that juts out\n- `nest`, but taken\n\n```rust\nfn main() { println!(\"hi\"); }\n```\nPick the one you like.".into(),
-            model: Some("wren".into()),
-            note: Some("34 tokens · 171 tok/s · balanced".into()),
-            steps: vec![],
+            model: Some("ollama".into()),
+            note: Some("34 tokens · 171 tok/s · llama3.2".into()),
+            ..Default::default()
         });
         c.chat.title = "names".into();
         println!("{}", k.render_html(&mut c, 130, 40, "target/snap/chat-msgs.html"));
@@ -1219,28 +1306,240 @@ mod tests {
         println!("available here: {:?}", providers::available(&k.config.ai));
     }
 
-    /// Talks to Wren's real server if it's up; skipped otherwise. `cargo test chat_wren_live -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn chat_wren_live() {
-        let mut k = Kit::new();
-        let mut c = Chat::new(&k.config);
-        c.chat.provider = Some("wren".into());
-        let mut cx_actions = vec![];
-        {
-            let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut cx_actions, focused: true, time: 1.0 };
-            c.send("what is 12*7?".into(), &mut cx);
+    /// Deletes the test chat from the real chat list even if the test fails half way.
+    struct Forget(String);
+    impl Drop for Forget {
+        fn drop(&mut self) {
+            store::delete(&self.0);
         }
-        for _ in 0..300 {
-            k.wait_wake(&mut c, 100);
-            if c.stream.is_none() {
-                break;
+    }
+
+    /// Run a captured CLI transcript through a parser, as the provider thread would (fake clock: 60 ms a line).
+    fn parse_fixture(text: &str, mut feed: impl FnMut(&serde_json::Value, u64, &mut dyn FnMut(Ev)) -> Result<(), String>) -> Vec<Vec<Ev>> {
+        text.lines()
+            .enumerate()
+            .map(|(i, l)| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                let mut evs = vec![];
+                feed(&v, i as u64 * 60, &mut |e| evs.push(e)).unwrap();
+                evs
+            })
+            .collect()
+    }
+
+    /// A chat mid-reply, as if `send` had started a stream.
+    fn agent_chat(k: &Kit, provider: &str, prompt: &str) -> Chat {
+        let mut c = Chat::new(&k.config);
+        c.provider = provider.into();
+        c.chat.provider = Some(provider.into());
+        c.chat.title = store::title_from(prompt);
+        c.chat.cwd = Some("C:\\work\\demo".into());
+        c.chat.messages.push(store::Msg { role: "user".into(), content: prompt.into(), ..Default::default() });
+        c.chat.messages.push(store::Msg { role: "assistant".into(), model: Some(provider.into()), ..Default::default() });
+        c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0 });
+        c
+    }
+
+    fn deliver(k: &mut Kit, c: &mut Chat, evs: impl IntoIterator<Item = Ev>) {
+        if let Some(s) = &c.stream {
+            s.inbox.lock().unwrap().extend(evs);
+        }
+        k.poll(c);
+    }
+
+    fn all_tools(parts: &[store::Part]) -> Vec<store::Tool> {
+        fn walk(t: &store::Tool, out: &mut Vec<store::Tool>) {
+            out.push(t.clone());
+            t.children.iter().for_each(|c| walk(c, out));
+        }
+        let mut out = vec![];
+        for p in parts {
+            if let store::Part::Tool(t) = p {
+                walk(t, &mut out);
             }
         }
-        let last = c.chat.messages.last().unwrap();
-        println!("reply: {:?}\nnote: {:?}", last.content, last.note);
-        assert!(!last.content.is_empty());
-        store::delete(&c.chat.id); // don't leave a test chat in the list
+        out
+    }
+
+    const CLAUDE_FIXTURE: &str = include_str!("chat/fixtures/claude-stream.jsonl");
+    const CODEX_FIXTURE: &str = include_str!("chat/fixtures/codex-exec.jsonl");
+    const PROMPT: &str = "track 5 steps with todos: create hello.txt (alpha, beta, gamma), change beta to BETA, cat it, grep for gamma, then have a subagent count its lines";
+
+    #[test]
+    fn chat_agent_claude_fixture() {
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", PROMPT);
+        let _forget = Forget(c.chat.id.clone());
+        let mut p = agent::Claude::new(std::path::Path::new("C:\\work\\demo"));
+        let per_line = parse_fixture(CLAUDE_FIXTURE, |v, t, s| p.feed(v, t, s));
+        // live: stop part way, while the Bash call runs
+        let bash_at = CLAUDE_FIXTURE.lines().position(|l| l.contains(r#""name": "Bash""#) && l.contains(r#""type": "assistant""#)).unwrap();
+        let mut rest = per_line.into_iter();
+        for evs in rest.by_ref().take(bash_at + 1) {
+            deliver(&mut k, &mut c, evs);
+        }
+        let s = k.render_html(&mut c, 140, 44, "target/snap/chat-agent-live.html");
+        println!("{s}");
+        assert!(s.contains("Running cat hello.txt…"), "live status line");
+        assert!(s.contains("2/5 done · now: Running cat command"), "pinned todo progress");
+        // the rest, then the end of the reply
+        for evs in rest {
+            deliver(&mut k, &mut c, evs);
+        }
+        deliver(&mut k, &mut c, [Ev::Done { note: Some(p.note(Duration::from_millis(45_300))) }]);
+        assert!(c.stream.is_none());
+        let m = c.chat.messages.last().unwrap();
+        let tools = all_tools(&m.parts);
+        let names: Vec<String> = tools.iter().map(|t| format!("{} {} [{}]", t.label, t.target, t.status)).collect();
+        println!("{names:#?}");
+        // every call in order, todo plumbing hidden, the subagent's Read nested under it
+        assert_eq!(
+            names,
+            ["Write hello.txt [done]", "Update hello.txt [done]", "Bash cat hello.txt [done]", "Grep 'gamma' in hello.txt [done]", "Agent Read hello.txt and count lines [done]", "Read hello.txt [done]"]
+        );
+        assert_eq!(tools[1].summary, "+1 -1");
+        assert!(tools[1].body.iter().any(|l| l == "-2\tbeta") && tools[1].body.iter().any(|l| l == "+2\tBETA"), "{:?}", tools[1].body);
+        assert_eq!(tools[2].body.len(), 3);
+        assert_eq!(tools[3].summary, "1 match");
+        assert_eq!(tools[5].parent.as_deref(), Some(tools[4].id.as_str()));
+        let todos = activity::todos(&m.parts).unwrap();
+        assert_eq!(todos.len(), 5);
+        assert!(todos.iter().all(|t| t.status == "completed"), "{todos:?}");
+        // text and calls interleave in the order they happened
+        let kinds: String = m.parts.iter().map(|p| match p {
+            store::Part::Text { .. } => 'T',
+            store::Part::Tool(_) => 't',
+            store::Part::Todos { .. } => 'L',
+            store::Part::Thinking { .. } => '.',
+        }).filter(|k| *k != '.').collect();
+        println!("{kinds}");
+        assert!(kinds.starts_with("TTL") || kinds.starts_with("TL") || kinds.contains("TtttttT"), "{kinds}");
+        assert!(kinds.ends_with('T'));
+        assert!(m.content.starts_with("I'll work through") && m.content.contains("All five steps completed"));
+        let note = m.note.clone().unwrap();
+        assert!(note.contains("4.3k tokens") && note.contains("$0.136") && note.contains("24 turns"), "{note}");
+        let s = k.render_html(&mut c, 140, 44, "target/snap/chat-agent.html");
+        println!("{s}");
+        assert!(s.contains("Update hello.txt · +1 -1"));
+        assert!(!s.contains("● TaskCreate") && !s.contains("● ToolSearch"), "todo plumbing stays hidden");
+        // ctrl+o: everything in full
+        k.key_mod(&mut c, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        c.scroll = 12;
+        let s = k.render_html(&mut c, 140, 44, "target/snap/chat-agent-expanded.html");
+        println!("{s}");
+        // the saved file keeps the transcript and loads back
+        let json = serde_json::to_string(&c.chat).unwrap();
+        let back: store::Chat = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.messages[1].parts, c.chat.messages[1].parts);
+    }
+
+    #[test]
+    fn chat_agent_click_and_errors() {
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "fix the failing test");
+        let _forget = Forget(c.chat.id.clone());
+        let mut p = agent::Claude::new(std::path::Path::new("/home/me/proj"));
+        // the older todo tool and a failing command, hand-written in stream-json's shape
+        let lines = [
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "Let me run the tests."},
+                {"type": "tool_use", "id": "t1", "name": "TodoWrite", "input": {"todos": [
+                    {"content": "Run the tests", "status": "in_progress", "activeForm": "Running the tests"},
+                    {"content": "Fix the parser", "status": "pending", "activeForm": "Fixing the parser"}]}},
+                {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "cargo test"}}]}}),
+            serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t2", "is_error": true,
+                "content": "Exit code 101\nrunning 3 tests\ntest parse ... FAILED\nerror: test failed"}]}}),
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t3", "name": "MultiEdit", "input": {
+                "file_path": "/home/me/proj/src/parse.rs", "edits": [{"old_string": "let n = 0;", "new_string": "let n = 1;"}, {"old_string": "a\nb", "new_string": "a\nc\nb"}]}},
+                {"type": "tool_use", "id": "t4", "name": "WebFetch", "input": {"url": "https://docs.rs/serde", "prompt": "x"}}]}}),
+        ];
+        for (i, l) in lines.iter().enumerate() {
+            let mut evs = vec![];
+            p.feed(l, i as u64 * 1500, &mut |e| evs.push(e)).unwrap();
+            deliver(&mut k, &mut c, evs);
+        }
+        let s = k.render_html(&mut c, 120, 36, "target/snap/chat-agent-errors.html");
+        println!("{s}");
+        assert!(s.contains("Bash cargo test · exit 101"));
+        assert!(s.contains("error: test failed"));
+        assert!(s.contains("Update src/parse.rs · +2 -1"), "MultiEdit diff counts");
+        assert!(s.contains("Fetch https://docs.rs/serde"));
+        assert!(s.contains("0/2 done · now: Running the tests"));
+        // clicking the Bash line opens it (all output), clicking again closes it
+        let (row, _) = c.tool_hits.iter().find(|(_, id)| id == "t2").cloned().unwrap();
+        let click = |row| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 10, row, modifiers: KeyModifiers::NONE };
+        k.mouse(&mut c, click(row), Rect::new(0, 0, 120, 36));
+        assert!(c.open.contains("t2"));
+        k.mouse(&mut c, click(row), Rect::new(0, 0, 120, 36));
+        assert!(!c.open.contains("t2"));
+        // esc: running calls end as stopped
+        k.key(&mut c, KeyCode::Esc);
+        assert!(all_tools(&c.chat.messages[1].parts).iter().all(|t| t.status != "running"));
+    }
+
+    #[test]
+    fn chat_agent_codex_fixture() {
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "codex", "make a short plan, create notes.txt (one, two, three), change two to TWO, print it");
+        let _forget = Forget(c.chat.id.clone());
+        let mut p = agent::Codex::new(std::path::Path::new("C:\\work\\demo"));
+        for evs in parse_fixture(CODEX_FIXTURE, |v, t, s| p.feed(v, t, s)) {
+            deliver(&mut k, &mut c, evs);
+        }
+        deliver(&mut k, &mut c, [Ev::Done { note: Some(p.note(Duration::from_millis(21_000))) }]);
+        let m = c.chat.messages.last().unwrap();
+        let tools = all_tools(&m.parts);
+        let names: Vec<String> = tools.iter().map(|t| format!("{} {} [{}]", t.label, t.target, t.status)).collect();
+        println!("{names:#?}");
+        assert_eq!(names[0], "Write notes.txt [done]");
+        assert_eq!(names[1], "Update notes.txt [done]");
+        assert!(names[2].starts_with("Run Get-Content -LiteralPath notes.txt [error]"), "{}", names[2]);
+        assert_eq!(tools[2].summary, "exit -1");
+        assert_eq!(activity::todos(&m.parts).map(|t| t.iter().filter(|x| x.status == "completed").count()), Some(2));
+        assert!(m.note.as_deref().unwrap_or("").contains("776 tokens"));
+        let s = k.render_html(&mut c, 140, 44, "target/snap/chat-agent-codex.html");
+        println!("{s}");
+    }
+
+    #[test]
+    fn chat_agent_ask_prompt() {
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "delete the build folder");
+        let _forget = Forget(c.chat.id.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let body = vec![agent::line('>', None, "rm -rf build")];
+        let ask = |tool: &str, tx: &std::sync::mpsc::Sender<approve::Decision>| approve::Ask { tool: tool.into(), label: tool.into(), target: "rm -rf build".into(), body: body.clone(), reply: tx.clone() };
+        deliver(&mut k, &mut c, [Ev::Ask(ask("Bash", &tx)), Ev::Ask(ask("Bash", &tx))]);
+        let s = k.render_html(&mut c, 120, 30, "target/snap/chat-agent-ask.html");
+        println!("{s}");
+        assert!(s.contains("allow Bash rm -rf build ?") && s.contains("always allow Bash"));
+        assert!(!s.contains("more lines"), "a one-line command isn't repeated under itself");
+        k.key(&mut c, KeyCode::Char('n'));
+        assert_eq!(rx.try_recv(), Ok(approve::Decision::Deny));
+        assert_eq!(c.asks.len(), 1);
+        k.key(&mut c, KeyCode::Char('a'));
+        assert_eq!(rx.try_recv(), Ok(approve::Decision::Allow));
+        assert!(c.asks.is_empty() && c.input.is_empty(), "y/n/a don't leak into the composer");
+        // after "always", the next one answers itself
+        deliver(&mut k, &mut c, [Ev::Ask(ask("Bash", &tx))]);
+        assert_eq!(rx.try_recv(), Ok(approve::Decision::Allow));
+        assert!(c.asks.is_empty());
+    }
+
+    #[test]
+    fn chat_old_unknown_provider() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.provider = "claude".into();
+        c.chat = serde_json::from_str(
+            r#"{"id":"old1","title":"an old chat","created":1,"updated":2,"provider":"retired-ai",
+            "messages":[{"role":"user","content":"hello"},{"role":"assistant","model":"retired-ai","content":"hi there","steps":[["looked it up","done",null]]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.provider_of(), "claude", "a chat with an AI oriel doesn't have continues with the current one");
+        let s = k.render(&mut c, 100, 24);
+        println!("{s}");
+        assert!(s.contains("hi there") && s.contains("looked it up"));
+        assert!(!s.contains("retired"));
     }
 }
 

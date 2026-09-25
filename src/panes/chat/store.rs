@@ -1,23 +1,91 @@
-//! Saved chats: one JSON file per chat, same format as nest's (~/.wren/chats), so old chats carry over.
-//! oriel keeps its own copy in <data dir>/oriel/chats; nest's chats are copied in once, never moved.
+//! Saved chats: one JSON file per chat in <data dir>/oriel/chats. Old files (plain `content`, the legacy `steps`
+//! work log) keep loading; agent replies also save `parts`, the ordered transcript of text and activity.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Msg {
     pub role: String,
+    /// The reply's text (all text parts joined): what /save, /note and follow-up prompts use.
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The muted line under a reply: tokens, speed, sources.
+    /// The muted line under a reply: duration, tokens, cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// Smart-mode work log: (label, state, detail).
+    /// Legacy work log from older chats: (label, state, detail). Still rendered, never written by new replies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<(String, String, Option<String>)>,
+    /// What a coding agent did, in order: text, thinking, tool calls, the todo list. Empty for plain chat replies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<Part>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Part {
+    Text {
+        text: String,
+    },
+    Thinking {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        tokens: u64,
+    },
+    Tool(Tool),
+    Todos {
+        items: Vec<Todo>,
+    },
+}
+
+/// One tool call: "Update src/app.rs · +3 -1", its diff or output, and (for subagents) the calls it made.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Tool {
+    pub id: String,
+    /// The tool's own name: Read, Edit, Bash, command_execution…
+    pub name: String,
+    /// What the transcript calls it: Read, Update, Write, Bash, Grep, Agent…
+    #[serde(default)]
+    pub label: String,
+    /// Short: a file path, a command, a pattern, a url.
+    #[serde(default)]
+    pub target: String,
+    /// running | done | error | stopped
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ms: u64,
+    /// "120 lines", "7 matches", "+3 -1", "exit 1".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    /// Diff or output lines, encoded by agent::line (kind char, line number, tab, text).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body: Vec<String>,
+    /// Set on a subagent's own calls: the Agent/Task call they belong to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<Tool>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Todo {
+    pub text: String,
+    /// The "-ing" form shown while it's in progress ("Writing tests").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub active: String,
+    /// pending | in_progress | completed
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -27,7 +95,7 @@ pub struct Chat {
     pub created: f64,
     pub updated: f64,
     pub messages: Vec<Msg>,
-    /// Which AI: "wren", "claude", "codex", "ollama", "openai", "anthropic".
+    /// Which AI: "claude", "codex", "ollama", "openai", "anthropic".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,10 +103,10 @@ pub struct Chat {
     /// Folder the CLI agents work in for this chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Per-provider scratch (CLI session ids), like nest's chat["state"].
+    /// Per-provider scratch (CLI session ids).
     #[serde(default)]
     pub state: serde_json::Map<String, Value>,
-    /// Anything else nest wrote, kept so files round-trip.
+    /// Anything else an older version wrote, kept so files round-trip.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
@@ -49,13 +117,6 @@ pub fn now() -> f64 {
 
 pub fn dir() -> PathBuf {
     crate::config::data_dir().join("chats")
-}
-
-fn nest_dir() -> Option<PathBuf> {
-    if std::env::var_os("ORIEL_DATA_DIR").is_some() {
-        return None; // a separate profile starts clean
-    }
-    Some(dirs::home_dir()?.join(".wren").join("chats"))
 }
 
 impl Chat {
@@ -79,7 +140,7 @@ impl Chat {
 
 pub fn save(c: &mut Chat) {
     if c.messages.is_empty() {
-        return; // empty chats vanish, like nest
+        return; // empty chats vanish
     }
     let d = dir();
     let _ = std::fs::create_dir_all(&d);
@@ -97,24 +158,9 @@ pub fn delete(id: &str) {
     let _ = std::fs::remove_file(dir().join(format!("{id}.json")));
 }
 
-/// All chats, newest first. On the first run nest's chats are copied in.
+/// All chats, newest first.
 pub fn load_all() -> Vec<Chat> {
-    let d = dir();
-    let empty = std::fs::read_dir(&d).map(|mut r| r.next().is_none()).unwrap_or(true);
-    if empty {
-        if let Some(n) = nest_dir() {
-            if let Ok(rd) = std::fs::read_dir(&n) {
-                let _ = std::fs::create_dir_all(&d);
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.extension().map(|x| x == "json").unwrap_or(false) {
-                        let _ = std::fs::copy(&p, d.join(e.file_name()));
-                    }
-                }
-            }
-        }
-    }
-    let mut out: Vec<Chat> = std::fs::read_dir(&d)
+    let mut out: Vec<Chat> = std::fs::read_dir(dir())
         .map(|rd| {
             rd.flatten()
                 .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
@@ -132,7 +178,7 @@ pub fn title_from(text: &str) -> String {
     if t.chars().count() <= 34 { t } else { format!("{}…", t.chars().take(33).collect::<String>().trim_end()) }
 }
 
-/// nest's sidebar groups: today, yesterday, previous 7 days, older.
+/// Sidebar groups: today, yesterday, previous 7 days, older.
 pub fn bucket(ts: f64, now_ts: f64, utc_offset: i64) -> &'static str {
     let day = |t: f64| ((t as i64 + utc_offset).div_euclid(86400)) as i64;
     match day(now_ts) - day(ts) {
@@ -140,5 +186,32 @@ pub fn bucket(ts: f64, now_ts: f64, utc_offset: i64) -> &'static str {
         1 => "yesterday",
         2..=6 => "previous 7 days",
         _ => "older",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_store_old_files_load() {
+        // an older file: legacy steps, an unknown provider, extra keys
+        let old = r#"{"id":"a1","title":"t","created":1,"updated":2,"provider":"someai","mystery":7,
+            "messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo","model":"someai",
+            "steps":[["searched","done",null]]}]}"#;
+        let c: Chat = serde_json::from_str(old).unwrap();
+        assert_eq!(c.messages[1].steps.len(), 1);
+        assert!(c.messages[1].parts.is_empty());
+        assert_eq!(c.extra.get("mystery").and_then(|v| v.as_u64()), Some(7));
+        // and the new shape round-trips
+        let mut m = Msg { role: "assistant".into(), content: "done".into(), ..Default::default() };
+        m.parts.push(Part::Text { text: "doing it".into() });
+        m.parts.push(Part::Tool(Tool { id: "t1".into(), name: "Edit".into(), label: "Update".into(), target: "a.rs".into(), status: "done".into(), ..Default::default() }));
+        m.parts.push(Part::Todos { items: vec![Todo { text: "x".into(), status: "pending".into(), ..Default::default() }] });
+        m.parts.push(Part::Thinking { text: String::new(), tokens: 40 });
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""kind":"tool""#), "{s}");
+        let back: Msg = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.parts, m.parts);
     }
 }

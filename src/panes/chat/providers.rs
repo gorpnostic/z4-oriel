@@ -1,22 +1,25 @@
 //! Every AI the chat can talk to, streaming. Each request runs on its own thread and reports through `send`.
 //!
-//!   wren       Wren's web server (/api/chat, SSE): research, memory, fast/balanced/smart modes
 //!   claude     Claude Code CLI (`claude -p --output-format stream-json`), resumes its session per chat
 //!   codex      Codex CLI (`codex exec --json`), resumes its thread per chat
 //!   ollama     any local Ollama model
 //!   openai     any OpenAI-compatible endpoint (OpenAI, OpenRouter, LM Studio, llama.cpp...)
 //!   anthropic  the Anthropic API
+//!
+//! The two CLI agents report everything they do (tool calls, diffs, output, todos) through agent.rs.
 
+use super::agent;
+use super::approve;
+use super::store::{Todo, Tool};
 use crate::config::{AiConfig, which};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const PROVIDERS: &[(&str, &str, &str)] = &[
     // id, label, what
-    ("wren", "Wren", "your local Wren model (research, memory, modes)"),
     ("claude", "Claude Code", "Claude Code CLI, works in the chat's folder"),
     ("codex", "Codex", "OpenAI Codex CLI, works in the chat's folder"),
     ("ollama", "Ollama", "a local model pulled into Ollama"),
@@ -24,8 +27,7 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
     ("anthropic", "Anthropic API", "Claude over the API (needs a key)"),
 ];
 
-/// Which AIs this machine can actually use, in the order the default is picked from. Wren only counts where
-/// it's installed (its local server answers, or its ~/.wren folder exists) — it lives on its owner's PC.
+/// Which AIs this machine can actually use, in the order the default is picked from.
 pub fn available(cfg: &AiConfig) -> Vec<&'static str> {
     let reach = |url: &str| -> bool {
         let hostport = url.split("//").nth(1).unwrap_or(url).split('/').next().unwrap_or("");
@@ -37,12 +39,7 @@ pub fn available(cfg: &AiConfig) -> Vec<&'static str> {
             .map(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(150)).is_ok())
             .unwrap_or(false)
     };
-    let local = |url: &str| url.contains("127.0.0.1") || url.contains("localhost");
     let mut out = vec![];
-    let wren_home = dirs::home_dir().map(|h| h.join(".wren").is_dir()).unwrap_or(false);
-    if cfg.provider == "wren" || wren_home || cfg.wren_urls.iter().any(|u| local(u) && reach(u)) {
-        out.push("wren");
-    }
     if which("claude").is_some() {
         out.push("claude");
     }
@@ -61,17 +58,35 @@ pub fn available(cfg: &AiConfig) -> Vec<&'static str> {
     out
 }
 
+/// A provider's name for people. Anything unknown (e.g. an AI an old chat used) is just "ai".
 pub fn label(id: &str) -> &'static str {
-    PROVIDERS.iter().find(|p| p.0 == id).map(|p| p.1).unwrap_or("no AI")
+    match id {
+        "none" => "no AI",
+        _ => PROVIDERS.iter().find(|p| p.0 == id).map(|p| p.1).unwrap_or("ai"),
+    }
+}
+
+pub fn is_known(id: &str) -> bool {
+    PROVIDERS.iter().any(|p| p.0 == id)
 }
 
 pub enum Ev {
+    /// Reply text.
     Token(String),
+    /// Thinking: text (often empty: redacted) and an estimated token count, both added to the current block.
+    Thinking { text: String, tokens: u64 },
+    /// A tool call, new or updated (matched by id; `parent` nests it under a subagent).
+    Tool(Tool),
+    /// The agent's todo list, whole.
+    Todos(Vec<Todo>),
+    /// Output tokens so far.
+    Usage(u64),
     Status(String),
-    Step(String, String, Option<String>),
     /// Remember a value in the chat's per-provider state (CLI session ids).
     State(String, String),
-    Done { note: Option<String>, sources: Vec<(String, String)>, memory: Option<Vec<String>> },
+    /// Claude Code wants permission for a tool call (/perms ask).
+    Ask(approve::Ask),
+    Done { note: Option<String> },
     Error(String),
 }
 
@@ -81,24 +96,19 @@ pub struct Request {
     pub messages: Vec<(String, String)>,
     pub cwd: std::path::PathBuf,
     pub perms: String,
-    pub mode: String,
-    pub memory: Vec<String>,
-    /// wren: web lookups allowed / forced for this message
-    pub web: bool,
-    pub research: bool,
     pub state: serde_json::Map<String, Value>,
     pub cfg: AiConfig,
 }
 
-pub fn start(req: Request, stop: Arc<AtomicBool>, send: impl Fn(Ev) + Send + 'static) {
+pub fn start(req: Request, stop: Arc<AtomicBool>, send: impl Fn(Ev) + Send + Sync + 'static) {
+    let send: Arc<dyn Fn(Ev) + Send + Sync> = Arc::new(send);
     std::thread::spawn(move || {
         let r = match req.provider.as_str() {
-            "claude" => claude(&req, &stop, &send),
-            "codex" => codex(&req, &stop, &send),
-            "ollama" => ollama(&req, &stop, &send),
-            "openai" => openai(&req, &stop, &send),
-            "anthropic" => anthropic(&req, &stop, &send),
-            "wren" => wren(&req, &stop, &send),
+            "claude" => claude(&req, &stop, send.clone()),
+            "codex" => codex(&req, &stop, &*send),
+            "ollama" => ollama(&req, &stop, &*send),
+            "openai" => openai(&req, &stop, &*send),
+            "anthropic" => anthropic(&req, &stop, &*send),
             _ => Err("no AI is set up: install Claude Code or Codex, run Ollama, or add a key with /key openai <key>".into()),
         };
         if let Err(e) = r {
@@ -172,52 +182,6 @@ fn sse(mut r: Box<dyn BufRead + Send>, stop: &AtomicBool, mut f: impl FnMut(&str
     }
 }
 
-// ------------------------------------------------------------------ wren
-fn wren(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), String> {
-    let msgs: Vec<Value> = req.messages.iter().map(|(r, c)| json!({"role": r, "content": c})).collect();
-    let body = json!({"messages": msgs, "memory": req.memory, "web": req.web, "research": req.research, "mode": req.mode});
-    let mut last_err = String::from("no Wren server configured");
-    for base in &req.cfg.wren_urls {
-        let url = format!("{}/api/chat", base.trim_end_matches('/'));
-        send(Ev::Status(format!("connecting to {}", host(base))));
-        let r = match post_stream(&url, &[], body.clone()) {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = e;
-                continue;
-            }
-        };
-        return sse(r, stop, |ev, data| {
-            let v: Value = serde_json::from_str(data).unwrap_or(Value::Null);
-            match ev {
-                "token" => send(Ev::Token(v["text"].as_str().unwrap_or("").to_string())),
-                "status" => send(Ev::Status(v["text"].as_str().unwrap_or("").to_string())),
-                "step" => send(Ev::Step(
-                    v["label"].as_str().unwrap_or("").to_string(),
-                    v["state"].as_str().unwrap_or("").to_string(),
-                    v["detail"].as_str().map(String::from),
-                )),
-                "done" => {
-                    let sources = v["sources"]
-                        .as_array()
-                        .map(|a| a.iter().map(|s| (s["title"].as_str().unwrap_or("").to_string(), s["url"].as_str().unwrap_or("").to_string())).collect())
-                        .unwrap_or_default();
-                    let memory = v["memory"].as_array().map(|a| a.iter().filter_map(|m| m.as_str().map(String::from)).collect());
-                    send(Ev::Done { note: v["stats"].as_str().map(String::from), sources, memory });
-                    return Ok(false);
-                }
-                _ => {
-                    if let Some(e) = v["error"].as_str() {
-                        return Err(e.to_string());
-                    }
-                }
-            }
-            Ok(true)
-        });
-    }
-    Err(format!("{last_err} — is Wren's server running? (`python -m wren.web` in the wren folder)"))
-}
-
 // ------------------------------------------------------------------ http APIs
 fn history(req: &Request) -> Vec<Value> {
     req.messages.iter().map(|(r, c)| json!({"role": r, "content": c})).collect()
@@ -230,7 +194,7 @@ fn ollama(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Str
     let mut r = post_stream(&url, &[], json!({"model": model, "messages": history(req), "stream": true}))?;
     let mut line = String::new();
     let mut tokens = 0u64;
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -246,13 +210,14 @@ fn ollama(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Str
         if let Some(t) = v["message"]["content"].as_str() {
             tokens += 1;
             send(Ev::Token(t.to_string()));
+            send(Ev::Usage(tokens));
         }
         if v["done"].as_bool() == Some(true) {
             break;
         }
     }
     let secs = t0.elapsed().as_secs_f64().max(0.01);
-    send(Ev::Done { note: Some(format!("{tokens} tokens · {:.0} tok/s · {model}", tokens as f64 / secs)), sources: vec![], memory: None });
+    send(Ev::Done { note: Some(format!("{tokens} tokens · {:.0} tok/s · {model}", tokens as f64 / secs)) });
     Ok(())
 }
 
@@ -272,7 +237,7 @@ fn openai(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Str
     }
     send(Ev::Status(format!("{} · {model}", host(&url))));
     let r = post_stream(&url, &headers, json!({"model": model, "messages": history(req), "stream": true}))?;
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     let mut n = 0u64;
     sse(r, stop, |_, data| {
         if data == "[DONE]" {
@@ -286,7 +251,7 @@ fn openai(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Str
         Ok(true)
     })?;
     let secs = t0.elapsed().as_secs_f64().max(0.01);
-    send(Ev::Done { note: Some(format!("{n} chunks · {:.1} s · {model}", secs)), sources: vec![], memory: None });
+    send(Ev::Done { note: Some(format!("{n} chunks · {:.1} s · {model}", secs)) });
     Ok(())
 }
 
@@ -314,7 +279,7 @@ fn anthropic(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), 
         }
         Ok(true)
     })?;
-    send(Ev::Done { note: Some(format!("{out_tokens} tokens · {model}")), sources: vec![], memory: None });
+    send(Ev::Done { note: Some(format!("{out_tokens} tokens · {model}")) });
     Ok(())
 }
 
@@ -330,7 +295,11 @@ fn transcript(req: &Request) -> String {
         .collect::<Vec<_>>()
         .join("\n\n");
     if t.len() > 12000 {
-        t = t[t.len() - 12000..].to_string();
+        let mut cut = t.len() - 12000;
+        while !t.is_char_boundary(cut) {
+            cut += 1;
+        }
+        t = t[cut..].to_string();
     }
     format!("(Conversation so far, for context:)\n\n{t}\n\n(New message:)\n{last}")
 }
@@ -398,7 +367,7 @@ fn run_cli(
     result
 }
 
-fn claude(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), String> {
+fn claude(req: &Request, stop: &AtomicBool, send: Arc<dyn Fn(Ev) + Send + Sync>) -> Result<(), String> {
     let sid = req.state.get("claude").and_then(|s| s.get("session")).and_then(|v| v.as_str()).map(String::from);
     let mode = match req.perms.as_str() {
         "full" => "bypassPermissions",
@@ -410,6 +379,21 @@ fn claude(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Str
         .iter()
         .map(|s| s.to_string())
         .collect();
+    // /perms ask: every call that needs permission comes back to the chat through oriel's own MCP server
+    let mut broker = None;
+    let mut cfg_file = None;
+    if req.perms == "ask" {
+        if let Ok(b) = approve::Broker::start(req.cwd.clone(), send.clone()) {
+            if let Some((a, path)) = approve::claude_args(&b) {
+                args.extend(a);
+                cfg_file = Some(path);
+                broker = Some(b);
+            }
+        }
+        if broker.is_none() {
+            send(Ev::Status("couldn't set up approvals: anything that needs permission will be refused".into()));
+        }
+    }
     if let Some(s) = &sid {
         args.push("--resume".into());
         args.push(s.clone());
@@ -419,46 +403,16 @@ fn claude(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Str
         args.push(m.clone());
     }
     let prompt = if sid.is_some() { req.messages.last().map(|m| m.1.clone()).unwrap_or_default() } else { transcript(req) };
-    send(Ev::Status("claude code is working".into()));
-    let mut note = None;
-    run_cli("claude", &args, &prompt, &req.cwd, stop, |ev| {
-        if let Some(s) = ev["session_id"].as_str() {
-            send(Ev::State("claude.session".into(), s.to_string()));
-        }
-        match ev["type"].as_str() {
-            Some("stream_event") => {
-                let d = &ev["event"]["delta"];
-                if d["type"] == "text_delta" {
-                    send(Ev::Token(d["text"].as_str().unwrap_or("").to_string()));
-                }
-            }
-            Some("assistant") => {
-                // tool use shows up as a step, like nest's work log
-                if let Some(items) = ev["message"]["content"].as_array() {
-                    for it in items {
-                        if it["type"] == "tool_use" {
-                            let name = it["name"].as_str().unwrap_or("tool");
-                            let input = &it["input"];
-                            let what = input["file_path"].as_str().or(input["command"].as_str()).or(input["pattern"].as_str()).unwrap_or("");
-                            send(Ev::Step(format!("{name} {}", crate::ui::fit(what, 60)), "done".into(), None));
-                        }
-                    }
-                }
-            }
-            Some("result") => {
-                if ev["is_error"].as_bool() == Some(true) {
-                    return Err(ev["result"].as_str().unwrap_or("Claude Code returned an error").to_string());
-                }
-                let tokens = ev["usage"]["output_tokens"].as_u64().unwrap_or(0);
-                let cost = ev["total_cost_usd"].as_f64().unwrap_or(0.0);
-                note = Some(format!("{tokens} tokens · ${cost:.3} · claude code"));
-            }
-            _ => {}
-        }
-        Ok(())
-    })
-    .map_err(|e| format!("{e} (run `claude` once in a terminal to sign in)"))?;
-    send(Ev::Done { note, sources: vec![], memory: None });
+    send(Ev::Status("claude code is starting".into()));
+    let t0 = Instant::now();
+    let mut p = agent::Claude::new(&req.cwd);
+    let r = run_cli("claude", &args, &prompt, &req.cwd, stop, |ev| p.feed(ev, t0.elapsed().as_millis() as u64, &mut |e| send(e)));
+    drop(broker);
+    if let Some(f) = cfg_file {
+        let _ = std::fs::remove_file(f);
+    }
+    r.map_err(|e| format!("{e} (run `claude` once in a terminal to sign in)"))?;
+    send(Ev::Done { note: Some(p.note(t0.elapsed())) });
     Ok(())
 }
 
@@ -473,8 +427,9 @@ fn codex(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Stri
     if req.perms == "full" {
         args.push("--dangerously-bypass-approvals-and-sandbox".into());
     } else {
+        // codex exec can't stop and ask, so "ask" is read-only
         args.push("-c".into());
-        args.push(format!("sandbox_mode={}", if req.perms == "read" { "read-only" } else { "workspace-write" }));
+        args.push(format!("sandbox_mode={}", if req.perms == "read" || req.perms == "ask" { "read-only" } else { "workspace-write" }));
     }
     if let Some(m) = &req.model {
         args.push("-m".into());
@@ -482,33 +437,11 @@ fn codex(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Stri
     }
     args.push("-".into());
     let prompt = if tid.is_some() { req.messages.last().map(|m| m.1.clone()).unwrap_or_default() } else { transcript(req) };
-    send(Ev::Status("codex is working".into()));
-    let mut note = None;
-    run_cli("codex", &args, &prompt, &req.cwd, stop, |ev| {
-        match ev["type"].as_str() {
-            Some("thread.started") => {
-                if let Some(t) = ev["thread_id"].as_str() {
-                    send(Ev::State("codex.thread".into(), t.to_string()));
-                }
-            }
-            Some("item.completed") => {
-                let it = &ev["item"];
-                match it["type"].as_str() {
-                    Some("agent_message") => send(Ev::Token(format!("{}\n\n", it["text"].as_str().unwrap_or("")))),
-                    Some("command_execution") => send(Ev::Step(format!("ran {}", crate::ui::fit(it["command"].as_str().unwrap_or(""), 60)), "done".into(), None)),
-                    Some("file_change") => send(Ev::Step("edited files".into(), "done".into(), None)),
-                    _ => {}
-                }
-            }
-            Some("turn.completed") => note = Some(format!("{} tokens · codex", ev["usage"]["output_tokens"].as_u64().unwrap_or(0))),
-            Some("error") | Some("turn.failed") => {
-                return Err(ev["message"].as_str().map(String::from).unwrap_or_else(|| ev["error"].to_string()));
-            }
-            _ => {}
-        }
-        Ok(())
-    })
-    .map_err(|e| format!("{e} (run `codex login` in a terminal)"))?;
-    send(Ev::Done { note, sources: vec![], memory: None });
+    send(Ev::Status("codex is starting".into()));
+    let t0 = Instant::now();
+    let mut p = agent::Codex::new(&req.cwd);
+    run_cli("codex", &args, &prompt, &req.cwd, stop, |ev| p.feed(ev, t0.elapsed().as_millis() as u64, &mut |e| send(e)))
+        .map_err(|e| format!("{e} (run `codex login` in a terminal)"))?;
+    send(Ev::Done { note: Some(p.note(t0.elapsed())) });
     Ok(())
 }
