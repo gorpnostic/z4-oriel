@@ -125,6 +125,8 @@ pub struct App {
     last_click: Option<(Instant, u16, u16)>,
     /// agents' last known activity, and the ones that finished while you weren't looking
     agent_state: HashMap<PaneId, Activity>,
+    /// panes opened with Action::OpenTagged: tag -> pane
+    tags: HashMap<String, PaneId>,
     done: std::collections::HashSet<PaneId>,
     _watcher: Option<notify::RecommendedWatcher>,
 }
@@ -160,6 +162,7 @@ impl App {
             ctx: None,
             last_click: None,
             agent_state: HashMap::new(),
+            tags: HashMap::new(),
             done: Default::default(),
         };
         app._watcher = watch_omarchy(tx);
@@ -372,6 +375,15 @@ impl App {
             }
         }
         self.agent_state.retain(|id, _| self.panes.contains_key(id));
+        // tell every app pane which tagged panes are still alive (the orchestrator follows its agents this way)
+        self.tags.retain(|_, id| self.panes.contains_key(id));
+        let live: Vec<(String, Option<Activity>)> = self.tags.iter().map(|(t, id)| (t.clone(), self.panes.get(id).and_then(|p| p.activity()))).collect();
+        let app_ids: Vec<PaneId> = self.tabs.iter().filter(|t| t.app.is_some()).map(|t| t.focus).collect();
+        for id in app_ids {
+            if let Some(p) = self.panes.get_mut(&id) {
+                p.tagged_panes(&live);
+            }
+        }
         self.done.retain(|id| self.panes.contains_key(id));
         if let Some(n) = notes.pop() {
             self.notify(n);
@@ -479,6 +491,29 @@ impl App {
                     self.cur = here;
                     if let Some(id) = self.tabs.iter().find(|t| t.app == Some(a)).map(|t| t.focus) {
                         self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), cx));
+                    }
+                }
+                Action::OpenTagged { pane, tag, name, focus } => {
+                    let here = self.cur;
+                    self.new_tab(pane);
+                    let id = self.tabs[self.cur].focus;
+                    self.tabs[self.cur].name = Some(name);
+                    self.tags.insert(tag, id);
+                    if !focus {
+                        self.cur = here;
+                    }
+                }
+                Action::FocusTag(tag) => {
+                    if let Some(&id) = self.tags.get(&tag) {
+                        if let Some(i) = self.tabs.iter().position(|t| t.root.contains(id)) {
+                            self.cur = i;
+                            self.tabs[i].focus = id;
+                        }
+                    }
+                }
+                Action::CloseTag(tag) => {
+                    if let Some(id) = self.tags.remove(&tag) {
+                        self.close(id);
                     }
                 }
                 Action::ToggleSidebar => self.sidebar = !self.sidebar,

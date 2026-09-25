@@ -4,6 +4,11 @@ use crate::pane::{Cx, Pane};
 use crossterm::event::KeyEvent;
 use ratatui::{Frame, layout::Rect};
 
+/// `oriel usage-sink` — Claude Code's statusLine command (reads its JSON on stdin). Returns the exit code.
+pub fn cli(_args: &[String]) -> i32 {
+    0
+}
+
 pub struct Ais {}
 
 impl Ais {

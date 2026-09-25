@@ -4,6 +4,11 @@ use crate::pane::{Cx, Pane};
 use crossterm::event::KeyEvent;
 use ratatui::{Frame, layout::Rect};
 
+/// `oriel report ...` — called by agent hooks (see the orchestrator). Returns the process exit code.
+pub fn cli(_args: &[String]) -> i32 {
+    0
+}
+
 pub struct Agents {}
 
 impl Agents {

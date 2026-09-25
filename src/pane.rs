@@ -35,6 +35,13 @@ pub enum Action {
     AppKey(&'static str, char),
     ToggleSidebar,
     ToggleIcons,
+    /// Open a pane in a new tab of its own, named `name` and remembered by `tag` (e.g. an orchestrator task id),
+    /// so it can be focused or closed later. Doesn't switch to it unless `focus` is true.
+    OpenTagged { pane: Box<dyn Pane>, tag: String, name: String, focus: bool },
+    /// Switch to the tab holding the pane opened with this tag (no-op if it's gone).
+    FocusTag(String),
+    /// Close the pane opened with this tag.
+    CloseTag(String),
     Quit,
 }
 
@@ -121,6 +128,9 @@ pub trait Pane {
     fn side(&mut self, _f: &mut Frame, _area: Rect, _cx: &mut Cx) {}
     /// Mouse event inside the side section (screen coordinates; `area` is the side section's rect).
     fn side_mouse(&mut self, _ev: MouseEvent, _area: Rect, _cx: &mut Cx) {}
+    /// Tagged panes the app still has open, activity included — lets the orchestrator follow its agents' tabs.
+    /// Called with the live list after every event batch; default: ignore.
+    fn tagged_panes(&mut self, _live: &[(String, Option<Activity>)]) {}
     /// Short live status shown next to the app's name in the sidebar, e.g. "▶ song" or "12%".
     fn badge(&self) -> Option<String> {
         None
