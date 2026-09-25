@@ -19,14 +19,14 @@ try {
     Invoke-WebRequest $url -OutFile "$tmp\oriel.zip" -UseBasicParsing
     Expand-Archive "$tmp\oriel.zip" -DestinationPath $tmp -Force
     $exe = Join-Path $dir 'oriel.exe'
-    # a running oriel.exe can't be overwritten, but it can be renamed out of the way
+    # a running oriel.exe can't be overwritten, but it can be renamed out of the way. Each old copy gets its own
+    # name, because an older one may still be running (and locked) too.
+    Get-ChildItem $dir -Filter 'oriel.exe.old*' -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
     if (Test-Path $exe) {
-        Remove-Item "$exe.old" -Force -ErrorAction SilentlyContinue
-        Rename-Item $exe 'oriel.exe.old' -Force
+        Rename-Item $exe ("oriel.exe.old-" + (Get-Date -Format 'yyyyMMddHHmmss')) -Force
     }
     Copy-Item "$tmp\oriel.exe" $exe -Force
     Unblock-File $exe
-    Remove-Item "$exe.old" -Force -ErrorAction SilentlyContinue  # fails quietly if the old one is still running
 } finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
