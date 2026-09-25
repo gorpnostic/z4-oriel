@@ -9,7 +9,7 @@ Tabs and tmux-style split panes · mouse-friendly · a single ~9 MB binary for L
 [![release](https://img.shields.io/github/v/release/gorpnostic/z4-oriel?color=d4884a)](https://github.com/gorpnostic/z4-oriel/releases/latest)
 [![license](https://img.shields.io/github/license/gorpnostic/z4-oriel?color=6e6e6e)](LICENSE)
 
-![oriel: chatting with Claude Code, chat history in the sidebar](docs/screenshot-chat.png)
+![oriel: the ai app with chat history in the sidebar](docs/screenshot-hero.png)
 
 </div>
 
@@ -36,17 +36,19 @@ Every app lives in the sidebar. Click one, or press its F-key.
 
 | | App | What it does |
 |---|---|---|
-| F1 | **ai** | Chat with Claude Code, Codex, Ollama, any OpenAI-compatible server, or the Anthropic API, all in one place. Coding agents work in a folder you choose. Markdown and code render properly, history is kept, and `/` opens a command menu. |
+| F1 | **ai** | Chat with Claude Code, Codex, Ollama, any OpenAI-compatible server, or the Anthropic API, all in one place. Coding agents show their full live transcript as they work: every file read, edit (as a diff), command and output, plus their todo list ticking off. `/perms ask` makes them ask before each change. History is kept, and `/` opens a command menu. |
 | F2 | **music** | Plays your music folder: cover art, a live spectrum, synced lyrics, playlists, shuffle and repeat. `F8` plays/pauses from any app. |
-| F3 | **system** | CPU, GPU (NVIDIA), memory, disks and network with live graphs. A process list you can sort, filter and kill. |
+| F3 | **system** | A task manager. It has a summary, a process list or tree (sort, filter, kill; per-process disk activity), per-core performance graphs, startup apps, services, network connections by process, and system info. |
 | F4 | **files** | A folder tree with previews: highlighted code, images drawn in the terminal, READMEs. |
 | F5 | **notes** | Markdown notes that autosave, with a live preview. |
-| F6 | **storage** | Finds what's safe to clean (caches, temp files, trash), what the biggest folders are, and which apps are installed. It can also install new ones. Nothing is deleted without asking. |
+| F6 | **storage** | Frees up space: it finds what's safe to clean (caches, temp files, trash), shows the biggest folders, and uninstalls apps. It also has a catalog of 60+ popular apps (OBS, Steam, Minecraft launchers, VPNs, AI apps, dev tools, browsers…) that installs with one key, using winget, pacman/AUR, apt, flatpak or npm to match your system. Nothing is deleted or installed without asking. |
 | F7 | **terminal** | A real shell. Split it next to anything. |
 
+![a Claude Code run: todos, edits as diffs, command output (dracula theme)](docs/screenshot-agent.png)
+
 <p align="center">
-  <img src="docs/screenshot-system.png" width="49%" alt="system monitor">
-  <img src="docs/screenshot-menu.png" width="49%" alt="the / command menu">
+  <img src="docs/screenshot-system.png" width="49%" alt="the system app">
+  <img src="docs/screenshot-apps.png" width="49%" alt="the app catalog">
 </p>
 
 ## Using it
@@ -59,10 +61,23 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | `alt t` / `alt 1-9` | new tab / go to tab |
 | `alt ←↑↓→` | move between panes (`alt shift ←↑↓→` resizes) |
 | `alt z` · `alt w` · `alt s` | zoom a pane · close it · hide the sidebar |
+| double-click a tab | rename it (also right-click → rename, or `ctrl+space` then `,`) |
+| right-click | menu: split, zoom, rename, new tab, close |
 | `ctrl+space` then `\|` `-` `x` `?` | tmux-style: split right, split down, close, list all keys |
 
 Each app shows its own keys along its bottom edge. The mouse works everywhere: click to focus, drag a divider to
 resize, scroll lists.
+
+### Agents in terminals
+
+Run Claude Code, Codex or another coding agent in a terminal tab, and oriel keeps an eye on it. The tab gets a
+status dot:
+
+- ◐ working
+- a red ● when it needs your answer
+- a green ● when it finished while you were in another tab
+
+You also get a notification, so you can run several agents side by side and only switch when one needs you.
 
 ### AI setup
 

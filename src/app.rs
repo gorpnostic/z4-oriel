@@ -1279,61 +1279,57 @@ mod tests {
         (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>().trim_end().to_string()).collect::<Vec<_>>().join("\n")
     }
 
-    /// The README screenshots, with demo data (not your chats/files):
-    /// `cargo test docs_screenshots -- --ignored`, then tools\snap.ps1 on docs\*.html
+    /// The README screenshots (no personal chats): `cargo test docs_screenshots -- --ignored`,
+    /// then tools\snap.ps1 on docs\*.html. The agent transcript one lives in panes::chat (docs_agent_screenshot).
     #[test]
     #[ignore]
     fn docs_screenshots() {
         let demo = std::path::Path::new("target/demo");
         let _ = std::fs::remove_dir_all(demo);
         std::fs::create_dir_all(demo.join("chats")).unwrap();
-        unsafe { std::env::set_var("ORIEL_DATA_DIR", demo.canonicalize().unwrap()) };
+        unsafe { std::env::set_var("ORIEL_DATA_DIR", std::path::absolute(demo).unwrap()) };
         let now = crate::panes::chat::demo_now();
-        let chat = |id: &str, title: &str, ago: f64, msgs: serde_json::Value| {
-            let c = serde_json::json!({"id": id, "title": title, "created": now - ago, "updated": now - ago, "messages": msgs, "provider": "claude"});
-            std::fs::write(demo.join("chats").join(format!("{id}.json")), c.to_string()).unwrap();
-        };
-        chat("d1", "debounce a search box", 60.0, serde_json::json!([
-            {"role": "user", "content": "how do I debounce a search box in js?"},
-            {"role": "assistant", "model": "claude", "content": "Wait until typing pauses, then search once:\n\n```js\nfunction debounce(fn, ms = 250) {\n  let t;\n  return (...args) => {\n    clearTimeout(t);\n    t = setTimeout(() => fn(...args), ms);\n  };\n}\n\ninput.addEventListener('input', debounce(e => search(e.target.value)));\n```\n\n- **250 ms** feels instant but skips most keystrokes\n- the last call always wins, so results never arrive out of order", "note": "212 tokens · $0.004 · claude code"},
-            {"role": "user", "content": "nice, and how do I cancel the fetch if a newer one starts?"},
-            {"role": "assistant", "model": "claude", "content": "Keep an `AbortController` per request and abort the previous one before starting the next.", "note": "96 tokens · $0.002 · claude code"}
-        ]));
-        chat("d2", "plan a 3 day trip to lisbon", 3600.0 * 5.0, serde_json::json!([{"role": "user", "content": "plan a 3 day trip to lisbon"}, {"role": "assistant", "content": "…"}]));
-        chat("d3", "explain rust lifetimes simply", 86400.0 * 1.2, serde_json::json!([{"role": "user", "content": "explain rust lifetimes simply"}, {"role": "assistant", "content": "…"}]));
-        chat("d4", "regex for a uk postcode", 86400.0 * 3.0, serde_json::json!([{"role": "user", "content": "regex for a uk postcode"}, {"role": "assistant", "content": "…"}]));
-        chat("d5", "what should I name my cat", 86400.0 * 9.0, serde_json::json!([{"role": "user", "content": "what should I name my cat"}, {"role": "assistant", "content": "…"}]));
-
-        let (tx, _rx) = std::sync::mpsc::channel();
+        for (i, (title, ago)) in [("debounce a search box", 60.0), ("plan a 3 day trip to lisbon", 18000.0), ("explain rust lifetimes simply", 100000.0),
+            ("regex for a uk postcode", 260000.0), ("fix the flaky login test", 300000.0), ("what should I name my cat", 800000.0)].iter().enumerate() {
+            let c = serde_json::json!({"id": format!("d{i}"), "title": title, "created": now - ago, "updated": now - ago, "provider": "claude",
+                "messages": [{"role": "user", "content": title}, {"role": "assistant", "content": "…"}]});
+            std::fs::write(demo.join("chats").join(format!("d{i}.json")), c.to_string()).unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut cfg = Config::default();
         cfg.theme = "oriel".into();
         cfg.ai.provider = "claude".into();
         let mut app = App::new(cfg, tx);
-        let s = snap(&mut app, "tmp");
-        // open the first demo chat by clicking it in the sidebar
-        let (row, line) = s.lines().enumerate().find(|(_, l)| l.contains("debounce a search box")).unwrap();
-        let col = line.chars().position(|_| true).unwrap_or(0) + 6;
-        app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: col as u16, row: row as u16, modifiers: KeyModifiers::NONE });
+        // a renamed tab with a finished agent, so the sidebar shows tabs + status dots
         let mut term = Terminal::new(TestBackend::new(150, 42)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
-        crate::testkit::save_html(term.backend().buffer(), "docs/screenshot-chat.html");
-        // the / menu
-        for c in "/model ".chars() {
-            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        }
-        term.draw(|f| app.draw(f)).unwrap();
-        crate::testkit::save_html(term.backend().buffer(), "docs/screenshot-menu.html");
-        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        // system monitor, live
+        crate::testkit::save_html(term.backend().buffer(), "docs/screenshot-hero.html");
+        // system summary with ~45 s of history
         app.goto_app("system");
         for _ in 0..460 {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            while let Ok(e) = rx.try_recv() { app.handle(e); }
             app.handle(Event::Tick);
         }
         term.draw(|f| app.draw(f)).unwrap();
         crate::testkit::save_html(term.backend().buffer(), "docs/screenshot-system.html");
+        // the app catalog (storage → get apps)
+        app.goto_app("storage");
+        term.draw(|f| app.draw(f)).unwrap();
+        for _ in 0..3 {
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(20) {
+            while let Ok(e) = rx.try_recv() { app.handle(e); }
+            std::thread::sleep(Duration::from_millis(200));
+            term.draw(|f| app.draw(f)).unwrap();
+            let b = term.backend().buffer();
+            let text: String = (0..b.area.height).flat_map(|y| (0..b.area.width).map(move |x| (x, y))).map(|(x, y)| b[(x, y)].symbol().to_string()).collect();
+            if text.contains("✓ installed") { break; }
+        }
+        crate::testkit::save_html(term.backend().buffer(), "docs/screenshot-apps.html");
     }
-
     #[test]
     fn app_rename_menu_agents() {
         let (tx, rx) = std::sync::mpsc::channel();

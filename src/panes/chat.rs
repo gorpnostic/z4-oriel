@@ -1354,6 +1354,24 @@ mod tests {
     const CODEX_FIXTURE: &str = include_str!("chat/fixtures/codex-exec.jsonl");
     const PROMPT: &str = "track 5 steps with todos: create hello.txt (alpha, beta, gamma), change beta to BETA, cat it, grep for gamma, then have a subagent count its lines";
 
+    /// README screenshot: a live Claude Code run in the dracula theme. `cargo test docs_agent -- --ignored`
+    #[test]
+    #[ignore]
+    fn docs_agent_screenshot() {
+        let mut k = Kit::new();
+        k.theme = crate::theme::get("dracula");
+        let mut c = agent_chat(&k, "claude", PROMPT);
+        c.chat.cwd = Some(if cfg!(windows) { "C:\\work\\demo".into() } else { "/home/you/demo".into() });
+        let _forget = Forget(c.chat.id.clone());
+        let mut p = agent::Claude::new(std::path::Path::new("C:\\work\\demo"));
+        let per_line = parse_fixture(CLAUDE_FIXTURE, |v, t, s| p.feed(v, t, s));
+        let grep_at = CLAUDE_FIXTURE.lines().position(|l| l.contains(r#""name": "Grep""#) && l.contains(r#""type": "assistant""#)).unwrap();
+        for evs in per_line.into_iter().take(grep_at + 1) {
+            deliver(&mut k, &mut c, evs);
+        }
+        k.render_html(&mut c, 150, 44, "docs/screenshot-agent.html");
+    }
+
     #[test]
     fn chat_agent_claude_fixture() {
         let mut k = Kit::new();
