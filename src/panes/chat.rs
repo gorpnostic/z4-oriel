@@ -177,12 +177,11 @@ impl Chat {
         }
     }
 
-    /// Where CLI agents run: the chat's folder, else where oriel started — never the home folder itself (on
-    /// Leif's PC home is a git repo, so Claude Code would file every chat's memories there).
+    /// Where CLI agents run: the chat's folder (/cwd), else the folder oriel was started in. Only if that folder
+    /// no longer exists does it fall back to oriel's own work folder.
     fn workdir(&self) -> PathBuf {
         let d = self.chat.cwd.clone().map(PathBuf::from).unwrap_or_else(|| self.launch_dir.clone());
-        let home = dirs::home_dir().unwrap_or_default();
-        if !d.is_dir() || d == home {
+        if !d.is_dir() {
             let w = crate::config::data_dir().join("work");
             if !w.join(".git").exists() {
                 let _ = std::fs::create_dir_all(&w);
