@@ -1,0 +1,60 @@
+# Builds oriel for Linux and Windows on GitHub's machines and publishes a release whenever a version tag is
+# pushed (tools\release.ps1 does the tagging). The install scripts download from the latest release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04's older glibc: the binary then runs on newer distros too (Arch/Omarchy, Fedora, Debian...)
+          - os: ubuntu-22.04
+            asset: oriel-linux-x86_64.tar.gz
+          - os: windows-latest
+            asset: oriel-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux build deps (ALSA for music playback)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - run: cargo build --release --locked
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: tar -czf ${{ matrix.asset }} -C target/release oriel
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path target/release/oriel.exe -DestinationPath ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then tag="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"; fi
+          gh release create "$tag" dist/* install.sh install.ps1 --title "oriel $tag" --generate-notes \
+            || gh release upload "$tag" dist/* install.sh install.ps1 --clobber

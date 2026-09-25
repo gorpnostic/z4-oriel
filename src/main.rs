@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("-h" | "--help") => {
             println!(
-                "oriel {} — a terminal workspace\n\n  oriel              open (home screen)\n  oriel <app>        open straight into an app: terminal ai claude codex music system files notes storage\n  oriel --config     print the config file path\n  oriel --version\n\nInside: alt p = palette, alt enter = new terminal, {} then ? = all keys.",
+                "oriel {} — a terminal workspace\n\n  oriel              open (home screen)\n  oriel <app>        open straight into an app: terminal ai claude codex music system files notes storage\n  oriel --config     print the config file path\n  oriel update       update to the latest release\n  oriel --version\n\nInside: alt p = palette, alt enter = new terminal, {} then ? = all keys.",
                 env!("CARGO_PKG_VERSION"),
                 cfg.prefix
             );
@@ -31,6 +31,19 @@ fn main() -> anyhow::Result<()> {
         Some("-V" | "--version") => {
             println!("oriel {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
+        }
+        Some("update" | "--update") => {
+            // re-run the installer: it fetches the latest release and swaps the binary (even this running one)
+            const RAW: &str = "https://raw.githubusercontent.com/gorpnostic/z4-oriel/master";
+            println!("oriel {} — updating to the latest release…", env!("CARGO_PKG_VERSION"));
+            let status = if cfg!(windows) {
+                std::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &format!("irm {RAW}/install.ps1 | iex")])
+                    .status()
+            } else {
+                std::process::Command::new("sh").args(["-c", &format!("curl -fsSL {RAW}/install.sh | sh")]).status()
+            };
+            std::process::exit(status.map(|s| s.code().unwrap_or(1)).unwrap_or(1));
         }
         Some("--config") => {
             println!("{}", config::path().display());

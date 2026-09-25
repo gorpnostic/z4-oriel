@@ -1,0 +1,25 @@
+# Publish a new oriel version: bumps the version, commits, tags and pushes. GitHub then builds the Linux and
+# Windows binaries and creates the release (.github/workflows/release.yml); `oriel update` picks it up.
+#   pwsh tools\release.ps1            # 0.1.0 -> 0.1.1
+#   pwsh tools\release.ps1 -Minor     # 0.1.0 -> 0.2.0
+#   pwsh tools\release.ps1 -Version 1.0.0
+param([string]$Version = "", [switch]$Minor, [switch]$Major)
+$ErrorActionPreference = 'Stop'
+Set-Location (Split-Path $PSScriptRoot -Parent)
+if (git status --porcelain) { throw "commit or stash your changes first" }
+$toml = Get-Content Cargo.toml -Raw
+$cur = [regex]::Match($toml, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+if (-not $Version) {
+    $p = $cur.Split('.') | ForEach-Object { [int]$_ }
+    if ($Major) { $p = @($p[0] + 1, 0, 0) } elseif ($Minor) { $p = @($p[0], $p[1] + 1, 0) } else { $p = @($p[0], $p[1], $p[2] + 1) }
+    $Version = $p -join '.'
+}
+$toml = [regex]::Replace($toml, '(?m)^version\s*=\s*"[^"]+"', "version = `"$Version`"", 1)
+[IO.File]::WriteAllText((Resolve-Path Cargo.toml), $toml)
+cargo build --release   # refreshes Cargo.lock with the new version (the workflow builds with --locked)
+git add Cargo.toml Cargo.lock
+git commit -m "release v$Version"
+git tag "v$Version"
+git push
+git push origin "v$Version"
+"v$Version pushed. GitHub is building it: https://github.com/gorpnostic/z4-oriel/actions"
