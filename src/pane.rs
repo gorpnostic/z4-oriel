@@ -27,6 +27,14 @@ pub enum Action {
     Close,
     Notify(String),
     SetTheme(String),
+    /// Open the palette with this text already typed (e.g. "theme " = the theme picker with live preview).
+    Palette(String),
+    /// Switch to an app's tab.
+    GotoApp(&'static str),
+    /// Send a key to an app's pane without switching to it (/play → the music app), opening it if needed.
+    AppKey(&'static str, char),
+    ToggleSidebar,
+    ToggleIcons,
     Quit,
 }
 

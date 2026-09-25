@@ -334,7 +334,31 @@ impl App {
                 Action::Open(p, place) => self.open(p, place, from),
                 Action::Close => self.close(from),
                 Action::Notify(s) => self.notify(s),
-                Action::SetTheme(t) => self.set_theme(&t, true),
+                Action::SetTheme(t) => {
+                    if theme::names().iter().any(|n| *n == t) {
+                        self.set_theme(&t, true);
+                        self.notify(format!("{}theme: {t}", ui::lead("theme")));
+                    } else {
+                        self.notify(format!("no theme called {t} — /theme lists them"));
+                    }
+                }
+                Action::Palette(q) => {
+                    self.open_palette();
+                    if let Some(p) = &mut self.palette {
+                        p.query = q;
+                    }
+                }
+                Action::GotoApp(a) => self.goto_app(a),
+                Action::AppKey(a, c) => {
+                    let here = self.cur;
+                    self.goto_app(a); // opens it if it isn't yet
+                    self.cur = here;
+                    if let Some(id) = self.tabs.iter().find(|t| t.app == Some(a)).map(|t| t.focus) {
+                        self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), cx));
+                    }
+                }
+                Action::ToggleSidebar => self.sidebar = !self.sidebar,
+                Action::ToggleIcons => self.run_cmd(Cmd::Icons),
                 Action::Quit => self.quit = true,
             }
         }
@@ -986,6 +1010,27 @@ mod tests {
         crate::testkit::save_html(term.backend().buffer(), &format!("target/snap/app-{name}.html"));
         let buf = term.backend().buffer();
         (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>().trim_end().to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn app_slash_and_palette() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "oriel".into();
+        let mut app = App::new(cfg, tx);
+        let _ = snap(&mut app, "k0");
+        let key = |app: &mut App, c: KeyCode, m: KeyModifiers| app.key(KeyEvent::new(c, m));
+        key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        let s = snap(&mut app, "slash");
+        println!("{}", s.lines().rev().take(16).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+        assert!(s.contains("/model"), "slash menu missing");
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Char('p'), KeyModifiers::ALT);
+        for c in "theme".chars() {
+            key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let s = snap(&mut app, "palette");
+        assert!(s.contains("theme ocean"), "theme list missing");
     }
 
     #[test]

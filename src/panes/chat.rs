@@ -33,10 +33,34 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/memory", "", "what wren remembers about you"),
     ("/remember", "<fact>", "tell wren something to remember"),
     ("/forget", "<text>", "forget memories containing <text>"),
-    ("/theme", "<name>", "switch colour theme (alt p lists them)"),
+    ("/best", "", "wren: rewrite the last reply in smart mode (2 drafts, best kept)"),
+    ("/research", "<question>", "wren: look it up on the web first, then answer"),
+    ("/web", "<on|off>", "wren: allow web lookups (on by default)"),
+    ("/key", "<openai|anthropic> <key>", "save an API key"),
+    ("/note", "", "save the last reply to notes"),
+    ("/save", "", "export this chat as a markdown file"),
+    ("/theme", "<name>", "switch colour theme (live preview with just /theme)"),
+    ("/play", "", "music: play / pause"),
+    ("/next", "", "music: next song"),
+    ("/prev", "", "music: previous song"),
+    ("/music", "", "go to the music app"),
+    ("/sidebar", "", "hide / show the sidebar"),
+    ("/icons", "", "nerd font icons on / off"),
+    ("/info", "", "what's running: AI, model, folder, memory"),
     ("/delete", "", "delete this chat"),
     ("/help", "", "keys and commands"),
+    ("/quit", "", "quit oriel"),
 ];
+
+/// One row of the / menu: what it shows, and what picking it does.
+struct MenuItem {
+    left: String,
+    desc: String,
+    /// The composer text after picking it.
+    fill: String,
+    /// Picking runs it (false = a command that still needs its argument typed).
+    run: bool,
+}
 
 const SUGGESTIONS: &[&str] = &["explain how rainbows form", "give me 3 tips for better sleep", "code a snake game in html", "what is a python function?"];
 
@@ -69,6 +93,10 @@ pub struct Chat {
     provider: String,
     mode: String,
     perms: String,
+    web: bool,
+    once_mode: Option<String>,
+    once_research: bool,
+    keys: HashMap<String, String>,
     info: Vec<String>,
     confirm_delete: bool,
     side_hits: Vec<(Rect, SideItem)>,
@@ -101,6 +129,10 @@ impl Chat {
             provider,
             mode: if cfg.ai.wren_mode.is_empty() { "balanced".into() } else { cfg.ai.wren_mode.clone() },
             perms: "edits".into(),
+            web: true,
+            once_mode: None,
+            once_research: false,
+            keys: HashMap::new(),
             info: vec![],
             confirm_delete: false,
             side_hits: vec![],
@@ -216,16 +248,25 @@ impl Chat {
         self.scroll = 0;
         let stop = Arc::new(AtomicBool::new(false));
         let inbox: Arc<Mutex<Vec<Ev>>> = Arc::default();
+        let mut cfg = cx.config.ai.clone();
+        if let Some(k) = self.keys.get("openai") {
+            cfg.openai_key = k.clone();
+        }
+        if let Some(k) = self.keys.get("anthropic") {
+            cfg.anthropic_key = k.clone();
+        }
         let req = providers::Request {
+            web: self.web,
+            research: std::mem::take(&mut self.once_research),
             provider: provider.clone(),
             model: self.chat.model.clone(),
             messages,
             cwd: self.workdir(),
             perms: self.perms.clone(),
-            mode: self.mode.clone(),
+            mode: self.once_mode.take().unwrap_or_else(|| self.mode.clone()),
             memory: self.memory.clone(),
             state: self.chat.state.clone(),
-            cfg: cx.config.ai.clone(),
+            cfg,
         };
         let (ib, waker) = (inbox.clone(), cx.waker());
         providers::start(req, stop.clone(), move |ev| {
@@ -325,6 +366,98 @@ impl Chat {
                 cx.notify(format!("forgot {} memor{}", before - self.memory.len(), if before - self.memory.len() == 1 { "y" } else { "ies" }));
             }
             "/theme" if !arg.is_empty() => cx.act(Action::SetTheme(arg)),
+            "/theme" => cx.act(Action::Palette("theme ".into())),
+            "/best" => {
+                if self.provider_of() == "wren" {
+                    self.once_mode = Some("smart".into());
+                    self.retry(cx);
+                } else {
+                    self.info.push("/best is wren's smart mode; other AIs: /retry".into());
+                }
+            }
+            "/research" if !arg.is_empty() => {
+                self.once_research = true;
+                self.send(arg, cx);
+            }
+            "/web" => {
+                self.web = match arg.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => !self.web,
+                };
+                cx.notify(format!("web lookups {}", if self.web { "on" } else { "off" }));
+            }
+            "/key" => {
+                let mut a = arg.split_whitespace();
+                match (a.next(), a.next()) {
+                    (Some(p @ ("openai" | "anthropic")), Some(key)) => {
+                        let mut c = crate::config::load();
+                        if p == "openai" {
+                            c.ai.openai_key = key.to_string();
+                        } else {
+                            c.ai.anthropic_key = key.to_string();
+                        }
+                        crate::config::save(&c);
+                        self.keys.insert(p.to_string(), key.to_string());
+                        cx.notify(format!("{p} key saved"));
+                    }
+                    _ => self.info.push("/key openai <key> · /key anthropic <key>  (saved in oriel's config file)".into()),
+                }
+            }
+            "/note" => match self.chat.messages.iter().rev().find(|m| m.role == "assistant" && !m.content.is_empty()) {
+                Some(m) => {
+                    let dir = crate::config::data_dir().join("notes");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let name: String = self.chat.title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
+                    let mut path = dir.join(format!("{}.md", name.trim()));
+                    let mut n = 2;
+                    while path.exists() {
+                        path = dir.join(format!("{} {n}.md", name.trim()));
+                        n += 1;
+                    }
+                    match std::fs::write(&path, format!("# {}\n\n{}\n", self.chat.title, m.content)) {
+                        Ok(_) => cx.notify(format!("saved to notes: {}", path.file_name().unwrap_or_default().to_string_lossy())),
+                        Err(e) => self.info.push(format!("couldn't save: {e}")),
+                    }
+                }
+                None => self.info.push("no reply to save yet".into()),
+            },
+            "/save" => {
+                if self.chat.messages.is_empty() {
+                    self.info.push("nothing to save yet".into());
+                } else {
+                    let dir = dirs::document_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default()).join("oriel chats");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let name: String = self.chat.title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
+                    let path = dir.join(format!("{}.md", name.trim()));
+                    let mut md = format!("# {}\n\n", self.chat.title);
+                    for m in &self.chat.messages {
+                        let who = if m.role == "user" { "you".to_string() } else { providers::label(m.model.as_deref().unwrap_or("wren")).to_lowercase() };
+                        md.push_str(&format!("**{who}:**\n\n{}\n\n", m.content));
+                    }
+                    match std::fs::write(&path, md) {
+                        Ok(_) => cx.notify(format!("saved {}", path.display())),
+                        Err(e) => self.info.push(format!("couldn't save: {e}")),
+                    }
+                }
+            }
+            "/play" => cx.act(Action::AppKey("music", ' ')),
+            "/next" => cx.act(Action::AppKey("music", 'n')),
+            "/prev" => cx.act(Action::AppKey("music", 'p')),
+            "/music" => cx.act(Action::GotoApp("music")),
+            "/sidebar" => cx.act(Action::ToggleSidebar),
+            "/icons" => cx.act(Action::ToggleIcons),
+            "/quit" => cx.act(Action::Quit),
+            "/info" => {
+                let p = self.provider_of();
+                self.info.push(format!("oriel {} · {} ({})", env!("CARGO_PKG_VERSION"), providers::label(&p), self.chat.model.clone().unwrap_or("default model".into())));
+                if p == "wren" {
+                    self.info.push(format!("  wren mode {} · web lookups {} · servers: {}", self.mode, if self.web { "on" } else { "off" }, cx.config.ai.wren_urls.join(", ")));
+                } else {
+                    self.info.push(format!("  works in {} · permissions {}", self.workdir().display(), self.perms));
+                }
+                self.info.push(format!("  {} memories · {} saved chats · config: {}", self.memory.len(), self.chats.len(), crate::config::path().display()));
+            }
             "/delete" => self.confirm_delete = true,
             "/help" => {
                 self.info.extend(
@@ -343,11 +476,70 @@ impl Chat {
         }
     }
 
-    fn menu_matches(&self) -> Vec<usize> {
-        if !self.input.starts_with('/') || self.input.contains(' ') {
+    /// Choices for a command's argument (what nest listed after `/model `, `/theme `...).
+    fn arg_options(&self, cmd: &str) -> Vec<(String, String)> {
+        let pairs = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+        match cmd {
+            "/model" => providers::PROVIDERS.iter().map(|(id, label, what)| (id.to_string(), format!("{label} — {what}"))).collect(),
+            "/mode" => pairs(&[("fast", "quick and simpler"), ("balanced", "the default"), ("smart", "slower: 2 drafts, the best is kept")]),
+            "/perms" => pairs(&[
+                ("edits", "edit files in the chat's folder (default)"),
+                ("full", "anything, never asks"),
+                ("read", "read-only"),
+                ("ask", "refuse whatever would need approval"),
+            ]),
+            "/web" => pairs(&[("on", "wren may look things up"), ("off", "answer from what it knows")]),
+            "/key" => pairs(&[("openai", "OpenAI-compatible key"), ("anthropic", "Anthropic API key")]),
+            "/theme" => crate::theme::names().into_iter().map(|n| (n.clone(), if n == "omarchy" { "follows your Omarchy theme".into() } else if n == "terminal" { "your terminal's own colours".into() } else { String::new() })).collect(),
+            "/cwd" => {
+                // folders chats have used, newest first
+                let mut seen = vec![];
+                for c in &self.chats {
+                    if let Some(d) = &c.cwd {
+                        if !seen.contains(d) && std::path::Path::new(d).is_dir() {
+                            seen.push(d.clone());
+                        }
+                    }
+                }
+                seen.into_iter().take(12).map(|d| (d, "used before".to_string())).collect()
+            }
+            _ => vec![],
+        }
+    }
+
+    fn menu(&self) -> Vec<MenuItem> {
+        if !self.input.starts_with('/') || self.input.contains('\n') {
             return vec![];
         }
-        (0..COMMANDS.len()).filter(|&i| COMMANDS[i].0.starts_with(self.input.as_str())).collect()
+        match self.input.split_once(' ') {
+            None => COMMANDS
+                .iter()
+                .filter(|c| c.0.starts_with(self.input.as_str()))
+                .map(|(c, a, d)| MenuItem {
+                    left: format!("{c} {a}"),
+                    desc: d.to_string(),
+                    fill: if a.contains('<') { format!("{c} ") } else { c.to_string() },
+                    run: !a.contains('<'),
+                })
+                .collect(),
+            Some((cmd, rest)) => {
+                let q = rest.trim_start().to_lowercase();
+                if q.contains(' ') {
+                    return vec![]; // past the argument (e.g. /key openai sk-...)
+                }
+                self.arg_options(cmd)
+                    .into_iter()
+                    .filter(|(v, _)| v.to_lowercase().starts_with(&q) || (q.len() >= 2 && v.to_lowercase().contains(&q)))
+                    .map(|(v, d)| MenuItem {
+                        left: v.clone(),
+                        desc: d,
+                        // /key still needs the key after the provider
+                        fill: if cmd == "/key" { format!("{cmd} {v} ") } else { format!("{cmd} {v}") },
+                        run: cmd != "/key",
+                    })
+                    .collect()
+            }
+        }
     }
 
     fn insert(&mut self, s: &str) {
@@ -648,20 +840,24 @@ impl Pane for Chat {
         }
 
         // ---- the / command menu, above the composer
-        let matches = self.menu_matches();
-        if !matches.is_empty() && cx.focused {
-            let rows = matches.len().min(10) as u16;
+        let items = self.menu();
+        if !items.is_empty() && cx.focused {
+            let rows = items.len().min(10) as u16;
             let mh = rows + 2;
             let mr = Rect { x: comp.x, y: comp.y.saturating_sub(mh), width: comp.width, height: mh };
             f.render_widget(ratatui::widgets::Clear, mr);
-            let inner = ui::frame(f, mr, "commands · ↑↓ tab enter", None, false, t);
-            self.menu_sel = self.menu_sel.min(matches.len() - 1);
+            let title = match self.input.split_once(' ') {
+                Some((cmd, _)) => format!("{cmd} · pick one · ↑↓ tab enter"),
+                None => "commands · ↑↓ tab enter".to_string(),
+            };
+            let inner = ui::frame(f, mr, &title, Some(&format!("{}/{}", self.menu_sel.min(items.len() - 1) + 1, items.len())), false, t);
+            self.menu_sel = self.menu_sel.min(items.len() - 1);
             let start = self.menu_sel.saturating_sub(rows as usize - 1);
-            for (row, &i) in matches.iter().skip(start).take(rows as usize).enumerate() {
-                let (c, a, d) = COMMANDS[i];
+            for (row, it) in items.iter().skip(start).take(rows as usize).enumerate() {
+                let d = it.desc.as_str();
                 let on = start + row == self.menu_sel;
                 let cs = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default().add_modifier(Modifier::BOLD) };
-                let left = format!("{c} {a}");
+                let left = it.left.clone();
                 let lw = (inner.width as usize / 2).min(36);
                 let line = Line::from(vec![
                     Span::styled(if on { "▌" } else { " " }, ui::accent(t)),
@@ -724,7 +920,7 @@ impl Pane for Chat {
             }
             return true;
         }
-        let matches = self.menu_matches();
+        let items = self.menu();
         match k.code {
             KeyCode::Char('n') if ctrl => self.new_chat(),
             KeyCode::Char('r') if ctrl => self.retry(cx),
@@ -760,15 +956,15 @@ impl Pane for Chat {
                     return true;
                 }
                 let mut text = self.input.trim().to_string();
-                if !matches.is_empty() && matches.len() > self.menu_sel {
-                    let cmd = COMMANDS[matches[self.menu_sel]].0;
-                    if text != cmd && COMMANDS[matches[self.menu_sel]].1.contains('<') {
-                        // needs an argument: complete and let them type it
-                        self.input = format!("{cmd} ");
+                if let Some(it) = items.get(self.menu_sel.min(items.len().saturating_sub(1))) {
+                    if !it.run {
+                        // a command that needs its argument: complete it, the menu then lists the choices
+                        self.input = it.fill.clone();
                         self.cursor = self.input.chars().count();
+                        self.menu_sel = 0;
                         return true;
                     }
-                    text = cmd.to_string();
+                    text = it.fill.clone();
                 }
                 if text.is_empty() {
                     return true;
@@ -782,13 +978,15 @@ impl Pane for Chat {
                     self.send(text, cx);
                 }
             }
-            KeyCode::Tab if !matches.is_empty() => {
-                let cmd = COMMANDS[matches[self.menu_sel.min(matches.len() - 1)]].0;
-                self.input = format!("{cmd} ");
+            KeyCode::Tab if !items.is_empty() => {
+                let it = &items[self.menu_sel.min(items.len() - 1)];
+                // tab on a command that takes an argument goes straight to its choices
+                self.input = if it.run && !it.fill.contains(' ') && self.arg_options(&it.fill).is_empty() { it.fill.clone() } else if it.fill.ends_with(' ') || it.fill.contains(' ') { it.fill.clone() } else { format!("{} ", it.fill) };
                 self.cursor = self.input.chars().count();
+                self.menu_sel = 0;
             }
-            KeyCode::Up if !matches.is_empty() => self.menu_sel = self.menu_sel.saturating_sub(1),
-            KeyCode::Down if !matches.is_empty() => self.menu_sel = (self.menu_sel + 1).min(matches.len() - 1),
+            KeyCode::Up if !items.is_empty() => self.menu_sel = self.menu_sel.saturating_sub(1),
+            KeyCode::Down if !items.is_empty() => self.menu_sel = (self.menu_sel + 1).min(items.len() - 1),
             KeyCode::Up if ctrl => self.scroll += 1,
             KeyCode::Down if ctrl => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::Up => {
@@ -941,6 +1139,18 @@ mod tests {
         println!("{}", k.render_html(&mut c, 130, 40, "target/snap/chat-msgs.html"));
         k.typ(&mut c, "/mo");
         println!("{}", k.render_html(&mut c, 130, 40, "target/snap/chat-menu.html"));
+        k.key(&mut c, KeyCode::Enter); // completes "/model " and lists the AIs
+        assert_eq!(c.input, "/model ");
+        let s = k.render_html(&mut c, 130, 40, "target/snap/chat-menu-model.html");
+        assert!(s.contains("claude") && s.contains("ollama"), "/model choices missing");
+        k.typ(&mut c, "cl");
+        assert_eq!(c.menu().len(), 1);
+        c.input = "/theme ".into();
+        c.cursor = 7;
+        let s = k.render(&mut c, 130, 40);
+        assert!(s.contains("ocean") && s.contains("terminal"), "/theme choices missing");
+        c.input.clear();
+        c.cursor = 0;
         println!("{}", k.render_side(&mut c, 32, 24));
     }
 

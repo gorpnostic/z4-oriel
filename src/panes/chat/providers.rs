@@ -46,6 +46,9 @@ pub struct Request {
     pub perms: String,
     pub mode: String,
     pub memory: Vec<String>,
+    /// wren: web lookups allowed / forced for this message
+    pub web: bool,
+    pub research: bool,
     pub state: serde_json::Map<String, Value>,
     pub cfg: AiConfig,
 }
@@ -134,7 +137,7 @@ fn sse(mut r: Box<dyn BufRead + Send>, stop: &AtomicBool, mut f: impl FnMut(&str
 // ------------------------------------------------------------------ wren
 fn wren(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), String> {
     let msgs: Vec<Value> = req.messages.iter().map(|(r, c)| json!({"role": r, "content": c})).collect();
-    let body = json!({"messages": msgs, "memory": req.memory, "web": true, "mode": req.mode});
+    let body = json!({"messages": msgs, "memory": req.memory, "web": req.web, "research": req.research, "mode": req.mode});
     let mut last_err = String::from("no Wren server configured");
     for base in &req.cfg.wren_urls {
         let url = format!("{}/api/chat", base.trim_end_matches('/'));
