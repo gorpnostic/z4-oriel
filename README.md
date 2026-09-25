@@ -107,6 +107,13 @@ oriel uses whatever you already have and picks the first one it finds:
 
 Switch any time with `/model`. Type `/` to see every command.
 
+**Permissions for coding agents:** `/perms` sets what Claude Code and Codex may do in chat, and it's remembered for every chat:
+
+- `ask` approves each edit or command;
+- `edits` (default) edits files in the chat's folder;
+- `plan` is read-only;
+- `bypass` is Claude Code's *bypass permissions* mode, which allows everything. Use it only in folders you trust.
+
 ## Themes
 
 `alt p` → type `theme`. Themes preview live as you move through the list. The default is **ultra**, with a soft

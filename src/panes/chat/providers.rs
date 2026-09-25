@@ -370,8 +370,8 @@ fn run_cli(
 fn claude(req: &Request, stop: &AtomicBool, send: Arc<dyn Fn(Ev) + Send + Sync>) -> Result<(), String> {
     let sid = req.state.get("claude").and_then(|s| s.get("session")).and_then(|v| v.as_str()).map(String::from);
     let mode = match req.perms.as_str() {
-        "full" => "bypassPermissions",
-        "read" => "plan",
+        "bypass" | "full" => "bypassPermissions",
+        "plan" | "read" => "plan",
         "ask" => "default",
         _ => "acceptEdits",
     };
@@ -424,12 +424,12 @@ fn codex(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Stri
         args.push(t.clone());
     }
     args.extend(["--json".into(), "--skip-git-repo-check".into()]);
-    if req.perms == "full" {
+    if req.perms == "bypass" || req.perms == "full" {
         args.push("--dangerously-bypass-approvals-and-sandbox".into());
     } else {
         // codex exec can't stop and ask, so "ask" is read-only
         args.push("-c".into());
-        args.push(format!("sandbox_mode={}", if req.perms == "read" || req.perms == "ask" { "read-only" } else { "workspace-write" }));
+        args.push(format!("sandbox_mode={}", if matches!(req.perms.as_str(), "plan" | "read" | "ask") { "read-only" } else { "workspace-write" }));
     }
     if let Some(m) = &req.model {
         args.push("-m".into());

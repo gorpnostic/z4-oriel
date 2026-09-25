@@ -28,6 +28,9 @@ pub struct AiConfig {
     /// AI for new chats: "claude", "codex", "ollama", "openai", "anthropic". Empty = the first one this
     /// computer has.
     pub provider: String,
+    /// What coding agents may do in chat: "ask", "edits" (default), "plan" (read-only) or "bypass" (anything).
+    /// Set with /perms; applies to every new chat.
+    pub perms: String,
     pub ollama_url: String,
     pub ollama_model: String,
     /// Any OpenAI-compatible endpoint (OpenAI, OpenRouter, LM Studio, llama.cpp server...).
@@ -65,6 +68,7 @@ impl Default for AiConfig {
     fn default() -> Self {
         AiConfig {
             provider: String::new(),
+            perms: "edits".into(),
             ollama_url: "http://127.0.0.1:11434".into(),
             ollama_model: "llama3.2".into(),
             openai_url: "https://api.openai.com/v1".into(),

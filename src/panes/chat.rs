@@ -32,7 +32,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/retry", "", "regenerate the last reply"),
     ("/model", "<ai> [model]", "switch AI: claude, codex, ollama, openai, anthropic"),
     ("/cwd", "<folder>", "folder Claude Code / Codex work in for this chat"),
-    ("/perms", "<ask|edits|full|read>", "what agents may do: edits (default), full, read-only, ask first"),
+    ("/perms", "<ask|edits|plan|bypass>", "what coding agents may do — remembered for every chat"),
     ("/key", "<openai|anthropic> <key>", "save an API key"),
     ("/note", "", "save the last reply to notes"),
     ("/save", "", "export this chat as a markdown file"),
@@ -57,6 +57,25 @@ struct MenuItem {
     fill: String,
     /// Picking runs it (false = a command that still needs its argument typed).
     run: bool,
+}
+
+/// The permission modes for coding agents in chat (Claude Code's own modes). Remembered in the config.
+const PERMS: &[(&str, &str)] = &[
+    ("ask", "asks you before each edit or command (y allow · n deny · a always allow that tool)"),
+    ("edits", "edits files in the chat's folder; anything else is refused (default)"),
+    ("plan", "read-only: looks and plans, changes nothing"),
+    ("bypass", "bypass permissions: never asks, allows everything — only in folders you trust"),
+];
+
+/// Canonical permission name; the old "full" / "read" still work.
+fn norm_perms(s: &str) -> Option<&'static str> {
+    match s.trim().to_lowercase().as_str() {
+        "ask" | "default" => Some("ask"),
+        "edits" | "acceptedits" | "accept" => Some("edits"),
+        "plan" | "read" | "readonly" | "read-only" => Some("plan"),
+        "bypass" | "full" | "yolo" | "bypasspermissions" => Some("bypass"),
+        _ => None,
+    }
 }
 
 const SUGGESTIONS: &[&str] = &["explain how rainbows form", "give me 3 tips for better sleep", "code a snake game in html", "what is a python function?"];
@@ -131,7 +150,7 @@ impl Chat {
             menu_sel: 0,
             cache: HashMap::new(),
             provider,
-            perms: "edits".into(),
+            perms: norm_perms(&cfg.ai.perms).unwrap_or("edits").to_string(),
             keys: HashMap::new(),
             expanded: false,
             open: HashSet::new(),
@@ -350,14 +369,22 @@ impl Chat {
                     self.info.push(format!("not a folder: {arg}"));
                 }
             }
-            "/perms" => {
-                if ["ask", "edits", "full", "read"].contains(&arg.as_str()) {
-                    self.perms = arg.clone();
-                    cx.notify(format!("agent permissions: {arg}"));
-                } else {
-                    self.info.push("/perms edits (default: edit files in the folder) · full (anything) · read (read-only) · ask (Claude Code asks you before edits and commands; Codex: read-only)".into());
+            "/perms" => match norm_perms(&arg) {
+                Some(p) => {
+                    self.perms = p.to_string();
+                    // remembered: every new chat (and the next time oriel starts) uses it
+                    let mut c = crate::config::load();
+                    c.ai.perms = p.to_string();
+                    crate::config::save(&c);
+                    cx.notify(format!("agent permissions: {p} · saved for every chat"));
                 }
-            }
+                None => {
+                    self.info.push(format!("permissions now: {} (saved for every chat). Choose one:", self.perms));
+                    for (k, what) in PERMS {
+                        self.info.push(format!("  /perms {k:<7} {what}"));
+                    }
+                }
+            },
             "/theme" if !arg.is_empty() => cx.act(Action::SetTheme(arg)),
             "/theme" => cx.act(Action::Palette("theme ".into())),
             "/key" => {
@@ -463,12 +490,7 @@ impl Chat {
                 .iter()
                 .map(|(id, label, what)| (id.to_string(), if self.avail.contains(id) { format!("{label} — {what}") } else { format!("{label} — not set up here") }))
                 .collect(),
-            "/perms" => pairs(&[
-                ("edits", "edit files in the chat's folder (default)"),
-                ("full", "anything, never asks"),
-                ("read", "read-only"),
-                ("ask", "Claude Code asks you first (y / n / a)"),
-            ]),
+            "/perms" => PERMS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
             "/key" => pairs(&[("openai", "OpenAI-compatible key"), ("anthropic", "Anthropic API key")]),
             "/theme" => crate::theme::names().into_iter().map(|n| (n.clone(), if n == "omarchy" { "follows your Omarchy theme".into() } else if n == "terminal" { "your terminal's own colours".into() } else { String::new() })).collect(),
             "/cwd" => {
@@ -818,6 +840,7 @@ impl Pane for Chat {
         let Some(s) = &mut self.stream else { return };
         let evs: Vec<Ev> = std::mem::take(&mut *s.inbox.lock().unwrap());
         let mut finished = false;
+        let mut denied_hint: Option<u32> = None;
         for ev in evs {
             let Some(m) = self.chat.messages.last_mut() else { break };
             match ev {
@@ -844,6 +867,10 @@ impl Pane for Chat {
                 Ev::Done { note } => {
                     activity::settle(&mut m.parts, "done");
                     if let Some(n) = note.filter(|n| !n.is_empty()) {
+                        // "… · 4 denied · …": say how to allow them
+                        if let Some(d) = n.split(" · ").find_map(|x| x.strip_suffix(" denied").and_then(|d| d.trim().parse::<u32>().ok())) {
+                            denied_hint = Some(d);
+                        }
                         m.note = Some(n);
                     }
                     finished = true;
@@ -858,6 +885,13 @@ impl Pane for Chat {
                     finished = true;
                 }
             }
+        }
+        if let Some(d) = denied_hint {
+            self.info.push(format!(
+                "{d} action{} blocked by the permission mode ({}). /perms ask to approve each one, /perms bypass to allow everything — saved for every chat.",
+                if d == 1 { " was" } else { "s were" },
+                self.perms
+            ));
         }
         if finished {
             self.stream = None;
@@ -1318,6 +1352,39 @@ mod tests {
             assert_eq!(c.chat.id, format!("t{i}"), "clicking row {i} opens that chat");
             assert_eq!(order(&c), before, "just opening chats must not reorder the list");
         }
+    }
+
+    #[test]
+    fn chat_perms_saved_and_bypass() {
+        let mut k = Kit::new();
+        k.config.ai.perms = "bypass".into();
+        let mut c = Chat::new(&k.config);
+        assert_eq!(c.perms, "bypass", "a new chat starts with the saved mode");
+        k.config.ai.perms = String::new();
+        let mut c2 = Chat::new(&k.config);
+        assert_eq!(c2.perms, "edits");
+        // /perms: the menu lists Claude Code's modes, bypass included
+        c2.input = "/perms ".into();
+        c2.cursor = 7;
+        let s = k.render(&mut c2, 130, 40);
+        assert!(s.contains("bypass") && s.contains("plan") && s.contains("ask") && s.contains("edits"), "{s}");
+        c2.input.clear();
+        c2.cursor = 0;
+        k.typ(&mut c2, "/perms full");
+        k.key(&mut c2, KeyCode::Enter);
+        assert_eq!(c2.perms, "bypass", "old name still works");
+        assert_eq!(norm_perms("read"), Some("plan"));
+        assert_eq!(norm_perms("nope"), None);
+        // a reply with blocked tools says how to allow them
+        c.provider = "claude".into();
+        c.chat.provider = Some("claude".into());
+        c.perms = "edits".into();
+        c.chat.messages.push(store::Msg { role: "user".into(), content: "look".into(), ..Default::default() });
+        c.chat.messages.push(store::Msg { role: "assistant".into(), model: Some("claude".into()), ..Default::default() });
+        c.stream = Some(Stream { stop: Arc::new(AtomicBool::new(false)), inbox: Arc::new(Mutex::new(vec![Ev::Done { note: Some("20s · 880 tokens · 5 turns · 4 denied · claude code".into()) }])), status: String::new(), started: Instant::now(), tokens: 0 });
+        k.poll(&mut c);
+        assert!(c.info.iter().any(|l| l.contains("4 actions were blocked") && l.contains("/perms bypass")), "{:?}", c.info);
+        store::delete(&c.chat.id);
     }
 
     #[test]
