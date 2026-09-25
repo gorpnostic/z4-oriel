@@ -106,8 +106,9 @@ Switch any time with `/model`. Type `/` to see every command.
 
 ## Themes
 
-`alt p` → type `theme`. Themes preview live as you move through the list. The built-in ones are oriel, ember,
-ocean, forest, sakura, synthwave, matrix, amber, dracula, mono and ultra (animated). There are also:
+`alt p` → type `theme`. Themes preview live as you move through the list. The default is **ultra**, with a soft
+animated rainbow. The others are oriel, ember, ocean, forest, sakura, synthwave, matrix, amber, dracula and mono.
+There are also:
 
 - **terminal**, which uses your terminal's own colours;
 - **omarchy** (the default on [Omarchy](https://omarchy.org)), which follows your Omarchy theme and recolours

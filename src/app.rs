@@ -1442,7 +1442,7 @@ mod tests {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let mut cfg = Config::default();
-        cfg.theme = "oriel".into();
+        cfg.theme = "ultra".into(); // the default look
         cfg.ai.provider = "claude".into();
         let mut app = App::new(cfg, tx);
         // a renamed tab with a finished agent, so the sidebar shows tabs + status dots

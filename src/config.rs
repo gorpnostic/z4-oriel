@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Config {
-    /// Theme name; empty = "omarchy" on Omarchy, else "oriel".
+    /// Theme name; empty = "omarchy" on Omarchy, else "ultra".
     pub theme: String,
     /// Shell for terminal panes; empty = pwsh/powershell on Windows, $SHELL on Linux/macOS.
     pub shell: String,
@@ -104,7 +104,8 @@ pub fn path() -> PathBuf {
 pub fn load() -> Config {
     let mut c: Config = std::fs::read_to_string(path()).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default();
     if c.theme.is_empty() {
-        c.theme = if crate::theme::omarchy_dir().is_some() { "omarchy".into() } else { "oriel".into() };
+        // the animated ultra theme by default; on Omarchy follow the desktop theme instead
+        c.theme = if crate::theme::omarchy_dir().is_some() { "omarchy".into() } else { "ultra".into() };
     }
     c
 }
