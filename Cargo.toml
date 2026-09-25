@@ -1,6 +1,6 @@
 [package]
 name = "oriel"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 description = "A fast terminal workspace: tabs, tmux-style split panes, and built-in apps (AI chat, music, system, files, notes, storage)"
 license = "MIT"
