@@ -130,6 +130,8 @@ impl Agents {
             Mode::Batch(_) => self.draw_batch(f, area, cx),
             Mode::Dirty(_) => self.draw_dirty(f, area, cx),
             Mode::Try(_) => self.draw_try(f, area, cx),
+            Mode::SaveTemplate(_) => self.draw_save_template(f, area, cx),
+            Mode::Templates(_) => self.draw_templates(f, area, cx),
             _ => {}
         }
         if self.prompt_pick.is_some() {
@@ -321,7 +323,10 @@ impl Agents {
                     if self.feedback_block(r).is_none() {
                         h.push(("c", "feedback to the lead"));
                     }
-                    h.extend([("d", "review"), ("T", "try it"), ("m", "merge into your branch"), ("x", "discard run")]);
+                    h.extend([("d", "review"), ("V", "second opinion"), ("T", "try it"), ("m", "merge into your branch"), ("x", "discard run")]);
+                }
+                if r.manual || !r.state.active() {
+                    h.push(("S", "save as template"));
                 }
                 h.extend([("↓", "cards"), ("R", "roster")]);
                 return h;
@@ -335,8 +340,8 @@ impl Agents {
             Some(Status::Todo) => h.extend([("enter", "start"), ("space", "mark"), ("e", "edit"), ("x", "delete")]),
             Some(Status::Running | Status::Blocked) if headless => h.extend([("enter", "live transcript"), ("t", "take over"), ("d", "diff"), ("x", "discard")]),
             Some(Status::Running | Status::Blocked) => h.extend([("enter", "open agent"), ("d", "diff"), ("c", "comment"), ("m", "merge"), ("x", "discard")]),
-            Some(Status::Review) if headless => h.extend([("enter", "transcript"), ("d", "diff"), ("T", "try it"), ("m", "merge"), ("c", "follow-up"), ("t", "take over"), ("x", "discard")]),
-            Some(Status::Review) => h.extend([("d", "diff"), ("T", "try it"), ("m", "merge"), ("c", "comment"), ("x", "discard"), ("r", "retry")]),
+            Some(Status::Review) if headless => h.extend([("enter", "transcript"), ("d", "diff"), ("V", "second opinion"), ("T", "try it"), ("m", "merge"), ("c", "follow-up"), ("t", "take over"), ("x", "discard")]),
+            Some(Status::Review) => h.extend([("d", "diff"), ("V", "second opinion"), ("T", "try it"), ("m", "merge"), ("c", "comment"), ("x", "discard"), ("r", "retry")]),
             Some(Status::Done) if sel.as_ref().map(|t| t.outcome != "merged" && t.run.is_empty()).unwrap_or(false) => h.push(("r", "retry")),
             _ => {}
         }
@@ -350,7 +355,7 @@ impl Agents {
         if self.installed("claude").is_some() {
             h.push(("P", "plan"));
         }
-        h.extend([("R", "roster"), ("o", "repo"), ("←→↑↓", "move")]);
+        h.extend([("W", "templates"), ("R", "roster"), ("o", "repo"), ("←→↑↓", "move")]);
         h
     }
 
@@ -621,12 +626,33 @@ impl Agents {
                 Status::Review | Status::Done => {
                     let st = if task.status == Status::Review && !busy { Style::default().fg(t.shine) } else { ui::muted(t) };
                     let last = if task.status == Status::Review && !task.summary.is_empty() && !task.want_merge && !busy { task.summary.clone() } else { task.last.clone() };
-                    lines.push(Line::styled(ui::fit(&last, w), st));
+                    // where its review stands, at the end of the line (it wins over the summary)
+                    let chip = if task.status == Status::Review { self.review_chip(task, spin, t) } else { vec![] };
+                    lines.push(spread(vec![Span::styled(last, st)], chip, w));
                     lines.push(spread(stat_spans(t), cost(t), w));
                 }
             }
         }
         f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// Where a finished card's review stands: a second opinion being written, comments waiting to go, or (a big
+    /// or hotspot diff, where research says another vendor's eyes pay off) a nudge to ask for one.
+    fn review_chip(&self, task: &Task, spin: &str, t: &Theme) -> Vec<Span<'static>> {
+        if let Some(by) = self.reviewing.get(&task.id) {
+            return vec![Span::styled(format!("{spin} {by}"), ui::accent(t))];
+        }
+        let notes = self.notes_of(&task.id);
+        if !notes.is_empty() {
+            let blocking = notes.iter().filter(|n| n.finding == Some(true)).count();
+            let on = notes.iter().filter(|n| n.on).count();
+            return vec![Span::styled(if blocking > 0 { format!("● {blocking} blocking") } else { format!("● {on} to send") }, bold(if blocking > 0 { t.danger } else { t.accent }))];
+        }
+        let hot = task.file_stats.iter().map(|f| f.0.as_str()).chain(task.touched.iter().map(String::as_str)).any(super::plan::is_hotspot);
+        if !task.worktree.is_empty() && (task.added + task.removed > 150 || hot || task.size == "M") {
+            return vec![Span::styled("V 2nd opinion?", Style::default().fg(t.muted))];
+        }
+        vec![]
     }
 
     // ------------------------------------------------------------------ diff

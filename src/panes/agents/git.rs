@@ -146,7 +146,8 @@ fn start_point(repo: &Path, dirty: &Dirty) -> Result<String, String> {
     if *dirty == Dirty::Ignore {
         return Ok(head);
     }
-    let st = porcelain(repo)?;
+    // oriel's own files (.oriel/: templates, the repo's setup) aren't work a new branch needs
+    let st = porcelain(repo)?.lines().filter(|l| !l.get(3..).is_some_and(|p| p.trim_matches('"').starts_with(".oriel/"))).collect::<Vec<_>>().join("\n");
     if st.trim().is_empty() {
         return Ok(head);
     }

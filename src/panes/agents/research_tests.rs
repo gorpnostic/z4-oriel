@@ -610,3 +610,207 @@ fn agents_snapshots_review_and_plan() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------------------------ templates
+
+/// S on a run of your tasks writes them to .oriel/templates/<name>.toml (discarded ones left out, their order
+/// kept as `after` keys); e edits the file in the list (a broken one isn't saved); W → enter asks for the {{args}}
+/// you put in, drops the tasks into TODO with them filled in and opens the run popup. A lead run that's still
+/// going can't be saved yet.
+#[test]
+fn agents_run_saved_as_template_and_run_again() {
+    let dir = scratch("templates");
+    let mut k = Kit::new();
+    let mut p = offline(&dir);
+    p.store.tasks.clear();
+    let here = p.repo_key();
+    let a = p.add_task("Fix the parser", "Fix the parser\nso it keeps comments", 0, "sonnet");
+    let b = p.add_task("Test the parser", "add a regression test", 1, "");
+    let c = p.add_task("Thrown away", "x", 0, "");
+    for (id, st, out) in [(&a, Status::Done, "merged"), (&b, Status::Done, "merged"), (&c, Status::Done, "discarded")] {
+        let t = p.task_mut(id).unwrap();
+        (t.status, t.outcome) = (st, out.to_string());
+    }
+    if let Some(t) = p.task_mut(&a) {
+        (t.priority, t.budget_usd, t.acceptance, t.owns) = (1, 1.5, "cargo test parser".into(), vec!["src/parse/**".into()]);
+    }
+    p.task_mut(&b).unwrap().depends_on = vec![a.clone()];
+    p.store.runs.push(store::Run { id: "r1".into(), repo: here.clone(), goal: "together, 3 tasks".into(), agent: "you".into(), state: store::RunState::Review, manual: true, batch: vec![a.clone(), b.clone(), c.clone()], branch: "oriel/batch-x".into(), created: store::now(), ..Default::default() });
+    p.lead_focus = true;
+    assert!(p.board_hints().contains(&("S", "save as template")));
+    k.key(&mut p, KeyCode::Char('S'));
+    assert!(matches!(&p.mode, Mode::SaveTemplate(v) if v.name.text == "fix-the-parser"), "named after its first task");
+    let s = k.render(&mut p, 150, 44);
+    assert!(s.contains("save the run as a template") && s.contains(".oriel/templates/fix-the-parser.toml"), "{s}");
+    k.key_mod(&mut p, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    k.typ(&mut p, "Parser fix");
+    k.key(&mut p, KeyCode::Enter);
+    let file = templates::dir(Path::new(&here)).join("parser-fix.toml");
+    assert!(file.is_file() && matches!(p.mode, Mode::Board), "{:?}", k.notices());
+    assert!(k.notices().last().is_some_and(|n| n.contains("parser-fix.toml") && n.contains("2 tasks")), "{:?}", k.notices());
+    let text = std::fs::read_to_string(&file).unwrap();
+    let t = templates::parse(&text).unwrap();
+    assert_eq!(t.tasks.len(), 2, "the discarded one isn't in it");
+    assert_eq!((t.tasks[0].prompt.as_str(), t.tasks[0].model.as_str(), t.tasks[0].priority, t.tasks[0].budget_usd, t.tasks[0].acceptance.as_str()), ("Fix the parser\nso it keeps comments", "sonnet", 1, 1.5, "cargo test parser"));
+    assert_eq!((t.tasks[0].owns.clone(), t.tasks[1].agent.as_str(), t.tasks[1].after.clone()), (vec!["src/parse/**".to_string()], "codex", vec!["t1".to_string()]));
+    // saving again doesn't overwrite it
+    k.key(&mut p, KeyCode::Char('S'));
+    k.key_mod(&mut p, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    k.typ(&mut p, "parser fix");
+    k.key(&mut p, KeyCode::Enter);
+    assert!(templates::dir(Path::new(&here)).join("parser-fix-2.toml").is_file());
+    std::fs::remove_file(templates::dir(Path::new(&here)).join("parser-fix-2.toml")).unwrap();
+    // W, e: a literal becomes an arg (a broken edit isn't saved)
+    p.lead_focus = false;
+    k.key(&mut p, KeyCode::Char('W'));
+    assert!(matches!(&p.mode, Mode::Templates(v) if v.items.len() == 1));
+    k.key(&mut p, KeyCode::Char('e'));
+    if let Mode::Templates(v) = &mut p.mode {
+        v.edit.as_mut().unwrap().1 = Input::new("name = [broken", true);
+    }
+    k.key_mod(&mut p, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    assert!(matches!(&p.mode, Mode::Templates(v) if v.edit.as_ref().is_some_and(|e| !e.2.is_empty())), "the error shows, nothing's saved");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    if let Mode::Templates(v) = &mut p.mode {
+        v.edit.as_mut().unwrap().1 = Input::new(&text.replace("title = \"Fix the parser\"", "title = \"Fix issue {{issue}}\"").replace("so it keeps comments", "as issue {{ issue }} says"), true);
+    }
+    k.key_mod(&mut p, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    let s = k.render(&mut p, 150, 44);
+    assert!(s.contains("parser-fix") && s.contains("asks for {{issue}}"), "{s}");
+    // enter: the arg, then the tasks
+    k.key(&mut p, KeyCode::Enter);
+    assert!(matches!(&p.mode, Mode::Templates(v) if v.args.as_ref().is_some_and(|a| a.names == vec!["issue".to_string()])));
+    k.key(&mut p, KeyCode::Enter);
+    assert!(k.render(&mut p, 150, 44).contains("issue is empty"));
+    k.typ(&mut p, "42");
+    k.key(&mut p, KeyCode::Enter);
+    assert!(matches!(p.mode, Mode::Batch(_)), "straight to the run popup");
+    let fix = p.store.tasks.iter().find(|t| t.title == "Fix issue 42" && t.status == Status::Todo).cloned().unwrap();
+    let test = p.store.tasks.iter().find(|t| t.title == "Test the parser" && t.status == Status::Todo).cloned().unwrap();
+    assert_eq!(fix.prompt, "Fix the parser\nas issue 42 says");
+    assert_eq!((fix.agent.as_str(), fix.model.as_str(), fix.budget_usd, fix.acceptance.as_str()), ("claude", "sonnet", 1.5, "cargo test parser"));
+    assert_eq!(test.depends_on, vec![fix.id.clone()], "its order came along");
+    assert_eq!(p.marked, vec![fix.id.clone(), test.id.clone()]);
+    k.key(&mut p, KeyCode::Esc);
+    // a lead run that's still going can't be saved yet
+    p.marked.clear();
+    p.store.runs.push(store::Run { id: "r2".into(), repo: here, goal: "g".into(), agent: "claude".into(), state: store::RunState::Running, created: store::now(), ..Default::default() });
+    p.lead_focus = true;
+    k.key(&mut p, KeyCode::Char('S'));
+    assert!(matches!(p.mode, Mode::Board) && k.notices().last().is_some_and(|n| n.contains("still at it")), "{:?}", k.notices());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Template args, names and a small pane.
+#[test]
+fn agents_template_args_and_names() {
+    let t = templates::Template {
+        name: "x".into(),
+        description: String::new(),
+        tasks: vec![templates::TaskT { key: "t1".into(), title: "Fix {{issue}} in {{ area }}".into(), prompt: "see {{issue}}".into(), agent: "claude".into(), owns: vec!["src/{{area}}/**".into()], ..Default::default() }],
+    };
+    assert_eq!(templates::args(&t), vec!["issue".to_string(), "area".to_string()]);
+    let f = templates::fill(&t, &[("issue".into(), "#7".into()), ("area".into(), "cli".into())]);
+    assert_eq!((f.tasks[0].title.as_str(), f.tasks[0].prompt.as_str(), f.tasks[0].owns[0].as_str()), ("Fix #7 in cli", "see #7", "src/cli/**"));
+    assert_eq!(templates::name_for("Fix issue #12 — fast!"), "fix-issue-12-fast");
+    assert_eq!(templates::name_for("!!"), "template");
+    assert!(templates::parse("name = \"x\"").unwrap_err().contains("no [[task]]"));
+    let text = templates::to_text(&t).unwrap();
+    assert!(text.starts_with("# oriel template") && templates::parse(&text).unwrap() == t, "{text}");
+    // the list and its forms in small panes
+    let dir = scratch("templates-small");
+    let mut k = Kit::new();
+    let mut p = offline(&dir);
+    templates::save(&p.repo.as_ref().unwrap().root.clone(), &t).unwrap();
+    k.key(&mut p, KeyCode::Char('W'));
+    let s = k.render_html(&mut p, 150, 44, "target/snap/agents-templates.html");
+    println!("{s}");
+    for (w, h) in [(60, 16), (30, 9), (20, 8)] {
+        k.render(&mut p, w, h);
+    }
+    k.key(&mut p, KeyCode::Enter);
+    k.typ(&mut p, "#7");
+    let s = k.render_html(&mut p, 150, 44, "target/snap/agents-template-args.html");
+    println!("{s}");
+    for (w, h) in [(60, 16), (30, 9), (20, 8)] {
+        k.render(&mut p, w, h);
+    }
+    k.key(&mut p, KeyCode::Esc);
+    k.key(&mut p, KeyCode::Char('e'));
+    for (w, h) in [(150, 44), (60, 16), (30, 9), (20, 8)] {
+        k.render(&mut p, w, h);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A finished card says where its review stands: a big diff nudges for a second opinion, one being written shows
+/// who's at it, findings show how many are blocking. V on the card asks for one.
+#[test]
+fn agents_card_shows_review_state_and_v_asks() {
+    let dir = scratch("review-chip");
+    let mut k = Kit::new();
+    let mut p = super::tests::demo(&dir);
+    let id = id_of(&p, "Usage sink status line"); // +212 −40
+    p.task_mut(&id).unwrap().worktree = dir.display().to_string();
+    let s = k.render(&mut p, 150, 44);
+    assert!(s.contains("V 2nd opinion?"), "a big diff nudges: {s}");
+    p.reviewing.insert(id.clone(), "codex".into());
+    assert!(k.render(&mut p, 150, 44).contains("codex"));
+    p.reviewing.clear();
+    p.notes.insert(id.clone(), vec![review::Note { path: "a".into(), line: 1, old: false, code: String::new(), text: "boom".into(), finding: Some(true), on: true }]);
+    assert!(k.render(&mut p, 150, 44).contains("● 1 blocking"));
+    // V on the card: here its checkout has no base to diff against, so it says so
+    p.select(&id);
+    assert!(p.board_hints().contains(&("V", "second opinion")));
+    k.key(&mut p, KeyCode::Char('V'));
+    assert!(k.notices().last().is_some_and(|n| n.contains("nothing to review")), "{:?}", k.notices());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// oriel's own files (.oriel/: a template you just saved, the repo's setup) don't count as uncommitted work when
+/// a task starts; your edits still do.
+#[test]
+fn agents_oriel_files_dont_make_the_checkout_dirty() {
+    let dir = scratch("oriel-files");
+    let repo = temp_repo(&dir);
+    std::fs::create_dir_all(repo.join(".oriel").join("templates")).unwrap();
+    std::fs::write(repo.join(".oriel").join("templates").join("x.toml"), "name = \"x\"\n").unwrap();
+    assert!(git::start_at(&repo, &dir.join("wt").join("one"), "one-1", "t1", None, None, &git::Dirty::Ask(String::new())).is_ok());
+    std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+    let e = git::start_at(&repo, &dir.join("wt").join("two"), "two-1", "t2", None, None, &git::Dirty::Ask(String::new())).err().unwrap();
+    assert!(e.starts_with(git::DIRTY) && e.contains("a.txt") && !e.contains(".oriel"), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The lead's review tool: a second opinion on one of its finished tasks, answered to the lead (blocking and
+/// optional findings with path:line), its cost counted toward the run; a task still working can't be reviewed.
+#[test]
+fn agents_lead_review_tool() {
+    let dir = scratch("lead-review");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(Arc::default()), fake_worker(Arc::default()));
+    p.fake_reviewer = Some(fake_reviewer(false, Arc::default()));
+    let wt = dir.join("wt").join("rev");
+    let s = git::start(&repo, &wt, "rev-1", "t1", None).unwrap();
+    std::fs::write(wt.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+    let here = repo.display().to_string();
+    p.store.runs.push(store::Run { id: "r1".into(), repo: here.clone(), goal: "g".into(), agent: "claude".into(), state: store::RunState::Running, branch: "oriel/lead-g".into(), created: store::now(), ..Default::default() });
+    p.store.tasks.push(Task { id: "k1".into(), key: "a".into(), run: "r1".into(), repo: here, title: "Shout".into(), prompt: "shout line two".into(), agent: "claude".into(), mode: "headless".into(), status: Status::Review, worktree: wt.display().to_string(), base_sha: s.base_sha.clone(), branch: s.branch.clone(), created: store::now(), ..Default::default() });
+    p.runs_live.insert("r1".into(), lead::RunLive::new());
+    let call = |p: &mut Agents, k: &mut Kit| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        with_cx(k, |cx| p.on_call(mcp::Call { run: "r1".into(), tool: "review".into(), args: json!({"id": "a"}), reply: tx }, cx));
+        rx.recv_timeout(Duration::from_secs(40)).unwrap()
+    };
+    let v: serde_json::Value = serde_json::from_str(&call(&mut p, &mut k).unwrap()).unwrap();
+    assert_eq!((v["reviewer"].as_str(), v["blocking"][0]["path"].as_str(), v["blocking"][0]["line"].as_u64()), (Some("codex"), Some("a.txt"), Some(2)), "{v}");
+    assert_eq!(v["optional"].as_array().map(|a| a.len()), Some(1));
+    until(&mut k, &mut p, 5000, "its cost", |p| p.store.runs[0].cost_usd > 0.1);
+    assert!(run0(&p).log.iter().any(|l| l.contains("second opinion on k1 from codex")), "{:?}", run0(&p).log);
+    assert!(p.notes_of("k1").is_empty(), "the lead's review goes to the lead, not into your comments");
+    p.task_mut("k1").unwrap().status = Status::Running;
+    assert!(call(&mut p, &mut k).unwrap_err().contains("still working"));
+    assert!(run::claude_tool_names().contains("mcp__oriel__review"), "a Claude lead may call it");
+    let _ = std::fs::remove_dir_all(&dir);
+}

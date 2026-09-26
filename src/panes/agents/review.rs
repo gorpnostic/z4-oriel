@@ -96,6 +96,38 @@ pub struct Finding {
     pub blocking: bool,
 }
 
+/// Everything a second opinion needs, off the UI thread.
+pub struct ReviewJob {
+    wt: PathBuf,
+    base: String,
+    author: String,
+    what: String,
+    agent: String,
+    model: String,
+    pub by: String,
+    bin: PathBuf,
+    fake: Option<run::Fake>,
+    tmp: PathBuf,
+}
+
+impl ReviewJob {
+    /// Show the reviewer the diff (cut to REVIEW_CHARS; it can read the rest) and collect its findings. Blocking.
+    pub fn run(&self) -> Result<Review, String> {
+        let mut diff = git::diff_text(&self.wt, &self.base, "", 1, 1_000_000)?;
+        if diff.len() > REVIEW_CHARS {
+            let cut = (0..=REVIEW_CHARS).rev().find(|&i| diff.is_char_boundary(i)).unwrap_or(0);
+            diff.truncate(cut);
+            diff.push_str("\n… (the diff goes on: read the changed files in the checkout)");
+        }
+        let spec = run::review_spec(&self.agent, &self.bin, &self.model, &review_prompt(&self.author, &self.what, &diff), &self.wt, &self.tmp, REVIEW_BUDGET);
+        let o = run::run(&spec, &Arc::new(AtomicBool::new(false)), self.fake.as_ref(), &mut |_| {});
+        match findings_of(&o) {
+            Some(findings) => Ok(Review { by: self.by.clone(), findings, cost: o.cost }),
+            None => Err(o.error.unwrap_or_else(|| "its answer had no findings list".into())),
+        }
+    }
+}
+
 /// A second opinion, back from the reviewer.
 pub struct Review {
     /// "codex" / "claude · sonnet"
@@ -421,28 +453,58 @@ impl Agents {
             cx.notify("a second opinion needs claude, codex or kimi installed");
             return;
         };
+        let job = self.review_job(PathBuf::from(wt), base, author, what, agent, model);
+        cx.notify(format!("{} is reviewing it (read-only, up to ${REVIEW_BUDGET:.2}) — its findings show up here", job.by));
+        self.reviewing.insert(id.to_string(), job.by.clone());
+        let id = id.to_string();
+        self.spawn(cx, move |send| send(Msg::Reviewed(id, job.run())));
+    }
+
+    /// A second opinion to run on a background thread (the reviewer's binary, or the tests' fake).
+    fn review_job(&self, wt: PathBuf, base: String, author: String, what: String, agent: String, model: String) -> ReviewJob {
         let by = if model.is_empty() { agent.clone() } else { format!("{agent} · {model}") };
         let bin = self.installed(&agent).unwrap_or_else(|| PathBuf::from(&agent));
-        let (fake, tmp) = (self.fake_reviewer.clone(), self.paths.agents.join("tmp"));
-        cx.notify(format!("{by} is reviewing it (read-only, up to ${REVIEW_BUDGET:.2}) — its findings show up here"));
-        self.reviewing.insert(id.to_string(), by.clone());
-        let id = id.to_string();
+        ReviewJob { wt, base, author, what, agent, model, by, bin, fake: self.fake_reviewer.clone(), tmp: self.paths.agents.join("tmp") }
+    }
+
+    /// The lead's `review` tool: a second opinion on one of its tasks, answered to the lead (not queued for you):
+    /// its blocking and optional findings, to send back with send_followup before merging (research #9).
+    pub(super) fn call_review(&mut self, run: &super::store::Run, id: &str, reply: super::lead::Reply, cx: &mut Cx) {
+        let t = match self.task_in(run, id) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        let busy = self.live.get(&t.id).is_some_and(|l| l.stop.is_some() || l.busy || l.checking);
+        let why = if matches!(t.status, super::store::Status::Running | super::store::Status::Blocked) || busy {
+            Some(format!("{} is still working — review it once it's finished", t.id))
+        } else if t.worktree.is_empty() || t.base_sha.is_empty() || !Path::new(&t.worktree).is_dir() {
+            Some(format!("{} has no worktree any more", t.id))
+        } else {
+            None
+        };
+        let who = self.reviewer_for(&t.agent);
+        let (Some((agent, model)), None) = (who.clone(), why.clone()) else {
+            let _ = reply.send(Err(why.unwrap_or_else(|| "no reviewer is installed (claude, codex or kimi)".into())));
+            return;
+        };
+        let job = self.review_job(PathBuf::from(&t.worktree), t.base_sha.clone(), t.agent.clone(), format!("{}\n{}", t.title, t.prompt), agent, model);
+        let (run_id, tid) = (run.id.clone(), t.id.clone());
         self.spawn(cx, move |send| {
-            let r = (|| {
-                let mut diff = git::diff_text(Path::new(&wt), &base, "", 1, 1_000_000)?;
-                if diff.len() > REVIEW_CHARS {
-                    let cut = (0..=REVIEW_CHARS).rev().find(|&i| diff.is_char_boundary(i)).unwrap_or(0);
-                    diff.truncate(cut);
-                    diff.push_str("\n… (the diff goes on: read the changed files in the checkout)");
-                }
-                let spec = run::review_spec(&agent, &bin, &model, &review_prompt(&author, &what, &diff), Path::new(&wt), &tmp, REVIEW_BUDGET);
-                let o = run::run(&spec, &Arc::new(AtomicBool::new(false)), fake.as_ref(), &mut |_| {});
-                match findings_of(&o) {
-                    Some(findings) => Ok(Review { by, findings, cost: o.cost }),
-                    None => Err(o.error.unwrap_or_else(|| "its answer had no findings list".into())),
-                }
-            })();
-            send(Msg::Reviewed(id, r));
+            let r = job.run();
+            let cost = r.as_ref().map(|rv| rv.cost).unwrap_or(0.0);
+            let answer = r.map(|rv| {
+                let list = |b: bool| -> Vec<Value> { rv.findings.iter().filter(|f| f.blocking == b).map(|f| serde_json::json!({"path": f.path, "line": f.line, "why": f.why, "repro": f.repro})).collect() };
+                serde_json::json!({"task": tid, "reviewer": rv.by, "blocking": list(true), "optional": list(false), "next": "send the blocking ones back with send_followup (quote path:line), then merge once it's fixed; the optional ones are your call"}).to_string()
+            });
+            let line = match &answer {
+                Ok(_) => format!("second opinion on {tid} from {}", job.by),
+                Err(e) => format!("second opinion on {tid} failed: {e}"),
+            };
+            let _ = reply.send(answer);
+            send(Msg::ReviewSpent(run_id, cost, line));
         });
     }
 

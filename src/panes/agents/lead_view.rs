@@ -348,7 +348,7 @@ impl Agents {
     pub(super) fn draw_lead_form(&self, f: &mut Frame, area: Rect, cx: &Cx) {
         let t = cx.theme;
         let Mode::LeadForm(form) = &self.mode else { return };
-        let inner = ui::popup(f, area, 92, 31, if form.retry.is_some() { "⚑ lead run · again" } else { "⚑ new lead run" }, t);
+        let inner = ui::popup(f, area, 92, 30, if form.retry.is_some() { "⚑ lead run · again" } else { "⚑ new lead run" }, t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let repo = self.repo.as_ref().map(|r| format!("{} · a lead agent plans the goal and hands it to workers on a new branch off {}", r.name, r.branch)).unwrap_or_default();
         f.render_widget(Paragraph::new(Span::styled(ui::fit(&repo, inner.width as usize), ui::muted(t))), Rect { height: 1, ..inner });
@@ -421,7 +421,7 @@ impl Agents {
                 Span::styled(if on { "› " } else { "  " }, bold(t.accent)),
                 Span::styled(box_, if on { st.bg(tint(t.accent, 0.2)) } else { st }),
                 Span::styled(" approve the plan first", if on { bold(t.fg) } else { Style::default().fg(t.fg) }),
-                Span::styled(" — its tasks come to you as cards (x drops · e edits · a starts them)", ui::muted(t)),
+                Span::styled(" — you see its tasks as cards before any worker starts", ui::muted(t)),
             ];
             if on {
                 spans.push(Span::styled("  space toggles", ui::muted(t)));

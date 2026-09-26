@@ -88,6 +88,8 @@ impl Agents {
         }
         let n = checked.items.len();
         let (serial, notes) = (checked.serial, checked.notes.clone());
+        // a run that went to review while its plan waited (its lead called done) takes the tasks in again
+        self.revive(run);
         let out = self.spawn_plan(&r, checked.items, cx);
         let reply = self.plan_reply(&out, serial, &notes);
         let mut card = json!({"event": "plan_approved", "tasks": reply["tasks"], "action": "the tasks are queued and start as worker slots free up: wait for their results"});
@@ -310,7 +312,8 @@ impl Agents {
         let t = cx.theme;
         let Mode::PlanReview(v) = &self.mode else { return };
         let (run_id, sel, editing, noting) = (v.run.clone(), v.sel, v.edit.is_some(), v.note.is_some());
-        let Some(r) = self.run_ref(&run_id).cloned() else {
+        let Some(r) = self.run_ref(&run_id).cloned().filter(|r| !r.held.is_empty()) else {
+            // approved or sent back meanwhile, or the run is gone
             self.mode = Mode::Board;
             return;
         };

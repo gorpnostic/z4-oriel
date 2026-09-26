@@ -1056,6 +1056,17 @@ impl Agents {
                 self.queue_merge(&t.id)
             }),
             "resolve_conflicts" => return self.call_resolve(&run, arg(a, "id"), c.reply, cx),
+            // another vendor's opinion on a task's diff (review.rs), answered when it's in
+            "review" => {
+                if let Err(e) = self.check_budget(&run.id, cx) {
+                    let _ = c.reply.send(Err(e));
+                    return;
+                }
+                if let Some(x) = self.run_mut(&run.id) {
+                    x.log(&format!("asked for a second opinion on {}", arg(a, "id")));
+                }
+                return self.call_review(&run, arg(a, "id"), c.reply, cx);
+            }
             "discard" => {
                 return match self.task_in(&run, arg(a, "id")) {
                     Ok(t) => self.discard_task(&t.id, Some(c.reply), cx),
@@ -1080,6 +1091,7 @@ impl Agents {
                     Ok("noted on the board".into())
                 }
             }
+            "done" if !run.held.is_empty() => Err("your plan still waits for the user's approval — call wait for plan_approved or plan_rejected first".into()),
             "done" => {
                 let summary = arg(a, "summary").to_string();
                 if let Some(r) = self.run_mut(&run.id) {
@@ -1148,7 +1160,7 @@ impl Agents {
         }
     }
 
-    fn task_in(&self, run: &Run, id: &str) -> Result<Task, String> {
+    pub(super) fn task_in(&self, run: &Run, id: &str) -> Result<Task, String> {
         match self.store.tasks.iter().rev().find(|t| t.run == run.id && (t.id == id || (!t.key.is_empty() && t.key == id))) {
             Some(t) => Ok(t.clone()),
             None => {

@@ -23,6 +23,7 @@ pub const TOOLS: &[(&str, &str, &str)] = &[
     ("merge", "Queue a finished task for merging into the integration branch. Merges run one at a time: conflict check, then the gate (build/tests + the task's acceptance command) on the merged result, then the branch moves. A conflict or failed gate goes back to the same worker automatically (2 tries, then a fresh worker) and merges when fixed. If the acceptance command itself was wrong (event acceptance_broken), merge again with a corrected one (or \"\" for none). Watch wait for the outcome.", r#"{"type":"object","properties":{"id":{"type":"string"},"acceptance":{"type":"string","description":"replace the task's acceptance command first"}},"required":["id"]}"#),
     ("send_followup", "Send a finished task's worker more instructions in the same session (review feedback); it goes back to running.", r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"}},"required":["id","text"]}"#),
     ("resolve_conflicts", "Merge the current integration branch into a task's worktree now and have its worker resolve the conflict markers (merge does this by itself on a conflict).", r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
+    ("review", "A second opinion on a finished task's diff from another vendor's AI (read-only, up to $1 of the run's budget): its blocking and optional findings with path:line. Worth it for big or risky diffs (over 150 lines, hotspot files, size M, concurrency or security); send the blocking ones back with send_followup before you merge.", r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
     ("spawn_task", "Add one task outside a plan (same checks as plan).", r#"{"type":"object","properties":{"worker":{"type":"string"},"title":{"type":"string"},"goal":{"type":"string"},"owns":{"type":"array","items":{"type":"string"}},"depends_on":{"type":"array","items":{"type":"string"}},"acceptance":{"type":"string"},"size":{"type":"string","enum":["S","M"]},"priority":{"type":"string","enum":["low","normal","high","urgent"]}},"required":["worker","title","goal","owns"]}"#),
     ("discard", "Throw a task away: stops its worker and deletes its worktree and branch.", r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
     ("note", "Post a short progress note on oriel's board. Set needs_user to notify the user (e.g. a task is blocked and needs a decision).", r#"{"type":"object","properties":{"text":{"type":"string"},"needs_user":{"type":"boolean"}},"required":["text"]}"#),
@@ -260,7 +261,7 @@ pub fn lead_system(b: &Brief, mcp: bool) -> String {
          HOW TO WORK\n\
          1. roster first. Then ONE plan with small tasks (S about 100 lines / 3 files, M about 400 / 8), each owning disjoint globs, each with an acceptance command when there's a way to check it. Hotspot files (Cargo.toml, package.json, lockfiles, mod.rs/lib.rs/index.ts registries, migrations) go to one scaffold task the others depend on. Two tasks or fewer run one after the other: for a small goal use a single task.\n\
          2. Write each goal so a worker with no other context can do it: what, where, how to verify. Never paste transcripts.\n\
-         3. wait for events. For each finished card: merge it if the summary and files look right, send_followup with precise fixes, or discard it. Use task_diff only when the card isn't enough.\n\
+         3. wait for events. For each finished card: merge it if the summary and files look right, send_followup with precise fixes, or discard it. Use task_diff only when the card isn't enough. For a big or risky diff (over 150 lines, hotspot files, size M), call review first and send its blocking findings back with send_followup.\n\
          4. If a task comes back blocked, answer its questions with send_followup, re-plan it, or post a note with needs_user.\n\
          5. When everything useful is merged, call done with a short summary.\n\n\
          ROUTING\n\
@@ -292,7 +293,7 @@ pub fn lead_system(b: &Brief, mcp: bool) -> String {
         s.push_str("- The user approves every plan before anything starts: after plan (or spawn_task) nothing runs until they do. Call wait: you get plan_approved (the tasks as they finally are, with ids: they may drop or edit some) or plan_rejected (their note: submit a new plan that takes it into account).\n");
     }
     if mcp {
-        s.push_str("\nYour tools are oriel's MCP tools (mcp__oriel__*): roster, plan, wait, task_status, task_diff, merge, send_followup, resolve_conflicts, spawn_task, discard, note, done.\n");
+        s.push_str("\nYour tools are oriel's MCP tools (mcp__oriel__*): roster, plan, wait, task_status, task_diff, merge, send_followup, resolve_conflicts, review, spawn_task, discard, note, done.\n");
     } else {
         s.push_str(&text_protocol());
     }

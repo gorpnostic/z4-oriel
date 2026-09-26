@@ -30,6 +30,7 @@ mod roster;
 mod run;
 mod store;
 mod stream;
+mod templates;
 #[cfg(test)]
 mod tests;
 mod view;
@@ -304,6 +305,8 @@ enum Msg {
     Plan(String, Result<PlanOut, String>),
     /// A second opinion on a task's or run's diff (review.rs).
     Reviewed(String, Result<review::Review, String>),
+    /// A second opinion the lead asked for is in: (run, what it cost, a line for the run's log).
+    ReviewSpent(String, f64, String),
     // ---- lead mode
     /// A headless worker's live event, and its end.
     Worker(String, stream::Ev),
@@ -593,6 +596,9 @@ enum Mode {
     Try(TryView),
     /// The lead's plan as cards, waiting for your approval (plan_view.rs).
     PlanReview(plan_view::PlanView),
+    /// S: a run saved as a template; W: the repo's templates (templates.rs).
+    SaveTemplate(templates::SaveView),
+    Templates(templates::TplView),
 }
 
 #[derive(Clone)]
@@ -1380,6 +1386,13 @@ impl Agents {
                 }
             }
             Msg::Reviewed(id, r) => self.on_reviewed(&id, r, cx),
+            Msg::ReviewSpent(run, cost, line) => {
+                // the lead asked for it: it counts as the lead's spend (the run's budget covers it)
+                if let Some(r) = self.run_mut(&run) {
+                    r.cost_usd += cost;
+                    r.log(&line);
+                }
+            }
             Msg::Worker(id, e) => self.on_worker_ev(&id, e),
             Msg::WorkerDone(id, o) => self.on_worker_done(&id, o, cx),
             Msg::Checked(id, stats, conflicts, resolved) => self.on_checked(&id, stats, conflicts, resolved, cx),
@@ -2625,6 +2638,11 @@ impl Agents {
                 Some(why) => cx.notify(why),
             },
             KeyCode::Char('T') if !run.branch.is_empty() => self.open_try(&run.id, cx),
+            // its tasks as a template, to run again (W)
+            KeyCode::Char('S') => self.open_save_template(&run.id, cx),
+            // another AI's opinion on the whole integration branch (its findings wait in the run's diff)
+            KeyCode::Char('V') if !run.state.active() && !run.branch.is_empty() => self.second_opinion(&run.id, cx),
+            KeyCode::Char('V') => {}
             KeyCode::Char('d' | 'm' | 'r' | 's' | 'T') => {}
             _ => return false,
         }
@@ -2662,6 +2680,7 @@ impl Agents {
             KeyCode::Char('L') => self.open_form_key('L', cx),
             KeyCode::Char('u') => self.undo_delete(cx),
             KeyCode::Char('R') => self.mode = Mode::Roster(RosterView { sel: 0, edit: None }),
+            KeyCode::Char('W') if self.repo.is_some() => self.open_templates(),
             KeyCode::Char('w') => {
                 if let Some(r) = self.current_run() {
                     self.mode = Mode::Watch(WatchView { run: r.id.clone(), sel: 0 });
@@ -2714,17 +2733,19 @@ impl Agents {
                 }
             }
             _ => {
-                let Some(id) = self.selected() else { return matches!(k.code, KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't' | 'T')) };
+                let Some(id) = self.selected() else { return matches!(k.code, KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't' | 'T' | 'V')) };
                 let t = self.task(&id).unwrap().clone();
                 let has_wt = !t.worktree.is_empty();
                 let running_headless = t.headless() && self.live(&id).stop.is_some();
                 let in_run = !t.run.is_empty();
-                if let (KeyCode::Char('c' | 'm' | 'x' | 'r' | 't'), Err(why), false) = (k.code, self.can_act(&id), t.status == Status::Done) {
+                if let (KeyCode::Char('c' | 'm' | 'x' | 'r' | 't' | 'V'), Err(why), false) = (k.code, self.can_act(&id), t.status == Status::Done) {
                     cx.notify(why);
                     return true;
                 }
                 match k.code {
                     KeyCode::Char('d') if has_wt => self.open_diff(&id, cx),
+                    // a second opinion on finished work: its findings wait in the diff view (d)
+                    KeyCode::Char('V') if has_wt && t.status == Status::Review && !running_headless => self.second_opinion(&id, cx),
                     KeyCode::Char('T') if has_wt && t.status != Status::Done => self.open_try(&id, cx),
                     KeyCode::Char('c') if has_wt && t.status != Status::Done && !running_headless => self.open_comment(id),
                     KeyCode::Char('m') if in_run && has_wt && t.status == Status::Review => self.confirm(Pending::Merge),
@@ -2733,7 +2754,7 @@ impl Agents {
                     KeyCode::Char('x') if t.status != Status::Done => self.confirm(Pending::Discard),
                     KeyCode::Char('r') if !in_run && t.status != Status::Todo && !(t.status == Status::Done && t.outcome == "merged") => self.confirm(Pending::Retry),
                     KeyCode::Char('t') if t.headless() && has_wt => self.take_over(&id, cx),
-                    KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't' | 'T') => {}
+                    KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't' | 'T' | 'V') => {}
                     _ => return false,
                 }
             }
@@ -3149,6 +3170,8 @@ impl Pane for Agents {
             Mode::Dirty(_) => self.dirty_key(k, cx),
             Mode::Try(_) => self.try_key(k, cx),
             Mode::PlanReview(_) => self.plan_review_key(k, cx),
+            Mode::SaveTemplate(_) => self.save_template_key(k, cx),
+            Mode::Templates(_) => self.templates_key(k, cx),
             Mode::Confirm(_) => {
                 let Mode::Confirm(c) = std::mem::replace(&mut self.mode, Mode::Board) else { return true };
                 // throwing something away (or stopping a run) takes a real y; enter only confirms merges
@@ -3251,6 +3274,9 @@ impl Pane for Agents {
         self.restored = false;
         if matches!(self.mode, Mode::PlanReview(_)) {
             return self.plan_review_paste(text);
+        }
+        if matches!(self.mode, Mode::SaveTemplate(_) | Mode::Templates(_)) {
+            return self.templates_paste(text);
         }
         match &mut self.mode {
             Mode::Batch(v) if v.editing => v.gate.insert(text.trim()),
