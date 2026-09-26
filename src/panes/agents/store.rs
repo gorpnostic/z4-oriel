@@ -114,6 +114,10 @@ pub struct Task {
     pub redispatches: u32,
     /// The lead asked to merge it: after a fix round, oriel merges it by itself.
     pub want_merge: bool,
+    /// The merge queue's tamper scan found test changes (an added #[ignore] / skip / xfail, asserts removed): it
+    /// waits for your y before it merges. `tests_ok` = you said y, so it isn't scanned again.
+    pub tamper: Vec<String>,
+    pub tests_ok: bool,
     /// Notes carried into a fresh re-dispatch (what went wrong before).
     pub history: Vec<String>,
 }

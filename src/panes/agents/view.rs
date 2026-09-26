@@ -474,6 +474,13 @@ impl Agents {
                     }
                     lines.push(spread(left, cost(t), w));
                 }
+                Status::Review if !task.tamper.is_empty() => {
+                    // the tamper scan parked it: a red chip, what it found, and the key that lets it through
+                    let chip = Span::styled(" touched tests ", Style::default().fg(Color::Black).bg(t.danger).add_modifier(Modifier::BOLD));
+                    let what = format!(" {}", task.tamper.join(" · "));
+                    lines.push(Line::from(vec![chip, Span::styled(ui::fit(&what, w.saturating_sub(15)), Style::default().fg(t.danger))]));
+                    lines.push(spread(vec![Span::styled("y", bold(t.accent)), Span::styled(" lets it merge · d diff", ui::muted(t))], cost(t), w));
+                }
                 Status::Review if task.blocked => {
                     let q = task.questions.first().cloned().unwrap_or_else(|| "blocked — needs a decision".into());
                     lines.push(Line::styled(ui::fit(&format!("? {q}"), w), Style::default().fg(t.danger)));
@@ -620,7 +627,7 @@ impl Agents {
         let t = cx.theme;
         let Mode::Form(form) = &self.mode else { return };
         let title = if form.editing.is_some() { "edit task" } else { "new task" };
-        let inner = ui::popup(f, area, 86, 37, &format!("{}{title}", ui::lead("new")), t);
+        let inner = ui::popup(f, area, 86, 40, &format!("{}{title}", ui::lead("new")), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let repo = self.repo.as_ref().map(|r| format!("{} · a new branch off {}", r.name, r.branch)).unwrap_or_default();
         f.render_widget(Paragraph::new(Span::styled(repo, ui::muted(t))), Rect { height: 1, ..inner });
@@ -635,7 +642,7 @@ impl Agents {
         let r = field(f, "title", 3, 0, &mut y);
         draw_input(f, r, &form.title, "what should it be called?", form.field == 0, t);
         // prompt
-        let ph = (bottom.saturating_sub(y + 21)).clamp(3, 12);
+        let ph = (bottom.saturating_sub(y + 24)).clamp(3, 12);
         let r = field(f, "prompt", ph + 2, 1, &mut y);
         draw_input(f, r, &form.prompt, "what should the agent do? (enter = new line, paste works)", form.field == 1, t);
         // agent chooser
@@ -689,11 +696,14 @@ impl Agents {
         // budget
         let r = field(f, "budget $ (stops it past this)", 3, 6, &mut y);
         draw_input(f, r, &form.budget, "empty = the roster's cap for this agent", form.field == 6, t);
+        // acceptance
+        let r = field(f, "acceptance (a command that proves it works)", 3, 7, &mut y);
+        draw_input(f, r, &form.acceptance, "e.g. cargo test parser · the worker makes it pass; a run's merge gate runs it · empty = none", form.field == 7, t);
         // buttons
         y += 1;
         if y < bottom {
             let btn = |label: &str, on: bool| {
-                if on && form.field == 7 {
+                if on && form.field == 8 {
                     Span::styled(format!(" {label} "), Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD))
                 } else if on {
                     Span::styled(format!("[{label}]"), bold(t.accent))

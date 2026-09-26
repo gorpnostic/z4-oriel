@@ -241,8 +241,10 @@ fn agents_batch_runs_without_a_lead() {
     assert!(r.manual && r.merged == 3, "{r:?}
 {:#?}", p.store.tasks);
     assert!(r.branch.contains("batch-"), "{}", r.branch);
-    let first = seen.lock().unwrap().first().cloned().unwrap_or_default();
-    assert!(first.contains(&c), "the urgent one started first: {first}");
+    // c (urgent) and a took the two slots; b waited. (Which of the two first reaches its worker depends on whose
+    // worktree git makes first, so only the pair is checked.)
+    let firsts: Vec<String> = seen.lock().unwrap().iter().take(2).cloned().collect();
+    assert!(firsts.iter().any(|s| s.contains(&c)) && !firsts.iter().any(|s| s.contains(&b)), "the urgent one went ahead of b: {firsts:?}");
     assert_eq!(p.task(&b).unwrap().attempts, 1, "b failed the gate once and went back to its worker");
     for (f, want) in [("a.txt", "aaa"), ("b.txt", "fixed"), ("c.txt", "sea")] {
         assert_eq!(sh(&repo, &["show", &format!("{}:{f}", r.branch)]), want);
@@ -792,5 +794,39 @@ fn agents_lead_live_claude_haiku() {
     let hello = sh(&repo, &["show", &format!("{}:hello.txt", r.branch)]);
     assert_eq!(hello.trim(), "hi");
     assert_eq!(r.protocol, "mcp");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+/// A worker that switches a test off doesn't get merged: the tamper scan parks it with a red "touched tests" chip
+/// and a needs-you alert, the run waits, and y on its card lets it merge.
+#[test]
+fn agents_tamper_scan_parks_the_merge() {
+    let dir = scratch("tamper");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(Arc::default()), fake_text_lead(json!([]), 0, Arc::default()));
+    p.lead_cfg.gate = "none".into();
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    let a = p.add_task("Quiet a test", "write t.rs: #[ignore]\\n#[test]\\nfn t() {}", 0, "");
+    let b = p.add_task("Add b", "write b.txt: bee", 0, "");
+    p.marked = vec![a.clone(), b.clone()];
+    k.key(&mut p, KeyCode::Enter);
+    k.key(&mut p, KeyCode::Char('p'));
+    until(&mut k, &mut p, 60_000, "a parked, b merged", |p| !p.task(&a).unwrap().tamper.is_empty() && p.task(&b).unwrap().status == Status::Done);
+    let t = p.task(&a).unwrap().clone();
+    assert_eq!(t.tamper, ["t.rs: #[ignore added"]);
+    assert!(t.blocked && !t.want_merge && t.status == Status::Review, "{t:?}");
+    assert_eq!(run0(&p).state, store::RunState::Running, "the run waits for you");
+    assert!(k.notices().iter().any(|n| n.contains("touched tests") && n.contains("y on its card")), "{:?}", k.notices());
+    p.select(&a);
+    let s = k.render_html(&mut p, 150, 44, "target/snap/agents-tamper.html");
+    assert!(s.contains("touched tests") && s.contains("lets it merge"), "{s}");
+    k.key(&mut p, KeyCode::Char('y'));
+    until(&mut k, &mut p, 60_000, "the run is ready", |p| run0(p).state == store::RunState::Review);
+    let t = p.task(&a).unwrap();
+    assert!(t.outcome == "merged" && t.tests_ok && t.tamper.is_empty(), "{t:?}");
+    assert!(sh(&repo, &["show", &format!("{}:t.rs", run0(&p).branch)]).contains("#[ignore]"));
     let _ = std::fs::remove_dir_all(&dir);
 }

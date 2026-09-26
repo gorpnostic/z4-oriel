@@ -682,6 +682,52 @@ pub fn file_stats(wt: &Path, base_sha: &str) -> Result<Vec<(String, u64, u64)>, 
     })
 }
 
+/// A task's own changes (committed + uncommitted + new files) as a diff with no context lines, for tamper_scan.
+pub fn task_diff(wt: &Path, base_sha: &str) -> Result<String, String> {
+    with_snapshot_index(wt, |env| {
+        let o = run_env(wt, &["-c", "core.quotepath=false", "diff", "--cached", "--no-color", "--no-ext-diff", "--no-renames", "-U0", base_sha], env);
+        if o.ok { Ok(o.stdout) } else { Err(err_line(&o, &["diff"])) }
+    })?
+}
+
+/// Added lines that switch a test off, in any of the usual test frameworks.
+const SKIPS: &[&str] = &["#[ignore", "@pytest.mark.skip", "@pytest.mark.xfail", "pytest.skip(", "@unittest.skip", ".skipTest(", "xfail", "it.skip(", "test.skip(", "describe.skip(", "xit(", "xtest(", "xdescribe(", "t.Skip(", "@Disabled", "@Ignore"];
+
+/// Test changes in a task's diff that make checks easier to pass rather than the code better: an added
+/// #[ignore] / skip / xfail, or a file that loses more asserts than it gains. One line per finding, e.g.
+/// "tests/parse.rs: #[ignore added" or "src/lib.rs: 3 asserts removed". Empty = nothing suspicious.
+pub fn tamper_scan(diff: &str) -> Vec<String> {
+    let mut hits = vec![];
+    let mut file = String::new();
+    let (mut gained, mut lost) = (0usize, 0usize);
+    let asserts = |l: &str| l.contains("assert") || l.contains("expect(");
+    let close = |file: &str, gained: usize, lost: usize, hits: &mut Vec<String>| {
+        if lost > gained {
+            let n = lost - gained;
+            hits.push(format!("{file}: {n} assert{} removed", if n == 1 { "" } else { "s" }));
+        }
+    };
+    for l in diff.lines() {
+        if let Some(rest) = l.strip_prefix("diff --git ") {
+            close(&file, gained, lost, &mut hits);
+            (gained, lost) = (0, 0);
+            file = rest.rsplit_once(" b/").map(|x| x.1).unwrap_or(rest).to_string();
+        } else if l.starts_with("+++ ") || l.starts_with("--- ") {
+            continue;
+        } else if let Some(add) = l.strip_prefix('+') {
+            if let Some(s) = SKIPS.iter().find(|s| add.contains(*s)) {
+                hits.push(format!("{file}: {s} added"));
+            }
+            gained += asserts(add) as usize;
+        } else if let Some(del) = l.strip_prefix('-') {
+            lost += asserts(del) as usize;
+        }
+    }
+    close(&file, gained, lost, &mut hits);
+    hits.dedup();
+    hits
+}
+
 /// Would this task merge into `integration` right now? The files that conflict (empty = clean).
 pub fn conflicts_with(repo: &Path, wt: &Path, base_sha: &str, integration: &str) -> Result<Vec<String>, String> {
     let d = diff_against(repo, wt, base_sha, Some(integration))?;

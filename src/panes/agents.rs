@@ -242,7 +242,7 @@ pub(super) const PRIORITIES: &[(i8, &str)] = &[(-1, "low"), (0, "normal"), (1, "
 struct Form {
     /// Some = editing this TODO task
     editing: Option<String>,
-    field: usize, // 0 title, 1 prompt, 2 agent, 3 model, 4 priority, 5 after, 6 budget, 7 buttons
+    field: usize, // 0 title, 1 prompt, 2 agent, 3 model, 4 priority, 5 after, 6 budget, 7 acceptance, 8 buttons
     title: Input,
     prompt: Input,
     agent: usize,
@@ -253,6 +253,8 @@ struct Form {
     after: Input,
     /// spend cap in USD ("" = the roster's)
     budget: Input,
+    /// a command that proves it works: the worker is told to make it pass, and a run's merge gate runs it
+    acceptance: Input,
     button: usize, // 0 add, 1 add & start
     err: String,
 }
@@ -1149,8 +1151,11 @@ impl Agents {
                 let t = t.clone();
                 if t.headless() {
                     self.start_worker(id, cx);
-                } else {
+                } else if t.acceptance.is_empty() {
                     self.open_agent(&t, &t.prompt, false, cx);
+                } else {
+                    let prompt = format!("{}\n\nWhen you're done, run `{}` from the repo root and make it pass.", t.prompt.trim_end(), t.acceptance);
+                    self.open_agent(&t, &prompt, false, cx);
                 }
             }
         }
@@ -1345,6 +1350,7 @@ impl Agents {
                 priority: PRIORITIES.iter().position(|p| p.0 == t.priority).unwrap_or(1),
                 after: Input::new(&t.depends_on.join(", "), false),
                 budget: Input::new(&if t.budget_usd > 0.0 { format!("{}", t.budget_usd) } else { String::new() }, false),
+                acceptance: Input::new(&t.acceptance, false),
                 button: 0,
                 err: String::new(),
             },
@@ -1358,6 +1364,7 @@ impl Agents {
                 priority: 1,
                 after: Input::new("", false),
                 budget: Input::new("", false),
+                acceptance: Input::new("", false),
                 button: 1,
                 err: String::new(),
             },
@@ -1430,6 +1437,7 @@ impl Agents {
             t.priority = priority;
             t.depends_on = after;
             t.budget_usd = budget;
+            t.acceptance = form.acceptance.text.trim().to_string();
         }
         self.save();
         self.mode = Mode::Board;
@@ -1569,6 +1577,7 @@ impl Agents {
                     KeyCode::Char('x') if !busy && t.status != Status::Done => self.confirm(Pending::Discard),
                     KeyCode::Char('r') if !in_run && !busy && t.status != Status::Todo && !(t.status == Status::Done && t.outcome == "merged") => self.confirm(Pending::Retry),
                     KeyCode::Char('t') if t.headless() && has_wt && !busy => self.take_over(&id, cx),
+                    KeyCode::Char('y') if !t.tamper.is_empty() && !busy => self.allow_test_changes(&id, cx),
                     KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't') => {}
                     _ => return false,
                 }
@@ -1641,8 +1650,8 @@ impl Agents {
                 self.submit_form(form, false, cx);
                 return true;
             }
-            KeyCode::Tab => form.field = (form.field + 1) % 8,
-            KeyCode::BackTab => form.field = (form.field + 7) % 8,
+            KeyCode::Tab => form.field = (form.field + 1) % 9,
+            KeyCode::BackTab => form.field = (form.field + 8) % 9,
             _ => {
                 let used = match form.field {
                     0 => form.title.key(k),
@@ -1650,16 +1659,17 @@ impl Agents {
                     3 => form.model.key(k),
                     5 => form.after.key(k),
                     6 => form.budget.key(k),
+                    7 => form.acceptance.key(k),
                     _ => false,
                 };
                 if !used {
                     match k.code {
-                        KeyCode::Enter if form.field == 7 => {
+                        KeyCode::Enter if form.field == 8 => {
                             let start = form.button == 1;
                             self.submit_form(form, start, cx);
                             return true;
                         }
-                        KeyCode::Enter | KeyCode::Down => form.field = (form.field + 1).min(7),
+                        KeyCode::Enter | KeyCode::Down => form.field = (form.field + 1).min(8),
                         KeyCode::Left if form.field == 4 => form.priority = form.priority.saturating_sub(1),
                         KeyCode::Right | KeyCode::Char(' ') if form.field == 4 => form.priority = (form.priority + 1).min(PRIORITIES.len() - 1),
                         KeyCode::Up => form.field = form.field.saturating_sub(1),
@@ -1674,7 +1684,7 @@ impl Agents {
                                 }
                             }
                         }
-                        KeyCode::Left | KeyCode::Right if form.field == 7 => form.button = 1 - form.button,
+                        KeyCode::Left | KeyCode::Right if form.field == 8 => form.button = 1 - form.button,
                         _ => {}
                     }
                 }
@@ -1940,6 +1950,7 @@ impl Pane for Agents {
             Mode::Form(f) => match f.field {
                 0 => f.title.insert(text),
                 3 => f.model.insert(text),
+                7 => f.acceptance.insert(text.trim()),
                 _ => {
                     f.field = 1;
                     f.prompt.insert(text)

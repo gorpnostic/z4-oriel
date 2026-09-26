@@ -37,6 +37,8 @@ const LOG_CAP: usize = 400;
 const MAX_TURNS: u32 = 80;
 /// Fix rounds in the same session before a fresh worker takes over.
 const MAX_ATTEMPTS: u32 = 2;
+/// How the merge queue says the tamper scan stopped a merge (the findings follow, one per line).
+const TAMPER: &str = "touched tests:\n";
 
 /// Something the lead should hear about.
 pub struct RunEvent {
@@ -1361,6 +1363,21 @@ impl Agents {
 
     // ---------------------------------------------------------------- the merge queue
 
+    /// y on a task the tamper scan parked: its test changes are fine, merge it.
+    pub(super) fn allow_test_changes(&mut self, id: &str, cx: &mut Cx) {
+        if let Some(tm) = self.task_mut(id) {
+            tm.tests_ok = true;
+            tm.tamper.clear();
+            tm.blocked = false;
+            tm.questions.clear();
+        }
+        match self.queue_merge(id) {
+            Ok(_) => cx.notify("you let its test changes through: merging it"),
+            Err(e) => cx.notify(e),
+        }
+        self.save();
+    }
+
     /// Put a finished task in line for the integration branch. Merges run one at a time (pump_merges).
     pub(super) fn queue_merge(&mut self, id: &str) -> Result<String, String> {
         let Some(t) = self.task(id).cloned() else { return Err(format!("no task {id}")) };
@@ -1432,6 +1449,14 @@ impl Agents {
                     }
                     Ok(())
                 };
+                // tests switched off or asserts removed: it waits for your y before anything is merged
+                if !t.tests_ok {
+                    let hits = git::task_diff(Path::new(&t.worktree), &t.base_sha).map(|d| git::tamper_scan(&d)).unwrap_or_default();
+                    if !hits.is_empty() {
+                        send(Msg::RunMerged(id.clone(), Err(git::MergeErr::Failed(format!("{TAMPER}{}", hits.join("\n"))))));
+                        return;
+                    }
+                }
                 let lead = PathBuf::from(&run.worktree);
                 let job = git::MergeJob { repo, wt: Path::new(&t.worktree), branch: &t.branch, integration: &run.branch, title: &t.title, worker: &t.worker, task_id: &t.id, lead_wt: Some(&lead) };
                 let r = git::merge_into(&job, &gate);
@@ -1506,6 +1531,18 @@ impl Agents {
                 }
                 self.record(&t.worker).gate_fails += 1;
                 self.bounce(id, &msg, false, cx);
+            }
+            Err(git::MergeErr::Failed(e)) if e.starts_with(TAMPER) => {
+                let hits: Vec<String> = e[TAMPER.len()..].lines().map(String::from).collect();
+                if let Some(tm) = self.task_mut(id) {
+                    tm.tamper = hits.clone();
+                    tm.want_merge = false;
+                    tm.blocked = true;
+                    tm.questions = vec![format!("it changed tests so they pass more easily ({}): the user decides, y on its card lets it merge", hits.join("; "))];
+                    tm.last = "parked: it touched tests".into();
+                }
+                cx.alert(crate::alerts::Kind::NeedsYou, format!("{} touched tests ({}): y on its card lets it merge", t.title, hits.first().cloned().unwrap_or_default()));
+                self.event(id, "blocked");
             }
             Err(git::MergeErr::Failed(e)) => {
                 if let Some(tm) = self.task_mut(id) {

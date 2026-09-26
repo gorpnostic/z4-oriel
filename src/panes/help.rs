@@ -189,6 +189,8 @@ fn topics() -> Vec<Topic> {
             P("Each gets its own worktree and the AI and model you gave it; finished work is merged one at a time into one new branch (conflict check and your build/tests, a failure goes back to it, then one fresh try). Review it with d and merge it with m once they're all in."),
             K("+ / -", "a task's priority: low · normal · high · urgent"),
             K("n  →  after / budget", "in the form: wait for other tasks (dependencies) and cap its spend"),
+            K("n  →  acceptance", "in the form: a command that proves it works (cargo test parser); the worker is told to make it pass and the merge runs it after your build/tests"),
+            K("y", "on a card marked touched tests: let it merge. Before merging, oriel looks for tests switched off (#[ignore], skip, xfail) or asserts removed, and parks the task until you decide"),
             Gap,
             H("single tasks"),
             K("n", "new task: title, prompt, which AI, priority, what it waits for, a budget — it opens in its own tab"),
