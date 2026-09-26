@@ -119,7 +119,8 @@ impl Kit {
     }
 
     pub fn notices(&self) -> Vec<String> {
-        self.actions.iter().filter_map(|a| if let Action::Notify(s) = a { Some(s.clone()) } else { None }).collect()
+        // alerts are toasts too (and also go to the event center)
+        self.actions.iter().filter_map(|a| match a { Action::Notify(s) | Action::Alert(_, s) => Some(s.clone()), _ => None }).collect()
     }
 }
 
