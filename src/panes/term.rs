@@ -3,7 +3,7 @@
 
 use crate::pane::{Activity, Cx, Pane, Waker};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::{
     Frame,
     layout::{Position, Rect},
@@ -20,7 +20,9 @@ pub struct Term {
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    /// The program until it starts running (first render): then a thread waits on it.
+    child: Option<Box<dyn Child + Send + Sync>>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
     exited: Arc<AtomicBool>,
     size: (u16, u16), // rows, cols
     scroll: usize,    // lines scrolled back (0 = live)
@@ -34,6 +36,11 @@ pub struct Term {
     last_scan: Instant,
     /// Tell the event center how this ended ("installing Firefox" -> "Firefox installed" / "failed").
     exit_alert: Option<String>,
+    /// (program, why) when the requested program didn't start: the pane runs the default shell instead, under a
+    /// red banner.
+    failed: Option<(String, String)>,
+    /// The program's exit status once it has ended (success?), set by the thread that waits on it.
+    exit: Arc<Mutex<Option<bool>>>,
 }
 
 /// Programs that are coding agents (by executable name), so their panes get status dots from the start.
@@ -57,23 +64,35 @@ impl Term {
             cmd.env_remove(k);
         }
         cmd.env("ORIEL", "1");
-        let child = pair.slave.spawn_command(cmd).unwrap_or_else(|e| {
-            // fall back to the default shell so the pane still works, with the error visible
-            eprintln!("oriel: couldn't start {prog}: {e}");
-            let (sh, a) = crate::config::default_shell(&crate::config::Config::default());
-            let mut c = CommandBuilder::new(sh);
-            c.args(a);
-            pair.slave.spawn_command(c).expect("spawn shell")
-        });
+        let (child, failed) = match pair.slave.spawn_command(cmd) {
+            Ok(c) => (c, None),
+            Err(e) => {
+                // fall back to the default shell so the pane still works; the banner and the title say what failed
+                // (never eprintln: the UI owns the screen, the text would land on top of it and vanish)
+                let (sh, a) = crate::config::default_shell(&crate::config::Config::default());
+                let mut c = CommandBuilder::new(sh);
+                c.args(a);
+                if let Some(d) = &dir {
+                    c.cwd(d);
+                }
+                // Windows says `CreateProcessW "<prog>\0" failed: <reason> (os error 2)`: the reason is the useful part
+                let e = e.to_string();
+                let why = e.rsplit_once("failed: ").map_or(e.as_str(), |(_, why)| why);
+                let why = why.split(" (os error").next().unwrap_or(why).trim().trim_end_matches('.').to_string();
+                (pair.slave.spawn_command(c).expect("spawn shell"), Some((prog.to_string(), why)))
+            }
+        };
         drop(pair.slave);
         let writer = pair.master.take_writer().expect("pty writer");
+        let killer = child.clone_killer();
         Term {
-            title: title.to_string(),
+            title: if failed.is_some() { format!("{title} · failed to start") } else { title.to_string() },
             icon,
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000))),
             writer: Arc::new(Mutex::new(writer)),
             master: pair.master,
-            child,
+            child: Some(child),
+            killer,
             exited: Arc::new(AtomicBool::new(false)),
             size: (24, 80),
             scroll: 0,
@@ -87,7 +106,14 @@ impl Term {
             },
             last_scan: Instant::now(),
             exit_alert: None,
+            failed,
+            exit: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Rows the failed-to-start banner takes at the top of the pane.
+    fn banner_h(&self) -> u16 {
+        self.failed.is_some() as u16
     }
 
     /// When the command ends, say so in the event center: `what` is e.g. "Firefox".
@@ -104,6 +130,7 @@ impl Term {
 
     fn start_reader(&mut self, waker: Waker) {
         let mut reader = self.master.try_clone_reader().expect("pty reader");
+        let waiter_waker = Waker { id: waker.id, tx: waker.tx.clone() };
         let parser = self.parser.clone();
         let writer = self.writer.clone();
         let exited = self.exited.clone();
@@ -132,6 +159,18 @@ impl Term {
             exited.store(true, Ordering::SeqCst);
             waker.wake();
         });
+        // ConPTY keeps the output open after the program ends (the reader above never sees EOF on Windows), so a
+        // second thread waits on the process itself: the pane closes and the exit alert fires, with no polling
+        if let Some(mut child) = self.child.take() {
+            let (exit, exited) = (self.exit.clone(), self.exited.clone());
+            std::thread::spawn(move || {
+                if let Ok(s) = child.wait() {
+                    *exit.lock().unwrap() = Some(s.success());
+                }
+                exited.store(true, Ordering::SeqCst);
+                waiter_waker.wake();
+            });
+        }
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -146,9 +185,26 @@ impl Term {
             return;
         }
         self.size = (rows, cols);
+        // the screen first, under one lock (so the reader can't slip output in between), then tell the program
+        set_size_keep_bottom(&mut self.parser.lock().unwrap(), rows, cols);
         let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
-        self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
     }
+}
+
+/// Resize the screen the way real terminals do: when it gets shorter than the cursor row, the top rows scroll
+/// into scrollback so the prompt and the newest output stay on screen (vt100 alone cuts rows off the bottom,
+/// and they'd be lost). The alternate screen just truncates: full-screen programs redraw on resize. A program's
+/// own scroll region keeps vt100's behaviour (it never feeds scrollback).
+fn set_size_keep_bottom(p: &mut vt100::Parser, rows: u16, cols: u16) {
+    let s = p.screen();
+    let (old_rows, _) = s.size();
+    let (r, c) = s.cursor_position();
+    if rows < old_rows && r >= rows && !s.alternate_screen() {
+        let n = r + 1 - rows;
+        // CSI n S scrolls the whole screen up n rows (into scrollback); then put the cursor back on its line
+        p.process(format!("\x1b[{n}S\x1b[{};{}H", r + 1 - n, c + 1).as_bytes());
+    }
+    p.screen_mut().set_size(rows, cols);
 }
 
 impl Term {
@@ -210,7 +266,10 @@ fn color(c: vt100::Color) -> Color {
 
 impl Drop for Term {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // only while it runs: once it has ended the pid could belong to something else (the unix killer is a bare pid)
+        if self.exit.lock().unwrap().is_none() {
+            let _ = self.killer.kill();
+        }
     }
 }
 
@@ -226,8 +285,24 @@ impl Pane for Term {
     }
     fn exit_note(&mut self) -> Option<(crate::alerts::Kind, String)> {
         let what = self.exit_alert.take()?;
-        let ok = self.child.try_wait().ok().flatten().map(|s| s.success()).unwrap_or(true);
-        Some(if ok { (crate::alerts::Kind::Download, format!("{what}: done")) } else { (crate::alerts::Kind::BuildFailed, format!("{what}: failed (see the terminal output next time with alt n)")) })
+        if let Some((prog, e)) = &self.failed {
+            // the shell that stood in for it exiting says nothing about the program: it never ran
+            return Some((crate::alerts::Kind::BuildFailed, format!("{what}: couldn't start {prog} ({e})")));
+        }
+        // the output can close a moment before the waiting thread has the exit status: give it a little time
+        let mut ok = *self.exit.lock().unwrap();
+        for _ in 0..10 {
+            if ok.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+            ok = *self.exit.lock().unwrap();
+        }
+        Some(match ok {
+            Some(true) => (crate::alerts::Kind::Download, format!("{what}: done")),
+            Some(false) => (crate::alerts::Kind::BuildFailed, format!("{what}: failed (see the terminal output next time with alt n)")),
+            None => (crate::alerts::Kind::Download, format!("{what}: ended (couldn't tell whether it worked)")),
+        })
     }
 
     fn alive(&self) -> bool {
@@ -256,6 +331,16 @@ impl Pane for Term {
             self.started = true;
             self.start_reader(cx.waker());
         }
+        let area = match &self.failed {
+            Some((prog, e)) if area.height > 1 => {
+                // the reason first: a narrow pane cuts the end of the line
+                let line = format!(" oriel: couldn't start {prog}: {e} · this is a plain shell");
+                let st = Style::default().fg(cx.theme.danger).add_modifier(Modifier::BOLD);
+                f.render_widget(ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(crate::ui::fit(&line, area.width as usize), st)), Rect { height: 1, ..area });
+                Rect { y: area.y + 1, height: area.height - 1, ..area }
+            }
+            _ => area,
+        };
         self.resize(area.height, area.width);
         let mut p = self.parser.lock().unwrap();
         p.screen_mut().set_scrollback(self.scroll);
@@ -325,7 +410,7 @@ impl Pane for Term {
             (p.screen().mouse_protocol_mode(), p.screen().mouse_protocol_encoding())
         };
         let col = ev.column.saturating_sub(area.x) + 1;
-        let row = ev.row.saturating_sub(area.y) + 1;
+        let row = ev.row.saturating_sub(area.y + self.banner_h()) + 1;
         if mode == vt100::MouseProtocolMode::None {
             // the program doesn't want the mouse: the wheel scrolls our scrollback
             match ev.kind {
@@ -364,6 +449,10 @@ fn btn(b: MouseButton) -> u16 {
 
 /// Key -> the bytes an xterm would send.
 pub fn encode_key(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
+    // a typed char, AltGr ones included (ctrl+alt+'@' on Windows is AltGr+2): the char itself, no ctrl/ESC
+    if let Some(c) = crate::ui::typed_char(&key) {
+        return Some(c.to_string().into_bytes());
+    }
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -442,4 +531,108 @@ pub fn encode_key(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
         out.insert(0, 27);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(c: char, m: KeyModifiers) -> Vec<u8> {
+        encode_key(KeyEvent::new(KeyCode::Char(c), m), false).unwrap()
+    }
+
+    #[test]
+    fn term_altgr_chars_reach_the_shell() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        // AltGr on Windows arrives as ctrl+alt+char: the shell gets the char, not ESC NUL / ESC '{'
+        assert_eq!(key('@', altgr), b"@");
+        assert_eq!(key('{', altgr), b"{");
+        assert_eq!(key('\\', altgr), b"\\");
+        assert_eq!(key('€', altgr), "€".as_bytes());
+        // real shortcuts are unchanged
+        assert_eq!(key('a', KeyModifiers::CONTROL), [1]);
+        assert_eq!(key(' ', KeyModifiers::CONTROL), [0]);
+        assert_eq!(key('b', KeyModifiers::ALT), [27, b'b']);
+        assert_eq!(key('c', altgr), [27, 3]);
+        assert_eq!(key('A', KeyModifiers::SHIFT), b"A");
+    }
+
+    fn row(p: &vt100::Parser, r: u16) -> String {
+        let (_, cols) = p.screen().size();
+        p.screen().rows(0, cols).nth(r as usize).unwrap_or_default().trim_end().to_string()
+    }
+
+    fn scrollback_rows(p: &mut vt100::Parser) -> usize {
+        p.screen_mut().set_scrollback(usize::MAX);
+        let n = p.screen().scrollback();
+        p.screen_mut().set_scrollback(0);
+        n
+    }
+
+    #[test]
+    fn term_shrinking_keeps_the_prompt_and_feeds_scrollback() {
+        let mut p = vt100::Parser::new(40, 80, 1000);
+        for i in 0..39 {
+            p.process(format!("line {i}\r\n").as_bytes());
+        }
+        p.process(b"PS> ");
+        assert_eq!(p.screen().cursor_position(), (39, 4));
+        set_size_keep_bottom(&mut p, 20, 80);
+        assert_eq!(row(&p, 19), "PS>", "the prompt stays on the last row");
+        assert_eq!(row(&p, 0), "line 20", "the newest output is still on screen");
+        assert_eq!(p.screen().cursor_position(), (19, 4));
+        assert_eq!(scrollback_rows(&mut p), 20, "the top 20 rows went into scrollback, not away");
+        // growing back doesn't touch scrollback
+        set_size_keep_bottom(&mut p, 30, 80);
+        assert_eq!(scrollback_rows(&mut p), 20);
+
+        // a short screen with the cursor near the top: nothing to push
+        let mut p = vt100::Parser::new(40, 80, 1000);
+        p.process(b"one\r\ntwo\r\n$ ");
+        set_size_keep_bottom(&mut p, 20, 80);
+        assert_eq!((row(&p, 0), row(&p, 2)), ("one".into(), "$".into()));
+        assert_eq!(scrollback_rows(&mut p), 0);
+
+        // full-screen programs (alternate screen) redraw themselves: plain truncation
+        let mut p = vt100::Parser::new(40, 80, 1000);
+        p.process(b"\x1b[?1049h\x1b[40;1Hbottom");
+        set_size_keep_bottom(&mut p, 20, 80);
+        assert_eq!(scrollback_rows(&mut p), 0);
+    }
+
+    /// A program that ends: the pane notices (on Windows too, where ConPTY never closes the output) and the exit
+    /// alert tells success from failure.
+    #[test]
+    fn term_program_exit_closes_the_pane_with_its_result() {
+        for (code, want) in [(3, crate::alerts::Kind::BuildFailed), (0, crate::alerts::Kind::Download)] {
+            let (prog, args) = if cfg!(windows) { ("cmd.exe", vec!["/c".to_string(), format!("exit {code}")]) } else { ("sh", vec!["-c".to_string(), format!("exit {code}")]) };
+            let mut k = crate::testkit::Kit::new();
+            let mut t = Term::new("install thing", "package", prog, args, None).alert_on_exit("thing");
+            assert!(t.failed.is_none());
+            k.render(&mut t, 80, 10); // starts it
+            let t0 = Instant::now();
+            while t.alive() && t0.elapsed() < Duration::from_secs(10) {
+                k.wait_wake(&mut t, 50);
+            }
+            assert!(!t.alive(), "exit {code}: the pane should close when the program ends");
+            let (kind, text) = t.exit_note().unwrap();
+            assert_eq!(kind, want, "exit {code}: {text}");
+            assert_eq!(text.ends_with("done"), code == 0, "{text}");
+        }
+    }
+
+    #[test]
+    fn term_failed_launch_says_so() {
+        let mut k = crate::testkit::Kit::new();
+        let mut t = Term::new("install thing", "package", "oriel-no-such-program-4242", vec![], None).alert_on_exit("thing");
+        assert_eq!(t.title(), "install thing · failed to start");
+        let s = k.render(&mut t, 130, 6);
+        let _ = k.render_html(&mut t, 130, 8, "target/snap/term-failed.html");
+        let first = s.lines().next().unwrap_or_default();
+        assert!(first.contains("oriel: couldn't start oriel-no-such-program-4242") && first.contains("plain shell"), "{s}");
+        // the stand-in shell ending isn't the install succeeding
+        let (kind, text) = t.exit_note().unwrap();
+        assert_eq!(kind, crate::alerts::Kind::BuildFailed);
+        assert!(text.starts_with("thing: couldn't start"), "{text}");
+    }
 }

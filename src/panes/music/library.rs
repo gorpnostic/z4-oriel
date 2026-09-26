@@ -165,6 +165,13 @@ pub fn is_audio(p: &Path) -> bool {
     p.extension().map(|e| AUDIO_EXT.contains(&e.to_string_lossy().to_lowercase().as_str())).unwrap_or(false)
 }
 
+/// Why oriel can't play a file it lists, if it can't: symphonia 0.5 has no Opus decoder, and .opus is yt-dlp's
+/// default audio format, so those songs are shown (muted) but never queued.
+pub fn unplayable(p: &Path) -> Option<&'static str> {
+    let ext = p.extension()?.to_string_lossy().to_lowercase();
+    (ext == "opus").then_some("no opus decoder")
+}
+
 pub fn stem(p: &Path) -> String {
     p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
 }

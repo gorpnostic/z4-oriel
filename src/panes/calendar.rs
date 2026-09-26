@@ -4,7 +4,7 @@
 use crate::pane::{Cx, Pane};
 use crate::panes::files::clock;
 use crate::ui;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::{Position, Rect},
@@ -365,7 +365,6 @@ impl Pane for Calendar {
                 KeyCode::Backspace => {
                     buf.pop();
                 }
-                KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => buf.push(c),
                 KeyCode::Enter => {
                     match self.input.take() {
                         Some(Input::Add(s)) if !s.trim().is_empty() => {
@@ -381,7 +380,11 @@ impl Pane for Calendar {
                     }
                     self.save();
                 }
-                _ => {}
+                _ => {
+                    if let Some(c) = ui::typed_char(&k) {
+                        buf.push(c); // AltGr chars too
+                    }
+                }
             }
             return true;
         }
@@ -497,6 +500,22 @@ mod tests {
         assert_eq!(parse_time("12am midnight snack"), (Some(0), "midnight snack".into()));
         assert_eq!(parse_time("3 apples"), (None, "3 apples".into()), "a bare number isn't a time");
         assert_eq!(parse_time("buy milk"), (None, "buy milk".into()));
+    }
+
+    #[test]
+    fn calendar_types_altgr_chars() {
+        let path = std::path::absolute("target/test-scratch/calendar-altgr.json").unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut k = Kit::new();
+        let mut c = Calendar::open_at(path);
+        k.key(&mut c, KeyCode::Char('a'));
+        k.typ(&mut c, "mail ann");
+        // AltGr+Q on a German layout types '@': crossterm on Windows reports ctrl+alt+'@'
+        k.key_mod(&mut c, KeyCode::Char('@'), crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT);
+        k.typ(&mut c, "example.org");
+        k.key_mod(&mut c, KeyCode::Char('x'), crossterm::event::KeyModifiers::CONTROL); // a real shortcut types nothing
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.plans.last().map(|p| p.text.as_str()), Some("mail ann@example.org"));
     }
 
     #[test]

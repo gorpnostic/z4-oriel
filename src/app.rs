@@ -798,14 +798,16 @@ impl App {
         }
         match (key.as_str(), k.code) {
             ("space", KeyCode::Char(' ')) => true,
-            // some terminals report ctrl+space as ctrl+@ / NUL
-            ("space", KeyCode::Char('@')) => true,
+            // some terminals report ctrl+space as ctrl+@ / NUL (but ctrl+alt+@ is AltGr typing '@')
+            ("space", KeyCode::Char('@')) => !k.modifiers.contains(KeyModifiers::ALT),
             (s, KeyCode::Char(c)) if s.chars().count() == 1 => s.starts_with(c.to_ascii_lowercase()),
             _ => false,
         }
     }
 
     fn key(&mut self, k: KeyEvent) {
+        // AltGr arrives as ctrl+alt+char on Windows: make it the plain char before any binding sees it
+        let k = ui::strip_altgr(k);
         self.sel = None;
         if self.onboard.is_none() && self.palette.is_none() && self.renaming.is_none() && self.ctx.is_none() && !self.prefix_armed {
             let v = matches!(k.code, KeyCode::Char('v') | KeyCode::Char('V'));
@@ -1997,6 +1999,17 @@ mod tests {
         }
         let s = snap(&mut app, "palette");
         assert!(s.contains("theme ocean"), "theme list missing");
+    }
+
+    #[test]
+    fn app_altgr_at_is_not_the_prefix() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config::default(), tx);
+        let altgr = KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        assert!(!app.is_prefix(&altgr), "AltGr+2 types '@' on a German layout");
+        assert!(app.is_prefix(&KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL)), "ctrl+@ is still ctrl+space");
+        app.key(altgr);
+        assert!(!app.prefix_armed);
     }
 
     #[test]

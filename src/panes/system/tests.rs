@@ -417,25 +417,38 @@ fn system_kill_confirm() {
     let mut p = fake_pane();
     p.killer = fake_kill; // never kill a real process in tests
     k.render(&mut p, 150, 44);
+    // j/k move like everywhere else: k is up, not kill
     k.key(&mut p, KeyCode::Char('j'));
-    let pid = p.selected().unwrap().pid;
+    k.key(&mut p, KeyCode::Char('j'));
     k.key(&mut p, KeyCode::Char('k'));
+    assert_eq!(p.sel, 1);
+    assert!(p.pending_kill.is_none());
+    let pid = p.selected().unwrap().pid;
+    k.key(&mut p, KeyCode::Char('x'));
     let out = k.render_html(&mut p, 150, 44, "target/snap/system-kill.html");
     assert!(out.contains(&format!("(pid {pid})?  y = yes · esc = no")));
     k.key(&mut p, KeyCode::Esc);
     assert!(p.pending_kill.is_none());
     assert!(k.notices().iter().any(|n| n == "left it alone"));
     assert_eq!(KILLED.load(Ordering::SeqCst), 0);
-    k.key(&mut p, KeyCode::Char('k'));
+    k.key(&mut p, KeyCode::Char('x'));
     k.key(&mut p, KeyCode::Char('y'));
     k.wait_wake(&mut p, 300);
     assert_eq!(KILLED.load(Ordering::SeqCst), pid);
     assert!(k.notices().iter().any(|n| n.starts_with("sent terminate")));
     // from the connections view it asks about the owning process
     k.key(&mut p, KeyCode::Char('6'));
-    k.key(&mut p, KeyCode::Char('k'));
+    k.key(&mut p, KeyCode::Char('x'));
     assert_eq!(p.pending_kill.as_ref().map(|k| k.0), Some(40));
     k.key(&mut p, KeyCode::Esc);
+    // switching views from the sidebar drops a pending question instead of letting it eat the next key unseen
+    k.key(&mut p, KeyCode::Char('2'));
+    k.key(&mut p, KeyCode::Char('x'));
+    assert!(p.pending_kill.is_some());
+    let mut acts = vec![];
+    let cx = crate::pane::Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut acts, focused: true, time: 1.0 };
+    p.set_view(View::Performance, &cx);
+    assert!(p.pending_kill.is_none());
 }
 
 /// The real machine: background sampling, then time what the UI thread does per refresh. The probes run for

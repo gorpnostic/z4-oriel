@@ -183,8 +183,9 @@ impl Inner {
                 self.orig = tracks.clone();
                 let shuffle = self.shared.lock().unwrap().shuffle;
                 let (queue, start) = if shuffle { self.shuffled(&tracks, i) } else { (tracks, i) };
+                let n = queue.len();
                 self.shared.lock().unwrap().queue = queue;
-                self.start(start, true);
+                self.start(start, true, 1, n);
             }
             Cmd::Toggle => {
                 let (playing, index, has_track) = {
@@ -196,8 +197,8 @@ impl Inner {
                 }
                 match &self.player {
                     // finished or failed: play it again from the top
-                    None => self.start(index, false),
-                    Some(p) if p.empty() => self.start(index, false),
+                    None => self.start(index, false, 1, 1),
+                    Some(p) if p.empty() => self.start(index, false, 1, 1),
                     Some(p) => {
                         if playing { p.pause() } else { p.play() }
                         self.shared.lock().unwrap().playing = !playing;
@@ -211,7 +212,7 @@ impl Inner {
                     (s.queue.len(), s.index)
                 };
                 if n > 0 {
-                    self.start((i + 1) % n, true);
+                    self.start((i + 1) % n, true, 1, n);
                 }
             }
             Cmd::Prev => {
@@ -225,7 +226,7 @@ impl Inner {
                 if pos > 3.0 {
                     self.seek(0.0);
                 } else {
-                    self.start((i + n - 1) % n, true);
+                    self.start((i + n - 1) % n, true, -1, n);
                 }
             }
             Cmd::Seek(t) => self.seek(t),
@@ -301,17 +302,18 @@ impl Inner {
         self.rng.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
-    fn start(&mut self, i: usize, count: bool) {
+    /// Play queue[i]. A song that can't be opened or decoded is skipped: up to `tries` songs are tried, stepping
+    /// `step` (+1 onward, -1 back) each time, so one bad file doesn't stop a playlist and a queue where nothing
+    /// plays can't loop forever. The last error stays on screen.
+    fn start(&mut self, i: usize, count: bool, step: isize, tries: usize) {
+        let Some(found) = self.find(i, step, tries) else { return };
         let (track, vol) = {
             let mut s = self.shared.lock().unwrap();
-            if s.queue.is_empty() {
-                return;
-            }
-            let i = i % s.queue.len();
-            s.index = i;
-            (s.queue[i].clone(), s.volume)
+            s.index = found.index;
+            (found.track.clone(), s.volume)
         };
-        match self.open(&track) {
+        let opened = found.opened.and_then(|src| self.ensure_sink().map(|()| src));
+        match opened {
             Ok((src, dur)) => {
                 self.scope.lock().unwrap().buf.clear();
                 let player = Player::connect_new(self.sink.as_ref().unwrap().mixer());
@@ -323,7 +325,7 @@ impl Inner {
                 s.track = Some(track.clone());
                 s.playing = true;
                 s.pos = 0.0;
-                s.error = None;
+                s.error = found.skipped.map(|e| format!("skipped: {e}"));
                 s.changed += 1;
             }
             Err(e) => {
@@ -351,16 +353,38 @@ impl Inner {
         self.wake();
     }
 
-    fn open(&mut self, t: &Track) -> Result<(Decoder<std::io::BufReader<std::fs::File>>, f64), String> {
+    /// The first song from queue[i] on (stepping `step`, at most `tries` songs) that opens and decodes, else the
+    /// last one tried, with its error. None = empty queue. Never touches the audio device, so a queue of bad files
+    /// fails without opening it.
+    fn find(&self, i: usize, step: isize, tries: usize) -> Option<Found> {
+        let n = self.shared.lock().unwrap().queue.len();
+        if n == 0 {
+            return None;
+        }
+        let tries = tries.clamp(1, n);
+        let mut i = i % n;
+        let mut skipped = None;
+        for k in 0..tries {
+            if k > 0 {
+                i = (i as isize + step).rem_euclid(n as isize) as usize;
+            }
+            let track = self.shared.lock().unwrap().queue.get(i).cloned()?;
+            match open(&track) {
+                Ok(src) => return Some(Found { index: i, track, opened: Ok(src), skipped }),
+                Err(e) if k + 1 < tries => skipped = Some(e),
+                Err(e) => return Some(Found { index: i, track, opened: Err(e), skipped: None }),
+            }
+        }
+        None
+    }
+
+    fn ensure_sink(&mut self) -> Result<(), String> {
         if self.sink.is_none() {
             let mut sink = DeviceSinkBuilder::open_default_sink().map_err(|e| format!("audio device: {e}"))?;
             sink.log_on_drop(false);
             self.sink = Some(sink);
         }
-        let file = std::fs::File::open(&t.path).map_err(|e| format!("can't open {}: {e}", t.path.display()))?;
-        let dec = Decoder::try_from(file).map_err(|e| format!("can't decode {}: {e}", t.title))?;
-        let dur = dec.total_duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        Ok((dec, dur))
+        Ok(())
     }
 
     fn seek(&mut self, t: f64) {
@@ -374,7 +398,7 @@ impl Inner {
         if self.player.as_ref().map(|p| p.empty()).unwrap_or(true) {
             // ended or failed: restart the song, then seek into it
             let i = self.shared.lock().unwrap().index;
-            self.start(i, false);
+            self.start(i, false, 1, 1);
         }
         let Some(p) = &self.player else { return };
         let t = t.clamp(0.0, (dur - 0.5).max(0.0));
@@ -396,8 +420,10 @@ impl Inner {
             (s.repeat, s.index, s.queue.len())
         };
         match repeat {
-            Repeat::One => self.start(i, true),
-            _ if i + 1 < n || repeat == Repeat::All => self.start(i + 1, true),
+            Repeat::One => self.start(i, true, 1, 1),
+            // a song that won't play is skipped; without repeat, only as far as the end of the list
+            Repeat::All => self.start(i + 1, true, 1, n),
+            _ if i + 1 < n => self.start(i + 1, true, 1, n - i - 1),
             _ => {
                 let mut s = self.shared.lock().unwrap();
                 s.playing = false;
@@ -407,6 +433,28 @@ impl Inner {
             }
         }
     }
+}
+
+type Dec = Decoder<std::io::BufReader<std::fs::File>>;
+
+/// What `find` came up with: the song it stopped at, and either its decoder (+ duration) or why it won't play.
+struct Found {
+    index: usize,
+    track: Track,
+    opened: Result<(Dec, f64), String>,
+    /// why the last song passed over on the way was skipped
+    skipped: Option<String>,
+}
+
+/// Open and decode a song's file (headers only; nothing plays).
+fn open(t: &Track) -> Result<(Dec, f64), String> {
+    if let Some(why) = library::unplayable(&t.path) {
+        return Err(format!("can't play {}: {why}", t.title));
+    }
+    let file = std::fs::File::open(&t.path).map_err(|e| format!("can't open {}: {e}", t.path.display()))?;
+    let dec = Decoder::try_from(file).map_err(|e| format!("can't decode {}: {e}", t.title))?;
+    let dur = dec.total_duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    Ok((dec, dur))
 }
 
 /// Perceptual-ish volume curve (nest used volume ** 1.6).
@@ -549,6 +597,85 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The engine's inside with no thread and no audio device: `find`/`start` are called directly.
+    fn inner(queue: Vec<Track>) -> Inner {
+        let (_tx, rx) = channel();
+        let shared = Shared { queue, index: 0, track: None, playing: false, pos: 0.0, dur: 0.0, volume: 0.0, shuffle: false, repeat: Repeat::Off, error: None, changed: 0 };
+        Inner {
+            rx,
+            shared: Arc::new(Mutex::new(shared)),
+            scope: Arc::new(Mutex::new(Scope { buf: vec![], rate: 44100 })),
+            state: Arc::new(Mutex::new(State::default())),
+            waker: Arc::new(Mutex::new(None)),
+            persist: false,
+            sink: None,
+            player: None,
+            orig: vec![],
+            rng: 1,
+        }
+    }
+
+    fn track(p: &std::path::Path) -> Track {
+        library::bare_track(p)
+    }
+
+    /// A tiny silent WAV (never played: `find` only reads its header).
+    fn wav(p: &std::path::Path) {
+        let data = vec![0u8; 1600];
+        let mut b = b"RIFF".to_vec();
+        b.extend((36 + data.len() as u32).to_le_bytes());
+        b.extend(b"WAVEfmt ");
+        b.extend(16u32.to_le_bytes());
+        b.extend(1u16.to_le_bytes()); // PCM
+        b.extend(1u16.to_le_bytes()); // mono
+        b.extend(8000u32.to_le_bytes());
+        b.extend(16000u32.to_le_bytes());
+        b.extend(2u16.to_le_bytes());
+        b.extend(16u16.to_le_bytes());
+        b.extend(b"data");
+        b.extend((data.len() as u32).to_le_bytes());
+        b.extend(data);
+        std::fs::write(p, b).unwrap();
+    }
+
+    #[test]
+    fn music_bad_songs_are_skipped_not_fatal() {
+        let dir = crate::panes::files::tests::scratch("music-skip");
+        std::fs::write(dir.join("broken.mp3"), b"this is not audio").unwrap();
+        std::fs::write(dir.join("song.opus"), b"OggS...").unwrap();
+        wav(&dir.join("good.wav"));
+        let (broken, opus, missing, good) = (track(&dir.join("broken.mp3")), track(&dir.join("song.opus")), track(&dir.join("gone.mp3")), track(&dir.join("good.wav")));
+
+        // onward from a bad song to the next one that decodes, saying what was skipped
+        let e = inner(vec![broken.clone(), opus.clone(), missing.clone(), good.clone()]);
+        let f = e.find(0, 1, 4).unwrap();
+        assert_eq!(f.index, 3);
+        assert!(f.opened.is_ok());
+        assert!(f.skipped.as_deref().is_some_and(|s| s.starts_with("can't open")), "{:?}", f.skipped);
+        // backwards too (prev), wrapping round
+        let f = e.find(2, -1, 4).unwrap();
+        assert_eq!(f.index, 3);
+        // opus is refused up front: no decoder for it
+        let f = e.find(1, 1, 1).unwrap();
+        assert!(f.opened.as_ref().err().is_some_and(|m| m.contains("no opus decoder")));
+        // a limit on tries (no repeat: only as far as the end of the list) stops at the last one tried
+        let f = e.find(0, 1, 2).unwrap();
+        assert_eq!(f.index, 1);
+        assert!(f.opened.is_err());
+
+        // nothing in the queue plays: every song is tried once, the error stays, and the audio device is never opened
+        let mut e = inner(vec![broken.clone(), opus, missing, broken]);
+        e.start(0, true, 1, 4);
+        let s = e.shared.lock().unwrap();
+        assert!(!s.playing && s.error.as_deref().is_some_and(|m| m.starts_with("can't decode")), "{:?}", s.error);
+        assert_eq!(s.index, 3);
+        drop(s);
+        assert!(e.sink.is_none() && e.player.is_none());
+        assert!(e.state.lock().unwrap().plays.is_empty(), "a song that never played isn't counted");
+    }
+
     #[test]
     fn music_spectrum_finds_a_tone() {
         let rate = 44100;

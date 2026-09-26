@@ -246,20 +246,35 @@ impl Music {
         Snap { track: s.track.clone(), playing: s.playing, pos: s.pos, dur: s.dur, volume: s.volume, shuffle: s.shuffle, repeat: s.repeat, error: s.error.clone() }
     }
 
-    fn play_sel(&mut self) {
-        if self.rows.is_empty() {
-            return;
+    /// Play the view from the selected song. Songs oriel can't decode (.opus) stay out of the queue; picking one
+    /// says why instead (the returned message, for a toast).
+    fn play_sel(&mut self) -> Option<String> {
+        let &sel = self.rows.get(self.sel)?;
+        let t = &self.lib.tracks[sel];
+        if let Some(why) = library::unplayable(&t.path) {
+            return Some(format!("can't play {}: {why}", library::clean_title(t).0));
         }
-        let tracks: Vec<Track> = self.rows.iter().map(|&i| self.lib.tracks[i].clone()).collect();
-        self.engine.send(Cmd::PlayList(tracks, self.sel));
+        let mut start = 0;
+        let mut tracks: Vec<Track> = vec![];
+        for (n, &i) in self.rows.iter().enumerate() {
+            let t = &self.lib.tracks[i];
+            if library::unplayable(&t.path).is_none() {
+                if n < self.sel {
+                    start += 1;
+                }
+                tracks.push(t.clone());
+            }
+        }
+        self.engine.send(Cmd::PlayList(tracks, start));
+        None
     }
 
-    fn toggle(&mut self) {
+    fn toggle(&mut self) -> Option<String> {
         if self.engine.shared.lock().unwrap().track.is_none() {
-            self.play_sel();
-        } else {
-            self.engine.send(Cmd::Toggle);
+            return self.play_sel();
         }
+        self.engine.send(Cmd::Toggle);
+        None
     }
 
     fn volume(&mut self, d: f32) {
@@ -657,16 +672,23 @@ impl Music {
             let is_sel = n == self.sel;
             let base = if is_sel { Style::default().bg(t.frame).add_modifier(Modifier::BOLD) } else { Style::default() };
             let fg = |c: Color| base.fg(c);
+            let cant = library::unplayable(&tr.path);
             let (title_st, meta_st, artist_st) = if playing {
                 (fg(t.accent).add_modifier(Modifier::BOLD), fg(t.accent), fg(t.accent))
+            } else if cant.is_some() {
+                (fg(t.muted), fg(t.muted), fg(t.muted))
             } else {
                 (fg(t.fg), fg(t.muted), fg(t.fg))
+            };
+            let title = match cant {
+                Some(why) => format!("{} · {why}", tr.title),
+                None => tr.title.clone(),
             };
             let mark = if playing { glyph(if s.playing { "play" } else { "pause" }) } else { "" };
             let mut spans = vec![
                 Span::styled(cell(mark, cols[0]), fg(t.accent)),
                 Span::styled(cell(&(n + 1).to_string(), cols[1]), meta_st),
-                Span::styled(cell(&tr.title, cols[2]), title_st),
+                Span::styled(cell(&title, cols[2]), title_st),
                 Span::styled(cell(&tr.artist, cols[3]), artist_st),
                 Span::styled(cell(&if tr.duration > 0.0 { fmt(tr.duration) } else { String::new() }, cols[4]), meta_st),
             ];
@@ -691,13 +713,14 @@ impl Music {
         }
     }
 
-    fn click(&mut self, hit: Hit, rect: Rect, col: u16) {
+    /// A click on something; returns a message to show, if any.
+    fn click(&mut self, hit: Hit, rect: Rect, col: u16) -> Option<String> {
         match hit {
             Hit::Row(n) => {
                 let again = self.last_click.map(|(m, at)| m == n && at.elapsed() < Duration::from_millis(500)).unwrap_or(false);
                 if self.sel == n && (again || self.last_click.map(|c| c.0 == n).unwrap_or(false)) {
-                    self.play_sel();
                     self.last_click = None;
+                    return self.play_sel();
                 } else {
                     self.sel = n;
                     self.last_click = Some((n, Instant::now()));
@@ -707,7 +730,7 @@ impl Music {
             Hit::Search => self.searching = true,
             Hit::Shuffle => self.shuffle(),
             Hit::Prev => self.engine.send(Cmd::Prev),
-            Hit::Toggle => self.toggle(),
+            Hit::Toggle => return self.toggle(),
             Hit::Next => self.engine.send(Cmd::Next),
             Hit::Repeat => self.repeat(),
             Hit::Progress => {
@@ -722,6 +745,7 @@ impl Music {
                 self.set_volume(v);
             }
         }
+        None
     }
 }
 
@@ -841,10 +865,11 @@ impl Pane for Music {
     }
 
     fn key(&mut self, key: KeyEvent, cx: &mut Cx) -> bool {
-        if key.modifiers.intersects(KeyModifiers::ALT) {
+        let typed = ui::typed_char(&key); // AltGr chars included
+        if key.modifiers.intersects(KeyModifiers::ALT) && typed.is_none() {
             return false;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && typed.is_none();
         // F12 sends a space to this pane from anywhere: when we aren't the focused pane it's always play/pause
         if self.searching && cx.focused {
             match key.code {
@@ -864,7 +889,7 @@ impl Pane for Music {
                     self.query.clear();
                     self.refill();
                 }
-                KeyCode::Char(c) if !ctrl => {
+                KeyCode::Char(c) if typed.is_some() => {
                     self.query.push(c);
                     self.refill();
                     self.scroll = 0;
@@ -880,7 +905,12 @@ impl Pane for Music {
         }
         let page = self.table_h.max(1) as isize;
         match key.code {
-            KeyCode::Char(' ') => self.toggle(),
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                let msg = if key.code == KeyCode::Enter { self.play_sel() } else { self.toggle() };
+                if let Some(m) = msg {
+                    cx.notify(m);
+                }
+            }
             KeyCode::Left => self.engine.send(Cmd::Nudge(-5.0)),
             KeyCode::Right => self.engine.send(Cmd::Nudge(5.0)),
             KeyCode::Char('n') => self.engine.send(Cmd::Next),
@@ -890,7 +920,6 @@ impl Pane for Music {
             KeyCode::Char('s') => self.shuffle(),
             KeyCode::Char('r') => self.repeat(),
             KeyCode::Char('/') => self.searching = true,
-            KeyCode::Enter => self.play_sel(),
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
             KeyCode::PageDown => self.move_sel(page),
@@ -913,7 +942,7 @@ impl Pane for Music {
         true
     }
 
-    fn mouse(&mut self, ev: MouseEvent, _area: Rect, _cx: &mut Cx) {
+    fn mouse(&mut self, ev: MouseEvent, _area: Rect, cx: &mut Cx) {
         let pos = Position { x: ev.column, y: ev.row };
         match ev.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
@@ -931,7 +960,9 @@ impl Pane for Music {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some((r, h)) = self.hits.iter().find(|(r, _)| r.contains(pos)).copied() {
-                    self.click(h, r, ev.column);
+                    if let Some(m) = self.click(h, r, ev.column) {
+                        cx.notify(m);
+                    }
                 } else {
                     self.searching = false;
                 }
@@ -1050,6 +1081,45 @@ mod tests {
         // narrow pane still works
         let s = k.render(&mut p, 70, 20);
         assert!(s.contains("nothing playing"));
+    }
+
+    #[test]
+    fn music_opus_rows_are_shown_but_never_queued() {
+        let mut k = Kit::new();
+        let mut p = fake(&k, 4);
+        k.render(&mut p, 150, 30); // loads the library
+        // song 1 is an .opus file (yt-dlp's default): listed, muted, marked, and left out of the queue
+        p.lib.tracks[1].path = "/nope/1.opus".into();
+        let s = k.render_html(&mut p, 150, 30, "target/snap/music-opus.html");
+        assert!(s.contains("no opus decoder"), "{s}");
+        k.key(&mut p, KeyCode::Char('j'));
+        k.key(&mut p, KeyCode::Enter);
+        assert!(k.notices().iter().any(|n| n.contains("no opus decoder")), "{:?}", k.notices());
+        // play from song 0: the queue holds the other three; none of them exist, so each is tried once and the
+        // error stays up (never touching the audio device: they fail before it would open)
+        k.key(&mut p, KeyCode::Char('k'));
+        k.key(&mut p, KeyCode::Enter);
+        for _ in 0..40 {
+            k.wait_wake(&mut p, 50);
+            if p.snap().error.is_some() {
+                break;
+            }
+        }
+        let sh = p.engine.shared.lock().unwrap();
+        assert_eq!(sh.queue.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["t0", "t2", "t3"]);
+        assert!(!sh.playing && sh.error.as_deref().is_some_and(|e| e.starts_with("can't open")), "{:?}", sh.error);
+        assert_eq!(sh.index, 2, "tried to the end of the list, then stopped");
+    }
+
+    #[test]
+    fn music_types_altgr_chars_in_search() {
+        let mut k = Kit::new();
+        let mut p = fake(&k, 3);
+        k.key(&mut p, KeyCode::Char('/'));
+        k.typ(&mut p, "ac");
+        k.key_mod(&mut p, KeyCode::Char('\\'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        k.key_mod(&mut p, KeyCode::Char('{'), KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert_eq!(p.query, "ac\\{");
     }
 
     #[test]

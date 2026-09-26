@@ -584,8 +584,8 @@ impl Pane for Files {
 
     fn key(&mut self, key: KeyEvent, cx: &mut Cx) -> bool {
         self.start(cx);
-        if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) {
-            return false;
+        if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) && ui::typed_char(&key).is_none() {
+            return false; // (AltGr chars like ~ still count)
         }
         let page = (self.list_rect.height.max(2) - 1) as usize;
         if self.focus_preview {

@@ -249,3 +249,59 @@ pub fn rule(f: &mut Frame, r: Rect, t: &Theme) {
 pub fn fg(c: Color) -> Style {
     Style::default().fg(c)
 }
+
+/// The character a key types into a text box, if it types one: plain or shift, and also AltGr. On Windows
+/// crossterm reports AltGr as ctrl+alt with the typed char (AltGr+2 on a German layout = ctrl+alt+'@'), so
+/// ctrl+alt on anything but a letter or digit counts as typing it (the rule reedline uses).
+pub fn typed_char(k: &crossterm::event::KeyEvent) -> Option<char> {
+    use crossterm::event::{KeyCode, KeyModifiers as M};
+    let KeyCode::Char(c) = k.code else { return None };
+    let m = k.modifiers - M::SHIFT;
+    if m.is_empty() || (m == M::CONTROL | M::ALT && is_altgr_char(c)) { Some(c) } else { None }
+}
+
+fn is_altgr_char(c: char) -> bool {
+    !c.is_ascii_alphanumeric() && c != ' '
+}
+
+/// An AltGr key turned into the plain char it types (ctrl+alt dropped, shift kept), so key bindings, the prefix
+/// and terminals see '@' rather than ctrl+alt+'@'. Everything else comes back unchanged.
+pub fn strip_altgr(mut k: crossterm::event::KeyEvent) -> crossterm::event::KeyEvent {
+    use crossterm::event::{KeyCode, KeyModifiers as M};
+    if let KeyCode::Char(c) = k.code {
+        if k.modifiers - M::SHIFT == M::CONTROL | M::ALT && is_altgr_char(c) {
+            k.modifiers &= M::SHIFT;
+        }
+    }
+    k
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
+
+    #[test]
+    fn altgr_types_its_char() {
+        let k = |c, m| KeyEvent::new(KeyCode::Char(c), m);
+        // plain and shifted keys type
+        assert_eq!(typed_char(&k('a', M::NONE)), Some('a'));
+        assert_eq!(typed_char(&k('A', M::SHIFT)), Some('A'));
+        // AltGr (ctrl+alt on Windows) types punctuation and symbols: @ { } [ ] \ | ~ €
+        for c in ['@', '{', '}', '[', ']', '\\', '|', '~', '€'] {
+            assert_eq!(typed_char(&k(c, M::CONTROL | M::ALT)), Some(c), "{c}");
+            assert_eq!(typed_char(&k(c, M::CONTROL | M::ALT | M::SHIFT)), Some(c), "{c}");
+            assert_eq!(strip_altgr(k(c, M::CONTROL | M::ALT)), k(c, M::NONE));
+        }
+        // but real shortcuts don't: ctrl+x, alt+x, ctrl+alt+letter/digit, ctrl+alt+space
+        assert_eq!(typed_char(&k('x', M::CONTROL)), None);
+        assert_eq!(typed_char(&k('x', M::ALT)), None);
+        assert_eq!(typed_char(&k('@', M::CONTROL)), None);
+        assert_eq!(typed_char(&k('e', M::CONTROL | M::ALT)), None);
+        assert_eq!(typed_char(&k('2', M::CONTROL | M::ALT)), None);
+        assert_eq!(typed_char(&k(' ', M::CONTROL | M::ALT)), None);
+        assert_eq!(strip_altgr(k('e', M::CONTROL | M::ALT)), k('e', M::CONTROL | M::ALT));
+        assert_eq!(strip_altgr(k('@', M::CONTROL)), k('@', M::CONTROL));
+        assert_eq!(typed_char(&KeyEvent::new(KeyCode::Enter, M::NONE)), None);
+    }
+}

@@ -3,7 +3,7 @@
 
 use crate::pane::{Cx, Pane};
 use crate::ui;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::{Position, Rect},
@@ -185,13 +185,15 @@ fn topics() -> Vec<Topic> {
             K("s  ·  r", "shuffle · repeat"),
             K("/", "search"),
             K("tab", "library · most played · playlists"),
+            P("A song that won't open or decode is skipped (the reason stays under the controls). .opus files are listed but can't play yet: oriel has no Opus decoder."),
         ]},
         Topic { icon: "system", title: "system", app: "system", items: vec![
             P("A task manager with seven views (1–7 or tab): summary, processes, performance, startup, services, connections, system info."),
+            K("j k  ·  ↑ ↓", "move"),
             K("c m r w n", "sort by cpu · memory · disk read · disk write · name"),
             K("t", "process tree"),
             K("/", "filter"),
-            K("k", "kill the selected process (asks first)"),
+            K("x  ·  delete", "kill the selected process (asks first: y kills it)"),
         ]},
         Topic { icon: "files", title: "files", app: "files", items: vec![
             K("enter", "open a folder / preview a file"),
@@ -206,8 +208,11 @@ fn topics() -> Vec<Topic> {
             P("Markdown notes that save as you type (the folder is set in setup)."),
             K("ctrl+n", "new note"),
             K("ctrl+e", "switch between editing and the rendered preview"),
+            K("ctrl+↑ ↓", "the previous / next note in the list (ctrl+pgup / pgdn too)"),
+            K("ctrl+f", "find a note by its title or text: ↑↓ pick, enter opens, esc closes"),
             K("ctrl+d", "delete the note (asks first)"),
             K("ctrl+z  ·  ctrl+y", "undo · redo"),
+            P("Notes are plain .md files, so other programs can change them too: new ones show up in the sidebar, and an outside change to the open note is loaded. If you had unsaved edits, it asks: r reloads theirs, ctrl+s keeps yours."),
         ]},
         Topic { icon: "bell", title: "alerts", app: "alerts", items: vec![
             P("Everything worth knowing that happened while you were busy: an agent finished or needs you, an approval or question is waiting, a build or merge check failed, a plan starts soon, an install finished, memory is nearly full, an AI's usage is near its limit, a new oriel is out."),
@@ -331,6 +336,16 @@ impl Pane for Help {
         let hints: &[(&str, &str)] = if self.searching { &[("type", "to search"), ("enter", "done"), ("esc", "clear")] } else { &[("↑↓", "topic"), ("pgup/pgdn", "scroll"), ("/", "search"), ("F1–F9", "back to an app")] };
         let area = ui::hint_line(f, area, hints, t);
         let body = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(1) };
+        if self.shown().is_empty() {
+            // don't leave the old topic up as if it matched
+            let lines = vec![
+                Line::from(Span::styled(format!("no topic matches \"{}\"", self.query), Style::default().fg(t.accent).add_modifier(Modifier::BOLD))),
+                Line::raw(""),
+                Line::from(Span::styled("try another word · esc clears the search", ui::muted(t))),
+            ];
+            f.render_widget(Paragraph::new(lines), body);
+            return;
+        }
         let topic = &self.topics[self.sel];
         let w = body.width as usize;
         let key_w = topic.items.iter().filter_map(|it| if let K(a, _) = it { Some(unicode_width::UnicodeWidthStr::width(*a)) } else { None }).max().unwrap_or(10).clamp(8, 28);
@@ -366,14 +381,17 @@ impl Pane for Help {
                     }
                 }
                 K(a, b) => {
+                    let key_st = Style::default().fg(t.accent).add_modifier(Modifier::BOLD);
+                    // a key wider than the column gets a line of its own, the description starts under it
+                    let own_line = unicode_width::UnicodeWidthStr::width(*a) > key_w;
+                    if own_line {
+                        lines.push(Line::from(Span::styled(format!("  {a}"), key_st)));
+                    }
                     let desc = wrap(b, key_w + 4, w);
                     for (n, d) in desc.iter().enumerate() {
-                        let k = if n == 0 { a.to_string() } else { String::new() };
+                        let k = if n == 0 && !own_line { a.to_string() } else { String::new() };
                         let pad = key_w.saturating_sub(unicode_width::UnicodeWidthStr::width(k.as_str()));
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("  {k}{}", " ".repeat(pad)), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
-                            Span::raw(format!("  {d}")),
-                        ]));
+                        lines.push(Line::from(vec![Span::styled(format!("  {k}{}", " ".repeat(pad)), key_st), Span::raw(format!("  {d}"))]));
                     }
                 }
                 Gap => lines.push(Line::raw("")),
@@ -396,8 +414,10 @@ impl Pane for Help {
                 KeyCode::Backspace => {
                     self.query.pop();
                 }
-                KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => self.query.push(c),
-                _ => return false,
+                _ => match ui::typed_char(&k) {
+                    Some(c) => self.query.push(c),
+                    None => return false,
+                },
             }
             if let Some(&first) = self.shown().first() {
                 if !self.shown().contains(&self.sel) {
@@ -408,6 +428,18 @@ impl Pane for Help {
             return true;
         }
         let shown = self.shown();
+        if shown.is_empty() {
+            // a search with no hits: nothing to move between (esc clears it, / starts a new one)
+            match k.code {
+                KeyCode::Esc => self.query.clear(),
+                KeyCode::Char('/') => {
+                    self.searching = true;
+                    self.query.clear();
+                }
+                _ => return false,
+            }
+            return true;
+        }
         let pos = shown.iter().position(|&i| i == self.sel).unwrap_or(0);
         match k.code {
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
@@ -448,7 +480,11 @@ impl Pane for Help {
             f.render_widget(Paragraph::new(Span::styled(q, ui::accent(t))), Rect { y, height: 1, ..area });
             y += 2;
         }
-        for i in self.shown() {
+        let shown = self.shown();
+        if shown.is_empty() && y < area.bottom() {
+            f.render_widget(Paragraph::new(Span::styled("no matches", ui::muted(t))), Rect { y, height: 1, ..area });
+        }
+        for i in shown {
             if y >= area.bottom() {
                 break;
             }
@@ -496,5 +532,48 @@ mod tests {
         }
         let side = k.render_side(&mut h, 30, 20);
         assert!(side.contains("keys & tabs") && !side.contains("music"), "{side}");
+    }
+
+    #[test]
+    fn help_search_without_hits_doesnt_crash() {
+        let mut k = Kit::new();
+        let mut h = Help::new();
+        k.key(&mut h, KeyCode::Char('/'));
+        k.typ(&mut h, "zzzz");
+        k.key(&mut h, KeyCode::Enter);
+        // moving with nothing to move between used to index an empty list and take oriel down
+        for c in [KeyCode::Down, KeyCode::Char('j'), KeyCode::Tab, KeyCode::Up, KeyCode::Char('k'), KeyCode::BackTab] {
+            assert!(!k.key(&mut h, c));
+        }
+        let s = k.render(&mut h, 100, 20);
+        assert!(s.contains("no topic matches \"zzzz\""), "{s}");
+        assert!(!s.contains("oriel in one minute"), "the old topic isn't shown as a hit");
+        assert!(k.render_side(&mut h, 30, 10).contains("no matches"));
+        // esc clears it and the arrows work again
+        assert!(k.key(&mut h, KeyCode::Esc));
+        assert!(h.query.is_empty());
+        assert!(k.key(&mut h, KeyCode::Down));
+    }
+
+    #[test]
+    fn help_wide_keys_dont_cut_the_description() {
+        let mut k = Kit::new();
+        let mut h = Help::new();
+        h.sel = h.topics.iter().position(|t| t.title == "chat commands").unwrap();
+        let w = 90;
+        let s = k.render(&mut h, w, 120);
+        let _ = k.render_html(&mut h, w, 60, "target/snap/help-wide-keys.html");
+        let effort = crate::panes::chat::COMMANDS.iter().find(|c| c.0 == "/effort").unwrap();
+        let key = format!("{} {}", effort.0, effort.1);
+        assert!(unicode_width::UnicodeWidthStr::width(key.as_str()) > 28, "the test needs a key wider than the column");
+        // the key sits on a line of its own and every word of the description is still there
+        let at = s.lines().position(|l| l.trim() == key.trim()).unwrap_or_else(|| panic!("{key} on its own line:\n{s}"));
+        let desc: String = s.lines().skip(at + 1).take(4).map(str::trim).collect::<Vec<_>>().join(" ");
+        let words: Vec<&str> = effort.2.split(' ').collect();
+        assert!(desc.contains(&words[..words.len().min(6)].join(" ")), "{desc}");
+        // and nothing runs past the pane's edge (the body is w - 4 wide)
+        for l in s.lines() {
+            assert!(unicode_width::UnicodeWidthStr::width(l) <= w as usize - 2, "{l}");
+        }
     }
 }
