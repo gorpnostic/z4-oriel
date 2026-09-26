@@ -199,15 +199,64 @@ fn is_diff_tool(t: &Tool) -> bool {
     matches!(t.name.as_str(), "Edit" | "MultiEdit" | "Write" | "NotebookEdit" | "file_change")
 }
 
+fn is_shell(t: &Tool) -> bool {
+    matches!(t.name.as_str(), "Bash" | "PowerShell" | "command_execution")
+}
+
+/// Calls that only look around; Claude Code folds a run of them into one line ("Searched for 1 pattern, read 2 files").
+fn is_lookup(t: &Tool) -> bool {
+    matches!(t.name.as_str(), "Read" | "Grep" | "Glob" | "LS") && t.status != "error" && t.parent.is_none()
+}
+
+/// A new file: its lines are shown as plain code, like Claude Code's "Wrote 28 lines to x".
+fn is_new_file(t: &Tool) -> bool {
+    (t.name == "Write" || (t.name == "file_change" && t.label == "Write")) && !t.summary.starts_with('+')
+}
+
 /// How many body lines a call shows when collapsed.
 fn compact_rows(t: &Tool) -> usize {
-    if is_diff_tool(t) {
+    if is_new_file(t) {
         10
-    } else if matches!(t.name.as_str(), "Bash" | "PowerShell" | "command_execution") || t.status == "error" {
+    } else if is_diff_tool(t) {
+        60 // Claude Code shows an edit's whole diff
+    } else if is_shell(t) || t.status == "error" {
         4
     } else {
         0
     }
+}
+
+fn plural_n(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The line under a call, the way Claude Code words it: "Added 7 lines, removed 1 line", "Read 12 lines"…
+fn sentence(tool: &Tool) -> Option<String> {
+    if tool.status == "error" {
+        return Some(format!("Error: {}", if tool.summary.is_empty() { "failed" } else { &tool.summary }));
+    }
+    if let Some((a, d)) = tool.summary.strip_prefix('+').and_then(|s| s.split_once(" -")) {
+        let (a, d) = (a.parse::<u64>().unwrap_or(0), d.parse::<u64>().unwrap_or(0));
+        return Some(match (a, d) {
+            (0, 0) => "No changes".into(),
+            (a, 0) => format!("Added {}", plural_n(a, "line", "lines")),
+            (0, d) => format!("Removed {}", plural_n(d, "line", "lines")),
+            (a, d) => format!("Added {}, removed {}", plural_n(a, "line", "lines"), plural_n(d, "line", "lines")),
+        });
+    }
+    if tool.summary.is_empty() {
+        return if tool.status == "running" && is_shell(tool) { Some("Running…".into()) } else { None };
+    }
+    Some(match tool.name.as_str() {
+        _ if is_new_file(tool) => format!("Wrote {} to {}", tool.summary, tool.target),
+        "Read" => format!("Read {}", tool.summary),
+        "Grep" | "Glob" => format!("Found {}", tool.summary),
+        "LS" => format!("Listed {}", tool.summary),
+        // a command's output speaks for itself
+        _ if is_shell(tool) && !tool.body.is_empty() && !tool.summary.starts_with("exit") => return None,
+        _ if is_shell(tool) && tool.summary == "no output" => "(No output)".into(),
+        _ => capitalize(&tool.summary),
+    })
 }
 
 fn icon(status: &str, t: &Theme, time: f64) -> Span<'static> {
@@ -219,23 +268,41 @@ fn icon(status: &str, t: &Theme, time: f64) -> Span<'static> {
     }
 }
 
-fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out: &mut Vec<Line<'static>>, hits: &mut Vec<(usize, String)>) {
-    let ind = "  ".to_string() + &"   ".repeat(depth);
-    let muted = Style::default().fg(t.muted);
-    // ---- header: ● Update src/app.rs · +3 -1 · 1.2s
-    let mut meta: Vec<Span<'static>> = vec![];
-    if !tool.summary.is_empty() {
-        let style = if tool.status == "error" { Style::default().fg(t.danger) } else { muted };
-        meta.push(Span::styled(" · ", muted));
-        // colour a "+3 -1" summary like the diff
-        if let Some((a, d)) = tool.summary.strip_prefix('+').and_then(|s| s.split_once(" -")) {
-            meta.push(Span::styled(format!("+{a}"), Style::default().fg(t.good)));
-            meta.push(Span::styled(format!(" -{d}"), Style::default().fg(t.danger)));
-        } else {
-            meta.push(Span::styled(ui::fit(&tool.summary, 70), style));
-        }
+fn tok_style(tk: crate::panes::files::preview::Tok, t: &Theme) -> Style {
+    use crate::panes::files::preview::Tok;
+    match tk {
+        Tok::Plain => Style::default().fg(t.fg),
+        Tok::Kw => Style::default().fg(t.accent),
+        Tok::Str => Style::default().fg(t.inline),
+        Tok::Com => Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
+        Tok::Num => Style::default().fg(t.good),
+        Tok::Func => Style::default().fg(t.shine),
+        Tok::Head => Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        Tok::Bold => Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
     }
-    if tool.ms >= 1000 || (tool.ms >= 100 && tool.status != "running") {
+}
+
+/// A diff line's background band (Claude Code tints whole added / removed lines).
+fn band(t: &Theme, add: bool) -> Option<ratatui::style::Color> {
+    use ratatui::style::Color;
+    let base = match t.bg {
+        Color::Rgb(..) => t.bg,
+        _ => Color::Rgb(14, 14, 16),
+    };
+    let tint = if add { t.good } else { t.danger };
+    match (base, tint) {
+        (Color::Rgb(..), Color::Rgb(..)) => Some(crate::theme::mix(base, tint, if add { 0.16 } else { 0.22 })),
+        _ => None,
+    }
+}
+
+fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out: &mut Vec<Line<'static>>, hits: &mut Vec<(usize, String)>) {
+    let ind = "     ".repeat(depth);
+    let muted = Style::default().fg(t.muted);
+    // ---- header: ● Update(src/app.rs)
+    let mut meta: Vec<Span<'static>> = vec![];
+    // only a long call says how long it took (Claude Code shows none)
+    if tool.ms >= 10_000 {
         meta.push(Span::styled(format!(" · {}", human_ms(tool.ms)), muted));
     } else if let (true, Some(since)) = (tool.status == "running" && v.live, tool.since.0) {
         // a long command: count up while it runs
@@ -245,50 +312,87 @@ fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out:
         }
     }
     let meta_w: usize = meta.iter().map(|s| s.content.width()).sum();
-    let label_w = tool.label.width();
-    let room = width.saturating_sub(ind.width() + 2 + label_w + 1 + meta_w).max(12);
-    let mut spans = vec![
-        Span::raw(ind.clone()),
-        icon(&tool.status, t, v.time),
-        Span::raw(" "),
-        Span::styled(tool.label.clone(), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
-    ];
+    let room = width.saturating_sub(ind.width() + 2 + tool.label.width() + 2 + meta_w).max(12);
+    let mut spans = vec![Span::raw(ind.clone()), icon(&tool.status, t, v.time), Span::raw(" "), Span::styled(tool.label.clone(), Style::default().fg(t.fg).add_modifier(Modifier::BOLD))];
     if !tool.target.is_empty() {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(ui::fit(&tool.target, room), Style::default().fg(t.fg)));
+        spans.push(Span::styled(format!("({})", ui::fit(&tool.target, room)), Style::default().fg(t.fg)));
     }
     spans.extend(meta);
     hits.push((out.len(), tool.id.clone()));
     out.push(Line::from(spans));
 
     let open = v.expanded ^ v.open.contains(&tool.id);
-    // ---- body: a diff, output, or an answer
-    let rows = if open { 300 } else { compact_rows(tool) };
-    let shown = tool.body.len().min(rows);
-    let hidden = tool.body.len() - shown;
-    let nw = tool.body[..shown].iter().map(|l| split_line(l).1.len()).max().unwrap_or(0);
-    let lead = format!("{ind}  └  ");
+    let lead = format!("{ind}  ⎿  ");
     let cont = format!("{ind}     ");
     let mut first = true;
-    for l in &tool.body[..shown] {
+    // ---- ⎿  Added 7 lines, removed 1 line
+    if let Some(sn) = sentence(tool) {
+        let style = if tool.status == "error" { Style::default().fg(t.danger) } else { Style::default().fg(t.fg) };
+        out.push(Line::from(vec![Span::styled(lead.clone(), muted), Span::styled(ui::fit(&sn, width.saturating_sub(lead.width())), style)]));
+        first = false;
+    }
+    // ---- the body: a highlighted diff, new code, or output
+    let rows = if open { 400 } else { compact_rows(tool) };
+    let shown = tool.body.len().min(rows);
+    let hidden = tool.body.len() - shown;
+    let body = &tool.body[..shown];
+    let nw = body.iter().map(|l| split_line(l).1.len()).max().unwrap_or(0);
+    let code = is_diff_tool(tool);
+    let new_file = is_new_file(tool);
+    let ext = std::path::Path::new(tool.target.split(", ").next().unwrap_or("")).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let colored = if code {
+        let texts: Vec<String> = body.iter().map(|l| split_line(l).2.to_string()).collect();
+        crate::panes::files::preview::highlight(&texts, &ext)
+    } else {
+        vec![]
+    };
+    for (n, l) in body.iter().enumerate() {
         let (k, num, text) = split_line(l);
         let prefix = if first { lead.clone() } else { cont.clone() };
         first = false;
         let mut sp = vec![Span::styled(prefix.clone(), muted)];
         let avail = width.saturating_sub(prefix.width() + if nw > 0 { nw + 3 } else { 0 }).max(8);
         match k {
-            '+' | '-' | ' ' => {
-                let (c, mark) = match k {
-                    '+' => (t.good, "+"),
+            '+' | '-' | ' ' if code => {
+                let bg = if new_file || k == ' ' { None } else { band(t, k == '+') };
+                let with_bg = |st: Style| if let Some(b) = bg { st.bg(b) } else { st };
+                let (numc, mark) = match k {
+                    '+' if !new_file => (t.good, "+"),
                     '-' => (t.danger, "-"),
                     _ => (t.muted, " "),
                 };
                 if nw > 0 {
+                    sp.push(Span::styled(format!("{num:>nw$} "), with_bg(Style::default().fg(numc))));
+                }
+                if !new_file {
+                    sp.push(Span::styled(mark.to_string(), with_bg(Style::default().fg(numc).add_modifier(Modifier::BOLD))));
+                }
+                // the code, syntax coloured, cut to fit, the band carried to the edge
+                let mut used = 0;
+                for (tk, piece) in colored.get(n).cloned().unwrap_or_default() {
+                    let piece = piece.replace('\t', "    ");
+                    let left = avail.saturating_sub(used);
+                    if left == 0 {
+                        break;
+                    }
+                    let piece = if piece.width() > left { ui::fit(&piece, left) } else { piece };
+                    used += piece.width();
+                    sp.push(Span::styled(piece, with_bg(tok_style(tk, t))));
+                }
+                if bg.is_some() {
+                    sp.push(Span::styled(" ".repeat(avail.saturating_sub(used)), with_bg(Style::default())));
+                }
+            }
+            '+' | '-' | ' ' => {
+                let c = match k {
+                    '+' => t.good,
+                    '-' => t.danger,
+                    _ => t.muted,
+                };
+                if nw > 0 {
                     sp.push(Span::styled(format!("{num:>nw$} "), muted));
                 }
-                sp.push(Span::styled(format!("{mark} "), Style::default().fg(c).add_modifier(Modifier::BOLD)));
-                let body_style = if k == ' ' { Style::default().fg(t.muted) } else { Style::default().fg(c) };
-                sp.push(Span::styled(ui::fit(text, avail), body_style));
+                sp.push(Span::styled(format!("{k} {}", ui::fit(text, avail)), Style::default().fg(c)));
             }
             '@' => sp.push(Span::styled(format!("{}┈┈", " ".repeat(nw + if nw > 0 { 1 } else { 0 })), muted)),
             '!' => sp.push(Span::styled(ui::fit(text, avail), Style::default().fg(t.danger))),
@@ -300,8 +404,8 @@ fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out:
     if hidden > 0 && shown > 0 {
         out.push(Line::from(vec![
             Span::styled(cont.clone(), muted),
-            Span::styled(format!("… {hidden} more line{}", if hidden == 1 { "" } else { "s" }), muted),
-            Span::styled(if open { String::new() } else { "  (ctrl+o or click to expand)".into() }, Style::default().fg(t.frame)),
+            Span::styled(format!("… +{hidden} line{}", if hidden == 1 { "" } else { "s" }), muted),
+            Span::styled(if open { String::new() } else { " (ctrl+o to expand)".into() }, Style::default().fg(t.frame)),
         ]));
     }
     // ---- a subagent's own calls
@@ -315,6 +419,48 @@ fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out:
             tool_lines(c, depth + 1, width, t, v, out, hits);
         }
     }
+}
+
+/// "Searched for 2 patterns, read 3 files" for a run of look-around calls (present tense while one runs).
+fn lookup_line(tools: &[&Tool], t: &Theme, v: &View) -> Line<'static> {
+    let count = |names: &[&str]| tools.iter().filter(|x| names.contains(&x.name.as_str())).count() as u64;
+    let running = tools.iter().any(|x| x.status == "running");
+    let (search, read, list) = (count(&["Grep", "Glob"]), count(&["Read"]), count(&["LS"]));
+    let mut bits = vec![];
+    if search > 0 {
+        bits.push(format!("{} for {}", if running { "searching" } else { "searched" }, plural_n(search, "pattern", "patterns")));
+    }
+    if read > 0 {
+        bits.push(format!("{} {}", if running { "reading" } else { "read" }, plural_n(read, "file", "files")));
+    }
+    if list > 0 {
+        bits.push(format!("{} {}", if running { "listing" } else { "listed" }, plural_n(list, "directory", "directories")));
+    }
+    let mut text = capitalize(&bits.join(", "));
+    if running {
+        text.push('…');
+    }
+    let muted = Style::default().fg(t.muted);
+    let mut spans = vec![Span::raw("  "), Span::styled(text, muted)];
+    if running {
+        spans.insert(0, icon("running", t, v.time));
+        spans[1] = Span::raw(" ");
+    }
+    Line::from(spans)
+}
+
+/// Claude Code marks each thing it says with a bullet: "● Fixing both bugs now."
+fn bullet(lines: &mut [Line<'static>], style: Style) {
+    let Some(l) = lines.first_mut() else { return };
+    let Some(first) = l.spans.first() else { return };
+    let Some(rest) = first.content.strip_prefix("  ") else { return };
+    let (rest, st) = (rest.to_string(), first.style);
+    let mut spans = vec![Span::styled("● ", style)];
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest, st));
+    }
+    spans.extend(l.spans.iter().skip(1).cloned());
+    *l = Line::from(spans);
 }
 
 fn todo_lines(items: &[Todo], width: usize, t: &Theme, time: f64, out: &mut Vec<Line<'static>>) {
@@ -349,22 +495,47 @@ pub fn todo_row(it: &Todo, prefix: &str, width: usize, t: &Theme) -> Line<'stati
 /// Draw a reply's parts. `hits` gets (line index, call id) for every call's header line (click to expand).
 pub fn render(parts: &[Part], width: usize, t: &Theme, v: &View, out: &mut Vec<Line<'static>>, hits: &mut Vec<(usize, String)>) {
     let muted = Style::default().fg(t.muted);
-    // blank lines between text and activity; consecutive calls sit together
+    // a blank line between blocks, like Claude Code
     let mut prev: Option<&'static str> = None;
-    let gap = |out: &mut Vec<Line<'static>>, prev: Option<&str>, kind: &str| {
-        if prev.is_some() && (prev != Some(kind) || kind != "tool") {
+    let gap = |out: &mut Vec<Line<'static>>, prev: Option<&str>, _kind: &str| {
+        if prev.is_some() {
             out.push(Line::raw(""));
         }
     };
+    let hidden_thinking = |i: usize| matches!(parts[i], Part::Thinking { .. }) && !v.expanded && !(v.live && i + 1 == parts.len());
+    let mut skip_to = 0;
     for (i, p) in parts.iter().enumerate() {
+        if i < skip_to {
+            continue;
+        }
         match p {
             Part::Text { text } => {
                 if text.trim().is_empty() {
                     continue;
                 }
                 gap(out, prev, "text");
-                out.extend(md::render(text.trim(), width.saturating_sub(1), "  ", t));
+                let mut lines = md::render(text.trim(), width.saturating_sub(1), "  ", t);
+                bullet(&mut lines, Style::default().fg(t.fg));
+                out.extend(lines);
                 prev = Some("text");
+            }
+            // a run of reads and searches: one line, until ctrl+o or a click opens it
+            Part::Tool(tool) if is_lookup(tool) && !v.expanded && !v.open.contains(&tool.id) => {
+                let mut run: Vec<&Tool> = vec![];
+                let mut j = i;
+                while j < parts.len() {
+                    match &parts[j] {
+                        Part::Tool(x) if is_lookup(x) => run.push(x),
+                        _ if hidden_thinking(j) => {}
+                        _ => break,
+                    }
+                    j += 1;
+                }
+                skip_to = j;
+                gap(out, prev, "tool");
+                hits.push((out.len(), tool.id.clone()));
+                out.push(lookup_line(&run, t, v));
+                prev = Some("tool");
             }
             Part::Thinking { text, tokens } => {
                 let live_last = v.live && i + 1 == parts.len();

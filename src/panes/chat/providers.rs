@@ -327,6 +327,11 @@ fn transcript(req: &Request) -> String {
     format!("(Conversation so far, for context:)\n\n{t}\n\n(New message:)\n{last}")
 }
 
+/// Environment a parent Claude Code session sets for its own children. An agent oriel starts isn't one of those:
+/// inheriting them turns off its transcript saving (so --resume breaks) and pins the parent's effort level.
+pub const CLAUDE_SESSION_ENV: &[&str] = &["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_EXECPATH", "CLAUDE_PID", "CLAUDE_EFFORT"];
+
 /// Kill a CLI and everything it started: npm installs run through a cmd.exe shim, and killing just that leaves
 /// the real agent running (and editing files).
 fn kill_tree(pid: u32) {
@@ -362,6 +367,9 @@ fn run_cli(
     };
     cmd.args(args).current_dir(cwd).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     cmd.env_remove("NO_COLOR");
+    for k in CLAUDE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

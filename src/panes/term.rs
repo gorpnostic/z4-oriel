@@ -51,6 +51,9 @@ impl Term {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env_remove("NO_COLOR"); // Claude Code sets it; shells in panes should have colour
+        for k in crate::panes::chat::providers::CLAUDE_SESSION_ENV {
+            cmd.env_remove(k);
+        }
         cmd.env("ORIEL", "1");
         let child = pair.slave.spawn_command(cmd).unwrap_or_else(|e| {
             // fall back to the default shell so the pane still works, with the error visible

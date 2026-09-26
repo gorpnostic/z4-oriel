@@ -6,7 +6,7 @@
 //! the pane; render only draws what is already in memory.
 
 pub mod clock;
-mod preview;
+pub(crate) mod preview;
 
 use crate::pane::{Action, Cx, Pane, Place, Waker};
 use crate::ui;

@@ -256,6 +256,20 @@ fn strip_cwd(cwd: &Path, s: &str) -> String {
     out
 }
 
+/// `cd "C:\work\demo" && npm test` -> `npm test`: going to the folder it's already in is noise.
+fn strip_cd(cwd: &Path, s: &str) -> String {
+    let norm = |p: &str| p.trim().trim_matches(['"', '\'']).replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+    let Some(rest) = s.trim_start().strip_prefix("cd ") else { return s.to_string() };
+    for sep in [" && ", "; ", " ; "] {
+        if let Some((dir, cmd)) = rest.split_once(sep) {
+            if norm(dir) == norm(&cwd.to_string_lossy()) || norm(dir) == "." {
+                return cmd.to_string();
+            }
+        }
+    }
+    s.to_string()
+}
+
 fn first_line(s: &str) -> String {
     let l = s.trim().lines().next().unwrap_or("").trim().to_string();
     if s.trim().lines().count() > 1 { format!("{l} …") } else { l }
@@ -286,7 +300,7 @@ pub fn target(name: &str, input: &Value, cwd: &Path) -> String {
     match name {
         "Read" | "Write" | "Edit" | "MultiEdit" => rel(cwd, &s("file_path")),
         "NotebookEdit" => rel(cwd, &s("notebook_path")),
-        "Bash" | "PowerShell" | "BashOutput" => first_line(&strip_cwd(cwd, &s("command"))),
+        "Bash" | "PowerShell" | "BashOutput" => first_line(&strip_cd(cwd, &strip_cwd(cwd, &s("command")))),
         "Grep" => {
             let mut t = format!("'{}'", s("pattern"));
             let p = if !s("path").is_empty() { rel(cwd, &s("path")) } else { s("glob") };

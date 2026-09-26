@@ -736,7 +736,23 @@ impl Chat {
         }
         let mut out: Vec<Line<'static>> = vec![];
         let mut hits: Vec<(usize, String)> = vec![];
-        if m.role == "user" {
+        let agent_chat = matches!(self.provider_of().as_str(), "claude" | "codex");
+        if m.role == "user" && agent_chat {
+            // like the Claude Code TUI: the prompt on a full-width grey band, "❯ " in front
+            let band = match (t.bg, t.fg) {
+                (ratatui::style::Color::Rgb(..), ratatui::style::Color::Rgb(..)) => crate::theme::mix(t.bg, t.fg, 0.14),
+                (_, ratatui::style::Color::Rgb(..)) => crate::theme::mix(ratatui::style::Color::Rgb(14, 14, 16), t.fg, 0.14),
+                _ => t.frame,
+            };
+            let body = md::wrap(vec![Span::raw(m.content.clone())], width.saturating_sub(3), "", "");
+            for (n, l) in body.into_iter().enumerate() {
+                let w = l.width();
+                let mut spans = vec![Span::styled(if n == 0 { "❯ " } else { "  " }, Style::default().fg(t.muted).bg(band))];
+                spans.extend(l.spans.into_iter().map(|s| Span::styled(s.content.to_string(), Style::default().fg(t.fg).bg(band))));
+                spans.push(Span::styled(" ".repeat(width.saturating_sub(w + 3)), Style::default().bg(band)));
+                out.push(Line::from(spans));
+            }
+        } else if m.role == "user" {
             // a box on the right with "you" set into its top border
             let max_w = (width * 7 / 10).max(20);
             let body = md::wrap(vec![Span::raw(m.content.clone())], max_w.saturating_sub(4), "", "");
@@ -763,11 +779,14 @@ impl Chat {
             out.push(Line::from(vec![Span::raw(pad), Span::styled(format!("╰{}╯", "─".repeat(box_w - 2)), frame)]));
         } else {
             let who = m.model.clone().unwrap_or_default();
-            out.push(Line::from(vec![
-                Span::styled(ui::lead("ai"), Style::default().fg(t.accent)),
-                Span::styled(providers::label(&who).to_lowercase(), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
-            ]));
-            out.push(Line::raw(""));
+            // agent chats read like the Claude Code TUI: no name above each reply, unless another AI wrote it
+            if !(agent_chat && who == self.provider_of()) {
+                out.push(Line::from(vec![
+                    Span::styled(ui::lead("ai"), Style::default().fg(t.accent)),
+                    Span::styled(providers::label(&who).to_lowercase(), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+                ]));
+                out.push(Line::raw(""));
+            }
             for (label, state, detail) in &m.steps {
                 let mark = match state.as_str() {
                     "done" => Span::styled("  ✓ ", Style::default().fg(t.good)),
@@ -799,7 +818,21 @@ impl Chat {
             }
             if let Some(n) = &m.note {
                 out.push(Line::raw(""));
-                out.extend(md::wrap(vec![Span::styled(n.clone(), Style::default().fg(t.muted))], width.saturating_sub(1), "  ", "  "));
+                let first = n.split(" · ").next().unwrap_or("");
+                let timed = !m.parts.is_empty() && first.chars().next().is_some_and(|c| c.is_ascii_digit()) && first.ends_with(['s', 'm']);
+                if timed {
+                    // Claude Code's sign-off, with a word of its own: "✻ Sautéed for 19s"
+                    const DONE: &[&str] = &["Worked", "Cooked", "Brewed", "Sautéed", "Crunched", "Baked", "Churned", "Simmered"];
+                    let verb = DONE[(i * 7 + m.content.len()) % DONE.len()];
+                    let rest: Vec<&str> = n.split(" · ").skip(1).filter(|x| !matches!(*x, "claude code" | "codex")).collect();
+                    let tail = if rest.is_empty() { String::new() } else { format!(" · {}", rest.join(" · ")) };
+                    out.push(Line::from(vec![
+                        Span::styled("✻ ", Style::default().fg(t.accent)),
+                        Span::styled(format!("{verb} for {first}{tail}"), Style::default().fg(t.muted)),
+                    ]));
+                } else {
+                    out.extend(md::wrap(vec![Span::styled(n.clone(), Style::default().fg(t.muted))], width.saturating_sub(1), "  ", "  "));
+                }
             }
         }
         out.push(Line::raw(""));
@@ -867,7 +900,8 @@ impl Chat {
         }
         // ---- the status line
         let e = s.started.elapsed();
-        let spin = SPIN[(e.as_millis() / 100) as usize % SPIN.len()];
+        const STAR: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
+        let spin = STAR[(e.as_millis() / 120) as usize % STAR.len()];
         let action = if !self.asks.is_empty() {
             "waiting for you".to_string()
         } else if s.status.starts_with("compacting") || s.status.starts_with("API hiccup") {
@@ -886,7 +920,7 @@ impl Chat {
         if !s.status.is_empty() && parts.is_empty() {
             meta.push(s.status.clone());
         }
-        meta.push("esc to stop".into());
+        meta.push("esc to interrupt".into());
         let act = ui::fit(&format!("{}…", activity::capitalize(&action)), width.saturating_sub(40).max(20));
         out.push(Line::from(vec![
             Span::styled(format!("  {spin} "), ui::accent(t)),
@@ -1728,6 +1762,149 @@ mod tests {
         c.stop();
     }
 
+    /// The same prompt in the real Claude Code TUI (run in a pty, off screen) and in oriel's chat, snapshotted side by
+    /// side to see what oriel's transcript is missing. Uses your Claude: run it on purpose, with the scratch folder
+    /// outside anything your hooks log.
+    /// `ORIEL_COMPARE_DIR=<folder> cargo test chat_compare_tui -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn chat_compare_tui() {
+        use crate::panes::term::Term;
+        let base = PathBuf::from(std::env::var("ORIEL_COMPARE_DIR").expect("set ORIEL_COMPARE_DIR"));
+        let model = std::env::var("ORIEL_COMPARE_MODEL").unwrap_or_else(|_| "sonnet".into());
+        let js = std::env::var("ORIEL_COMPARE_SCENARIO").is_ok_and(|s| s == "js");
+        let prompt = std::env::var("ORIEL_COMPARE_PROMPT").unwrap_or_else(|_| {
+            if js {
+                "Make a short todo list first, then: every function in calc.js should throw a TypeError when given a non-number, and divide() should throw a RangeError on division by zero. Add calc.test.js using node:test, and run it with node --test.".into()
+            } else {
+                "stats.py has two bugs: mean() crashes on an empty list (it should return None) and median() is wrong for even-length lists. Fix both, add test_stats.py with unittest tests for them, and run the tests.".into()
+            }
+        });
+        let setup = |d: &std::path::Path| {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+            if js {
+                std::fs::write(d.join("calc.js"), "function add(a, b) {\n  return a + b;\n}\n\nfunction subtract(a, b) {\n  return a - b;\n}\n\nfunction multiply(a, b) {\n  return a * b;\n}\n\nfunction divide(a, b) {\n  return a / b;\n}\n\nmodule.exports = { add, subtract, multiply, divide };\n").unwrap();
+                std::fs::write(d.join("package.json"), "{\n  \"name\": \"calc\",\n  \"version\": \"1.0.0\",\n  \"scripts\": { \"test\": \"node --test\" }\n}\n").unwrap();
+            } else {
+                std::fs::write(d.join("stats.py"), "def mean(xs):\n    return sum(xs) / len(xs)\n\n\ndef median(xs):\n    xs = sorted(xs)\n    return xs[len(xs) // 2]\n\n\ndef mode(xs):\n    return max(set(xs), key=xs.count)\n").unwrap();
+            }
+        };
+        let only_oriel = std::env::var("ORIEL_COMPARE_ONLY").is_ok_and(|s| s == "oriel");
+        let (tui_dir, oriel_dir) = (base.join("tui"), base.join("oriel"));
+        setup(&tui_dir);
+        setup(&oriel_dir);
+        let (w, h) = (130u16, 140u16);
+        let mut k = Kit::new();
+        let dump = |name: &str, text: &str| {
+            let t: Vec<&str> = text.lines().map(|l| l.trim_end()).collect();
+            let last = t.iter().rposition(|l| !l.is_empty()).unwrap_or(0);
+            std::fs::write(base.join(format!("{name}.txt")), t[..=last].join("\n")).unwrap();
+        };
+
+        // ---- the real thing, in a pty
+        let mut cx_actions = vec![];
+        if !only_oriel {
+        let claude = crate::config::which("claude").expect("claude isn't installed");
+        let args = vec!["--model".into(), model.clone(), "--permission-mode".into(), "bypassPermissions".into()];
+        let mut term = Term::new("claude", "claude", &claude.to_string_lossy(), args, Some(tui_dir.clone()));
+        let t0 = Instant::now();
+        let mut ready = false;
+        while t0.elapsed() < Duration::from_secs(60) {
+            k.wait_wake(&mut term, 400);
+            let s = k.render(&mut term, w, h);
+            if s.contains("Yes, I accept") {
+                k.key(&mut term, KeyCode::Down);
+                k.key(&mut term, KeyCode::Enter);
+            } else if s.contains("Yes, proceed") || s.contains("Yes, I trust") {
+                k.key(&mut term, KeyCode::Enter);
+            } else if s.contains("? for shortcuts") || s.contains("bypass permissions on") {
+                ready = true;
+                break;
+            }
+        }
+        dump("tui-start", &k.render(&mut term, w, h));
+        assert!(ready, "the TUI never came up: see tui-start.txt");
+        {
+            let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut cx_actions, focused: true, time: 1.0 };
+            term.paste(&prompt, &mut cx);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        k.key(&mut term, KeyCode::Enter);
+        let (t0, mut last, mut changed, mut shots) = (Instant::now(), String::new(), Instant::now(), vec![6u64, 14, 24]);
+        while t0.elapsed() < Duration::from_secs(420) {
+            k.wait_wake(&mut term, 300);
+            let s = k.render(&mut term, w, h);
+            if shots.first().is_some_and(|&at| t0.elapsed() >= Duration::from_secs(at)) {
+                let at = shots.remove(0);
+                k.render_html(&mut term, w, h, &base.join(format!("tui-mid{at}.html")).to_string_lossy());
+                dump(&format!("tui-mid{at}"), &s);
+            }
+            // the spinner animates while it works, so a screen that holds still for 8s means it's done
+            if s != last {
+                last = s;
+                changed = Instant::now();
+            } else if t0.elapsed() > Duration::from_secs(10) && changed.elapsed() > Duration::from_secs(8) {
+                break;
+            }
+        }
+        let s = k.render_html(&mut term, w, h, &base.join("tui.html").to_string_lossy());
+        dump("tui", &s);
+        println!("TUI done in {:.0}s", t0.elapsed().as_secs_f64());
+        {
+            let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut cx_actions, focused: true, time: 1.0 };
+            term.paste("/exit", &mut cx);
+        }
+        k.key(&mut term, KeyCode::Enter);
+        std::thread::sleep(Duration::from_secs(2));
+        drop(term);
+        }
+
+        // ---- oriel's chat, same prompt, same model
+        providers::LIVE.store(true, Ordering::SeqCst);
+        let mut c = Chat::new(&k.config);
+        let _forget = Forget(c.chat.id.clone());
+        c.provider = "claude".into();
+        c.chat.provider = Some("claude".into());
+        c.chat.model = Some(model.clone());
+        c.perms = "bypass".into();
+        c.chat.cwd = Some(oriel_dir.to_string_lossy().to_string());
+        {
+            let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut cx_actions, focused: true, time: 1.0 };
+            c.send(prompt.clone(), &mut cx);
+        }
+        let (t0, mut shots) = (Instant::now(), vec![6u64, 14, 24]);
+        while c.stream.is_some() && t0.elapsed() < Duration::from_secs(420) {
+            k.wait_wake(&mut c, 300);
+            if shots.first().is_some_and(|&at| t0.elapsed() >= Duration::from_secs(at)) {
+                let at = shots.remove(0);
+                let s = k.render_html(&mut c, w, h, &base.join(format!("oriel-mid{at}.html")).to_string_lossy());
+                dump(&format!("oriel-mid{at}"), &s);
+            }
+        }
+        let s = k.render_html(&mut c, w, h, &base.join("oriel.html").to_string_lossy());
+        dump("oriel", &s);
+        println!("oriel done in {:.0}s", t0.elapsed().as_secs_f64());
+        std::fs::write(base.join("oriel-parts.json"), serde_json::to_string_pretty(&c.chat.messages).unwrap()).unwrap();
+    }
+
+    /// Re-draw the transcript chat_compare_tui saved, with the current renderer (no AI call).
+    /// `ORIEL_COMPARE_DIR=<folder> cargo test chat_compare_redraw -- --ignored`
+    #[test]
+    #[ignore]
+    fn chat_compare_redraw() {
+        let base = PathBuf::from(std::env::var("ORIEL_COMPARE_DIR").expect("set ORIEL_COMPARE_DIR"));
+        let msgs: Vec<store::Msg> = serde_json::from_str(&std::fs::read_to_string(base.join("oriel-parts.json")).unwrap()).unwrap();
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.provider = "claude".into();
+        c.chat.provider = Some("claude".into());
+        c.chat.model = Some("sonnet".into());
+        c.chat.title = store::title_from(&msgs[0].content);
+        c.chat.messages = msgs;
+        k.render_html(&mut c, 130, 140, &base.join("oriel2.html").to_string_lossy());
+    }
+
     #[test]
     fn chat_no_ai() {
         let mut k = Kit::new();
@@ -1871,7 +2048,7 @@ mod tests {
         assert!(note.contains("4.3k tokens") && note.contains("$0.136") && note.contains("24 turns"), "{note}");
         let s = k.render_html(&mut c, 140, 44, "target/snap/chat-agent.html");
         println!("{s}");
-        assert!(s.contains("Update hello.txt · +1 -1"));
+        assert!(s.contains("Update(hello.txt)") && s.contains("⎿  Added 1 line, removed 1 line"), "Claude Code's wording");
         assert!(!s.contains("● TaskCreate") && !s.contains("● ToolSearch"), "todo plumbing stays hidden");
         // ctrl+o: everything in full
         k.key_mod(&mut c, KeyCode::Char('o'), KeyModifiers::CONTROL);
@@ -1910,10 +2087,10 @@ mod tests {
         }
         let s = k.render_html(&mut c, 120, 36, "target/snap/chat-agent-errors.html");
         println!("{s}");
-        assert!(s.contains("Bash cargo test · exit 101"));
+        assert!(s.contains("Bash(cargo test)") && s.contains("⎿  Error: exit 101"));
         assert!(s.contains("error: test failed"));
-        assert!(s.contains("Update src/parse.rs · +2 -1"), "MultiEdit diff counts");
-        assert!(s.contains("Fetch https://docs.rs/serde"));
+        assert!(s.contains("Update(src/parse.rs)") && s.contains("Added 2 lines, removed 1 line"), "MultiEdit diff counts");
+        assert!(s.contains("Fetch(https://docs.rs/serde)"));
         assert!(s.contains("0/2 done · now: Running the tests"));
         // clicking the Bash line opens it (all output), clicking again closes it
         let (row, _) = c.tool_hits.iter().find(|(_, id)| id == "t2").cloned().unwrap();
