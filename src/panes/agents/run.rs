@@ -321,13 +321,14 @@ pub const WORKER_PREAMBLE: &str = "You are a worker agent run by oriel, alone in
 - Finish with your report: status (done or blocked), a summary of what you changed (at most 120 words) and any questions.\n\n";
 
 /// The task block that follows the preamble.
-pub fn task_block(id: &str, title: &str, goal: &str, owns: &[String], reads: &[String], acceptance: &str, size: &str, history: &[String]) -> String {
+#[allow(clippy::too_many_arguments)]
+pub fn task_block(id: &str, title: &str, goal: &str, owns: &[String], reads: &[String], acceptance: &str, size: &str, history: &[String], shell: &str) -> String {
     let mut s = format!("TASK {id}: {title}\nGOAL:\n{}\nOWNS: {}\n", goal.trim(), if owns.is_empty() { "(only what the goal needs)".to_string() } else { owns.join(", ") });
     if !reads.is_empty() {
         s.push_str(&format!("READ FIRST: {}\n", reads.join(", ")));
     }
     if !acceptance.is_empty() {
-        s.push_str(&format!("ACCEPTANCE: {acceptance}\n"));
+        s.push_str(&format!("ACCEPTANCE (runs in {shell} from the repo root): {acceptance}\n"));
     }
     match size {
         "S" => s.push_str("SIZE: S (about 100 lines, up to 3 files)\n"),
@@ -533,6 +534,8 @@ pub fn lead_spec(agent: &str, bin: &Path, model: &str, prompt: &str, system: &st
                 allowed = format!("{allowed},{}", claude_tool_names());
                 // wait long-polls for up to 10 minutes and merges run the gate
                 env.push(("MCP_TOOL_TIMEOUT".to_string(), "1800000".to_string()));
+                // load oriel's dozen tools up front instead of a ToolSearch round trip per tool
+                env.push(("ENABLE_TOOL_SEARCH".to_string(), "false".to_string()));
             }
             a.push("--strict-mcp-config".into());
             a.extend(["--allowedTools".into(), allowed]);

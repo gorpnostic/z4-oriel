@@ -20,7 +20,7 @@ pub const TOOLS: &[(&str, &str, &str)] = &[
     ("wait", "Block until something happens instead of polling: a task finished (with a compact result card), merged, bounced back to its worker (conflict or failed gate, oriel retries it by itself), got blocked or failed. Returns the new events since your last wait, or after timeout_s (default 300, max 600) with none.", r#"{"type":"object","properties":{"timeout_s":{"type":"integer"},"ids":{"type":"array","items":{"type":"string"},"description":"only wake for these tasks"}}}"#),
     ("task_status", "Compact cards for one task, or every task in this run when id is omitted: state, summary, files with lines changed, gate result, conflicts, questions, cost.", r#"{"type":"object","properties":{"id":{"type":"string"}}}"#),
     ("task_diff", "A task's diff against where it branched off, one page at a time (200 lines), optionally just one path. Only when a card isn't enough.", r#"{"type":"object","properties":{"id":{"type":"string"},"path":{"type":"string"},"page":{"type":"integer"}},"required":["id"]}"#),
-    ("merge", "Queue a finished task for merging into the integration branch. Merges run one at a time: conflict check, then the gate (build/tests + the task's acceptance command) on the merged result, then the branch moves. A conflict or failed gate goes back to the same worker automatically (2 tries, then a fresh worker) and merges when fixed. Watch wait for the outcome.", r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
+    ("merge", "Queue a finished task for merging into the integration branch. Merges run one at a time: conflict check, then the gate (build/tests + the task's acceptance command) on the merged result, then the branch moves. A conflict or failed gate goes back to the same worker automatically (2 tries, then a fresh worker) and merges when fixed. If the acceptance command itself was wrong (event acceptance_broken), merge again with a corrected one (or \"\" for none). Watch wait for the outcome.", r#"{"type":"object","properties":{"id":{"type":"string"},"acceptance":{"type":"string","description":"replace the task's acceptance command first"}},"required":["id"]}"#),
     ("send_followup", "Send a finished task's worker more instructions in the same session (review feedback); it goes back to running.", r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"}},"required":["id","text"]}"#),
     ("resolve_conflicts", "Merge the current integration branch into a task's worktree now and have its worker resolve the conflict markers (merge does this by itself on a conflict).", r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
     ("spawn_task", "Add one task outside a plan (same checks as plan).", r#"{"type":"object","properties":{"worker":{"type":"string"},"title":{"type":"string"},"goal":{"type":"string"},"owns":{"type":"array","items":{"type":"string"}},"depends_on":{"type":"array","items":{"type":"string"}},"acceptance":{"type":"string"},"size":{"type":"string","enum":["S","M"]}},"required":["worker","title","goal","owns"]}"#),
@@ -241,6 +241,8 @@ pub struct Brief<'a> {
     pub max_parallel: u32,
     pub budget: f64,
     pub roster: &'a str,
+    /// The shell acceptance commands and the gate run in ("bash", "PowerShell", "cmd", "sh").
+    pub shell: &'a str,
 }
 
 /// oriel's instructions for the lead (Claude gets them as an appended system prompt, the others at the top of
@@ -264,11 +266,18 @@ pub fn lead_system(b: &Brief, mcp: bool) -> String {
          - Spread concurrent tasks across vendors (separate usage limits). Skip a worker at 5h >= 85% or weekly >= 90%; below 25% weekly left, give it only S tasks.\n\n",
     );
     s.push_str(&format!(
-        "THIS RUN\n- Integration branch: {} (made from the user's {}).\n- At most {} workers at once; the rest queue.\n- Budget for the whole run (you + workers): ${:.2}. New work is refused once it's spent.\n- Workers:\n{}\n",
+        "THIS RUN\n- Integration branch: {} (made from the user's {}).\n- At most {} workers at once; the rest queue.\n- Budget for the whole run (you + workers): ${:.2}. New work is refused once it's spent.\n- Acceptance commands and the gate run in {} from the repo root: write them for {}{}.\n- Workers:\n{}\n",
         b.integration,
         b.base,
         b.max_parallel.clamp(1, 5),
         b.budget,
+        b.shell,
+        b.shell,
+        match b.shell {
+            "bash" | "sh" => " (e.g. `test -f notes.md && grep -q Usage notes.md`, `cargo test cli`)",
+            "PowerShell" => " (e.g. `if (-not (Select-String -Quiet Usage notes.md)) { exit 1 }`)",
+            _ => " (e.g. `findstr /c:Usage notes.md`)",
+        },
         b.roster
     ));
     if mcp {
@@ -390,12 +399,12 @@ mod tests {
         assert_eq!(a[1], ("wait".to_string(), json!({})));
         assert_eq!(parse_actions("{\"actions\":[{\"tool\":\"done\",\"args\":{\"summary\":\"ok\"}}]}").unwrap()[0].0, "done");
         assert!(parse_actions("no json here").is_none());
-        let sys = lead_system(&Brief { integration: "oriel/lead-x", base: "master", max_parallel: 3, budget: 5.0, roster: "- codex" }, false);
+        let sys = lead_system(&Brief { integration: "oriel/lead-x", base: "master", max_parallel: 3, budget: 5.0, roster: "- codex", shell: "bash" }, false);
         assert!(sys.contains("END EVERY REPLY") && sys.contains("resolve_conflicts") && sys.contains("oriel/lead-x"));
-        let a = lead_system(&Brief { integration: "i", base: "b", max_parallel: 3, budget: 5.0, roster: "" }, true);
+        let a = lead_system(&Brief { integration: "i", base: "b", max_parallel: 3, budget: 5.0, roster: "", shell: "bash" }, true);
         assert!(a.contains("mcp__oriel__") && a.contains("ROUTING"));
         // byte-stable: the shared part comes first and doesn't depend on the run
-        let b = lead_system(&Brief { integration: "j", base: "c", max_parallel: 2, budget: 1.0, roster: "- kimi" }, true);
+        let b = lead_system(&Brief { integration: "j", base: "c", max_parallel: 2, budget: 1.0, roster: "- kimi", shell: "bash" }, true);
         let cut = a.find("THIS RUN").unwrap();
         assert_eq!(a[..cut], b[..cut]);
     }

@@ -577,18 +577,43 @@ pub fn detect_gate(dir: &Path) -> Option<String> {
     }
 }
 
-/// Run a gate command through the shell in `dir`, killed after `timeout`. Err = the first lines of the failure.
+/// The shell gates and acceptance commands run in: what agents write commands for. On Windows that's Git for
+/// Windows' bash (the one Claude Code's Bash tool uses; never System32's WSL launcher), else PowerShell, else
+/// cmd. Elsewhere `sh`. (program, args before the command, name for prompts)
+pub fn gate_shell() -> &'static (PathBuf, Vec<String>, &'static str) {
+    static SHELL: std::sync::OnceLock<(PathBuf, Vec<String>, &'static str)> = std::sync::OnceLock::new();
+    SHELL.get_or_init(|| {
+        if !cfg!(windows) {
+            return (PathBuf::from("sh"), vec!["-c".into()], "sh");
+        }
+        let from_git = crate::config::which("git").and_then(|g| Some(g.parent()?.parent()?.join("bin").join("bash.exe")));
+        let bash = [Some(PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")), from_git].into_iter().flatten().find(|p| p.is_file());
+        if let Some(b) = bash {
+            return (b, vec!["-c".into()], "bash");
+        }
+        if let Some(p) = crate::config::which("pwsh") {
+            return (p, vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into()], "PowerShell");
+        }
+        (PathBuf::from("cmd.exe"), vec!["/d".into(), "/s".into(), "/c".into()], "cmd")
+    })
+}
+
+/// Did a gate command fail to *run* (a shell syntax error, a missing program) rather than fail its check?
+pub fn shell_trouble(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    ["is not recognized as", "command not found", "syntax error", "unexpected token", "was unexpected at this time", "missing `]'", "missing ']'", "unexpected eof", "unterminated", "parsererror", "no such file or directory: '"]
+        .iter()
+        .any(|p| m.contains(p))
+        || m.contains("(exit 127)")
+        || m.contains("(exit 9009)")
+}
+
+/// Run a gate command through the gate shell in `dir`, killed after `timeout`. Err = the first lines of the failure.
 pub fn run_gate(dir: &Path, cmd: &str, timeout: std::time::Duration, env: &[(&str, &str)]) -> Result<(), String> {
     use std::io::Read;
-    let mut c = if cfg!(windows) {
-        let mut c = command("cmd.exe");
-        c.args(["/d", "/s", "/c", cmd]);
-        c
-    } else {
-        let mut c = command("sh");
-        c.args(["-c", cmd]);
-        c
-    };
+    let (prog, pre, _) = gate_shell();
+    let mut c = command(&prog.to_string_lossy());
+    c.args(pre).arg(cmd);
     c.current_dir(dir).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).env("CI", "1").env_remove("NO_COLOR");
     for (k, v) in env {
         c.env(k, v);

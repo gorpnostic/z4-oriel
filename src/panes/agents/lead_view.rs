@@ -209,7 +209,7 @@ impl Agents {
         lines.push(spread(facts, lead_cost, w));
         if !run.error.is_empty() {
             lines.push(Line::styled(ui::fit(&format!("✗ {}", run.error), w), Style::default().fg(t.danger)));
-        } else if !run.summary.is_empty() && !run.state.active() {
+        } else if !run.summary.is_empty() && !run.state.active() && !run.log.iter().rev().take(4).any(|l| l.starts_with("done: ")) {
             lines.push(Line::styled(ui::fit(&format!("done: {}", run.summary), w), Style::default().fg(t.shine)));
         }
         let room = (inner.height as usize).saturating_sub(lines.len());

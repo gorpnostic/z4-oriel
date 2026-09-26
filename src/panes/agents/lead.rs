@@ -344,6 +344,12 @@ impl Agents {
         let Some(t) = self.task(task).cloned() else { return };
         let mut card = self.card(&t);
         card["event"] = json!(kind);
+        match kind {
+            "bounced" => card["action"] = json!(format!("oriel sent it back to {} (fix round {} of {MAX_ATTEMPTS}); it merges by itself once fixed — just wait", t.worker, t.attempts)),
+            "redispatched" => card["action"] = json!(format!("starting over with {} in a fresh worktree; review its card when it finishes", t.worker)),
+            "acceptance_broken" => card["action"] = json!(format!("the acceptance command didn't run (see gate) — nothing was merged. Merge again with a command that works in {}: merge {{\"id\": \"{}\", \"acceptance\": \"...\"}} (\"\" for none)", git::gate_shell().2, t.id)),
+            _ => {}
+        }
         let l = self.runs_live.entry(t.run.clone()).or_insert_with(RunLive::new);
         l.events.push(RunEvent { task: task.to_string(), card, delivered: false });
         if l.events.len() > 300 {
@@ -510,7 +516,7 @@ impl Agents {
             }
         }
         let roster = self.roster();
-        let brief = mcp::Brief { integration: &r.branch, base: &r.base_branch, max_parallel: r.max_parallel, budget: r.budget_usd, roster: &roster::roster_brief(&roster) };
+        let brief = mcp::Brief { integration: &r.branch, base: &r.base_branch, max_parallel: r.max_parallel, budget: r.budget_usd, roster: &roster::roster_brief(&roster), shell: git::gate_shell().2 };
         let d = Driver {
             run: id.to_string(),
             agent: r.agent.clone(),
@@ -694,7 +700,15 @@ impl Agents {
                 };
             }
             "send_followup" => self.call_followup(&run, arg(a, "id"), arg(a, "text"), cx),
-            "merge" => self.task_in(&run, arg(a, "id")).and_then(|t| self.queue_merge(&t.id)),
+            "merge" => self.task_in(&run, arg(a, "id")).and_then(|t| {
+                if let Some(acc) = a["acceptance"].as_str() {
+                    if let Some(tm) = self.task_mut(&t.id) {
+                        tm.acceptance = acc.trim().to_string();
+                        tm.gate.clear();
+                    }
+                }
+                self.queue_merge(&t.id)
+            }),
             "resolve_conflicts" => return self.call_resolve(&run, arg(a, "id"), c.reply, cx),
             "discard" => {
                 return match self.task_in(&run, arg(a, "id")) {
@@ -873,8 +887,12 @@ impl Agents {
         if text.is_empty() {
             return Err("send_followup needs text".into());
         }
-        if matches!(t.status, Status::Running | Status::Blocked) || self.live.get(&t.id).is_some_and(|l| l.stop.is_some()) {
-            return Err(format!("{} is still running — wait for it first", t.id));
+        if matches!(t.status, Status::Running | Status::Blocked) || self.live.get(&t.id).is_some_and(|l| l.stop.is_some() || l.busy || l.checking) {
+            return Err(if t.want_merge {
+                format!("{} is already back with its worker fixing a failed merge (round {} of {MAX_ATTEMPTS}); oriel merges it when that's done — wait for the event", t.id, t.attempts)
+            } else {
+                format!("{} is still running — wait for it first", t.id)
+            });
         }
         if t.worktree.is_empty() || !Path::new(&t.worktree).is_dir() {
             return Err(format!("{} has no worktree any more ({})", t.id, state_name(&t)));
@@ -1046,7 +1064,7 @@ impl Agents {
     /// A headless worker's first run, once its worktree exists: the shared preamble, then its task block.
     pub(super) fn start_worker(&mut self, id: &str, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
-        let prompt = format!("{}{}", run::WORKER_PREAMBLE, run::task_block(&t.id, &t.title, &t.prompt, &t.owns, &t.reads, &t.acceptance, &t.size, &t.history));
+        let prompt = format!("{}{}", run::WORKER_PREAMBLE, run::task_block(&t.id, &t.title, &t.prompt, &t.owns, &t.reads, &t.acceptance, &t.size, &t.history, git::gate_shell().2));
         self.spawn_worker(id, &prompt, "", cx);
     }
 
@@ -1304,6 +1322,9 @@ impl Agents {
             return self.event(id, "failed");
         }
         if t.blocked {
+            if let Some(tm) = self.task_mut(id) {
+                tm.want_merge = false;
+            }
             cx.notify(format!("⚑ {} is blocked: {}", t.title, t.questions.first().cloned().unwrap_or_default()));
             return self.event(id, "blocked");
         }
@@ -1378,8 +1399,12 @@ impl Agents {
                             cmds.push(t.acceptance.clone());
                         }
                     }
-                    for c in cmds {
-                        git::run_gate(&gate_wt, &c, timeout, &[])?;
+                    let n = cmds.len();
+                    for (i, c) in cmds.into_iter().enumerate() {
+                        // the acceptance command goes last; its failures are marked so a broken command isn't
+                        // blamed on the worker
+                        let acceptance = !t.acceptance.is_empty() && i + 1 == n;
+                        git::run_gate(&gate_wt, &c, timeout, &[]).map_err(|e| if acceptance { format!("acceptance {e}") } else { e })?;
                     }
                     Ok(())
                 };
@@ -1439,11 +1464,22 @@ impl Agents {
                 self.bounce(id, &format!("merge conflict in {}", files.join(", ")), true, cx);
             }
             Err(git::MergeErr::Gate(msg)) => {
-                self.record(&t.worker).gate_fails += 1;
+                let acceptance = msg.starts_with("acceptance ");
+                let msg = msg.trim_start_matches("acceptance ").to_string();
                 if let Some(tm) = self.task_mut(id) {
                     tm.gate = msg.clone();
                     tm.last = format!("gate failed: {}", msg.lines().next().unwrap_or(""));
                 }
+                if acceptance && git::shell_trouble(&msg) {
+                    // the lead's acceptance command didn't even run: nothing for the worker to fix
+                    if let Some(tm) = self.task_mut(id) {
+                        tm.want_merge = false;
+                        tm.last = "the acceptance command itself failed to run".into();
+                    }
+                    self.event(id, "acceptance_broken");
+                    return;
+                }
+                self.record(&t.worker).gate_fails += 1;
                 self.bounce(id, &msg, false, cx);
             }
             Err(git::MergeErr::Failed(e)) => {
@@ -1469,7 +1505,6 @@ impl Agents {
             tm.attempts += 1;
             tm.want_merge = true;
         }
-        self.event(id, "bounced");
         if self.check_budget(&t.run, cx).is_err() {
             return self.bounce_failed(id, "the run's budget is spent", cx);
         }
@@ -1477,11 +1512,13 @@ impl Agents {
             self.start_resolve(id, None, cx);
         } else {
             let p = format!(
-                "oriel tried to merge your work, but the gate failed on the merged result (your changes plus everything already merged):\n{why}\n\nFix it within OWNS and finish with your report. oriel merges it again when you're done (attempt {} of {MAX_ATTEMPTS}).",
+                "oriel tried to merge your work, but the gate failed on the merged result (your changes plus everything already merged):\n{why}\n\nFix it within OWNS and finish with your report; oriel merges it again when you're done (attempt {} of {MAX_ATTEMPTS}). If the failure isn't caused by your code (e.g. the check itself is wrong), change nothing and report status \"blocked\" saying why.",
                 t.attempts + 1
             );
             self.worker_again(id, &p, cx);
         }
+        // told after the fix started, so the card says what's actually happening
+        self.event(id, "bounced");
     }
 
     fn bounce_failed(&mut self, id: &str, why: &str, cx: &mut Cx) {
@@ -1570,6 +1607,16 @@ impl Agents {
 
     /// Discard a task: stop its worker first if it's running. `reply` answers the lead once it's gone.
     pub(super) fn discard_task(&mut self, id: &str, reply: Option<Reply>, cx: &mut Cx) {
+        if self.merging.as_deref() == Some(id) || self.live.get(id).is_some_and(|l| l.busy || l.checking) {
+            let msg = format!("{id} is in the middle of a git step (merging or checking) — try again in a moment");
+            match reply {
+                Some(r) => {
+                    let _ = r.send(Err(msg));
+                }
+                None => cx.notify(msg),
+            }
+            return;
+        }
         self.merge_queue.retain(|x| x != id);
         if let Some(stop) = self.live.get(id).and_then(|l| l.stop.clone()) {
             stop.store(true, Ordering::SeqCst);

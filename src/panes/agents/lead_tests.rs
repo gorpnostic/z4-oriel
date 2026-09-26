@@ -129,6 +129,10 @@ fn fake_text_lead(first: Value, target: usize, prompts: Arc<Mutex<Vec<String>>>)
                     if e["event"] == "finished" {
                         merges.push(json!({"tool": "merge", "args": {"id": e["key"]}}));
                     }
+                    // its acceptance command was wrong: merge without one
+                    if e["event"] == "acceptance_broken" {
+                        merges.push(json!({"tool": "merge", "args": {"id": e["key"], "acceptance": ""}}));
+                    }
                 }
                 if let Some(m) = v["board"]["merged"].as_array() {
                     merged = m.len();
@@ -175,12 +179,21 @@ fn start(k: &mut Kit, p: &mut Agents, goal: &str) {
     assert_eq!(p.store.runs.len(), 1);
 }
 
+/// Fails when any .txt file says BROKEN — written for whichever shell gates run in here.
 fn gate_cmd() -> String {
-    if cfg!(windows) { "findstr /m BROKEN *.txt >nul && exit /b 1 || exit /b 0".into() } else { "! grep -q BROKEN *.txt".into() }
+    match git::gate_shell().2 {
+        "bash" | "sh" => "! grep -q BROKEN *.txt".into(),
+        "PowerShell" => "if (Select-String -Quiet BROKEN *.txt) { exit 1 }".into(),
+        _ => "findstr /m BROKEN *.txt >nul && exit /b 1 || exit /b 0".into(),
+    }
 }
 
 fn accept_cmd(file: &str) -> String {
-    if cfg!(windows) { format!("if exist {file} (exit /b 0) else (exit /b 1)") } else { format!("test -f {file}") }
+    match git::gate_shell().2 {
+        "bash" | "sh" => format!("test -f {file}"),
+        "PowerShell" => format!("if (-not (Test-Path {file})) {{ exit 1 }}"),
+        _ => format!("if exist {file} (exit /b 0) else (exit /b 1)"),
+    }
 }
 
 fn run0(p: &Agents) -> store::Run {
@@ -206,12 +219,13 @@ fn agents_lead_text_protocol_plan_conflict_gate_merge() {
             {"id": "a", "title": "Change line two", "goal": "write a.txt: one\\nTWO-A\\nthree\\nfour", "worker": "w1", "owns": ["a.txt"], "size": "S"},
             {"id": "b", "title": "Add b", "goal": "write b.txt: bee\nwrite a.txt: one\\nTWO-B\\nthree\\nfour", "worker": "w2", "owns": ["b.txt"], "size": "S"},
             {"id": "c", "title": "Add c", "goal": "write c.txt: sea", "worker": "w1", "owns": ["c.txt"], "acceptance": accept_cmd("c.txt"), "size": "S"},
-            {"id": "g", "title": "Add g", "goal": "write g.txt: BROKEN", "worker": "w3", "owns": ["g.txt"], "size": "S"}
+            {"id": "g", "title": "Add g", "goal": "write g.txt: BROKEN", "worker": "w3", "owns": ["g.txt"], "size": "S"},
+            {"id": "e", "title": "Add e", "goal": "write e.txt: eee", "worker": "w2", "owns": ["e.txt"], "acceptance": "definitely-not-a-command-xyz --check", "size": "S"}
         ]}},
         {"tool": "wait", "args": {"timeout_s": 20}}
     ]);
     let mut k = Kit::new();
-    let mut p = lead_pane(&dir, &repo, fake_worker(seen.clone()), fake_text_lead(plan, 4, prompts.clone()));
+    let mut p = lead_pane(&dir, &repo, fake_worker(seen.clone()), fake_text_lead(plan, 5, prompts.clone()));
     p.lead_cfg.gate = gate_cmd();
     k.render(&mut p, 150, 44);
     until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
@@ -221,17 +235,17 @@ fn agents_lead_text_protocol_plan_conflict_gate_merge() {
     assert_eq!(r.state, store::RunState::Review, "run: {r:?}\nprompts: {:?}", prompts.lock().unwrap());
     assert_eq!(r.protocol, "text");
     assert!(r.branch.starts_with("oriel/lead-add-three-files"), "{}", r.branch);
-    assert_eq!(r.merged, 4, "{:#?}", p.store.tasks);
+    assert_eq!(r.merged, 5, "{:#?}", p.store.tasks);
     // the conflict and the gate failure went back to their workers and merged on the next try
     let (b, g) = (by_key(&p, "b"), by_key(&p, "g"));
     assert!(b.attempts >= 1 || by_key(&p, "a").attempts >= 1, "one of a/b conflicted");
     assert_eq!(g.attempts, 1, "g failed the gate once");
     assert!(p.store.tasks.iter().all(|t| t.status == Status::Done && t.outcome == "merged"));
     let log = sh(&repo, &["log", "--format=%s%n%b", &r.branch]);
-    for key in ["a", "b", "c", "g"] {
+    for key in ["a", "b", "c", "g", "e"] {
         assert!(log.contains(&format!("Oriel-Task: {}", by_key(&p, key).id)), "{log}");
     }
-    assert_eq!(sh(&repo, &["rev-list", "--count", &format!("{}..{}", r.base_sha, r.branch)]), "4", "one commit per task");
+    assert_eq!(sh(&repo, &["rev-list", "--count", &format!("{}..{}", r.base_sha, r.branch)]), "5", "one commit per task");
     let a_txt = sh(&repo, &["show", &format!("{}:a.txt", r.branch)]);
     assert!(a_txt.contains("TWO-A") && a_txt.contains("TWO-B") && !a_txt.contains("<<<<"), "{a_txt}");
     assert_eq!(sh(&repo, &["show", &format!("{}:g.txt", r.branch)]), "fixed");
@@ -239,16 +253,18 @@ fn agents_lead_text_protocol_plan_conflict_gate_merge() {
     assert!(!repo.join("b.txt").exists());
     let rec = &p.store.records;
     assert_eq!(rec["w3"].gate_fails, 1);
+    assert_eq!(rec["w2"].gate_fails, 0, "a broken acceptance command isn't the worker's fault");
+    assert_eq!(by_key(&p, "e").attempts, 0, "and it wasn't sent back to its worker");
     assert!(rec.values().map(|r| r.conflicts).sum::<u32>() >= 1);
-    assert_eq!(rec.values().map(|r| r.merged).sum::<u32>(), 4);
+    assert_eq!(rec.values().map(|r| r.merged).sum::<u32>(), 5);
     assert!(seen.lock().unwrap().iter().any(|s| s.contains("conflict markers")) || seen.lock().unwrap().len() >= 5);
     assert!(k.notices().iter().any(|n| n.contains("lead finished")), "{:?}", k.notices());
     // what the lead heard: result cards, never transcripts
     let heard = prompts.lock().unwrap().join("\n");
-    assert!(heard.contains("\"event\":\"finished\"") && heard.contains("\"event\":\"merged\"") && heard.contains("\"event\":\"bounced\""), "{heard}");
+    assert!(heard.contains("\"event\":\"finished\"") && heard.contains("\"event\":\"merged\"") && heard.contains("\"event\":\"bounced\"") && heard.contains("\"event\":\"acceptance_broken\""), "{heard}");
     assert!(heard.contains("\"summary\":\"did"), "cards carry the worker's summary");
     let board = k.render_html(&mut p, 150, 44, "target/snap/agents-lead.html");
-    assert!(board.contains("lead") && board.contains("ready for review") && board.contains("4 merged"), "{board}");
+    assert!(board.contains("lead") && board.contains("ready for review") && board.contains("5 merged"), "{board}");
 
     // the user reviews the integration branch and merges it into master
     k.key(&mut p, KeyCode::Up);
@@ -484,6 +500,27 @@ fn agents_lead_resume_after_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn agents_lead_gate_shell_and_trouble() {
+    let (prog, _, name) = git::gate_shell();
+    assert!(["bash", "sh", "PowerShell", "cmd"].contains(name), "{name}");
+    assert!(!prog.as_os_str().is_empty());
+    let lower = prog.to_string_lossy().to_lowercase();
+    assert!(!lower.contains("system32\\bash") && !lower.contains("windowsapps"), "never the WSL launcher: {lower}");
+    assert!(git::shell_trouble("`x` failed (exit 1):\n'x' is not recognized as an internal or external command,"));
+    assert!(git::shell_trouble("`test -f a && [ \"$(cat a)\" = hi` failed (exit 2):\n[: missing ']'"));
+    assert!(git::shell_trouble("`frob` failed (exit 127):\nbash: frob: command not found"));
+    assert!(!git::shell_trouble("`cargo test` failed (exit 101):\ntest foo ... FAILED\nerror: test failed"));
+    // a real failing check in the gate shell
+    let dir = scratch("gate-shell");
+    let e = git::run_gate(&dir, "definitely-not-a-command-xyz", Duration::from_secs(20), &[]).unwrap_err();
+    assert!(git::shell_trouble(&e), "{e}");
+    assert!(git::run_gate(&dir, &accept_cmd("nope.txt"), Duration::from_secs(20), &[]).is_err());
+    std::fs::write(dir.join("yes.txt"), "y").unwrap();
+    git::run_gate(&dir, &accept_cmd("yes.txt"), Duration::from_secs(20), &[]).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ------------------------------------------------------------------ snapshots
 
 /// A run in full swing for the screenshots: a lead panel, workers in every state, live transcripts.
@@ -623,6 +660,39 @@ fn agents_lead_snapshots() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Opt-in, one small Codex turn: the exact command line oriel gives a Codex lead (MCP via `-c mcp_servers.*`
+/// through the npm .cmd shim, --ignore-user-config, read-only sandbox) loads `oriel mcp-lead` and calls a tool
+/// that reaches a Broker here. Needs `cargo build` first.   cargo test agents_lead_codex_mcp -- --ignored
+#[test]
+#[ignore]
+fn agents_lead_codex_mcp_live() {
+    let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("debug").join(if cfg!(windows) { "oriel.exe" } else { "oriel" });
+    assert!(exe.is_file(), "run cargo build first");
+    let bin = crate::config::which("codex").expect("codex on PATH");
+    let dir = std::env::temp_dir().join(format!("oriel-codex-mcp-{}", store::now()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let got: Arc<Mutex<Vec<String>>> = Arc::default();
+    let g2 = got.clone();
+    let b = mcp::Broker::start("live".into(), Arc::new(move |c: mcp::Call| {
+        g2.lock().unwrap().push(c.tool.clone());
+        let _ = c.reply.send(Ok("{\"workers\":[{\"name\":\"codex\",\"tier\":\"mid\"}]}".into()));
+    }))
+    .unwrap();
+    let proto = run::Proto::Mcp(exe, b.port, b.token.clone());
+    let spec = run::lead_spec("codex", &bin, "", "Call the oriel roster tool exactly once, then reply with the worker names it returned. Do nothing else.", "You are testing a tool connection.", "", &proto, 0.0, &dir, &dir.join("tmp"));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut entries = vec![];
+    let o = run::run(&spec, &stop, None, &mut |e| {
+        if let Ev::Entry(x) = &e {
+            entries.push(x.line());
+        }
+    });
+    println!("outcome: {o:?}\nentries: {entries:#?}\ntools called: {:?}", got.lock().unwrap());
+    assert!(got.lock().unwrap().contains(&"roster".to_string()), "codex never reached oriel's roster tool");
+    assert!(entries.iter().any(|l| l.starts_with("roster")), "the stream shows the MCP call: {entries:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Opt-in, costs a few cents: a real Claude lead (haiku) orchestrating a real Claude worker (haiku) through
 /// oriel's MCP server in a temp repo. Needs `cargo build` first (the lead's CLI starts target/debug/oriel).
 /// cargo test agents_lead_live -- --ignored --nocapture
@@ -631,7 +701,10 @@ fn agents_lead_snapshots() {
 fn agents_lead_live_claude_haiku() {
     let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("debug").join(if cfg!(windows) { "oriel.exe" } else { "oriel" });
     assert!(exe.is_file(), "run cargo build first");
-    let dir = scratch("lead-live");
+    // outside the source tree on purpose: real agent sessions started under a developer's code folder can be
+    // picked up by their own global hooks; a temp folder keeps this run to itself
+    let dir = std::env::temp_dir().join(format!("oriel-lead-live-{}", store::now()));
+    std::fs::create_dir_all(&dir).unwrap();
     let repo = temp_repo(&dir);
     let mut k = Kit::new();
     let mut p = Agents::with_paths(Paths { agents: dir.join("agents"), wt: dir.join("wt") });

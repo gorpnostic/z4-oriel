@@ -613,14 +613,12 @@ impl Agents {
 
     fn today(&self) -> f64 {
         let now = crate::panes::files::clock::local(store::now());
-        self.store
-            .tasks
-            .iter()
-            .filter(|t| {
-                let d = crate::panes::files::clock::local(t.started.max(t.created));
-                (d.year, d.month, d.day) == (now.year, now.month, now.day)
-            })
-            .fold(0.0, |a, t| a + t.cost_usd)
+        let same = |t: i64| {
+            let d = crate::panes::files::clock::local(t);
+            (d.year, d.month, d.day) == (now.year, now.month, now.day)
+        };
+        // workers, plus the leads that orchestrated them
+        self.store.tasks.iter().filter(|t| same(t.started.max(t.created))).fold(0.0, |a, t| a + t.cost_usd) + self.store.runs.iter().filter(|r| same(r.created)).fold(0.0, |a, r| a + r.cost_usd)
     }
 
     // ------------------------------------------------------------------ the state machine
@@ -637,7 +635,7 @@ impl Agents {
             dirty = true;
         }
         // lead mode: start what can start, merge what's queued, watch the workers, answer waits
-        let runs = self.store.runs.iter().any(|r| r.state.active()) || !self.merge_queue.is_empty() || self.merging.is_some();
+        let runs = self.store.runs.iter().any(|r| r.state.active()) || !self.merge_queue.is_empty() || self.merging.is_some() || self.live.values().any(|l| l.stop.is_some());
         if runs || !self.waiters.is_empty() {
             let before = (self.store.tasks.iter().filter(|t| t.status == Status::Running).count(), self.merge_queue.len(), self.merging.clone());
             self.schedule(cx);

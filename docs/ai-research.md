@@ -177,3 +177,94 @@ Frugal / Balanced / Max.
 - **Claude side:** merge only `effortLevel`, `model`, `autoCompactEnabled` and the `env` keys into `~/.claude/settings.json`. Never overwrite other keys, and always show a diff and ask before writing. That file holds the user's hooks.
 - **Codex side:** add a `[profiles.oriel-frugal]` block.
 - **Live readouts:** CLAUDE.md line count, MCP servers enabled, cache hit %.
+
+## 5. Lead mode (2026-09-25)
+
+One goal; a **lead** agent the user picks (Claude Code, Codex or Kimi Code, remembered in `[lead] agent`) plans it and hands tasks to **workers** from the roster (`[[roster]]`), all headless. Code: `src/panes/agents/{lead,mcp,plan,run,stream,roster,lead_view}.rs`.
+
+### Verified on the dev machine
+Flags checked against `--help` of the installed builds, and live where noted.
+
+| | Claude Code 2.1.283 | Codex 0.157.0 | Kimi Code 0.29.1 |
+|---|---|---|---|
+| headless | `-p --output-format stream-json --verbose` | `exec --json` | `-p <prompt> --output-format stream-json` |
+| per-run MCP | `--mcp-config <file>` + `--strict-mcp-config` | `-c mcp_servers.oriel.{command,args,required,startup_timeout_sec,tool_timeout_sec,default_tools_approval_mode}` | no flag: `[mcp_servers]` in config.toml or a project `.kimi-code/mcp.json` |
+| lead can't edit | `--permission-mode default --allowedTools Read,Grep,Glob,LS,mcp__oriel__… --disallowedTools Edit,Write,…,Bash,Agent` | `--sandbox read-only` | prompt only (`-p` always runs with auto permissions) |
+| caps | `--max-turns` (not in `--help`, but honoured: result subtype `error_max_turns`), `--max-budget-usd` | none, so oriel prices `turn.completed` and tails the rollout file | none, so oriel prices what it can and enforces |
+| structured report | `--json-schema`, which arrives as a `StructuredOutput` tool call (live) | `--output-schema <file>` | a ```json block |
+| resume | `--session-id <uuid>` up front, then `--resume` | `exec resume <id>` (no `-C`/`-s` there, so `-c sandbox_mode=…` and cwd) | `-S <id>` (with `-p`: **U**) |
+| minimal profile | `--exclude-dynamic-system-prompt-sections`, no MCP servers, `Agent` disallowed | `--ignore-user-config -c agents.enabled=false` | `KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY=2` |
+
+- **No `codex mcp-server` subcommand** in 0.157 (it isn't in `--help`). oriel's own server is `oriel mcp-lead <port> <token>`.
+- **Codex over MCP (live, `agents_lead_codex_mcp_live`):** the exact lead command line, through the npm `.cmd` shim, loaded `oriel mcp-lead` and called `roster` through the broker. $0.03 API-equivalent, 10 s. TOML **literal** strings (`'…'`) are what survive cmd.exe quoting.
+- **Kimi:** not signed in on the dev machine, so its lead and worker paths are unverified live. A lead whose MCP tools never reach oriel (zero calls) is switched to the text protocol automatically.
+- **Claude lead + worker (live, `agents_lead_live_claude_haiku`, haiku):** MCP worked end to end.
+  - The first run cost **$1.15 in 7.7 min** because acceptance commands ran in `cmd.exe` while the model wrote bash. The run bounced the task, retried and re-planned 5×.
+  - Fixed: gates now run in Git Bash on Windows (never the System32 WSL launcher), else PowerShell, else cmd. The lead is told which shell. A command that fails to *run* (`shell_trouble`) is reported to the lead as `acceptance_broken` and isn't bounced to the worker.
+- Each fresh Claude session costs about 30k cache-write tokens of base prompt (~$0.04 on haiku). Fewer, bigger tasks beat many tiny ones.
+
+### How a run works
+1. **Setup.** `L` opens a form: goal, lead agent/model, workers at once (1-5), run budget.
+   - It creates the integration branch `oriel/lead-<slug>` off the checked-out branch, plus a detached, read-only checkout of it for the lead.
+   - The lead runs there with oriel's instructions (Claude: `--append-system-prompt-file`; others at the top of the first prompt).
+   - The instructions are byte-stable apart from a closing "THIS RUN" block.
+2. **Tools** (MCP, or JSON actions in the text protocol, same handler):
+
+   | Tool | Does |
+   |---|---|
+   | `roster` | workers, their tier, plan usage, track record, rate-limit pause |
+   | `plan` | typed tasks |
+   | `wait` | blocks on events |
+   | `task_status` | compact cards |
+   | `task_diff` | paged diff |
+   | `merge` | queues a merge |
+   | `send_followup` | more instructions to a finished worker |
+   | `resolve_conflicts` | merges the integration branch into a task and hands the markers to its worker |
+   | `spawn_task` | adds one task outside a plan |
+   | `discard` | throws a task away |
+   | `note` | a note on the board (`needs_user` notifies the user) |
+   | `done` | finishes the run |
+
+   `wait` sends MCP progress notifications every 25 s. Timeouts: `MCP_TOOL_TIMEOUT=1800000`, Codex `tool_timeout_sec=1800`, Kimi `toolTimeoutMs`.
+3. **Plan checks** (`plan.rs`), done mechanically:
+   - Every task `owns` globs.
+   - Tasks that can run at the same time can't own overlapping files.
+   - Hotspot files (manifests, lockfiles, `mod.rs`/`lib.rs`/`index.ts`, migrations) go to one scaffold task, and every other task depends on it.
+   - Size S or M, capped by the number of owned files. L is refused.
+   - Deps must exist and have no cycles.
+   - Solo gate: 2 tasks run one after the other.
+   - Tasks start once their deps are merged and a slot is free. Same-model starts are staggered 5 s so the prompt cache warms.
+4. **Workers.** Each worker runs in its own worktree off the integration branch. Its prompt is the shared preamble plus a task block (OWNS, ACCEPTANCE and the shell it runs in, SIZE, earlier attempts). Workers never run git; oriel commits.
+5. **Merge queue**, one at a time:
+   1. Commit the worker's leftovers.
+   2. `git merge-tree --write-tree` against the integration tip.
+   3. One candidate `commit-tree` with an `Oriel-Task: <id>` trailer.
+   4. The gate on that exact tree in a reusable scratch worktree. The gate is `[lead] gate`, or auto-detected (`cargo check --quiet`, `go build ./...`), plus the task's acceptance command.
+   5. `update-ref` as a compare-and-swap.
+   6. The lead's checkout moves to the new tip.
+
+   If a merge fails:
+   - **Conflict:** oriel merges the integration branch into the task's worktree and hands the markers to the same worker session.
+   - **Gate failure:** the same session gets the first 20 lines of the failure.
+   - Either way it gets 2 fix rounds, then a fresh re-dispatch (premium tier or another vendor, with notes about the earlier attempts), then it's blocked.
+6. **Watchdog**, in the same session: a nudge first, then a fresh worker. It fires on:
+   - the same call 4×
+   - the same failing command 3×
+   - 25 calls with no edit (builds and tests excluded)
+   - 5 minutes with no output
+
+   A `rate_limit_event` with status `rejected` pauses that vendor until it resets.
+7. **Budgets.** The run cap covers the lead plus every worker; no new work starts once it's hit. Per-task caps come from the roster (Claude `--max-budget-usd`; others stopped by oriel). The lead has its own cap (`[lead] budget_usd`).
+8. **Finish.** The lead calls `done`, and the run waits for review. The user reviews the integration branch with `d` and squash-merges it with `m` (clean tree, same branch). `x` discards the run. oriel never pushes.
+9. **Crash safety.** The plan, task states, session ids (Claude's are chosen up front) and records are saved on every change. After a restart the run shows as stopped. `r` resumes the lead's session with the current board and continues cut-off workers.
+
+**Watching:**
+- `w` tiles the lead and its workers side by side, live.
+- `enter` opens one agent's full transcript, with diffs and output.
+- `t` moves a headless worker into a real terminal tab (`claude --resume` / `codex resume` / `kimi -S`), and the card follows the tab.
+
+**Skipped for now:**
+- the cross-vendor reviewer and best-of-2 (research items 9-10)
+- tailing Kimi's `wire.jsonl`
+- a time-based "spinning" rule
+- Windows Job Objects (`taskkill /T` kills the process tree instead)
