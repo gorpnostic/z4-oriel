@@ -506,6 +506,8 @@ fn run_cli(
     }
     let _ = child.kill();
     let status = child.wait().ok();
+    // gone: its id may be a different process's soon, which closing oriel mustn't kill
+    pid_out.store(0, Ordering::SeqCst);
     let code = status.and_then(|s| s.code());
     // stderr's reader ends with the process; give it a moment to hand over what it read
     let t0 = Instant::now();
@@ -528,6 +530,8 @@ struct Pipe {
     pending: Vec<(String, bool)>,
     /// seen at least one replay (an old CLI without --replay-user-messages never sends any: close after a turn)
     replays: bool,
+    /// mode changes sent so far (each request needs an id of its own)
+    modes: usize,
 }
 
 impl Pipe {
@@ -548,7 +552,8 @@ impl Pipe {
     /// there's nothing to tell: the next message starts with the new mode anyway.
     fn set_mode(&mut self, perms: &str) {
         let Some(stdin) = &mut self.stdin else { return };
-        let line = mode_request(perms, self.pending.len() + 1);
+        self.modes += 1;
+        let line = mode_request(perms, self.modes);
         let _ = stdin.write_all(format!("{line}\n").as_bytes()).and_then(|_| stdin.flush());
     }
 }
@@ -725,19 +730,27 @@ mod tests {
     #[test]
     fn chat_cli_stops_mid_command() {
         let stop = Arc::new(AtomicBool::new(false));
-        let s2 = stop.clone();
-        std::thread::spawn(move || {
+        let pid = Arc::new(AtomicU32::new(0));
+        let (s2, p2) = (stop.clone(), pid.clone());
+        // the process id is there while it runs (so closing oriel can kill it at once); then esc
+        let seen = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            while p2.load(Ordering::SeqCst) == 0 && t0.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let running = p2.load(Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(400));
             s2.store(true, Ordering::SeqCst);
+            running
         });
         let (exe, args): (&str, Vec<String>) =
             if cfg!(windows) { ("cmd", vec!["/c".into(), "ping -n 30 127.0.0.1 >nul".into()]) } else { ("sh", vec!["-c".into(), "sleep 30".into()]) };
         let t0 = Instant::now();
-        let pid = AtomicU32::new(0);
         let r = run_cli(exe, &args, |_| {}, &std::env::temp_dir(), &stop, &pid, |_| Ok(()));
         assert!(r.is_ok(), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
-        assert_ne!(pid.load(Ordering::SeqCst), 0, "the process id is kept, so closing oriel can kill it at once");
+        assert_ne!(seen.join().unwrap(), 0, "the process id is kept while it runs");
+        assert_eq!(pid.load(Ordering::SeqCst), 0, "and forgotten once it's gone (the id could be another process's by then)");
     }
 
     /// A CLI that prints part of a turn and dies: its exit code and last stderr line come back, so the chat can say

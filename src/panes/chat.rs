@@ -587,6 +587,9 @@ impl Chat {
         self.risky_armed = false;
         self.review = None;
         self.restore = None;
+        // a ctrl+d (or ctrl+x) pending on the chat you clicked away from mustn't land on this one
+        self.confirm_delete = false;
+        self.chord_x = false;
     }
 
     /// The chat's folder as the agent will get it, without touching the disk (it's drawn every frame).
@@ -628,10 +631,15 @@ impl Chat {
         }
     }
 
-    /// Back on a chat: its reply, and whatever it's waiting on you for, comes back on screen.
+    /// Back on a chat: its reply, and whatever it's waiting on you for, comes back on screen. A prompt that was
+    /// waiting there has only just appeared for you: it gets the same grace as a new one (keys typed on the way
+    /// in, ctrl+pgdn and on, mustn't answer it).
     fn unpark(&mut self) {
         if let Some(r) = self.parked.remove(&self.chat.id) {
             self.put_run(r);
+            if !self.asks.is_empty() || !self.questions.is_empty() {
+                self.front_changed();
+            }
         }
     }
 
@@ -1559,7 +1567,7 @@ impl Chat {
         let others = self.chats.iter().filter(|c| c.id != self.chat.id).flat_map(|c| c.messages.iter().rev().map(move |m| (m, Some(c.title.as_str()))));
         for (m, from) in mine.chain(others) {
             let text = m.content.trim();
-            if m.role != "user" || text.is_empty() || !seen.insert(text.to_string()) {
+            if m.role != "user" || text.is_empty() || oriel_wrote(text) || !seen.insert(text.to_string()) {
                 continue;
             }
             out.push((m.content.clone(), from.map(String::from)));
@@ -1654,11 +1662,17 @@ impl Chat {
         self.menu_sel = 0;
     }
 
-    /// Run an edit or a move on the box through the editor (`input` and `cursor` stay the truth).
+    /// Run an edit or a move on the box through the editor (`input` and `cursor` stay the truth). A recalled
+    /// prompt you change is your draft from then on: ↑ / ↓ no longer swap it for another one.
     fn edit<R>(&mut self, f: impl FnOnce(&mut Editor) -> R) -> R {
         self.ed.load(&self.input, self.cursor);
         let r = f(&mut self.ed);
-        self.input = self.ed.text();
+        let text = self.ed.text();
+        if text != self.input {
+            self.history_pos = None;
+            self.history_from = None;
+        }
+        self.input = text;
         self.cursor = self.ed.char_index();
         r
     }
@@ -2105,7 +2119,13 @@ impl Chat {
                 let other = (other.0.to_string(), other.1.to_string());
                 for (i, (label, what)) in cur.options.iter().chain(std::iter::once(&other)).enumerate() {
                     let on = i == self.qs.sel;
-                    let tick = if cur.multi && i < n { if self.qs.ticked.get(i).copied().unwrap_or(false) { "[x] " } else { "[ ] " } } else { "" };
+                    // (Other has no box to tick, but lines up with the choices that do)
+                    let tick = match (cur.multi, i < n) {
+                        (true, true) if self.qs.ticked.get(i).copied().unwrap_or(false) => "[x] ",
+                        (true, true) => "[ ] ",
+                        (true, false) => "    ",
+                        _ => "",
+                    };
                     let st = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default() };
                     // `code` in a label shows as code, and a long label is cut so its description still shows
                     let mut lab = md::inline(&ui::fit(&format!("{tick}{label}"), lw + tick.len()), st, t);
@@ -2694,7 +2714,9 @@ impl Chat {
         }
         let Some(h) = self.handoffs.remove(id) else { return };
         let Some(parent) = self.chat_ref(id).cloned() else { return };
-        let card = parent.messages.last().filter(|m| m.role == "assistant").map(|m| m.content.trim().to_string()).unwrap_or_default();
+        // the reply to the card request (a message you queued meanwhile may have been answered after it)
+        let asked = parent.messages.iter().rposition(|m| m.role == "user" && m.content.starts_with(HANDOFF_ASK));
+        let card = asked.and_then(|i| parent.messages.get(i + 1)).filter(|m| m.role == "assistant").map(|m| m.content.trim().to_string()).unwrap_or_default();
         if failed || card.is_empty() {
             self.info.push("the handoff card didn't come back: /handoff again to retry".into());
             return;
@@ -2706,7 +2728,7 @@ impl Chat {
         child.title = parent.title.clone();
         child.extra.insert("parent".into(), serde_json::Value::String(parent.id.clone()));
         let next = if h.goal.is_empty() { "Read it, then say in two or three lines where things stand and what you'd do first. Don't change anything yet.".to_string() } else { format!("Next: {}", h.goal) };
-        let first = format!("Handoff from an earlier session (\"{}\"):\n\n{card}\n\n{next}", parent.title);
+        let first = format!("{HANDOFF_FROM} (\"{}\"):\n\n{card}\n\n{next}", parent.title);
         let who = providers::label(&p).to_lowercase();
         if id == self.chat.id {
             self.persist_if_changed();
@@ -3027,11 +3049,20 @@ fn exit_of(e: &str) -> String {
     e.split("(exit ").nth(1).and_then(|r| r.split(')').next()).map(|n| format!("exit {n}")).unwrap_or_else(|| "failed".into())
 }
 
+/// How the check loop's messages and a handoff's first message start.
+const CHECK_SAYS: &str = "◎ check ";
+const HANDOFF_FROM: &str = "Handoff from an earlier session";
+
 /// The check loop's next message after a failure: what failed, the first lines, and what to do.
 fn not_yet(cmd: &str, err: &str, turn: u32, max: u32) -> String {
     let (head, rest) = err.split_once('\n').unwrap_or((err, ""));
     let body = if rest.trim().is_empty() { String::new() } else { format!("\n\n```\n{}\n```", rest.trim_end()) };
-    format!("◎ check {turn} of {max}: not yet — {}{body}\n\nFix it, then end your turn: oriel runs {cmd} again when you stop.", head.trim_end_matches(':'))
+    format!("{CHECK_SAYS}{turn} of {max}: not yet — {}{body}\n\nFix it, then end your turn: oriel runs {cmd} again when you stop.", head.trim_end_matches(':'))
+}
+
+/// A message oriel sent in your name (a check loop's "not yet", a handoff): not one of your prompts to recall.
+fn oriel_wrote(text: &str) -> bool {
+    text.starts_with(CHECK_SAYS) || text.starts_with(HANDOFF_ASK) || text.starts_with(HANDOFF_FROM)
 }
 
 /// Files a reply's calls edited, written or deleted.
@@ -4057,11 +4088,7 @@ impl Pane for Chat {
             // the start / end of the line you're on
             KeyCode::Char('a') if ctrl => self.edit(|e| e.col = 0),
             KeyCode::Char('e') if ctrl => self.edit(|e| e.col = e.lines[e.row].chars().count()),
-            KeyCode::Char(c) if !ctrl => {
-                self.insert(&c.to_string());
-                self.history_pos = None;
-                self.history_from = None;
-            }
+            KeyCode::Char(c) if !ctrl => self.insert(&c.to_string()),
             KeyCode::Esc => {
                 if !self.input.is_empty() {
                     // clears the box (and the / menu) first: stopping a reply takes an esc on an empty box
@@ -4372,6 +4399,13 @@ mod tests {
             assert_eq!(c.chat.id, format!("t{i}"), "clicking row {i} opens that chat");
             assert_eq!(order(&c), before, "just opening chats must not reorder the list");
         }
+        // ctrl+d, then a click on another chat: the delete it was about to confirm doesn't carry over
+        let mut k = k;
+        k.key_mod(&mut c, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(c.confirm_delete);
+        c.open_chat("t0");
+        k.key(&mut c, KeyCode::Char('y'));
+        assert!(c.chats.iter().any(|x| x.id == "t0") && c.chat.id == "t0" && c.input == "y");
     }
 
     #[test]
@@ -5314,6 +5348,17 @@ mod tests {
         let sent = c.chat.messages.len();
         k.key(&mut c, KeyCode::Enter);
         assert_eq!((c.input.as_str(), c.chat.messages.len()), (races, sent));
+        // a recalled prompt you change is your draft: ↑ / ↓ scroll the chat instead of swapping it
+        c.set_input(String::new());
+        up(&mut k, &mut c);
+        k.key(&mut c, KeyCode::Backspace);
+        up(&mut k, &mut c);
+        k.key(&mut c, KeyCode::Down);
+        assert_eq!((c.input.as_str(), c.history_from.as_deref()), ("hello her", None));
+        // what oriel sent in your name (a check loop's "not yet", a handoff) isn't one of your prompts
+        c.chats[0].messages.push(user(&not_yet("cargo test", "`cargo test` failed (exit 1):\nboom", 1, 20)));
+        c.chats[0].messages.push(user(&format!("{HANDOFF_ASK}\n\nThe next session's goal: x.")));
+        assert!(c.prompt_history().iter().all(|(p, _)| !p.starts_with("◎ check") && !p.starts_with("Write a handoff card")), "{:?}", c.prompt_history());
     }
 
     /// The live reply's cached blocks draw exactly what a fresh draw does: every line and every click target, folded
@@ -5575,9 +5620,13 @@ mod tests {
         assert!(k.notices().iter().any(|n| n.contains("wants to: Bash cargo test") && n.contains("refactor the parser")), "{:?}", k.notices());
         let side = k.render_side(&mut c, 40, 12);
         assert!(side.contains("? refactor the parser"), "{side}");
-        // back on it: the prompt is there to answer
+        // back on it: the prompt is there to answer, though not by a key typed the moment it showed up
+        c.parked.get_mut(&a).unwrap().since = Instant::now() - Duration::from_secs(5);
         c.open_chat(&a);
         assert!(c.stream.is_some() && c.asks.len() == 1 && c.chat.messages.last().unwrap().content.contains("Splitting it up"));
+        k.key(&mut c, KeyCode::Char('n'));
+        assert!(rx.try_recv().is_err() && c.input == "n", "a key on the way in goes to the box: {:?}", c.input);
+        k.key(&mut c, KeyCode::Esc);
         ripe(&mut c);
         k.key(&mut c, KeyCode::Char('y'));
         assert_eq!(rx.try_recv(), Ok(approve::Decision::Allow));
@@ -6187,15 +6236,19 @@ mod tests {
         let ask = c.chat.messages.iter().rev().find(|m| m.role == "user").unwrap().content.clone();
         assert!(ask.starts_with("Write a handoff card") && ask.contains("goal: finish the parser"), "{ask}");
         assert!(c.info.iter().any(|l| l.contains("a fresh codex chat starts from it")), "{:?}", c.info);
-        // the card comes back
+        // the card comes back, with a message you queued meanwhile answered after it
         c.stream = Some(test_stream(None));
+        c.queue.push(Queued { text: "also note the lexer's quirks".into(), sent: false });
         deliver(&mut k, &mut c, [Ev::Token("**State** lexer works\n**Next** 1. the parser".into()), Ev::Done { note: None }]);
+        assert_eq!(c.chat.id, parent, "the queued message is answered first");
+        c.stream = Some(test_stream(None));
+        deliver(&mut k, &mut c, [Ev::Token("Noted.".into()), Ev::Done { note: None }]);
         assert_ne!(c.chat.id, parent, "a fresh chat is on screen");
         let _forget2 = Forget(c.chat.id.clone());
         assert_eq!(c.chat.provider.as_deref(), Some("codex"));
         assert_eq!(c.chat.extra.get("parent").and_then(|v| v.as_str()), Some(parent.as_str()));
         let first = &c.chat.messages[0].content;
-        assert!(first.starts_with("Handoff from an earlier session") && first.contains("**State** lexer works") && first.ends_with("Next: finish the parser"), "{first}");
+        assert!(first.starts_with("Handoff from an earlier session") && first.contains("**State** lexer works") && !first.contains("Noted") && first.ends_with("Next: finish the parser"), "{first}");
         assert!(c.chats.iter().any(|x| x.id == parent), "the old chat stays in the list");
         c.stop();
         c.persist();
@@ -6211,6 +6264,72 @@ mod tests {
         deliver(&mut k, &mut c, [Ev::Error("network down".into())]);
         assert_eq!(c.chat.id, id, "no fresh chat");
         assert!(c.info.iter().any(|l| l.contains("handoff card didn't come back")), "{:?}", c.info);
+    }
+
+    /// Every screen the chat can show draws at any size without a panic, down to a single cell: the new-chat
+    /// picker, a reply with a question, an approval, queued messages and todos, the restore prompt, the diff view,
+    /// the / menu and a tall composer.
+    #[test]
+    fn chat_small_sizes_dont_panic() {
+        let mut k = Kit::new();
+        let sizes: Vec<(u16, u16)> = [1u16, 2, 5, 9, 20, 33, 45, 61, 80].iter().flat_map(|&w| [1u16, 2, 3, 4, 5, 6, 8, 11, 20].map(|h| (w, h))).collect();
+        let all = |c: &mut Chat, k: &mut Kit, what: &str| {
+            for &(w, h) in &sizes {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    k.render(c, w, h);
+                    k.render_side(c, w, h);
+                }));
+                assert!(r.is_ok(), "{what} at {w}x{h}");
+            }
+        };
+        // the new agent chat's folder picker
+        let mut c = Chat::new(&k.config);
+        c.provider = "claude".into();
+        c.chat.provider = Some("claude".into());
+        c.launch_dir = dirs::home_dir().unwrap_or_default();
+        all(&mut c, &mut k, "folder picker");
+        // a reply with everything pinned above the box
+        let mut c = long_live_chat(&mut k, 1);
+        let _forget = Forget(c.chat.id.clone());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (qtx, _qrx) = std::sync::mpsc::channel();
+        let q = approve::Q { question: "Which `license` should the new crate use?".into(), header: "License".into(), multi: true, options: vec![("MIT".into(), "short".into()), ("Apache-2.0 with a very long label".into(), "patents".into())] };
+        deliver(&mut k, &mut c, [Ev::Question(approve::Question { qs: vec![q.clone(), q], reply: qtx }), Ev::Ask(bash_ask("cargo publish --dry-run", &tx))]);
+        c.queue.push(Queued { text: "and a README\nwith two lines".into(), sent: false });
+        c.scroll = 5;
+        all(&mut c, &mut k, "live reply");
+        c.input = "a draft\nover\nseveral\nlines that go on for a while so they wrap in a narrow box".into();
+        c.cursor = 7;
+        all(&mut c, &mut k, "live reply with a draft");
+        c.input = "/".into();
+        c.cursor = 1;
+        all(&mut c, &mut k, "the / menu");
+        c.input.clear();
+        c.cursor = 0;
+        c.stop();
+        // the restore prompt, then the diff view
+        c.restore = Some(Restore { chat: c.chat.id.clone(), idx: 1, ckpt: "abc".into(), plan: Some(Ok(ckpt::Plan { write: vec!["src/a.rs".into()], delete: vec!["new.txt".into(); 8] })), busy: false });
+        all(&mut c, &mut k, "restore prompt");
+        c.restore = None;
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-let x = 1;\n+let x = 2;\ndiff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+fresh\n";
+        c.review = Some(Review { chat: c.chat.id.clone(), idx: 1, ckpt: "abc".into(), title: "everything this chat changed (since turn 1)".into(), data: Some(Ok(git::parse_diff(diff))), file: 1, scroll: 3, hits: vec![] });
+        all(&mut c, &mut k, "diff view");
+        c.review = None;
+    }
+
+    /// In a question where several choices can be ticked, "Other…" (no box of its own) still lines up with them.
+    #[test]
+    fn chat_question_other_lines_up() {
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "set it up");
+        let _forget = Forget(c.chat.id.clone());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let q = approve::Q { question: "Which ones?".into(), header: String::new(), multi: true, options: vec![("MIT".into(), "short".into()), ("Apache-2.0".into(), "patents".into())] };
+        deliver(&mut k, &mut c, [Ev::Question(approve::Question { qs: vec![q], reply: tx })]);
+        let s = k.render(&mut c, 100, 30);
+        let col = |what: &str| s.lines().find(|l| l.contains(what)).and_then(|l| l.find(what).map(|b| l[..b].chars().count()));
+        assert!(col("short").is_some() && col("short") == col("patents") && col("short") == col("type your own answer"), "{s}");
+        c.stop();
     }
 }
 
