@@ -13,6 +13,8 @@ mod draw;
 mod scan;
 mod sys;
 #[cfg(test)]
+mod qa_tools;
+#[cfg(test)]
 mod tests;
 
 use crate::pane::{Action, Cx, Place, Waker};
