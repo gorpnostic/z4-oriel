@@ -602,6 +602,9 @@ fn codex(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Stri
 }
 
 #[cfg(test)]
+mod qa_chat_cli;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
