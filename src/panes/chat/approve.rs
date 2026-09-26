@@ -13,10 +13,49 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 pub const TOOL: &str = "mcp__oriel__approve";
+
+/// The header of the question Claude's finished plan comes as, and its answers: (label, what it means, the
+/// permission mode it starts in). Anything typed instead (Other) is feedback: it keeps planning.
+pub const PLAN_HEADER: &str = "Plan";
+pub const PLAN_CHOICES: &[(&str, &str, &str)] = &[
+    ("Yes, and accept edits", "start now: it edits files in the folder without asking", "edits"),
+    ("Yes, in auto mode", "start now: Claude decides what's safe and asks about the rest", "auto"),
+    ("Yes, asking first", "start now: you approve every edit and command", "ask"),
+];
+
+pub fn plan_question() -> Q {
+    Q {
+        question: "Claude's plan is above. Start on it?".into(),
+        header: PLAN_HEADER.into(),
+        multi: false,
+        options: PLAN_CHOICES.iter().map(|(l, w, _)| (l.to_string(), w.to_string())).collect(),
+    }
+}
+
+/// What "always allow" covers for a call, like Claude Code's own rules: a command by its first word or two
+/// (`Bash(npm test:*)`), a command with pipes, chains or redirects only exactly as it is, any other tool whole.
+pub fn rule(tool: &str, input: &Value) -> String {
+    if !matches!(tool, "Bash" | "PowerShell") {
+        return tool.to_string();
+    }
+    let cmd = input["command"].as_str().unwrap_or("").trim();
+    if cmd.is_empty() {
+        return tool.to_string();
+    }
+    if cmd.contains(['|', ';', '&', '`', '>', '<', '\n']) || cmd.contains("$(") {
+        return format!("{tool}({cmd})");
+    }
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let sub = words.get(1).filter(|w| !w.starts_with('-') && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    match sub {
+        Some(s) => format!("{tool}({} {s}:*)", words[0]),
+        None => format!("{tool}({}:*)", words[0]),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Decision {
@@ -26,11 +65,12 @@ pub enum Decision {
 
 /// One pending approval, shown in the chat until answered.
 pub struct Ask {
-    pub tool: String,
     pub label: String,
     pub target: String,
     /// A diff or the command, when there is one to look at.
     pub body: Vec<String>,
+    /// What answering "always" allows from then on in this chat (see `rule`).
+    pub rule: String,
     pub reply: mpsc::Sender<Decision>,
 }
 
@@ -91,8 +131,9 @@ fn token() -> String {
 }
 
 impl Broker {
-    /// `mode` is the chat's /perms: only "ask" brings approvals to the chat; questions always do.
-    pub fn start(cwd: std::path::PathBuf, mode: String, send: Arc<dyn Fn(Ev) + Send + Sync>) -> std::io::Result<Broker> {
+    /// `mode` is the chat's /perms as it is right now (shift+tab mid-reply changes it): only "ask" and "auto" bring
+    /// approvals to the chat; questions always do.
+    pub fn start(cwd: std::path::PathBuf, mode: Arc<Mutex<String>>, send: Arc<dyn Fn(Ev) + Send + Sync>) -> std::io::Result<Broker> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
@@ -118,7 +159,7 @@ impl Broker {
 }
 
 /// One request from the MCP server: `{"token", "tool_name", "input"}` -> `{"behavior": "allow"|"deny", ...}`.
-fn handle(stream: TcpStream, tok: &str, cwd: &std::path::Path, mode: &str, send: &dyn Fn(Ev)) -> std::io::Result<()> {
+fn handle(stream: TcpStream, tok: &str, cwd: &std::path::Path, live_mode: &Mutex<String>, send: &dyn Fn(Ev)) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut line = String::new();
@@ -149,8 +190,32 @@ fn handle(stream: TcpStream, tok: &str, cwd: &std::path::Path, mode: &str, send:
         };
         return writeln!(out, "{ans}");
     }
+    // the end of plan mode: the plan goes in the transcript and you pick how it starts (or say what to change)
+    if tool == "ExitPlanMode" {
+        let plan = v["input"]["plan"].as_str().unwrap_or("").trim().to_string();
+        if !plan.is_empty() {
+            send(Ev::Plan(plan));
+        }
+        let (tx, rx) = mpsc::channel();
+        send(Ev::Question(Question { qs: vec![plan_question()], reply: tx }));
+        let picked = rx.recv().ok().flatten().and_then(|a| a.values().next().and_then(|v| v.as_str()).map(String::from));
+        let ans = match picked {
+            Some(a) => match PLAN_CHOICES.iter().find(|c| c.0 == a) {
+                Some((_, _, mode)) => {
+                    *live_mode.lock().unwrap() = mode.to_string();
+                    send(Ev::Perms(mode.to_string()));
+                    let set = json!([{"type": "setMode", "mode": super::providers::cli_mode(mode), "destination": "session"}]);
+                    json!({"behavior": "allow", "updatedInput": v["input"], "updatedPermissions": set})
+                }
+                None => json!({"behavior": "deny", "message": format!("The user wants to keep planning. What they said: {a}")}),
+            },
+            None => json!({"behavior": "deny", "message": "The user hasn't approved the plan. Stay in plan mode and ask what they'd like changed."}),
+        };
+        return writeln!(out, "{ans}");
+    }
     // outside /perms ask (and auto, which only sends what it thinks is risky), the mode decides, as it did
     // before oriel was asked at all
+    let mode = live_mode.lock().unwrap().clone();
     if mode != "ask" && mode != "auto" {
         let msg = format!("Not allowed in oriel's current permission mode ({mode}). The user can change it with /perms in oriel.");
         return writeln!(out, "{}", json!({"behavior": "deny", "message": msg}));
@@ -164,7 +229,8 @@ fn handle(stream: TcpStream, tok: &str, cwd: &std::path::Path, mode: &str, send:
         }
     }
     let (tx, rx) = mpsc::channel();
-    send(Ev::Ask(Ask { tool, label: t.label, target: t.target, body, reply: tx }));
+    let rule = rule(&tool, &v["input"]);
+    send(Ev::Ask(Ask { label: t.label, target: t.target, body, rule, reply: tx }));
     // no answer (the reply was stopped, oriel closed) counts as a no
     let d = rx.recv().unwrap_or(Decision::Deny);
     let ans = match d {
@@ -222,7 +288,14 @@ pub fn serve(input: impl BufRead, mut out: impl Write, ask: impl Fn(&str, &Value
                 let a = &req["params"]["arguments"];
                 let input = if a["input"].is_object() { a["input"].clone() } else { json!({}) };
                 let answer = match ask(a["tool_name"].as_str().unwrap_or("tool"), &input) {
-                    Ok(v) if v["behavior"] == "allow" => json!({"behavior": "allow", "updatedInput": if v["updatedInput"].is_object() { v["updatedInput"].clone() } else { input }}),
+                    Ok(v) if v["behavior"] == "allow" => {
+                        let mut ok = json!({"behavior": "allow", "updatedInput": if v["updatedInput"].is_object() { v["updatedInput"].clone() } else { input }});
+                        // an approved plan also switches Claude's mode
+                        if v["updatedPermissions"].is_array() {
+                            ok["updatedPermissions"] = v["updatedPermissions"].clone();
+                        }
+                        ok
+                    }
                     Ok(v) => json!({"behavior": "deny", "message": v["message"].as_str().unwrap_or("The user said no in oriel.")}),
                     Err(e) => json!({"behavior": "deny", "message": format!("Couldn't ask the user: {e}")}),
                 };
@@ -268,10 +341,10 @@ mod tests {
         let send: Arc<dyn Fn(Ev) + Send + Sync> = Arc::new(move |ev| {
             if let Ev::Ask(a) = ev {
                 a2.lock().unwrap().push(format!("{} {}", a.label, a.target));
-                let _ = a.reply.send(if a.tool == "Bash" { Decision::Allow } else { Decision::Deny });
+                let _ = a.reply.send(if a.label == "Bash" { Decision::Allow } else { Decision::Deny });
             }
         });
-        let b = Broker::start(std::path::PathBuf::from("/w"), "ask".into(), send).unwrap();
+        let b = Broker::start(std::path::PathBuf::from("/w"), Arc::new(Mutex::new("ask".into())), send).unwrap();
         let rpc = [
             json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
             json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
@@ -312,12 +385,13 @@ mod tests {
                 let _ = q.reply.send(Some(m));
             }
             Ev::Ask(a) => {
-                s2.lock().unwrap().push(format!("ASKED {}", a.tool));
+                s2.lock().unwrap().push(format!("ASKED {}", a.label));
                 let _ = a.reply.send(Decision::Allow);
             }
             _ => {}
         });
-        let b = Broker::start(std::path::PathBuf::from("/w"), "edits".into(), send).unwrap();
+        let mode = Arc::new(Mutex::new("edits".to_string()));
+        let b = Broker::start(std::path::PathBuf::from("/w"), mode.clone(), send).unwrap();
         let q = json!({"questions": [{"question": "Tabs or spaces?", "header": "Indentation", "multiSelect": false, "options": [{"label": "Tabs", "description": "t"}, {"label": "Spaces", "description": "s"}]}]});
         let v = forward(b.port, &b.token, "AskUserQuestion", &q).unwrap();
         assert_eq!(v["behavior"], "allow");
@@ -327,5 +401,67 @@ mod tests {
         assert_eq!(v["behavior"], "deny");
         assert!(v["message"].as_str().unwrap().contains("/perms"));
         assert_eq!(*seen.lock().unwrap(), vec!["Tabs or spaces? [2]".to_string()], "edits mode never asks about Bash");
+        // shift+tab to ask mid-reply: the next call is asked about
+        *mode.lock().unwrap() = "ask".into();
+        let v = forward(b.port, &b.token, "Bash", &json!({"command": "rm -rf x"})).unwrap();
+        assert_eq!(v["behavior"], "allow");
+        assert_eq!(seen.lock().unwrap().last().map(String::as_str), Some("ASKED Bash"));
+    }
+
+    /// The end of plan mode: the plan reaches the chat, the choice picks the mode it starts in (the broker's own
+    /// mode switches with it), and typed feedback keeps it planning.
+    #[test]
+    fn chat_approve_plan() {
+        let answer: Arc<Mutex<Option<String>>> = Arc::default();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (a2, s2) = (answer.clone(), seen.clone());
+        let send: Arc<dyn Fn(Ev) + Send + Sync> = Arc::new(move |ev| match ev {
+            Ev::Plan(p) => s2.lock().unwrap().push(format!("PLAN {p}")),
+            Ev::Perms(m) => s2.lock().unwrap().push(format!("PERMS {m}")),
+            Ev::Question(q) => {
+                s2.lock().unwrap().push(format!("QUESTION {} [{}]", q.qs[0].header, q.qs[0].options.len()));
+                let mut m = serde_json::Map::new();
+                m.insert(q.qs[0].question.clone(), json!(a2.lock().unwrap().clone().unwrap_or_default()));
+                let _ = q.reply.send(Some(m));
+            }
+            Ev::Ask(a) => s2.lock().unwrap().push(format!("ASKED {}", a.label)),
+            _ => {}
+        });
+        let mode = Arc::new(Mutex::new("plan".to_string()));
+        let b = Broker::start(std::path::PathBuf::from("/w"), mode.clone(), send).unwrap();
+        let plan = json!({"plan": "## Split the parser\n\n1. move the lexer out\n2. add tests"});
+        *answer.lock().unwrap() = Some("Split it in three, not two".into());
+        let v = forward(b.port, &b.token, "ExitPlanMode", &plan).unwrap();
+        assert_eq!(v["behavior"], "deny");
+        assert!(v["message"].as_str().unwrap().contains("Split it in three"), "{v}");
+        assert_eq!(*mode.lock().unwrap(), "plan", "still planning");
+        *answer.lock().unwrap() = Some(PLAN_CHOICES[0].0.into());
+        let v = forward(b.port, &b.token, "ExitPlanMode", &plan).unwrap();
+        assert_eq!(v["behavior"], "allow", "{v}");
+        assert_eq!(v["updatedPermissions"][0]["mode"], "acceptEdits");
+        assert_eq!(*mode.lock().unwrap(), "edits");
+        let s = seen.lock().unwrap().clone();
+        assert!(s[0].starts_with("PLAN ## Split the parser") && s[1] == "QUESTION Plan [3]", "{s:?}");
+        assert_eq!(s.last().map(String::as_str), Some("PERMS edits"));
+        // the MCP side passes the mode switch on to Claude
+        let rpc = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "approve", "arguments": {"tool_name": "ExitPlanMode", "input": plan}}}).to_string();
+        let mut out = vec![];
+        serve(rpc.as_bytes(), &mut out, |tool, input| forward(b.port, &b.token, tool, input));
+        let reply: Value = serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
+        let ans: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(ans["updatedPermissions"][0]["type"], "setMode");
+    }
+
+    /// "Always allow" covers a command by its first word or two, and a chained command only exactly.
+    #[test]
+    fn chat_approve_rules() {
+        let r = |c: &str| rule("Bash", &json!({"command": c}));
+        assert_eq!(r("npm test"), "Bash(npm test:*)");
+        assert_eq!(r("git push --force origin main"), "Bash(git push:*)");
+        assert_eq!(r("rm -rf build"), "Bash(rm:*)");
+        assert_eq!(r("cat hello.txt"), "Bash(cat:*)");
+        assert_eq!(r("cd x && rm -rf y"), "Bash(cd x && rm -rf y)");
+        assert_eq!(r("ls | wc -l"), "Bash(ls | wc -l)");
+        assert_eq!(rule("Edit", &json!({"file_path": "a.rs"})), "Edit");
     }
 }

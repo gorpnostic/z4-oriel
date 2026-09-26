@@ -22,6 +22,9 @@ pub struct Msg {
     /// What a coding agent did, in order: text, thinking, tool calls, the todo list. Empty for plain chat replies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parts: Vec<Part>,
+    /// On a reply: the chat's CLI sessions as they were before it started, so regenerating it can go back to them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_before: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -137,6 +140,22 @@ pub fn now() -> f64 {
 }
 
 pub fn dir() -> PathBuf {
+    // tests keep their chats to themselves (unless they picked a data folder, as the README screenshots do); files
+    // an earlier run left behind are cleared once
+    #[cfg(test)]
+    if std::env::var_os("ORIEL_DATA_DIR").is_none() {
+        let d = std::path::absolute("target/test-scratch/chat/chats").unwrap_or_default();
+        static SWEEP: std::sync::Once = std::sync::Once::new();
+        SWEEP.call_once(|| {
+            let old = |e: &std::fs::DirEntry| e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(600));
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                if old(&e) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        });
+        return d;
+    }
     crate::config::data_dir().join("chats")
 }
 

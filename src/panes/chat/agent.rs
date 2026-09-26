@@ -284,6 +284,7 @@ pub fn label(name: &str) -> String {
         "NotebookEdit" => "Notebook".into(),
         "LS" => "List".into(),
         "AskUserQuestion" => "Asked you".into(),
+        "ExitPlanMode" => "Plan".into(),
         "command_execution" => "Run".into(),
         "file_change" => "Update".into(),
         n if n.starts_with("mcp__") => {
@@ -326,6 +327,8 @@ pub fn target(name: &str, input: &Value, cwd: &Path) -> String {
             let first = input["questions"][0]["header"].as_str().filter(|h| !h.is_empty()).or(input["questions"][0]["question"].as_str()).unwrap_or("");
             if qs > 1 { format!("{first} +{}", qs - 1) } else { first.to_string() }
         }
+        // the plan's own title (the plan itself goes in the transcript when Claude asks you to approve it)
+        "ExitPlanMode" => input["plan"].as_str().unwrap_or("").lines().map(|l| l.trim().trim_start_matches('#').trim()).find(|l| !l.is_empty()).unwrap_or("").to_string(),
         _ => {
             // first short string argument
             for k in ["file_path", "path", "command", "url", "query", "pattern", "description", "name"] {
@@ -385,6 +388,12 @@ fn plural(n: u64, one: &str, many: &str) -> String {
 /// Fill in a finished call from its tool_result (`text`) and Claude Code's structured `tool_use_result`.
 fn finish(t: &mut Tool, text: &str, r: &Value, is_error: bool) {
     t.status = if is_error { "error".into() } else { "done".into() };
+    if is_error && t.name == "ExitPlanMode" {
+        // you asked for changes to the plan: not a failure
+        t.status = "done".into();
+        t.summary = "you asked for changes: it keeps planning".into();
+        return;
+    }
     if is_error {
         let msg = text.replace("<tool_use_error>", "").replace("</tool_use_error>", "");
         let mut lines = msg.trim().lines();
@@ -548,6 +557,8 @@ pub struct Claude {
     denied: u64,
     session: String,
     pub model: String,
+    /// The last turn got to its `result`: a run that ends without one was cut short (a crash, a kill).
+    pub finished: bool,
 }
 
 impl Claude {
@@ -645,6 +656,11 @@ impl Claude {
             }
         }
         let parent = v["parent_tool_use_id"].as_str();
+        match v["type"].as_str() {
+            Some("result") => self.finished = true,
+            Some("assistant" | "stream_event") => self.finished = false, // another turn (a queued message) started
+            _ => {}
+        }
         match v["type"].as_str() {
             Some("system") => match v["subtype"].as_str() {
                 Some("init") => {
@@ -848,7 +864,9 @@ impl Claude {
                 self.result_tokens += v["usage"]["output_tokens"].as_u64().unwrap_or(0);
                 self.turns += v["num_turns"].as_u64().unwrap_or(0);
                 self.cost = self.cost.max(v["total_cost_usd"].as_f64().unwrap_or(0.0));
-                self.denied += v["permission_denials"].as_array().map(|a| a.len() as u64).unwrap_or(0);
+                // a question you skipped or a plan you sent back isn't something the mode blocked
+                let blocked = |d: &&Value| !matches!(d["tool_name"].as_str(), Some("AskUserQuestion" | "ExitPlanMode"));
+                self.denied += v["permission_denials"].as_array().map(|a| a.iter().filter(blocked).count() as u64).unwrap_or(0);
                 self.usage(send);
             }
             _ => {}
@@ -926,6 +944,8 @@ pub struct Codex {
     started: HashMap<String, u64>,
     tokens: u64,
     errors: Vec<String>,
+    /// Got to `turn.completed`: a run that ends without it was cut short.
+    pub finished: bool,
 }
 
 /// `"...pwsh.exe" -Command 'Get-Content x'` / `bash -lc 'ls'` -> the command inside.
@@ -1061,6 +1081,7 @@ impl Codex {
                 }
             }
             "turn.completed" => {
+                self.finished = true;
                 self.tokens += v["usage"]["output_tokens"].as_u64().unwrap_or(0);
                 send(Ev::Usage(self.tokens));
             }
@@ -1101,6 +1122,36 @@ mod tests {
         let l = line('+', Some(12), "x\ty\x1b[31m!");
         let (k, n, t) = split_line(&l);
         assert_eq!((k, n, t), ('+', "12", "x    y!"));
+    }
+
+    /// A run only counts as finished once it reached its result: stopping short (a crash mid-turn) is noticed.
+    #[test]
+    fn chat_agent_knows_when_a_turn_finished() {
+        let feed_all = |text: &str, n: usize, p: &mut dyn FnMut(&Value)| text.lines().take(n).for_each(|l| p(&serde_json::from_str(l).unwrap()));
+        let claude = include_str!("fixtures/claude-stream.jsonl");
+        let bash_at = claude.lines().position(|l| l.contains(r#""name": "Bash""#) && l.contains(r#""type": "assistant""#)).unwrap();
+        let mut c = Claude::new(Path::new("C:\\work\\demo"));
+        feed_all(claude, bash_at + 1, &mut |v| c.feed(v, 0, &mut |_| {}).unwrap());
+        assert!(!c.finished, "mid-turn");
+        let mut c = Claude::new(Path::new("C:\\work\\demo"));
+        feed_all(claude, usize::MAX, &mut |v| c.feed(v, 0, &mut |_| {}).unwrap());
+        assert!(c.finished, "ends on its result");
+        let codex = include_str!("fixtures/codex-exec.jsonl");
+        let mut x = Codex::new(Path::new("C:\\work\\demo"));
+        feed_all(codex, codex.lines().count() - 1, &mut |v| x.feed(v, 0, &mut |_| {}).unwrap());
+        assert!(!x.finished);
+        feed_all(codex.lines().last().unwrap(), 1, &mut |v| x.feed(v, 0, &mut |_| {}).unwrap());
+        assert!(x.finished, "turn.completed");
+        // a plan shows as "Plan(its title)"; sending it back isn't an error
+        let mut t = describe("p1", "ExitPlanMode", &serde_json::json!({"plan": "## Refactor the parser\n\n1. split it"}), Path::new("/w"));
+        assert_eq!((t.label.as_str(), t.target.as_str()), ("Plan", "Refactor the parser"));
+        finish(&mut t, "The user wants to keep planning", &Value::Null, true);
+        assert_eq!(t.status, "done");
+        // and neither it nor a skipped question counts as blocked by the mode
+        let mut c = Claude::new(Path::new("/w"));
+        let denials = serde_json::json!({"type": "result", "permission_denials": [{"tool_name": "ExitPlanMode"}, {"tool_name": "AskUserQuestion"}, {"tool_name": "Bash"}]});
+        c.feed(&denials, 0, &mut |_| {}).unwrap();
+        assert!(c.note(Duration::from_secs(1)).contains("1 denied"), "{}", c.note(Duration::from_secs(1)));
     }
 
     #[test]

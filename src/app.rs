@@ -130,6 +130,18 @@ struct Palette {
     theme_before: String,
 }
 
+/// oriel's window has the focus (the terminal reports it): panes check it to tell you about things while you're
+/// in another window.
+pub(crate) static TERM_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn term_focused() -> bool {
+    TERM_FOCUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tests that flip TERM_FOCUSED hold this, so they don't see each other's.
+#[cfg(test)]
+pub(crate) static FOCUS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct App {
     panes: HashMap<PaneId, Box<dyn Pane>>,
     tabs: Vec<Tab>,
@@ -724,6 +736,15 @@ impl App {
                 let id = self.focused();
                 self.with_pane(id, |p, cx| p.paste(&s, cx));
             }
+            // (before the catch-all below, or they never arrive: raise() then thinks you're always looking)
+            Event::Input(CEvent::FocusGained) => {
+                self.term_focused = true;
+                TERM_FOCUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Event::Input(CEvent::FocusLost) => {
+                self.term_focused = false;
+                TERM_FOCUSED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             Event::Input(_) => {}
             Event::Wake(id) => {
                 self.with_pane(id, |p, cx| p.poll(cx));
@@ -752,8 +773,6 @@ impl App {
                 };
                 self.raise(k, s, app, None);
             }
-            Event::Input(CEvent::FocusGained) => self.term_focused = true,
-            Event::Input(CEvent::FocusLost) => self.term_focused = false,
             Event::ThemeFilesChanged => {
                 if self.theme.name == "omarchy" {
                     std::thread::sleep(Duration::from_millis(150)); // let omarchy finish swapping files
@@ -2013,5 +2032,19 @@ mod tests {
         }
         app.new_tab(Box::new(crate::panes::home::Home::new()));
         println!("{}", snap(&mut app, "home"));
+    }
+
+    /// The terminal saying oriel's window lost or got the focus reaches the app (and the panes): desktop
+    /// notifications depend on it.
+    #[test]
+    fn app_window_focus() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config::default(), tx);
+        let _one_at_a_time = FOCUS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        app.handle(Event::Input(CEvent::FocusLost));
+        let lost = (app.term_focused, term_focused());
+        app.handle(Event::Input(CEvent::FocusGained));
+        assert_eq!(lost, (false, false));
+        assert!(app.term_focused && term_focused());
     }
 }
