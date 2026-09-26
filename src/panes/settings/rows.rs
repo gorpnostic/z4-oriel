@@ -142,16 +142,26 @@ pub(super) struct Env {
 }
 
 impl Env {
+    /// Everything, PATH lookups included (once per settings pane).
     pub fn scan() -> Env {
+        let mut e = Env::quick();
+        for (app, label) in [("claude", "claude code"), ("codex", "codex")] {
+            if crate::panes::available(app) {
+                e.starts.push((app.into(), label.into()));
+            }
+        }
+        e.shells = shells();
+        e.kinds = crate::panes::agents::installed_kinds();
+        e
+    }
+
+    /// Without looking anything up on PATH (the palette opens this often): shells and agents are left out, so
+    /// those rows show their raw value.
+    pub fn quick() -> Env {
         let mut starts: Vec<(String, String)> = crate::app::SIDEBAR.iter().map(|s| (s.0.to_string(), s.2.to_string())).collect();
         starts.push(("home".into(), "home screen".into()));
         starts.push(("updates".into(), "updates".into()));
-        for (app, label) in [("claude", "claude code"), ("codex", "codex")] {
-            if crate::panes::available(app) {
-                starts.push((app.into(), label.into()));
-            }
-        }
-        Env { themes: crate::theme::names(), starts, shells: shells(), kinds: crate::panes::agents::installed_kinds(), ..Env::default() }
+        Env { themes: crate::theme::names(), starts, ..Env::default() }
     }
 }
 

@@ -56,7 +56,7 @@ const STEPS: &[Step] = &[
     },
     Step {
         title: "chat with any AI",
-        body: "F1 is chat. /provider picks the AI (Claude Code, Codex, Ollama\u{2026}), /model its model, /perms what coding agents may do \u{2014} all remembered. Go back to chat.",
+        body: "F1 is chat. /provider picks the AI (Claude Code, Codex, Ollama\u{2026}), /model its model, /perms what coding agents may do; alt , has every setting. Go back to chat.",
         keys: "F1",
         done: Some(|now, _| now.app == Some("ai")),
     },

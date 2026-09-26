@@ -1441,7 +1441,7 @@ impl Pane for Chat {
         }
         if let Some(d) = denied_hint {
             self.info.push(format!(
-                "{d} action{} blocked by the permission mode ({}). /perms ask to approve each one, /perms bypass to allow everything — saved for every chat.",
+                "{d} action{} blocked by the permission mode ({}). /perms ask to approve each one, /perms bypass to allow everything (this chat; /perms default <mode> for new ones).",
                 if d == 1 { " was" } else { "s were" },
                 self.perms
             ));

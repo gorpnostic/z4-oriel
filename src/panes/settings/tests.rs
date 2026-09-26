@@ -57,6 +57,10 @@ fn settings_every_section_renders() {
         }
         assert!(s.contains("in file") && s.contains("applies") || *cat == "roster" || *cat == "tools", "{cat}: the panel\n{s}");
     }
+    // a narrow pane: the panel goes under the list
+    p.set_cat(1, &mut Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut vec![], focused: true, time: 1.0 });
+    let s = k.render_html(&mut p, 96, 40, "target/snap/settings-narrow.html");
+    assert!(s.contains("default AI") && s.contains("in file"), "{s}");
     let side = k.render_side(&mut p, 30, 12);
     assert!(side.contains("general") && side.contains("providers & keys") && side.contains("tools"), "{side}");
 }
@@ -139,6 +143,7 @@ fn settings_keys_are_masked_and_addresses_checked() {
     at(&mut k, &mut p, "ai.anthropic_key");
     key(&mut k, &mut p, KeyCode::Enter);
     k.typ(&mut p, "sk-ant-secret-a1b2");
+    k.render_html(&mut p, 160, 36, "target/snap/settings-typing.html");
     let s = show(&mut k, &mut p);
     assert!(!s.contains("secret") && s.contains("a1b2"), "masked while typing\n{s}");
     key(&mut k, &mut p, KeyCode::Enter);
@@ -183,6 +188,7 @@ fn settings_prefix_capture_refuses_clashes() {
     at(&mut k, &mut p, "prefix");
     key(&mut k, &mut p, KeyCode::Enter);
     assert!(show(&mut k, &mut p).contains("press a key"));
+    k.render_html(&mut p, 160, 36, "target/snap/settings-capture.html");
     k.key_mod(&mut p, KeyCode::Char('s'), KeyModifiers::CONTROL);
     let s = show(&mut k, &mut p);
     assert!(s.contains("ctrl+s is save in the agents forms"), "names the clash\n{s}");
@@ -299,6 +305,7 @@ fn settings_find_and_jump() {
     at(&mut k, &mut p, "keys");
     assert_eq!(p.cat, 2, "a word of a section's name");
     let s = at(&mut k, &mut p, "model");
+    k.render_html(&mut p, 160, 36, "target/snap/settings-find.html");
     assert!(p.title().contains("find") && s.contains("── AI chat") && s.contains("── lead mode") && s.contains("lead model"), "several: a search\n{s}");
     key(&mut k, &mut p, KeyCode::Esc);
     assert!(p.filter.is_empty());

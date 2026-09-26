@@ -241,8 +241,10 @@ fn agents_batch_runs_without_a_lead() {
     assert!(r.manual && r.merged == 3, "{r:?}
 {:#?}", p.store.tasks);
     assert!(r.branch.contains("batch-"), "{}", r.branch);
-    let first = seen.lock().unwrap().first().cloned().unwrap_or_default();
-    assert!(first.contains(&c), "the urgent one started first: {first}");
+    // two start together (the order their threads report in is up to the OS): the urgent one is one of them,
+    // though it was added last
+    let first_two: Vec<String> = seen.lock().unwrap().iter().take(2).cloned().collect();
+    assert!(first_two.iter().any(|s| s.contains(&c)), "the urgent one started first: {first_two:?}");
     assert_eq!(p.task(&b).unwrap().attempts, 1, "b failed the gate once and went back to its worker");
     for (f, want) in [("a.txt", "aaa"), ("b.txt", "fixed"), ("c.txt", "sea")] {
         assert_eq!(sh(&repo, &["show", &format!("{}:{f}", r.branch)]), want);
