@@ -120,6 +120,10 @@ pub trait Pane {
     fn tick_every(&self) -> Option<Duration> {
         None
     }
+    /// True if `poll` should keep ticking while the pane isn't on screen (the calendar's reminders).
+    fn ticks_hidden(&self) -> bool {
+        false
+    }
     /// A terminal pane is dead once its process exits; the app then closes it.
     fn alive(&self) -> bool {
         true

@@ -40,6 +40,7 @@ pub const SIDEBAR: &[(&str, &str, &str, &str)] = &[
     ("system", "system", "system", "F5"),
     ("files", "files", "files", "F6"),
     ("notes", "notes", "notes", "F7"),
+    ("calendar", "calendar", "calendar", ""),
     ("storage", "storage", "storage", "F8"),
     ("terminal", "term", "terminal", "F9"),
     // ── pinned to the bottom of the sidebar
@@ -47,7 +48,7 @@ pub const SIDEBAR: &[(&str, &str, &str, &str)] = &[
     ("help", "search", "help", "F10"),
 ];
 /// SIDEBAR entries from here on sit at the bottom of the sidebar, not in a section.
-const FOOTER: usize = 9;
+const FOOTER: usize = 10;
 /// Where each sidebar section starts: (index into SIDEBAR, heading).
 const SECTIONS: &[(usize, &str)] = &[(0, "ai"), (3, "tools")];
 
@@ -220,6 +221,9 @@ impl App {
         app._theme_watcher = watch_themes(tx);
         if !cfg!(test) && !crate::onboard::done_before() {
             app.onboard = Some(crate::onboard::Onboard::new(&app.theme.name, &app.config));
+        }
+        if !cfg!(test) && startup_needs_calendar(&app.config.startup) {
+            app.goto_app("calendar");
         }
         let startup = app.config.startup.clone();
         if SIDEBAR.iter().any(|a| a.0 == startup) {
@@ -458,7 +462,7 @@ impl App {
             d = d.min(Duration::from_secs(4).saturating_sub(t.elapsed()) + Duration::from_millis(10));
         }
         let mut ids = self.visible();
-        ids.extend(self.panes.iter().filter(|(_, p)| p.is_terminal()).map(|(id, _)| *id));
+        ids.extend(self.panes.iter().filter(|(_, p)| p.is_terminal() || p.ticks_hidden()).map(|(id, _)| *id));
         for id in ids {
             if let Some(every) = self.panes.get(&id).and_then(|p| p.tick_every()) {
                 let last = self.last_tick.get(&id).copied().unwrap_or(self.start);
@@ -706,7 +710,7 @@ impl App {
             }
             Event::Tick => {
                 let mut ids = self.visible();
-                ids.extend(self.panes.iter().filter(|(id, p)| p.is_terminal() && !ids.contains(id)).map(|(id, _)| *id).collect::<Vec<_>>());
+                ids.extend(self.panes.iter().filter(|(id, p)| (p.is_terminal() || p.ticks_hidden()) && !ids.contains(id)).map(|(id, _)| *id).collect::<Vec<_>>());
                 for id in ids {
                     let due = match self.panes.get(&id).and_then(|p| p.tick_every()) {
                         Some(every) => self.last_tick.get(&id).map(|t| t.elapsed() >= every).unwrap_or(true),
@@ -1568,6 +1572,11 @@ pub(crate) fn local_offset_secs() -> i64 {
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
+/// The calendar keeps its reminders only while it runs, so open it in the background when a timed plan is coming.
+fn startup_needs_calendar(startup: &str) -> bool {
+    startup != "calendar" && crate::panes::calendar::has_timed_plans()
+}
 
 /// Your theme files: saving one recolours oriel.
 fn watch_themes(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {

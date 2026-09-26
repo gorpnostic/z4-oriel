@@ -69,6 +69,7 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | F5 | **system** | A task manager: a summary, processes as a list or tree (sort, filter, kill), per-core graphs, startup apps, services, network connections and system info. |
 | F6 | **files** | A folder tree with previews: highlighted code, images drawn in the terminal, READMEs. |
 | F7 | **notes** | Markdown notes that save as you type, with a live preview. |
+| | **calendar** | A month at a glance and the day's plans. `a` adds one ("2pm dentist"); plans with a time pop up as a reminder from any app. |
 | F8 | **storage** | Frees up space. It finds what's safe to clean (caches, temp files, trash), shows the biggest folders, and uninstalls apps. It also has a catalog of 60+ popular apps (OBS, Steam, Minecraft launchers, VPNs, AI apps, dev tools, browsers…) that install with one key, using whichever package manager your system has: winget, pacman/AUR, apt, flatpak or npm. Nothing is deleted or installed without asking. |
 | F9 | **terminal** | A real shell. Split it next to anything. |
 | | **themes** | Make your own theme: every colour with a live preview. (Bottom of the sidebar, with help.) |

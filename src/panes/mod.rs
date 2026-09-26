@@ -2,6 +2,7 @@
 
 pub mod agents;
 pub mod ais;
+pub mod calendar;
 pub mod chat;
 pub mod files;
 pub mod help;
@@ -48,6 +49,7 @@ pub fn open(name: &str, cfg: &Config) -> Option<Box<dyn Pane>> {
         "system" => Box::new(system::System::new()),
         "files" => Box::new(files::Files::new(None)),
         "notes" => Box::new(notes::Notes::new()),
+        "calendar" => Box::new(calendar::Calendar::new()),
         "storage" => Box::new(storage::Storage::new()),
         "agents" => Box::new(agents::Agents::new(cfg)),
         "ais" => Box::new(ais::Ais::new(cfg)),

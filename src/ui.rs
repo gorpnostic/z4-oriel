@@ -27,6 +27,7 @@ const ICONS: &[(&str, &str, &str)] = &[
     ("storage", "\u{F02CA}", "%"), // md-harddisk
     ("home", "\u{F02DC}", "@"),    // md-home
     ("theme", "\u{F03D8}", "&"),   // md-palette
+    ("calendar", "\u{F00ED}", "="), // md-calendar
     ("play", "\u{F040A}", ">"),
     ("pause", "\u{F03E4}", "||"),
     ("prev", "\u{F04AE}", "|<"),
