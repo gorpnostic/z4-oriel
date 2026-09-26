@@ -463,6 +463,8 @@ impl Agents {
             "merged": ids(&|t| t.status == Status::Done && t.outcome == "merged"),
             "spend_usd": (self.spend(run) * 1000.0).round() / 1000.0,
             "budget_usd": self.run_ref(run).map(|r| r.budget_usd).unwrap_or(0.0),
+            // a plan waiting for the user: nothing starts until they approve it
+            "awaiting_approval": self.run_ref(run).map(|r| r.held.len()).unwrap_or(0),
         })
     }
 
@@ -530,7 +532,7 @@ impl Agents {
     /// L → a new lead run: the integration branch + the lead's checkout (background), then the lead. `gate` = the
     /// command every merge must pass ("" = none).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn start_run(&mut self, goal: &str, agent: &str, model: &str, max_parallel: u32, budget: f64, gate: &str, cx: &mut Cx) -> Result<String, String> {
+    pub(super) fn start_run(&mut self, goal: &str, agent: &str, model: &str, max_parallel: u32, budget: f64, gate: &str, approve: bool, cx: &mut Cx) -> Result<String, String> {
         let goal = goal.trim().to_string();
         if goal.is_empty() {
             return Err("what's the goal?".into());
@@ -561,9 +563,11 @@ impl Agents {
             max_parallel: max_parallel.clamp(1, 5),
             created: store::now(),
             gate: Some(gate.trim().to_string()),
+            approve,
             ..Default::default()
         });
         self.runs_live.insert(id.clone(), RunLive::new());
+        self.store.approve_plan = approve;
         // remember the choice for next time
         self.lead_cfg.agent = agent.to_string();
         self.lead_cfg.model = model.trim().to_string();
@@ -616,6 +620,7 @@ impl Agents {
         if let Some(g) = &r.gate {
             f.gate = super::Input::new(g, false);
         }
+        f.approve = r.approve;
         f
     }
 
@@ -725,7 +730,7 @@ impl Agents {
         }
         let roster = self.roster();
         let gate = self.run_gate(&r).unwrap_or_default();
-        let brief = mcp::Brief { integration: &r.branch, base: &r.base_branch, max_parallel: r.max_parallel, budget: r.budget_usd, roster: &roster::roster_brief(&roster), shell: git::gate_shell().2, gate: &gate };
+        let brief = mcp::Brief { integration: &r.branch, base: &r.base_branch, max_parallel: r.max_parallel, budget: r.budget_usd, roster: &roster::roster_brief(&roster), shell: git::gate_shell().2, gate: &gate, approve: r.approve };
         let d = Driver {
             run: id.to_string(),
             agent: r.agent.clone(),
@@ -1153,23 +1158,86 @@ impl Agents {
         }
     }
 
-    fn call_plan(&mut self, run: &Run, a: &Value, cx: &mut Cx) -> Result<String, String> {
-        let items: Vec<plan::Item> = a["tasks"].as_array().ok_or("plan needs a tasks list")?.iter().enumerate().map(|(i, v)| plan::parse_item(v, i)).collect();
-        let existing: Vec<plan::Existing> = self
-            .run_tasks(&run.id)
+    /// The run's tasks a new plan must not collide with (plan.rs).
+    pub(super) fn plan_existing(&self, run: &str) -> Vec<plan::Existing> {
+        self.run_tasks(run)
             .iter()
             .filter(|t| !(t.status == Status::Done && t.outcome == "discarded"))
             .map(|t| plan::Existing { key: t.key.clone(), id: t.id.clone(), owns: if t.owns.is_empty() { t.touched.clone() } else { t.owns.clone() }, open: t.status != Status::Done })
-            .collect();
+            .collect()
+    }
+
+    /// The roster workers a plan may name: enabled, and their AI installed.
+    pub(super) fn plan_worker_names(&self) -> Vec<String> {
+        self.roster().iter().filter(|w| w.enabled && (self.fake_worker.is_some() || self.installed(&w.agent).is_some())).map(|w| w.name.clone()).collect()
+    }
+
+    fn call_plan(&mut self, run: &Run, a: &Value, cx: &mut Cx) -> Result<String, String> {
+        let items: Vec<plan::Item> = a["tasks"].as_array().ok_or("plan needs a tasks list")?.iter().enumerate().map(|(i, v)| plan::parse_item(v, i)).collect();
+        let existing = self.plan_existing(&run.id);
         if let Some(dup) = items.iter().find(|i| existing.iter().any(|e| e.key == i.key)) {
             return Err(format!("task id {:?} is already used in this run — pick new ids", dup.key));
         }
-        let roster = self.roster();
-        let workers: Vec<String> = roster.iter().filter(|w| w.enabled && (self.fake_worker.is_some() || self.installed(&w.agent).is_some())).map(|w| w.name.clone()).collect();
+        let workers = self.plan_worker_names();
         let checked = plan::check(items, &existing, &workers).map_err(|e| format!("plan rejected, nothing started — fix these and submit again:\n- {}", e.join("\n- ")))?;
         self.check_budget(&run.id, cx)?;
+        if run.approve {
+            return self.hold_plan(run, checked, cx);
+        }
+        let serial = checked.serial;
+        let notes = checked.notes.clone();
+        let out = self.spawn_plan(run, checked.items, cx);
+        Ok(self.plan_reply(&out, serial, &notes).to_string())
+    }
+
+    /// The user approves plans in this run: this one waits for them (plan_view.rs), checked but not started.
+    fn hold_plan(&mut self, run: &Run, checked: plan::Checked, cx: &mut Cx) -> Result<String, String> {
+        if !run.held.is_empty() {
+            return Err("a plan of yours is already waiting for the user's approval — call wait: you'll get plan_approved or plan_rejected".into());
+        }
+        let n = checked.items.len();
+        let keys: Vec<Value> = checked.items.iter().map(|it| json!({"key": it.key, "title": it.title, "worker": it.worker})).collect();
+        if let Some(r) = self.run_mut(&run.id) {
+            r.held = checked.items;
+            r.held_notes = checked.notes;
+            r.dropped.clear();
+            r.edited.clear();
+            r.log(&format!("plan of {n} task{} waits for your approval · enter on this panel", if n == 1 { "" } else { "s" }));
+        }
+        cx.alert(crate::alerts::Kind::NeedsYou, format!("the lead's plan is ready: {n} task{} — approve it on the agents board (enter on the lead panel)", if n == 1 { "" } else { "s" }));
+        self.save();
+        Ok(json!({"held": true, "tasks": keys, "note": "The user approves plans in this run: nothing starts until they do. Call wait now; you'll get plan_approved (the tasks as they finally are, with ids; they may have dropped or edited some) or plan_rejected (with their note: submit a new plan)."}).to_string())
+    }
+
+    /// The plan's answer: each task's id, key, worker and state.
+    pub(super) fn plan_reply(&self, out: &[(String, String, String)], serial: bool, notes: &[String]) -> Value {
+        let tasks: Vec<Value> = out
+            .iter()
+            .filter_map(|(id, key, w)| {
+                let t = self.task(id)?;
+                let mut v = json!({"id": id, "key": key, "worker": w, "state": state_name(t)});
+                let wf = self.waiting_for(t);
+                if !wf.is_empty() {
+                    v["waiting_for"] = json!(wf);
+                }
+                Some(v)
+            })
+            .collect();
+        let mut v = json!({"tasks": tasks});
+        if serial {
+            v["solo"] = json!(true);
+        }
+        if !notes.is_empty() {
+            v["notes"] = json!(notes);
+        }
+        v
+    }
+
+    /// A checked plan's tasks, queued in the run (they start as their dependencies merge): (id, key, worker).
+    pub(super) fn spawn_plan(&mut self, run: &Run, items: Vec<plan::Item>, cx: &mut Cx) -> Vec<(String, String, String)> {
+        let roster = self.roster();
         let mut out = vec![];
-        for it in checked.items {
+        for it in items {
             let w = roster.iter().find(|w| w.name.eq_ignore_ascii_case(&it.worker)).cloned().unwrap_or_default();
             let id = store::new_id(&self.store.tasks);
             self.store.tasks.push(Task {
@@ -1202,26 +1270,14 @@ impl Agents {
             out.push((id, it.key, w.name));
         }
         self.schedule(cx);
-        let tasks: Vec<Value> = out
-            .iter()
-            .map(|(id, key, w)| {
-                let t = self.task(id).unwrap();
-                let mut v = json!({"id": id, "key": key, "worker": w, "state": state_name(t)});
-                let wf = self.waiting_for(t);
-                if !wf.is_empty() {
-                    v["waiting_for"] = json!(wf);
-                }
-                v
-            })
-            .collect();
-        let mut v = json!({"tasks": tasks});
-        if checked.serial {
-            v["solo"] = json!(true);
-        }
-        if !checked.notes.is_empty() {
-            v["notes"] = json!(checked.notes);
-        }
-        Ok(v.to_string())
+        out
+    }
+
+    /// Something about the whole run the lead should hear (plan_approved, plan_rejected): wakes any `wait`.
+    pub(super) fn run_event(&mut self, run: &str, card: Value) {
+        let l = self.runs_live.entry(run.to_string()).or_insert_with(RunLive::new);
+        l.events.push(RunEvent { task: String::new(), card, delivered: false });
+        self.check_waiters();
     }
 
     fn call_followup(&mut self, run: &Run, id: &str, text: &str, cx: &mut Cx) -> Result<String, String> {
@@ -1356,9 +1412,10 @@ impl Agents {
         let mut keep = vec![];
         for w in std::mem::take(&mut self.waiters) {
             let board = self.board_json(&w.run);
-            let nothing_left = board["running"].as_array().is_some_and(|a| a.is_empty()) && board["queued"].as_array().is_some_and(|a| a.is_empty()) && board["merging"].as_array().is_some_and(|a| a.is_empty());
+            let nothing_left = board["running"].as_array().is_some_and(|a| a.is_empty()) && board["queued"].as_array().is_some_and(|a| a.is_empty()) && board["merging"].as_array().is_some_and(|a| a.is_empty()) && board["awaiting_approval"] == 0;
             let l = self.runs_live.entry(w.run.clone()).or_insert_with(RunLive::new);
-            let news: Vec<usize> = l.events.iter().enumerate().filter(|(_, e)| !e.delivered && (w.ids.is_empty() || w.ids.contains(&e.task))).map(|(i, _)| i).collect();
+            // (news about the whole run, like the user approving the plan, wakes every wait)
+            let news: Vec<usize> = l.events.iter().enumerate().filter(|(_, e)| !e.delivered && (w.ids.is_empty() || e.task.is_empty() || w.ids.contains(&e.task))).map(|(i, _)| i).collect();
             if !news.is_empty() || now >= w.deadline || (nothing_left && l.events.iter().all(|e| e.delivered)) {
                 let cards: Vec<Value> = news
                     .iter()
@@ -1499,7 +1556,11 @@ impl Agents {
             0.0
         };
         let wt = PathBuf::from(&t.worktree);
-        let spec = run::worker_spec(&t.agent, &bin, &t.model, prompt, resume, t.max_turns, cap, &wt, &self.paths.agents.join("tmp"));
+        let mut spec = run::worker_spec(&t.agent, &bin, &t.model, prompt, resume, t.max_turns, cap, &wt, &self.paths.agents.join("tmp"));
+        if t.port > 0 {
+            // its checkout's own port, for a dev server or a test that needs one (project.rs)
+            spec.env.push(("ORIEL_PORT".into(), t.port.to_string()));
+        }
         let stop = Arc::new(AtomicBool::new(false));
         {
             let l = self.live(id);
@@ -1875,8 +1936,10 @@ impl Agents {
                     let mut cmds: Vec<String> = vec![];
                     if gate_cmd.is_empty() || base.is_some() || !t.acceptance.is_empty() {
                         git::gate_checkout(repo, &gate_wt, sha)?;
-                        // a JS project's gate needs its dependencies: borrow the main checkout's
-                        git::link_deps(repo, &gate_wt);
+                        // the repo's own setup (.oriel/project.toml: pnpm install, .env…) on the merged tree, so a
+                        // dependency a worker added is there; without one a JS gate borrows the main checkout's
+                        let proj = super::project::load(repo).unwrap_or_default();
+                        super::project::prepare(&proj, repo, &gate_wt, 0, timeout, true)?;
                         if let Some(c) = base.or_else(|| if gate_cmd.is_empty() { git::detect_gate(&gate_wt) } else { None }) {
                             cmds.push(c);
                         }
@@ -2240,7 +2303,7 @@ impl Agents {
         if r.branch.is_empty() {
             return;
         }
-        self.mode = super::Mode::Diff(super::DiffView { id: id.to_string(), data: None, file: 0, scroll: 0 });
+        self.mode = super::Mode::Diff(super::DiffView::new(id));
         let id = id.to_string();
         self.spawn(cx, move |send| send(Msg::Diff(id, git::branch_diff(Path::new(&r.repo), &r.base_sha, &r.branch))));
     }

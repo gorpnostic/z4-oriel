@@ -22,8 +22,7 @@ fn agents_plan_marks_cards_and_spreads_them() {
     let mut k = Kit::new();
     let mut p = offline(&dir);
     let here = p.repo_key();
-    let items = vec![("One".to_string(), "do one".to_string()), ("Two".into(), "do two".into()), ("Three".into(), "do three".into())];
-    with_cx(&mut k, |cx| p.on_msg(Msg::Plan(here.clone(), Ok((items, 0.05))), cx));
+    with_cx(&mut k, |cx| p.on_msg(Msg::Plan(here.clone(), Ok(super::tests::plan_out(&[("One", "do one"), ("Two", "do two"), ("Three", "do three")], 0.05))), cx));
     let ids: Vec<String> = ["One", "Two", "Three"].iter().map(|t| id_of(&p, t)).collect();
     assert_eq!(p.marked, ids, "marked in plan order");
     // the default roster from what's installed (claude, codex): haiku (cheap), codex (mid), sonnet (premium)
@@ -412,7 +411,7 @@ fn agents_try_opens_a_terminal_in_the_checkout() {
     p.select(&id);
     k.key(&mut p, KeyCode::Char('T'));
     assert!(matches!(p.mode, Mode::Try(_)));
-    assert!(k.render(&mut p, 150, 44).contains("run there first"));
+    assert!(k.render(&mut p, 150, 44).contains("run there (remembered"));
     k.typ(&mut p, "pnpm dev");
     k.key(&mut p, KeyCode::Enter);
     let tag = format!("agent-try:{id}");
@@ -435,10 +434,15 @@ fn agents_try_opens_a_terminal_in_the_checkout() {
     assert!(!matches!(p.mode, Mode::Try(_)));
     // the shell: runs the command, then stays
     let cfg = |s: &str| crate::config::Config { shell: s.into(), ..Default::default() };
-    assert_eq!(try_shell(&cfg("pwsh -NoLogo"), "pnpm dev").1, vec!["-NoLogo", "-NoExit", "-Command", "pnpm dev"]);
-    assert_eq!(try_shell(&cfg("bash"), "pnpm dev").1, vec!["-c", "pnpm dev; exec bash"]);
-    assert_eq!(try_shell(&cfg("cmd.exe"), "npm start").1, vec!["/k", "npm start"]);
-    assert!(try_shell(&cfg("bash"), " ").1.is_empty(), "no command: just the shell");
+    assert_eq!(try_shell(&cfg("pwsh -NoLogo"), "", "pnpm dev", 0).1, vec!["-NoLogo", "-NoExit", "-Command", "pnpm dev"]);
+    assert_eq!(try_shell(&cfg("bash"), "", "pnpm dev", 0).1, vec!["-c", "pnpm dev; exec bash"]);
+    assert_eq!(try_shell(&cfg("cmd.exe"), "", "npm start", 0).1, vec!["/k", "npm start"]);
+    assert!(try_shell(&cfg("bash"), "", " ", 0).1.is_empty(), "no command: just the shell");
+    // with the checkout's port set in it, and a setup that has to work before the command runs
+    assert_eq!(try_shell(&cfg("pwsh -NoLogo"), "pnpm install", "pnpm dev", 5401).1, vec!["-NoLogo", "-NoExit", "-Command", "$env:ORIEL_PORT='5401'; pnpm install; if ($?) { pnpm dev }"]);
+    assert_eq!(try_shell(&cfg("bash"), "pnpm install", "pnpm dev", 5401).1, vec!["-c", "export ORIEL_PORT=5401; pnpm install && pnpm dev; exec bash"]);
+    assert_eq!(try_shell(&cfg("cmd.exe"), "", "npm start", 5401).1, vec!["/k", "set ORIEL_PORT=5401&& npm start"]);
+    assert_eq!(try_shell(&cfg("cmd.exe"), "", "", 5401).1, vec!["/k", "set ORIEL_PORT=5401"], "a bare shell still gets its port");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -505,7 +509,7 @@ fn agents_workflow_popups_in_small_panes() {
     let modes: Vec<Box<dyn Fn(&mut Agents)>> = vec![
         Box::new(move |p| p.mode = Mode::Dirty(DirtyAsk { then: DirtyThen::Task(id.clone()), status: " M a.rs".into() })),
         Box::new(|p| p.mode = Mode::Dirty(DirtyAsk { then: DirtyThen::MergeRun("r1".into()), status: String::new() })),
-        Box::new(|p| p.mode = Mode::Try(TryView { id: "r1".into(), dir: PathBuf::from("x"), title: "a title".into(), input: Input::new("pnpm dev", false) })),
+        Box::new(|p| p.mode = Mode::Try(TryView { id: "r1".into(), dir: PathBuf::from("x"), title: "a title".into(), input: Input::new("pnpm dev", false), setup: "pnpm install".into(), port: 5401 })),
         Box::new(|p| p.mode = Mode::Batch(BatchView { gate: Input::new("cargo test", false), editing: true })),
         Box::new(|p| p.mode = Mode::Comment("r1".into(), Input::new("more", true))),
         Box::new(|p| p.mode = Mode::LeadForm(p.new_lead_form())),

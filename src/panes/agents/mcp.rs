@@ -245,6 +245,8 @@ pub struct Brief<'a> {
     pub shell: &'a str,
     /// The run's merge gate ("" = none: only acceptance commands check a merge).
     pub gate: &'a str,
+    /// The user approves each plan before anything starts (plan_approved / plan_rejected come through wait).
+    pub approve: bool,
 }
 
 /// oriel's instructions for the lead (Claude gets them as an appended system prompt, the others at the top of
@@ -286,6 +288,9 @@ pub fn lead_system(b: &Brief, mcp: bool) -> String {
         },
         b.roster
     ));
+    if b.approve {
+        s.push_str("- The user approves every plan before anything starts: after plan (or spawn_task) nothing runs until they do. Call wait: you get plan_approved (the tasks as they finally are, with ids: they may drop or edit some) or plan_rejected (their note: submit a new plan that takes it into account).\n");
+    }
     if mcp {
         s.push_str("\nYour tools are oriel's MCP tools (mcp__oriel__*): roster, plan, wait, task_status, task_diff, merge, send_followup, resolve_conflicts, spawn_task, discard, note, done.\n");
     } else {
@@ -405,14 +410,16 @@ mod tests {
         assert_eq!(a[1], ("wait".to_string(), json!({})));
         assert_eq!(parse_actions("{\"actions\":[{\"tool\":\"done\",\"args\":{\"summary\":\"ok\"}}]}").unwrap()[0].0, "done");
         assert!(parse_actions("no json here").is_none());
-        let sys = lead_system(&Brief { integration: "oriel/lead-x", base: "master", max_parallel: 3, budget: 5.0, roster: "- codex", shell: "bash", gate: "" }, false);
+        let sys = lead_system(&Brief { integration: "oriel/lead-x", base: "master", max_parallel: 3, budget: 5.0, roster: "- codex", shell: "bash", gate: "", approve: false }, false);
         assert!(sys.contains("END EVERY REPLY") && sys.contains("resolve_conflicts") && sys.contains("oriel/lead-x"));
         assert!(sys.contains("no build/test gate") && sys.contains("give every task one"), "a run without a gate says so");
-        let a = lead_system(&Brief { integration: "i", base: "b", max_parallel: 3, budget: 5.0, roster: "", shell: "bash", gate: "cargo check" }, true);
+        assert!(!sys.contains("plan_approved"));
+        let a = lead_system(&Brief { integration: "i", base: "b", max_parallel: 3, budget: 5.0, roster: "", shell: "bash", gate: "cargo check", approve: true }, true);
         assert!(a.contains("mcp__oriel__") && a.contains("ROUTING"));
         assert!(a.contains("The merge gate is `cargo check`"));
+        assert!(a.contains("The user approves every plan") && a.contains("plan_rejected"), "a run you approve plans in says so");
         // byte-stable: the shared part comes first and doesn't depend on the run
-        let b = lead_system(&Brief { integration: "j", base: "c", max_parallel: 2, budget: 1.0, roster: "- kimi", shell: "bash", gate: "" }, true);
+        let b = lead_system(&Brief { integration: "j", base: "c", max_parallel: 2, budget: 1.0, roster: "- kimi", shell: "bash", gate: "", approve: false }, true);
         let cut = a.find("THIS RUN").unwrap();
         assert_eq!(a[..cut], b[..cut]);
     }

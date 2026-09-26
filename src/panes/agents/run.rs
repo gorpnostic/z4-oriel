@@ -453,6 +453,68 @@ pub fn worker_spec(agent: &str, bin: &Path, model: &str, prompt: &str, resume: &
     }
 }
 
+/// A second opinion's command line (review.rs): read-only in the checkout, the diff in `prompt`, the findings as
+/// JSON (claude --json-schema, codex --output-schema, kimi a ```json block). Capped at `budget`.
+#[allow(clippy::too_many_arguments)]
+pub fn review_spec(agent: &str, bin: &Path, model: &str, prompt: &str, wt: &Path, tmp: &Path, budget: f64) -> Spec {
+    let model = model.trim();
+    let mut a: Vec<String> = vec![];
+    let mut stdin = None;
+    let mut cleanup = vec![];
+    let schema = super::review::FINDINGS_SCHEMA;
+    match agent {
+        "codex" => {
+            a.extend(["exec".into(), "-C".into(), wt.to_string_lossy().to_string(), "--sandbox".into(), "read-only".into()]);
+            let _ = std::fs::create_dir_all(tmp);
+            let file = tmp.join(format!("oriel-findings-{}.json", uuid()));
+            if std::fs::write(&file, schema).is_ok() {
+                a.extend(["--output-schema".into(), file.to_string_lossy().to_string()]);
+                cleanup.push(file);
+            }
+            a.extend(["--json".into(), "--skip-git-repo-check".into(), "--ignore-user-config".into(), "-c".into(), "agents.enabled=false".into()]);
+            if !model.is_empty() {
+                a.extend(["-m".into(), model.into()]);
+            }
+            a.push("-".into());
+            stdin = Some(prompt.to_string());
+        }
+        "kimi" => {
+            if !model.is_empty() {
+                a.extend(["-m".into(), model.into()]);
+            }
+            a.extend(["-p".into(), format!("{prompt}\n\nEnd with your findings as a ```json block: {schema}"), "--output-format".into(), "stream-json".into()]);
+        }
+        _ => {
+            // like the lead: it reads, and nothing else
+            a.extend(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "default", "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections"].map(String::from));
+            a.extend(["--allowedTools".into(), "Read,Grep,Glob,LS".into(), "--disallowedTools".into(), "Edit,Write,MultiEdit,NotebookEdit,Bash,PowerShell,Agent,Task".into()]);
+            if !is_shim(bin) {
+                a.extend(["--json-schema".into(), schema.into()]);
+            }
+            if !model.is_empty() {
+                a.extend(["--model".into(), model.into()]);
+            }
+            a.extend(["--max-turns".into(), "16".into()]);
+            if budget > 0.0 {
+                a.extend(["--max-budget-usd".into(), format!("{budget:.2}")]);
+            }
+            stdin = Some(prompt.to_string());
+        }
+    }
+    Spec {
+        agent: agent.into(),
+        prog: bin.to_path_buf(),
+        args: a,
+        cwd: wt.to_path_buf(),
+        stdin,
+        model: model.into(),
+        budget_usd: if agent == "claude" { 0.0 } else { budget },
+        cleanup,
+        prompt: prompt.into(),
+        ..Default::default()
+    }
+}
+
 /// How a lead talks to oriel.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Proto {

@@ -100,6 +100,7 @@ impl Agents {
         }
         match self.mode {
             Mode::Diff(_) => self.draw_diff(f, area, cx),
+            Mode::PlanReview(_) => self.draw_plan_review(f, area, cx),
             Mode::Watch(_) => self.draw_watch(f, area, cx),
             Mode::Log(_) => self.draw_log(f, area, cx),
             _ => {
@@ -187,13 +188,21 @@ impl Agents {
     fn draw_try(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
         let Mode::Try(v) = &self.mode else { return };
-        let inner = ui::popup(f, area, 80, 11, &format!("{}try it", ui::lead("term")), t);
+        let setup = !v.setup.trim().is_empty();
+        let inner = ui::popup(f, area, 80, if setup { 12 } else { 11 }, &format!("{}try it", ui::lead("term")), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let w = inner.width as usize;
-        f.render_widget(Paragraph::new(vec![Line::styled(ui::fit(&v.title, w), bold(t.fg)), Line::styled(ui::fit(&format!("a terminal in {}", v.dir.display()), w), ui::muted(t))]), Rect { height: 2, ..inner });
-        let r = Rect { y: inner.y + 3, height: 3, ..inner };
-        let ri = ui::frame(f, r, "run there first (remembered for this repo)", None, true, t);
-        draw_input(f, ri, &v.input, "nothing — just a shell · or e.g. pnpm dev, cargo run", true, t);
+        // (the port first: a long path gets cut)
+        let port = if v.port > 0 { format!("ORIEL_PORT {} · ", v.port) } else { String::new() };
+        let mut head = vec![Line::styled(ui::fit(&v.title, w), bold(t.fg)), Line::styled(ui::fit(&format!("{port}a terminal in {}", v.dir.display()), w), ui::muted(t))];
+        if setup {
+            head.push(Line::styled(ui::fit(&format!("runs the repo's setup first: {}", v.setup.trim()), w), Style::default().fg(t.shine)));
+        }
+        let hh = head.len() as u16;
+        f.render_widget(Paragraph::new(head), Rect { height: hh, ..inner });
+        let r = Rect { y: inner.y + hh + 1, height: 3, ..inner };
+        let ri = ui::frame(f, r, "run there (remembered for this repo · $ORIEL_PORT is its port)", None, true, t);
+        draw_input(f, ri, &v.input, "nothing — just a shell · or e.g. pnpm dev --port $ORIEL_PORT (.oriel/project.toml `run`)", true, t);
         let hr = Rect { y: inner.bottom().saturating_sub(1), height: 1, ..inner };
         f.render_widget(Paragraph::new(Line::from(vec![Span::styled("enter", bold(t.fg)), Span::styled(" open", ui::muted(t)), Span::styled(" · ", ui::muted(t)), Span::styled("esc", bold(t.fg)), Span::styled(" cancel", ui::muted(t))])).centered(), hr);
     }
@@ -302,7 +311,7 @@ impl Agents {
                     // it never started
                     return vec![("r", "retry with the same goal"), ("x", "discard"), ("↓", "cards")];
                 }
-                let mut h = vec![("enter", "lead transcript"), ("w", "watch")];
+                let mut h = if r.held.is_empty() { vec![("enter", "lead transcript"), ("w", "watch")] } else { vec![("enter", "review the lead's plan"), ("w", "watch")] };
                 if r.state.active() {
                     h.extend([("s", "stop run"), ("d", "diff so far")]);
                 } else {
@@ -535,7 +544,7 @@ impl Agents {
         if task.followups > 0 {
             right.insert(0, Span::styled(format!("↻{} ", task.followups), ui::muted(t)));
         }
-        let who = if task.run.is_empty() {
+        let mut who = if task.run.is_empty() {
             vec![Span::styled(format!("{}{} · {model}", ui::lead(icon), task.agent), ui::muted(t))]
         } else {
             let tier_c = match task.tier.as_str() {
@@ -549,6 +558,10 @@ impl Agents {
             }
             v
         };
+        // its checkout's own port, in a repo whose project.toml sets checkouts up
+        if task.port > 0 && !task.worktree.is_empty() && task.status != Status::Done && self.projects.get(&task.repo).is_some_and(|p| p.is_set()) {
+            who.push(Span::styled(format!(" · :{}", task.port), Style::default().fg(t.accent)));
+        }
         lines.push(spread(who, right, w));
         // 3-4: what it's doing / asking / the error, and the numbers
         let stat_spans = |t: &Theme| -> Vec<Span<'static>> {
@@ -565,7 +578,8 @@ impl Agents {
             if m.is_empty() { vec![] } else { vec![Span::styled(m, bold(t.fg))] }
         };
         if !task.error.is_empty() {
-            let (a, b) = two_lines(&format!("✗ {}", task.error), w);
+            // (a setup's or gate's failure has several lines: they run on)
+            let (a, b) = two_lines(&format!("✗ {}", task.error.split('\n').map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" · ")), w);
             lines.push(Line::styled(a, Style::default().fg(t.danger)));
             lines.push(Line::styled(b, Style::default().fg(t.danger)));
         } else {
@@ -619,26 +633,58 @@ impl Agents {
 
     fn draw_diff(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
-        let Mode::Diff(v) = &mut self.mode else { return };
+        let Mode::Diff(v) = &self.mode else { return };
         let id = v.id.clone();
+        let typing = v.typing.is_some();
         // a lead run's review diff shows as a task: its goal, integration branch → the user's branch
         let task = self.store.tasks.iter().find(|x| x.id == id).cloned().or_else(|| {
             self.store.runs.iter().find(|r| r.id == id).map(|r| Task { id: r.id.clone(), title: format!("⚑ {}", r.goal.lines().next().unwrap_or("")), branch: r.branch.clone(), base_branch: r.base_branch.clone(), error: r.error.clone(), ..Default::default() })
         });
         let task = task.unwrap_or_default();
-        // c only where it works (a run: back to its lead; a task: a follow-up in its session)
         let is_run = self.run_ref(&id).is_some();
-        let mut hints = vec![("↑↓", "file"), ("pgup/pgdn", "scroll"), ("m", "merge")];
-        if self.comment_block(&id).is_none() {
-            hints.push(("c", if is_run { "feedback to the lead" } else { "comment" }));
+        let block = self.comment_block(&id);
+        let notes: Vec<super::review::Note> = self.notes_of(&id).to_vec();
+        let ticked = notes.iter().filter(|n| n.on).count();
+        let reviewing = self.reviewing.get(&id).cloned();
+        // keys only where they work: c and enter when feedback can go (a run: its lead; a task: its session)
+        let mut hints: Vec<(String, String)> = vec![];
+        let mut h = |k: &str, d: &str| hints.push((k.to_string(), d.to_string()));
+        if typing {
+            h("enter", "add the comment");
+            h("esc", "drop it");
+        } else {
+            h("↑↓", "line");
+            h("←→", "file");
+            if block.is_none() {
+                h("c", "comment on the line");
+                if ticked > 0 {
+                    h("enter", &format!("send {ticked}"));
+                }
+            }
+            if !notes.is_empty() {
+                h("space", "tick");
+                h("n", "next comment");
+            }
+            if reviewing.is_none() {
+                h("V", "second opinion");
+            }
+            if block.is_none() {
+                h("C", if is_run { "feedback to the lead" } else { "comment on it all" });
+            }
+            for (k, d) in [("m", "merge"), ("T", "try it"), ("x", "discard"), ("R", "reload"), ("esc", "board")] {
+                h(k, d);
+            }
         }
-        hints.extend([("T", "try it"), ("x", "discard"), ("R", "reload"), ("esc", "board")]);
-        let Mode::Diff(v) = &mut self.mode else { return };
-        let body = ui::hint_line(f, area, &fit_hints(&hints, area.width as usize), t);
+        let hint_refs: Vec<(&str, &str)> = hints.iter().map(|(k, d)| (k.as_str(), d.as_str())).collect();
+        let body = ui::hint_line(f, area, &fit_hints(&hint_refs, area.width as usize), t);
         let body = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };
+        let Mode::Diff(v) = &mut self.mode else { return };
         // header: title, branch → target, totals, merge check
         let mut right: Vec<Span> = vec![];
         let mut left = vec![Span::styled("◆ ", bold(t.shine)), Span::styled(task.title.clone(), bold(t.fg)), Span::styled(format!("   {} → {}", task.branch, task.base_branch), ui::muted(t))];
+        if let Some(by) = &reviewing {
+            right.push(Span::styled(format!("{} {by} is reviewing…   ", SPIN[(cx.time * 10.0) as usize % 10]), ui::accent(t)));
+        }
         match &v.data {
             None => right.push(Span::styled(format!("{} reading diff", SPIN[(cx.time * 10.0) as usize % 10]), ui::muted(t))),
             Some(Err(e)) => right.push(Span::styled(e.clone(), Style::default().fg(t.danger))),
@@ -655,7 +701,7 @@ impl Agents {
             }
         }
         if !task.error.is_empty() {
-            left.push(Span::styled(format!("   ✗ {}", task.error), Style::default().fg(t.danger)));
+            left.push(Span::styled(format!("   ✗ {}", task.error.lines().next().unwrap_or("")), Style::default().fg(t.danger)));
         }
         f.render_widget(Paragraph::new(spread(left, right, body.width as usize)), Rect { height: 1, ..body });
         let main = Rect { y: body.y + 2, height: body.height.saturating_sub(2), ..body };
@@ -670,8 +716,10 @@ impl Agents {
         let lw = (main.width / 3).clamp(24, 44).min(main.width.saturating_sub(20));
         let lr = Rect { width: lw, ..main };
         let rr = Rect { x: main.x + lw + 1, width: main.width.saturating_sub(lw + 1), ..main };
-        // file list
-        let li = ui::frame(f, lr, &format!("{}files", ui::lead("files")), Some(&format!("{}/{}", v.file + 1, d.files.len())), false, t);
+        // the left column: the files, and under them your comments and the findings, when there are any
+        let nh = if notes.is_empty() { 0 } else { (notes.len() as u16 + 2).min(lr.height / 2).max(4.min(lr.height)) };
+        let fr = Rect { height: lr.height.saturating_sub(nh), ..lr };
+        let li = ui::frame(f, fr, &format!("{}files", ui::lead("files")), Some(&format!("{}/{}", v.file + 1, d.files.len())), false, t);
         let conflicted: Vec<&String> = d.conflicts.iter().flatten().collect();
         let h = li.height as usize;
         let start = v.file.saturating_sub(h.saturating_sub(1));
@@ -679,48 +727,104 @@ impl Agents {
             let y = li.y + row as u16;
             let r = Rect { y, height: 1, ..li };
             let on = i == v.file;
-            let nums = format!("+{} −{}", file.added, file.removed);
             let name = file.path.rsplit(['/', '\\']).next().unwrap_or(&file.path).to_string();
             let dir = file.path.strip_suffix(&name).unwrap_or("").to_string();
-            let mark = if conflicted.iter().any(|c| **c == file.path) { "✗ " } else if file.note == "new" { "+ " } else if file.note == "deleted" { "− " } else { "  " };
-            let mark_st = if mark == "✗ " { bold(t.danger) } else { Style::default().fg(t.good) };
+            let commented = notes.iter().any(|n| n.path == file.path);
+            let mark = if conflicted.iter().any(|c| **c == file.path) {
+                "✗ "
+            } else if commented {
+                "● "
+            } else if file.note == "new" {
+                "+ "
+            } else if file.note == "deleted" {
+                "− "
+            } else {
+                "  "
+            };
+            let mark_st = match mark {
+                "✗ " => bold(t.danger),
+                "● " => bold(t.accent),
+                _ => Style::default().fg(t.good),
+            };
             let mut line = spread(
                 vec![Span::styled(mark, mark_st), Span::styled(dir, ui::muted(t)), Span::styled(name, if on { bold(t.accent) } else { Style::default().fg(t.fg) })],
                 vec![Span::styled(format!("+{}", file.added), Style::default().fg(t.good)), Span::styled(format!(" −{}", file.removed), Style::default().fg(t.danger))],
                 r.width as usize,
             );
-            let _ = nums;
             if on {
                 line = line.style(Style::default().bg(tint(t.accent, 0.18)));
             }
             f.render_widget(Paragraph::new(line), r);
             self.hits.push((r, Hit::File(i)));
         }
-        // hunks
         let file = &d.files[v.file];
+        if nh > 0 {
+            let nr = Rect { y: fr.bottom(), height: nh, ..lr };
+            let sub = format!("{ticked} to send");
+            let ni = ui::frame(f, nr, "comments", Some(&sub), false, t);
+            let here: Vec<&super::review::Note> = file.lines.get(v.cursor).map(|l| notes.iter().filter(|n| n.at(&file.path, l)).collect()).unwrap_or_default();
+            let mut lines = vec![];
+            for n in notes.iter().take(ni.height as usize) {
+                let (tag, c) = note_style(n, t);
+                let at_cursor = here.contains(&n);
+                let st = if at_cursor { Style::default().bg(tint(t.accent, 0.18)) } else { Style::default() };
+                let text = format!("{}: {}", n.anchor().rsplit(['/', '\\']).next().unwrap_or(""), n.text);
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(if n.on { "● " } else { "○ " }, bold(c)),
+                        Span::styled(tag, Style::default().fg(c)),
+                        Span::styled(ui::fit(&text, (ni.width as usize).saturating_sub(2 + tag.width())), if n.on { Style::default().fg(t.fg) } else { ui::muted(t) }),
+                    ])
+                    .style(st),
+                );
+            }
+            f.render_widget(Paragraph::new(lines), ni);
+        }
+        // hunks, with the cursor's line lit and a mark by every line that has a comment
         let sub = if file.note.is_empty() { format!("+{} −{}", file.added, file.removed) } else { format!("{} · +{} −{}", file.note, file.added, file.removed) };
         let ri = ui::frame(f, rr, &format!("{}{}", ui::lead("code"), file.path), Some(&sub), true, t);
         self.hits.push((rr, Hit::DiffBody));
+        // typing a comment: its box sits at the bottom
+        let ri_lines = if typing && ri.height > 6 { Rect { height: ri.height - 3, ..ri } } else { ri };
         let gw = file.lines.iter().filter_map(|l| l.old.max(l.new)).max().unwrap_or(1).to_string().len().max(3);
-        let h = ri.height as usize;
+        let h = ri_lines.height as usize;
         let max_scroll = file.lines.len().saturating_sub(h);
+        // keep the cursor in view, with a little context around it
+        let margin = 2.min(h / 4);
+        if v.cursor < v.scroll + margin {
+            v.scroll = v.cursor.saturating_sub(margin);
+        } else if v.cursor + margin + 1 > v.scroll + h {
+            v.scroll = (v.cursor + margin + 1).saturating_sub(h);
+        }
         v.scroll = v.scroll.min(max_scroll);
-        let (add_bg, del_bg) = (tint(t.good, 0.16), tint(t.danger, 0.16));
-        let tw = (ri.width as usize).saturating_sub(gw * 2 + 4);
+        let (add_bg, del_bg, cur_bg) = (tint(t.good, 0.16), tint(t.danger, 0.16), tint(t.accent, 0.30));
+        let tw = (ri_lines.width as usize).saturating_sub(gw * 2 + 5);
         let mut lines = vec![];
-        for l in file.lines.iter().skip(v.scroll).take(h) {
+        for (i, l) in file.lines.iter().enumerate().skip(v.scroll) {
+            if lines.len() >= h {
+                break;
+            }
             let num = |n: Option<u32>| n.map(|x| format!("{x:>gw$}")).unwrap_or_else(|| " ".repeat(gw));
             let text = ui::fit(&l.text.replace('\t', "    "), tw);
-            let line = match l.kind {
+            let here: Vec<&super::review::Note> = notes.iter().filter(|n| n.at(&file.path, l)).collect();
+            let cursor = i == v.cursor;
+            let mark = match here.first().map(|n| note_style(n, t).1) {
+                _ if cursor => Span::styled("›", bold(t.accent)),
+                Some(c) => Span::styled("●", bold(c)),
+                None => Span::raw(" "),
+            };
+            let mut line = match l.kind {
                 Kind::Hunk => Line::from(vec![
+                    Span::raw(" "),
                     Span::styled(format!("{} ", "┄".repeat(gw * 2 + 1)), Style::default().fg(t.frame)),
                     Span::styled(format!("@@ -{} +{} ", l.old.unwrap_or(0), l.new.unwrap_or(0)), ui::accent(t)),
                     Span::styled(ui::fit(&l.text, tw.saturating_sub(14)), ui::muted(t)),
                 ]),
-                Kind::Note => Line::styled(format!("  {}", l.text), ui::muted(t)),
+                Kind::Note => Line::styled(format!("   {}", l.text), ui::muted(t)),
                 Kind::Add => {
                     let pad = tw.saturating_sub(text.width());
                     Line::from(vec![
+                        mark,
                         Span::styled(format!("{} {} ", num(None), num(l.new)), Style::default().fg(t.good).bg(add_bg)),
                         Span::styled("+ ", bold(t.good).bg(add_bg)),
                         Span::styled(format!("{text}{}", " ".repeat(pad)), Style::default().fg(t.good).bg(add_bg)),
@@ -729,20 +833,48 @@ impl Agents {
                 Kind::Del => {
                     let pad = tw.saturating_sub(text.width());
                     Line::from(vec![
+                        mark,
                         Span::styled(format!("{} {} ", num(l.old), num(None)), Style::default().fg(t.danger).bg(del_bg)),
                         Span::styled("- ", bold(t.danger).bg(del_bg)),
                         Span::styled(format!("{text}{}", " ".repeat(pad)), Style::default().fg(t.danger).bg(del_bg)),
                     ])
                 }
-                Kind::Ctx => Line::from(vec![Span::styled(format!("{} {} ", num(l.old), num(l.new)), Style::default().fg(t.frame)), Span::raw("  "), Span::styled(text, Style::default().fg(t.fg))]),
+                Kind::Ctx => {
+                    let pad = tw.saturating_sub(text.width());
+                    Line::from(vec![mark, Span::styled(format!("{} {} ", num(l.old), num(l.new)), Style::default().fg(t.frame)), Span::raw("  "), Span::styled(format!("{text}{}", " ".repeat(pad)), Style::default().fg(t.fg))])
+                }
             };
+            if cursor {
+                for s in line.spans.iter_mut().skip(1) {
+                    s.style = s.style.bg(cur_bg);
+                }
+            }
+            let row = Rect { y: ri_lines.y + lines.len() as u16, height: 1, ..ri_lines };
+            self.hits.push((row, Hit::DiffLine(i)));
             lines.push(line);
+            // the comments (and findings) on this line, right under it
+            for n in &here {
+                let (tag, c) = note_style(n, t);
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(gw * 2 + 3)),
+                    Span::styled(format!("{} {tag}", if n.on { "▸" } else { "▹" }), bold(c)),
+                    Span::styled(ui::fit(&n.text, tw.saturating_sub(4 + tag.width())), Style::default().fg(c)),
+                ]));
+            }
         }
-        f.render_widget(Paragraph::new(lines), ri);
-        if max_scroll > 0 {
+        lines.truncate(h);
+        f.render_widget(Paragraph::new(lines), ri_lines);
+        if max_scroll > 0 && !typing {
             let pct = v.scroll * 100 / max_scroll.max(1);
             let r = Rect { x: rr.x + 2, y: rr.bottom().saturating_sub(1), width: 12.min(rr.width.saturating_sub(4)), height: 1 };
             f.render_widget(Paragraph::new(Span::styled(format!(" {pct}% "), ui::muted(t))), r);
+        }
+        if let (Some(inp), Some(l)) = (&v.typing, file.lines.get(v.cursor)) {
+            let at = if l.kind == Kind::Del { format!("{}:{} (removed)", file.path, l.old.unwrap_or(0)) } else { format!("{}:{}", file.path, l.new.unwrap_or(0)) };
+            let br = Rect { y: ri.bottom().saturating_sub(3), height: 3.min(ri.height), ..ri };
+            f.render_widget(Clear, br);
+            let bi = ui::frame(f, br, &format!("comment on {at} · enter adds it · esc drops it"), None, true, t);
+            draw_input(f, bi, inp, "what's wrong here, or what should change?", true, t);
         }
     }
 
@@ -970,12 +1102,31 @@ impl Agents {
             Mode::Plan(i) => ("plan", "claude reads the repo (read-only) and splits the goal into TODO cards".to_string(), i, "what's the goal? (↑ earlier goals)"),
             _ => return,
         };
-        let inner = ui::popup(f, area, 84, if extra.is_some() { 13 } else { 12 }, &format!("{}{title}", ui::lead(if title == "plan" { "claude" } else { "new" })), t);
+        // your ticked line comments and findings go along with it
+        let notes: Vec<&super::review::Note> = match &self.mode {
+            Mode::Comment(id, _) => self.notes_of(id).iter().filter(|n| n.on).collect(),
+            _ => vec![],
+        };
+        let shown = notes.len().min(6);
+        let more = if notes.len() > shown { 1 } else { 0 };
+        let ph = if notes.is_empty() { ph } else { "anything to add? (optional) — enter sends it with the comments above" };
+        let h = if extra.is_some() { 13 } else { 12 } + if notes.is_empty() { 0 } else { shown as u16 + more + 1 };
+        let inner = ui::popup(f, area, 84, h, &format!("{}{title}", ui::lead(if title == "plan" { "claude" } else { "new" })), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let w = inner.width as usize;
         let mut head_lines = vec![Line::styled(ui::fit(&head, w), ui::muted(t))];
         if let Some((s, st)) = &extra {
             head_lines.push(Line::styled(ui::fit(s, w), *st));
+        }
+        if !notes.is_empty() {
+            head_lines.push(Line::styled(format!("with {} comment{}:", notes.len(), if notes.len() == 1 { "" } else { "s" }), bold(t.fg)));
+            for n in notes.iter().take(shown) {
+                let (tag, c) = note_style(n, t);
+                head_lines.push(Line::from(vec![Span::styled(format!("● {tag}"), Style::default().fg(c)), Span::styled(ui::fit(&format!("{}: {}", n.anchor(), n.text), w.saturating_sub(2 + tag.width())), Style::default().fg(t.fg))]));
+            }
+            if more > 0 {
+                head_lines.push(Line::styled(format!("  … and {} more", notes.len() - shown), ui::muted(t)));
+            }
         }
         let hh = head_lines.len() as u16;
         f.render_widget(Paragraph::new(head_lines), Rect { height: hh, ..inner });
@@ -1122,6 +1273,16 @@ impl Agents {
                 f.render_widget(Paragraph::new(spread(vec![Span::styled("today", ui::muted(t))], vec![Span::styled(format!("${today:.2}"), bold(t.fg))], r.width as usize)), r);
             }
         }
+    }
+}
+
+/// How a comment shows: (tag, colour). Yours in the accent, a reviewer's blocking finding in red, an optional one
+/// in yellow.
+fn note_style(n: &super::review::Note, t: &Theme) -> (&'static str, Color) {
+    match n.finding {
+        Some(true) => ("blocking · ", t.danger),
+        Some(false) => ("optional · ", t.shine),
+        None => ("", t.accent),
     }
 }
 

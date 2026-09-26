@@ -3,10 +3,12 @@
 //! (manifests, lockfiles, module registries, migrations) belong to one scaffold task everything else waits for,
 //! sizes are capped, and tiny plans run one task at a time (the solo gate).
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// One task as the lead planned it.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// One task as the lead planned it (kept in tasks.json while a plan waits for your approval).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Item {
     /// The lead's own id for it (what depends_on refers to).
     pub key: String,

@@ -120,6 +120,8 @@ pub struct Task {
     pub want_merge: bool,
     /// Notes carried into a fresh re-dispatch (what went wrong before).
     pub history: Vec<String>,
+    /// Its checkout's own ORIEL_PORT (0 = none yet): the setup, the worker and `T` get it (project.rs).
+    pub port: u16,
 }
 
 /// How a roster worker has done so far (shown to the lead in roster()).
@@ -234,6 +236,15 @@ pub struct Run {
     /// The merge gate chosen when it started ("" = none). None = a run from before the form had a gate row: the
     /// config's `[lead] gate`, else what's detected in the gate checkout.
     pub gate: Option<String>,
+    /// The ORIEL_PORT `T` gives the lead's checkout (0 = none yet).
+    pub port: u16,
+    /// You approve the lead's plan before any worker starts: a plan it submits waits in `held` (checked by
+    /// plan.rs) until you do (plan_view.rs). `dropped` and `edited` are the keys you took out or changed.
+    pub approve: bool,
+    pub held: Vec<super::plan::Item>,
+    pub held_notes: Vec<String>,
+    pub dropped: Vec<String>,
+    pub edited: Vec<String>,
 }
 
 impl Run {
@@ -262,6 +273,8 @@ pub struct Store {
     pub gates: std::collections::BTreeMap<String, String>,
     /// Per repo: what `T` starts in the checkout it opens ("pnpm dev"), "" = just a shell.
     pub try_cmds: std::collections::BTreeMap<String, String>,
+    /// The lead form's "approve the plan first", as you left it.
+    pub approve_plan: bool,
 }
 
 /// Where the orchestrator keeps things. `agents` = tasks.json + status/, `wt` = the worktrees.

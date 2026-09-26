@@ -32,7 +32,7 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// A worker that does what its goal's script says.
-fn fake_worker(seen: Arc<Mutex<Vec<String>>>) -> run::Fake {
+pub(super) fn fake_worker(seen: Arc<Mutex<Vec<String>>>) -> run::Fake {
     let n = Arc::new(AtomicUsize::new(0));
     Arc::new(move |spec: &run::Spec, stop: &AtomicBool, on: &mut dyn FnMut(Ev)| -> run::Outcome {
         let p = spec.prompt.clone();
@@ -148,7 +148,7 @@ fn with_cx<R>(k: &mut Kit, f: impl FnOnce(&mut crate::pane::Cx) -> R) -> R {
 }
 
 /// Mark these TODO tasks and run them together: `serial` = s (one after another), else p.
-fn run_batch(k: &mut Kit, p: &mut Agents, ids: &[String], serial: bool) {
+pub(super) fn run_batch(k: &mut Kit, p: &mut Agents, ids: &[String], serial: bool) {
     p.marked = ids.to_vec();
     k.key(p, KeyCode::Enter);
     assert!(matches!(p.mode, Mode::Batch(_)));
@@ -158,7 +158,7 @@ fn run_batch(k: &mut Kit, p: &mut Agents, ids: &[String], serial: bool) {
 
 /// A scripted text-protocol lead: `first` is its first reply's actions; afterwards it merges every task that
 /// finished and waits, until `target` tasks are merged — then it's done.
-fn fake_text_lead(first: Value, target: usize, prompts: Arc<Mutex<Vec<String>>>) -> run::Fake {
+pub(super) fn fake_text_lead(first: Value, target: usize, prompts: Arc<Mutex<Vec<String>>>) -> run::Fake {
     Arc::new(move |spec: &run::Spec, _stop: &AtomicBool, on: &mut dyn FnMut(Ev)| -> run::Outcome {
         let p = spec.prompt.clone();
         prompts.lock().unwrap().push(p.clone());
@@ -197,12 +197,12 @@ fn fake_text_lead(first: Value, target: usize, prompts: Arc<Mutex<Vec<String>>>)
     })
 }
 
-fn roster() -> Vec<RosterEntry> {
+pub(super) fn roster() -> Vec<RosterEntry> {
     let w = |name: &str, agent: &str, model: &str, tier: &str| RosterEntry { name: name.into(), agent: agent.into(), model: model.into(), tier: tier.into(), good_at: format!("{tier} work"), max_turns: 20, budget_usd: 1.0, enabled: true };
     vec![w("w1", "claude", "haiku", "cheap"), w("w2", "codex", "", "mid"), w("w3", "claude", "sonnet", "premium")]
 }
 
-fn lead_pane(dir: &Path, repo: &Path, worker: run::Fake, lead: run::Fake) -> Agents {
+pub(super) fn lead_pane(dir: &Path, repo: &Path, worker: run::Fake, lead: run::Fake) -> Agents {
     let mut p = Agents::with_paths(Paths { agents: dir.join("agents"), wt: dir.join("wt") });
     p.start_dir = Some(repo.to_path_buf());
     p.fake_agent = Some(noop_agent());
@@ -216,7 +216,7 @@ fn lead_pane(dir: &Path, repo: &Path, worker: run::Fake, lead: run::Fake) -> Age
 }
 
 /// L → type the goal → ctrl+s.
-fn start(k: &mut Kit, p: &mut Agents, goal: &str) {
+pub(super) fn start(k: &mut Kit, p: &mut Agents, goal: &str) {
     k.key(p, KeyCode::Char('L'));
     assert!(matches!(p.mode, Mode::LeadForm(_)));
     k.typ(p, goal);
@@ -226,7 +226,7 @@ fn start(k: &mut Kit, p: &mut Agents, goal: &str) {
 }
 
 /// Fails when any .txt file says BROKEN — written for whichever shell gates run in here.
-fn gate_cmd() -> String {
+pub(super) fn gate_cmd() -> String {
     match git::gate_shell().2 {
         "bash" | "sh" => "! grep -q BROKEN *.txt".into(),
         "PowerShell" => "if (Select-String -Quiet BROKEN *.txt) { exit 1 }".into(),
@@ -234,7 +234,7 @@ fn gate_cmd() -> String {
     }
 }
 
-fn accept_cmd(file: &str) -> String {
+pub(super) fn accept_cmd(file: &str) -> String {
     match git::gate_shell().2 {
         "bash" | "sh" => format!("test -f {file}"),
         "PowerShell" => format!("if (-not (Test-Path {file})) {{ exit 1 }}"),
@@ -242,11 +242,11 @@ fn accept_cmd(file: &str) -> String {
     }
 }
 
-fn run0(p: &Agents) -> store::Run {
+pub(super) fn run0(p: &Agents) -> store::Run {
     p.store.runs[0].clone()
 }
 
-fn by_key<'a>(p: &'a Agents, key: &str) -> &'a Task {
+pub(super) fn by_key<'a>(p: &'a Agents, key: &str) -> &'a Task {
     p.store.tasks.iter().find(|t| t.key == key).unwrap_or_else(|| panic!("no task {key}"))
 }
 
@@ -1222,7 +1222,7 @@ fn agents_lead_live_claude_haiku() {
     until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some() && p.installed("claude").is_some());
     let id = {
         let mut cx = crate::pane::Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut vec![], focused: true, time: 1.0 };
-        p.start_run("Create a file hello.txt containing exactly the word hi. One task for the haiku worker (owns hello.txt, size S), merge it, then done.", "claude", "haiku", 1, 1.20, "", &mut cx).unwrap()
+        p.start_run("Create a file hello.txt containing exactly the word hi. One task for the haiku worker (owns hello.txt, size S), merge it, then done.", "claude", "haiku", 1, 1.20, "", false, &mut cx).unwrap()
     };
     until(&mut k, &mut p, 600_000, "the live lead finishes", |p| p.run_ref(&id).is_some_and(|r| !r.state.active()));
     let r = p.run_ref(&id).unwrap().clone();
@@ -1294,7 +1294,7 @@ fn agents_lead_takes_feedback_after_review() {
     assert_eq!(sh(&repo, &["show", &format!("{branch}:a.txt")]), "first", "the first pass is still there");
     // the run diff and the lead's transcript take c as well; a run of your own tasks doesn't offer it
     let rid = run0(&p).id.clone();
-    p.mode = Mode::Diff(DiffView { id: rid.clone(), data: None, file: 0, scroll: 0 });
+    p.mode = Mode::Diff(DiffView::new(&rid));
     k.key(&mut p, KeyCode::Char('c'));
     assert!(matches!(&p.mode, Mode::Comment(id, _) if *id == rid));
     k.key(&mut p, KeyCode::Esc);
@@ -1306,7 +1306,7 @@ fn agents_lead_takes_feedback_after_review() {
     if let Some(r) = p.run_mut(&rid) {
         r.manual = true;
     }
-    p.mode = Mode::Diff(DiffView { id: rid.clone(), data: None, file: 0, scroll: 0 });
+    p.mode = Mode::Diff(DiffView::new(&rid));
     assert!(!k.render(&mut p, 150, 44).contains("feedback to the lead"), "no c where it can't work");
     k.key(&mut p, KeyCode::Char('c'));
     assert!(matches!(p.mode, Mode::Diff(_)));

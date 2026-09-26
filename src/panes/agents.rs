@@ -20,7 +20,12 @@ mod lead_tests;
 mod lead_view;
 mod mcp;
 mod plan;
+mod plan_view;
+mod project;
 pub mod prompts;
+#[cfg(test)]
+mod research_tests;
+mod review;
 mod roster;
 mod run;
 mod store;
@@ -78,28 +83,49 @@ fn try_tag(id: &str) -> String {
     format!("agent-try:{id}")
 }
 
-/// The shell `T` opens, running `cmd` first when there is one and staying open after it.
-fn try_shell(cfg: &crate::config::Config, cmd: &str) -> (String, Vec<String>) {
+/// The shell `T` opens: ORIEL_PORT set when the checkout has one, then `setup` (only if it works) and `cmd` when
+/// there are any, and it stays open after them.
+fn try_shell(cfg: &crate::config::Config, setup: &str, cmd: &str, port: u16) -> (String, Vec<String>) {
     let (prog, mut args) = crate::config::default_shell(cfg);
-    let cmd = cmd.trim();
-    if cmd.is_empty() {
+    let (setup, cmd) = (setup.trim(), cmd.trim());
+    if cmd.is_empty() && setup.is_empty() && port == 0 {
         return (prog, args);
     }
     let name = Path::new(&prog).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let join = |set: String, and: &dyn Fn(&str, &str) -> String| -> String {
+        let work = match (setup.is_empty(), cmd.is_empty()) {
+            (true, _) => cmd.to_string(),
+            (false, true) => setup.to_string(),
+            (false, false) => and(setup, cmd),
+        };
+        [set, work].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("; ")
+    };
+    let set = |s: String| if port > 0 { s } else { String::new() };
     match name.as_str() {
-        "pwsh" | "powershell" => args.extend(["-NoExit".into(), "-Command".into(), cmd.into()]),
-        "cmd" => args.extend(["/k".into(), cmd.into()]),
-        "nu" => args.extend(["-e".into(), cmd.into()]),
-        _ => args.extend(["-c".into(), format!("{cmd}; exec {prog}")]),
+        // (PowerShell 5 has no &&)
+        "pwsh" | "powershell" => args.extend(["-NoExit".into(), "-Command".into(), join(set(format!("$env:ORIEL_PORT='{port}'")), &|a, b| format!("{a}; if ($?) {{ {b} }}"))]),
+        "cmd" => {
+            // `set X=1&& y`: a space before && would end up in the value
+            let work = join(String::new(), &|a, b| format!("{a} && {b}"));
+            let line = match (port > 0, work.is_empty()) {
+                (false, _) => work,
+                (true, true) => format!("set ORIEL_PORT={port}"),
+                (true, false) => format!("set ORIEL_PORT={port}&& {work}"),
+            };
+            args.extend(["/k".into(), line]);
+        }
+        "nu" => args.extend(["-e".into(), join(set(format!("$env.ORIEL_PORT = '{port}'")), &|a, b| format!("{a}; {b}"))]),
+        _ => args.extend(["-c".into(), format!("{}; exec {prog}", join(set(format!("export ORIEL_PORT={port}")), &|a, b| format!("{a} && {b}")))]),
     }
     (prog, args)
 }
 
-/// Look a folder's repo up (and the gate it would get), for `from`.
+/// Look a folder's repo up (and the gate it would get, and its .oriel/project.toml), for `from`.
 fn probe_repo(dir: &Path, from: RepoFrom, send: &dyn Fn(Msg)) {
     let r = git::repo_info(dir);
     if let Ok(i) = &r {
         send(Msg::Gate(i.root.display().to_string(), git::detect_gate_in(&i.root)));
+        send(Msg::Project(i.root.display().to_string(), project::load(&i.root)));
     }
     send(Msg::Repo(r, from));
 }
@@ -170,7 +196,7 @@ fn find_agent(id: &str) -> Option<PathBuf> {
 
 /// Program + args for a terminal pane running `bin` with `args`. `.cmd` shims (npm installs on Windows) go
 /// through cmd.exe, whose quoting can't carry newlines or double quotes, so those get flattened.
-fn wrap_cmd(bin: &Path, args: Vec<String>, task_id: &str) -> (String, Vec<String>) {
+fn wrap_cmd(bin: &Path, args: Vec<String>, task_id: &str, port: u16) -> (String, Vec<String>) {
     let p = bin.to_string_lossy().to_string();
     let low = p.to_lowercase();
     if cfg!(windows) && (low.ends_with(".cmd") || low.ends_with(".bat")) {
@@ -178,13 +204,30 @@ fn wrap_cmd(bin: &Path, args: Vec<String>, task_id: &str) -> (String, Vec<String
         a.extend(args.into_iter().map(|s| s.replace(['\r', '\n'], " ").replace('"', "'")));
         ("cmd.exe".into(), a)
     } else if cfg!(unix) {
-        // no env API on terminal panes: `env` sets ORIEL_TASK_ID for the agent (and its hooks)
-        let mut a = vec![format!("ORIEL_TASK_ID={task_id}"), p];
+        // no env API on terminal panes: `env` sets ORIEL_TASK_ID for the agent (and its hooks), and its checkout's port
+        let mut a = vec![format!("ORIEL_TASK_ID={task_id}")];
+        if port > 0 {
+            a.push(format!("ORIEL_PORT={port}"));
+        }
+        a.push(p);
         a.extend(args);
         ("env".into(), a)
     } else {
         (p, args)
     }
+}
+
+/// A task's first prompt in its tab: its own, plus the files it may edit and how to check it when it has them
+/// (the planner's cards do).
+fn hand_prompt(t: &Task) -> String {
+    let mut p = t.prompt.clone();
+    if !t.owns.is_empty() {
+        p.push_str(&format!("\n\nOnly edit files matching: {}.", t.owns.join(", ")));
+    }
+    if !t.acceptance.is_empty() {
+        p.push_str(&format!("\nWhen you're done, check it works with: {}", t.acceptance));
+    }
+    p
 }
 
 /// The agent's arguments. `followup` = continue the task's last session with `prompt` as the next message.
@@ -240,12 +283,14 @@ enum Msg {
     Repo(Result<git::RepoInfo, String>, RepoFrom),
     /// The gate a repo would get by itself: (command, why) — see git::detect_gate_in.
     Gate(String, (Option<String>, String)),
+    /// A repo's .oriel/project.toml, freshly read (setup, copy, run, ports).
+    Project(String, Result<project::Project, String>),
     /// Folders your chats work in, newest first (the repo picker lists them).
     ChatDirs(Vec<String>),
     /// Your changes were committed (or not) so that this can go ahead.
     Committed(DirtyThen, Result<String, String>),
-    /// T: the checkout is ready to try (its dependencies linked): (id, folder, command, title).
-    TryReady(String, PathBuf, String, String),
+    /// T: the checkout is ready to try (its files copied, its dependencies linked).
+    TryReady(TryLaunch),
     Agents(Vec<(&'static str, Option<PathBuf>)>),
     Status(String, StatusFile),
     Started(String, Result<git::Started, String>),
@@ -256,7 +301,9 @@ enum Msg {
     Merged(String, Result<String, String>),
     Removed(String, Result<(), String>, Then),
     /// The planner's cards, for the repo it read (the board may have moved to another one meanwhile).
-    Plan(String, Result<(Vec<(String, String)>, f64), String>),
+    Plan(String, Result<PlanOut, String>),
+    /// A second opinion on a task's or run's diff (review.rs).
+    Reviewed(String, Result<review::Review, String>),
     // ---- lead mode
     /// A headless worker's live event, and its end.
     Worker(String, stream::Ev),
@@ -369,6 +416,10 @@ struct DiffView {
     data: Option<Result<git::Diff, String>>,
     file: usize,
     scroll: usize,
+    /// The line under the cursor (an index into the file's lines; always a code line once it has moved).
+    cursor: usize,
+    /// c: the comment being typed for the cursor's line.
+    typing: Option<Input>,
 }
 
 struct Picker {
@@ -381,7 +432,7 @@ struct Picker {
 
 /// `L`: a new lead run.
 struct LeadForm {
-    field: usize, // 0 goal, 1 lead agent, 2 model, 3 max parallel, 4 run budget, 5 gate, 6 start
+    field: usize, // 0 goal, 1 lead agent, 2 model, 3 max parallel, 4 run budget, 5 gate, 6 approve, 7 start
     goal: Input,
     agent: usize,
     model: Input,
@@ -389,6 +440,8 @@ struct LeadForm {
     budget: Input,
     /// the merge gate for this run ("" = none)
     gate: Input,
+    /// show the lead's plan as cards to approve before any worker starts (plan_view.rs)
+    approve: bool,
     /// r on a run that never started: this form replaces it (it goes once the new one starts)
     retry: Option<String>,
     err: String,
@@ -435,8 +488,22 @@ struct TryView {
     id: String,
     dir: PathBuf,
     title: String,
-    /// run this there ("pnpm dev"), remembered per repo; empty = just a shell
+    /// run this there ("pnpm dev"), remembered per repo (project.toml's `run` until you change it); empty = a shell
     input: Input,
+    /// the repo's setup, run first in a checkout that never had it (the lead's own)
+    setup: String,
+    /// the checkout's ORIEL_PORT
+    port: u16,
+}
+
+/// What a `T` terminal starts with, once its checkout is ready.
+struct TryLaunch {
+    id: String,
+    dir: PathBuf,
+    title: String,
+    setup: String,
+    cmd: String,
+    port: u16,
 }
 
 /// ctrl+t in a goal or prompt field: your saved prompts, filtered by what you type.
@@ -524,6 +591,8 @@ enum Mode {
     /// Uncommitted changes in the way of starting or merging: what to do with them.
     Dirty(DirtyAsk),
     Try(TryView),
+    /// The lead's plan as cards, waiting for your approval (plan_view.rs).
+    PlanReview(plan_view::PlanView),
 }
 
 #[derive(Clone)]
@@ -532,6 +601,8 @@ enum Hit {
     Column(usize),
     File(usize),
     DiffBody,
+    /// a line of the diff (its index in the file)
+    DiffLine(usize),
     Repo(String),
     NewTask,
     LeadPanel,
@@ -614,9 +685,22 @@ pub struct Agents {
     prompt_pick: Option<PromptPick>,
     /// The task x deleted last, and when (u puts it back for a little while).
     deleted: Option<(Task, Instant)>,
+    // ---- review (review.rs)
+    /// Per task or run: your line comments and a second opinion's findings, until they're sent.
+    notes: HashMap<String, Vec<review::Note>>,
+    /// Second opinions being written: task or run -> who.
+    reviewing: HashMap<String, String>,
+    /// The comment box was opened from this diff (esc goes back to it).
+    comment_back: Option<String>,
+    /// Tests: run this instead of a real reviewer.
+    fake_reviewer: Option<run::Fake>,
     // ---- where work starts
     /// Per repo: the gate it would get by itself (git::detect_gate_in), found when the repo opens.
     gate_detect: HashMap<String, (Option<String>, String)>,
+    /// Per repo: its .oriel/project.toml as last read (re-read whenever a checkout is made).
+    projects: HashMap<String, project::Project>,
+    /// Per repo: why its project.toml didn't read, as last said.
+    project_err: HashMap<String, String>,
     /// Per repo: uncommitted changes you chose to start without (not asked again while they stay the same).
     dirty_seen: HashMap<String, String>,
     /// Runs whose integration branch is being made: (repo, lead checkout, slug), to try again after the dirty ask.
@@ -717,7 +801,13 @@ impl Agents {
             recall: None,
             prompt_pick: None,
             deleted: None,
+            notes: HashMap::new(),
+            reviewing: HashMap::new(),
+            comment_back: None,
+            fake_reviewer: None,
             gate_detect: HashMap::new(),
+            projects: HashMap::new(),
+            project_err: HashMap::new(),
             dirty_seen: HashMap::new(),
             starting: HashMap::new(),
             chat_hint: ChatDir::default(),
@@ -1032,6 +1122,20 @@ impl Agents {
             Msg::Gate(repo, g) => {
                 self.gate_detect.insert(repo, g);
             }
+            Msg::Project(repo, p) => match p {
+                Ok(p) => {
+                    self.project_err.remove(&repo);
+                    self.projects.insert(repo, p);
+                }
+                // a broken file: nothing from it applies, and it's said (once per mistake)
+                Err(e) => {
+                    self.projects.insert(repo.clone(), project::Project::default());
+                    if self.project_err.get(&repo) != Some(&e) {
+                        cx.notify(format!("{e} — its setup, copy, run and ports are ignored until it's fixed"));
+                        self.project_err.insert(repo, e);
+                    }
+                }
+            },
             Msg::ChatDirs(v) => self.chat_dirs = v,
             Msg::Repo(r, from) => {
                 self.repo_loading = false;
@@ -1079,7 +1183,7 @@ impl Agents {
                 }
                 Err(e) => cx.notify(format!("couldn't commit: {e}")),
             },
-            Msg::TryReady(id, dir, cmd, title) => self.open_try_tab(&id, dir, &cmd, &title, cx),
+            Msg::TryReady(l) => self.open_try_tab(l, cx),
             Msg::Status(id, st) => self.on_status(&id, st, cx),
             Msg::Started(id, r) => self.on_started(&id, r, cx),
             Msg::Refreshed(id, stats, c) => {
@@ -1140,6 +1244,7 @@ impl Agents {
                 if let Mode::Diff(v) = &mut self.mode {
                     if v.id == id {
                         v.data = Some(r);
+                        v.set_file(v.file); // the cursor on its first code line
                     }
                 }
             }
@@ -1231,19 +1336,40 @@ impl Agents {
             Msg::Plan(repo, r) => {
                 self.planning = false;
                 match r {
-                    Ok((items, usd)) if !items.is_empty() => {
-                        let n = items.len();
-                        // spread over the roster, cheap tier first, as a lead would
-                        let workers = self.plan_workers();
-                        let ids: Vec<String> = items.into_iter().enumerate().map(|(i, (title, prompt))| {
-                            let (agent, model) = workers[i % workers.len()].clone();
-                            self.add_task_in(&repo, &title, &prompt, agent, &model)
-                        }).collect();
-                        let cost = if usd > 0.0 { format!(" · ${usd:.2}") } else { String::new() };
-                        if repo == self.repo_key() {
+                    Ok(out) if !out.items.is_empty() => {
+                        let n = out.items.len();
+                        // spread over the roster, cheap tier first, as a lead would (the planner's thread did it)
+                        let names = self.plan_names();
+                        let mut made: Vec<(String, String)> = vec![];
+                        for (i, it) in out.items.iter().enumerate() {
+                            let who = if it.worker.is_empty() { names[i % names.len()].clone() } else { it.worker.clone() };
+                            let (agent, model) = self.worker_of(&who);
+                            let id = self.add_task_in(&repo, &it.title, &it.goal, agent, &model);
+                            if let Some(t) = self.task_mut(&id) {
+                                t.owns = it.owns.clone();
+                                t.acceptance = it.acceptance.clone();
+                                t.priority = it.priority;
+                            }
+                            made.push((it.key.clone(), id));
+                        }
+                        // what they wait for, as the cards' "after" links
+                        for (it, (_, id)) in out.items.iter().zip(made.clone()) {
+                            let deps: Vec<String> = it.depends_on.iter().filter_map(|d| made.iter().find(|(k, _)| k == d).map(|(_, x)| x.clone())).collect();
+                            if let Some(t) = self.task_mut(&id) {
+                                t.depends_on = deps;
+                            }
+                        }
+                        self.save();
+                        let ids: Vec<String> = made.into_iter().map(|x| x.1).collect();
+                        let cost = if out.cost > 0.0 { format!(" · ${:.2}", out.cost) } else { String::new() };
+                        let note = out.notes.first().map(|n| format!(" · {n}")).unwrap_or_default();
+                        if repo == self.repo_key() && !out.problems.is_empty() {
+                            // they don't check out (overlapping files, say): here, but not marked to run together
+                            cx.notify(format!("planned {n} tasks{cost}, but they don't check out: {} — look them over before running them together", out.problems[0]));
+                        } else if repo == self.repo_key() {
                             // marked, ready to run together
                             self.marked = ids;
-                            cx.notify(format!("planned {n} tasks{cost} · enter runs them (p together, s in order) · e edits one"));
+                            cx.notify(format!("planned {n} tasks{cost} · enter runs them (p together, s in order) · e edits one{note}"));
                         } else {
                             let name = Path::new(&repo).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                             cx.notify(format!("planned {n} tasks in {name}{cost}"));
@@ -1253,6 +1379,7 @@ impl Agents {
                     Err(e) => cx.notify(format!("plan failed: {e}")),
                 }
             }
+            Msg::Reviewed(id, r) => self.on_reviewed(&id, r, cx),
             Msg::Worker(id, e) => self.on_worker_ev(&id, e),
             Msg::WorkerDone(id, o) => self.on_worker_done(&id, o, cx),
             Msg::Checked(id, stats, conflicts, resolved) => self.on_checked(&id, stats, conflicts, resolved, cx),
@@ -1458,11 +1585,20 @@ impl Agents {
 
     /// Who the planner's cards go to, in turn: the roster's enabled workers whose AI is installed, cheap tier first
     /// (so parallel tasks spread over vendors and their limits). No usable roster: the first installed agent.
-    fn plan_workers(&self) -> Vec<(usize, String)> {
-        let mut w: Vec<crate::config::RosterEntry> = self.roster().into_iter().filter(|w| w.enabled && self.installed(&w.agent).is_some() && !self.paused.contains_key(&w.agent)).collect();
+    fn plan_names(&self) -> Vec<String> {
+        let mut w: Vec<crate::config::RosterEntry> = self.roster().into_iter().filter(|w| w.enabled && self.installed(&w.agent).is_some() && !self.paused.contains_key(&w.agent) && KINDS.iter().any(|k| k.0 == w.agent)).collect();
         w.sort_by_key(|w| roster::TIERS.iter().position(|t| *t == w.tier).unwrap_or(1));
-        let v: Vec<(usize, String)> = w.iter().filter_map(|w| KINDS.iter().position(|k| k.0 == w.agent).map(|i| (i, w.model.clone()))).collect();
-        if v.is_empty() { vec![(self.default_agent(), String::new())] } else { v }
+        if w.is_empty() { vec![KINDS[self.default_agent()].0.to_string()] } else { w.into_iter().map(|w| w.name).collect() }
+    }
+
+    /// A planned card's worker as (agent, model): a roster name, or an agent's own id.
+    fn worker_of(&self, name: &str) -> (usize, String) {
+        if let Some(w) = self.roster().into_iter().find(|w| w.name.eq_ignore_ascii_case(name)) {
+            if let Some(i) = KINDS.iter().position(|k| k.0 == w.agent) {
+                return (i, w.model);
+            }
+        }
+        (KINDS.iter().position(|k| k.0 == name).unwrap_or(self.default_agent()), String::new())
     }
 
     fn add_task(&mut self, title: &str, prompt: &str, agent: usize, model: &str) -> String {
@@ -1553,7 +1689,52 @@ impl Agents {
         self.save();
         let id2 = id.to_string();
         let dirty = dirty.unwrap_or_else(|| git::Dirty::Ask(self.dirty_seen.get(&root.display().to_string()).cloned().unwrap_or_default()));
-        self.spawn(cx, move |send| send(Msg::Started(id2.clone(), git::start_at(&root, &wt, &slug, &id2, hook.as_deref(), base.as_deref(), &dirty))));
+        let port = self.port_for(id);
+        let timeout = Duration::from_secs(self.lead_cfg.gate_timeout_s.max(30) as u64);
+        self.spawn(cx, move |send| {
+            let r = git::start_at(&root, &wt, &slug, &id2, hook.as_deref(), base.as_deref(), &dirty);
+            // the repo's own settings (.oriel/project.toml), read afresh: files git doesn't track, then its setup
+            // (pnpm install…) before any agent starts. A setup that fails takes the worktree with it.
+            let r = r.and_then(|s| {
+                let proj = project::load(&root);
+                send(Msg::Project(root.display().to_string(), proj.clone()));
+                let proj = proj.unwrap_or_default();
+                if !proj.setup.trim().is_empty() {
+                    send(Msg::Progress(id2.clone(), format!("setting up: {}…", proj.setup.trim())));
+                }
+                match project::prepare(&proj, &root, &s.worktree, port, timeout, false) {
+                    Ok(()) => Ok(s),
+                    Err(e) => {
+                        let _ = git::remove(&root, &s.worktree, &s.branch);
+                        Err(e)
+                    }
+                }
+            });
+            send(Msg::Started(id2.clone(), r));
+        });
+    }
+
+    /// The ORIEL_PORT of a task's (or a run's) checkout: the one it has, else the lowest free one in its repo's
+    /// range (project.toml `ports`) that no other open checkout holds.
+    fn port_for(&mut self, id: &str) -> u16 {
+        let (have, repo) = match (self.task(id), self.run_ref(id)) {
+            (Some(t), _) => (t.port, t.repo.clone()),
+            (None, Some(r)) => (r.port, r.repo.clone()),
+            _ => return 0,
+        };
+        let tasks = self.store.tasks.iter().filter(|t| t.id != id && t.port > 0 && t.status != Status::Done).map(|t| t.port);
+        let taken: Vec<u16> = tasks.chain(self.store.runs.iter().filter(|r| r.id != id && r.port > 0 && r.state.open()).map(|r| r.port)).collect();
+        if have > 0 && !taken.contains(&have) {
+            return have;
+        }
+        let range = self.projects.get(&repo).map(|p| p.port_range()).unwrap_or(project::DEFAULT_PORTS);
+        let port = project::free_port(range, &taken);
+        if let Some(t) = self.task_mut(id) {
+            t.port = port;
+        } else if let Some(r) = self.run_mut(id) {
+            r.port = port;
+        }
+        port
     }
 
     fn on_started(&mut self, id: &str, r: Result<git::Started, String>, cx: &mut Cx) {
@@ -1571,13 +1752,32 @@ impl Agents {
             }
             Err(e) => {
                 let headless = self.task(id).is_some_and(|t| t.headless());
+                // the repo's setup failed (project.toml): nothing will start until that's fixed, so it's blocked
+                let setup = e.starts_with("setup ");
+                let first = e.lines().next().unwrap_or("").trim_end_matches(':').to_string();
                 if let Some(t) = self.task_mut(id) {
                     t.status = if headless { Status::Review } else { Status::Todo };
                     t.last.clear();
                     t.error = e.clone();
+                    if headless && setup {
+                        t.blocked = true;
+                        t.questions = vec![format!("{first} — fix the setup in .oriel/project.toml; x discards the task")];
+                    }
                 }
-                cx.notify(format!("couldn't start: {e}"));
-                if headless {
+                if setup {
+                    let mut lines = e.lines();
+                    let l = self.live(id);
+                    lead::upsert(&mut l.log, stream::Entry::error(lines.next().unwrap_or("")));
+                    for line in lines.take(12) {
+                        lead::upsert(&mut l.log, stream::Entry::note(line));
+                    }
+                }
+                cx.notify(format!("couldn't start: {}", if setup { format!("{first} (its card has the rest)") } else { e.clone() }));
+                if headless && setup {
+                    let title = self.task(id).map(|t| t.title.clone()).unwrap_or_default();
+                    cx.alert(crate::alerts::Kind::NeedsYou, format!("{title}: {first}"));
+                    self.event(id, "blocked");
+                } else if headless {
                     self.event_failed(id);
                 } else {
                     self.select(id);
@@ -1602,7 +1802,7 @@ impl Agents {
                 if t.headless() {
                     self.start_worker(id, cx);
                 } else {
-                    self.open_agent(&t, &t.prompt, false, cx);
+                    self.open_agent(&t, &hand_prompt(&t), false, cx);
                 }
             }
         }
@@ -1626,7 +1826,7 @@ impl Agents {
                     cx.notify(format!("{} isn't installed", t.agent));
                     return;
                 };
-                wrap_cmd(&bin, agent_args, &t.id)
+                wrap_cmd(&bin, agent_args, &t.id, t.port)
             }
         };
         let icon = KINDS.iter().find(|k| k.0 == t.agent).map(|k| k.1).unwrap_or("robot");
@@ -1643,7 +1843,7 @@ impl Agents {
         if t.worktree.is_empty() || !Path::new(&t.worktree).is_dir() {
             return;
         }
-        self.mode = Mode::Diff(DiffView { id: id.to_string(), data: None, file: 0, scroll: 0 });
+        self.mode = Mode::Diff(DiffView::new(id));
         let id = id.to_string();
         // a lead-run task merges into its integration branch: check conflicts against that
         let target = if t.run.is_empty() { None } else { self.run_ref(&t.run).map(|r| r.branch.clone()) };
@@ -1740,11 +1940,20 @@ impl Agents {
     /// Feedback for a task: continue its agent's session in the worktree with the comment as the next prompt. For a
     /// lead run it goes to the lead (run_feedback).
     fn comment(&mut self, id: &str, text: &str, cx: &mut Cx) {
-        let text = text.trim();
-        if text.is_empty() {
+        // your ticked line comments (and a second opinion's findings) go along, after what you typed
+        let lines = self.ticked(id);
+        let typed = text.trim().to_string();
+        let msg = review::message(self.notes_of(id), text);
+        if msg.is_empty() {
             return;
         }
-        if self.run_ref(id).is_some() {
+        let text = msg.as_str();
+        if let Some(r) = self.run_ref(id) {
+            if let Some(why) = self.feedback_block(r) {
+                cx.notify(why);
+                return;
+            }
+            self.notes.remove(id);
             return self.run_feedback(id, text, cx);
         }
         let Some(t) = self.task(id).cloned() else { return };
@@ -1766,12 +1975,14 @@ impl Agents {
                 return;
             }
             // your answer unblocks it (worker_again), and a finished run takes the new round in
+            self.notes.remove(id);
             self.revive(&t.run);
             self.worker_again(id, text, cx);
             self.save();
             return;
         }
         let over = t.budget_usd > 0.0 && t.cost_usd >= t.budget_usd;
+        self.notes.remove(id);
         self.open_agent(&t, text, true, cx);
         let tm = self.task_mut(id).unwrap();
         if over {
@@ -1783,7 +1994,7 @@ impl Agents {
         tm.followups += 1;
         tm.question.clear();
         tm.error.clear();
-        tm.last = format!("comment: {}", text.lines().next().unwrap_or(""));
+        tm.last = if typed.is_empty() && lines > 0 { format!("comment: {lines} line comment{}", if lines == 1 { "" } else { "s" }) } else { format!("comment: {}", text.lines().next().unwrap_or("")) };
         self.select(id);
         self.save();
     }
@@ -1796,7 +2007,8 @@ impl Agents {
         }
         self.planning = true;
         let key = repo.root.display().to_string();
-        self.spawn(cx, move |send| send(Msg::Plan(key, run_planner(&bin, &repo.root, &goal))));
+        let names = self.plan_names();
+        self.spawn(cx, move |send| send(Msg::Plan(key, plan_checked(&bin, &repo.root, &goal, &names))));
     }
 
     /// enter on a card: start it, jump to its agent, or review it. Headless workers show their live transcript.
@@ -1929,6 +2141,7 @@ impl Agents {
 
     /// c: feedback for a task or a lead run.
     fn open_comment(&mut self, id: String) {
+        self.comment_back = None;
         let (inp, restored) = match self.drafts.comment.remove(&id) {
             Some(i) => (i, true),
             None => (Input::new("", true), false),
@@ -2160,14 +2373,14 @@ impl Agents {
     /// T: a terminal in the checkout of a run (its integration branch as it stands) or of a task, to try the result
     /// before merging it. The popup keeps a command to start there per repo ("pnpm dev").
     fn open_try(&mut self, id: &str, cx: &mut Cx) {
-        let (dir, title, repo) = if let Some(r) = self.run_ref(id) {
+        let (dir, title, repo, lead) = if let Some(r) = self.run_ref(id) {
             if r.state.active() {
                 cx.notify("the run is still going: its checkout moves with every merge — try it once it's in review (or stopped)");
                 return;
             }
-            (r.worktree.clone(), format!("⚑ {}", r.goal.lines().next().unwrap_or("")), r.repo.clone())
+            (r.worktree.clone(), format!("⚑ {}", r.goal.lines().next().unwrap_or("")), r.repo.clone(), true)
         } else if let Some(t) = self.task(id) {
-            (t.worktree.clone(), t.title.clone(), t.repo.clone())
+            (t.worktree.clone(), t.title.clone(), t.repo.clone(), false)
         } else {
             return;
         };
@@ -2175,8 +2388,14 @@ impl Agents {
             cx.notify("nothing to try: its checkout is gone");
             return;
         }
-        let cmd = self.store.try_cmds.get(&repo).cloned().unwrap_or_default();
-        self.mode = Mode::Try(TryView { id: id.to_string(), dir: PathBuf::from(dir), title, input: Input::new(&cmd, false) });
+        // what you ran last in this repo, else its project.toml `run`
+        let proj = self.projects.get(&repo).cloned().unwrap_or_default();
+        let cmd = self.store.try_cmds.get(&repo).cloned().unwrap_or_else(|| proj.run.trim().to_string());
+        // workers' checkouts got the setup when they were made; the lead's own never did
+        let setup = if lead { proj.setup.trim().to_string() } else { String::new() };
+        let port = self.port_for(id);
+        self.save();
+        self.mode = Mode::Try(TryView { id: id.to_string(), dir: PathBuf::from(dir), title, input: Input::new(&cmd, false), setup, port });
     }
 
     fn try_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
@@ -2186,17 +2405,25 @@ impl Agents {
             KeyCode::Enter => {
                 let repo = self.run_ref(&v.id).map(|r| r.repo.clone()).or_else(|| self.task(&v.id).map(|t| t.repo.clone())).unwrap_or_default();
                 let cmd = v.input.text.trim().to_string();
-                if cmd.is_empty() {
+                // remembered only when it isn't what project.toml says (then editing the file keeps applying)
+                if cmd == self.projects.get(&repo).map(|p| p.run.trim().to_string()).unwrap_or_default() {
                     self.store.try_cmds.remove(&repo);
                 } else {
                     self.store.try_cmds.insert(repo.clone(), cmd.clone());
                 }
                 self.save();
-                // a JS checkout borrows your node_modules, so `pnpm dev` runs as it does in your own
-                let (id, dir, title) = (v.id, v.dir, v.title);
+                let l = TryLaunch { id: v.id, dir: v.dir, title: v.title, setup: project::with_port(&v.setup, v.port), cmd: project::with_port(&cmd, v.port), port: v.port };
                 self.spawn(cx, move |send| {
-                    git::link_deps(Path::new(&repo), &dir);
-                    send(Msg::TryReady(id, dir, cmd, title));
+                    // the files git doesn't track (.env…); a JS checkout without a setup borrows your node_modules, so
+                    // `pnpm dev` runs as it does in your own
+                    let proj = project::load(Path::new(&repo)).unwrap_or_default();
+                    project::copy_files(&proj, Path::new(&repo), &l.dir);
+                    if proj.setup.trim().is_empty() {
+                        git::link_deps(Path::new(&repo), &l.dir);
+                    } else if !l.setup.is_empty() {
+                        git::unlink_deps(&l.dir); // its setup installs its own
+                    }
+                    send(Msg::TryReady(l));
                 });
             }
             _ => {
@@ -2207,17 +2434,17 @@ impl Agents {
         true
     }
 
-    fn open_try_tab(&mut self, id: &str, dir: PathBuf, cmd: &str, title: &str, cx: &mut Cx) {
-        let name = format!("try · {}", ui_short(title, 18));
+    fn open_try_tab(&mut self, l: TryLaunch, cx: &mut Cx) {
+        let name = format!("try · {}", ui_short(&l.title, 18));
         let pane = match &self.fake_agent {
             // tests: a no-op instead of a real shell
-            Some((prog, args)) => crate::panes::term::Term::new(&name, "term", prog, args.clone(), Some(dir)),
+            Some((prog, args)) => crate::panes::term::Term::new(&name, "term", prog, args.clone(), Some(l.dir)),
             None => {
-                let (prog, args) = try_shell(cx.config, cmd);
-                crate::panes::term::Term::new(&name, "term", &prog, args, Some(dir))
+                let (prog, args) = try_shell(cx.config, &l.setup, &l.cmd, l.port);
+                crate::panes::term::Term::new(&name, "term", &prog, args, Some(l.dir))
             }
         };
-        let tag = try_tag(id);
+        let tag = try_tag(&l.id);
         cx.act(Action::CloseTag(tag.clone()));
         cx.act(Action::OpenTagged { pane: Box::new(pane), tag, name, focus: true });
     }
@@ -2384,6 +2611,8 @@ impl Agents {
             KeyCode::Char('s') if run.state.active() => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::StopRun }),
             KeyCode::Esc => self.lead_focus = false,
             KeyCode::Char('w') => self.mode = Mode::Watch(WatchView { run: run.id, sel: 0 }),
+            // its plan waits for you: the cards first
+            KeyCode::Enter if !run.held.is_empty() => self.open_plan_review(&run.id),
             KeyCode::Enter => self.mode = Mode::Log(LogView { target: LogTarget::Lead(run.id), scroll: 0, back: None }),
             KeyCode::Char('d') if !run.branch.is_empty() => self.open_run_diff(&run.id, cx),
             KeyCode::Char('m') if !run.state.active() && !run.branch.is_empty() => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::MergeRun }),
@@ -2585,74 +2814,6 @@ impl Agents {
         }
     }
 
-    fn diff_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
-        let Mode::Diff(v) = &self.mode else { return false };
-        // the same guard as on the board: no second git step for a task while one is running
-        let id = v.id.clone();
-        if matches!(k.code, KeyCode::Char('m' | 'x' | 'c')) && self.task(&id).is_some() {
-            if let Err(why) = self.can_act(&id) {
-                cx.notify(why);
-                return true;
-            }
-        }
-        let Mode::Diff(v) = &mut self.mode else { return false };
-        let nfiles = v.data.as_ref().and_then(|d| d.as_ref().ok()).map(|d| d.files.len()).unwrap_or(0);
-        match k.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('d') => self.mode = Mode::Board,
-            KeyCode::Up | KeyCode::Char('k') => {
-                v.file = v.file.saturating_sub(1);
-                v.scroll = 0;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                v.file = (v.file + 1).min(nfiles.saturating_sub(1));
-                v.scroll = 0;
-            }
-            KeyCode::PageDown | KeyCode::Char(' ') => v.scroll += 20,
-            KeyCode::PageUp => v.scroll = v.scroll.saturating_sub(20),
-            KeyCode::Char('J') => v.scroll += 1,
-            KeyCode::Char('K') => v.scroll = v.scroll.saturating_sub(1),
-            KeyCode::Home | KeyCode::Char('g') => v.scroll = 0,
-            KeyCode::Char('R') => {
-                let id = v.id.clone();
-                if self.run_ref(&id).is_some() {
-                    self.open_run_diff(&id, cx);
-                } else {
-                    self.open_diff(&id, cx);
-                }
-            }
-            KeyCode::Char('m') => {
-                let id = v.id.clone();
-                let what = if self.run_ref(&id).is_some() { Pending::MergeRun } else { Pending::Merge };
-                self.mode = Mode::Confirm(Confirm { id, what });
-            }
-            KeyCode::Char('x') => {
-                let id = v.id.clone();
-                let what = if self.run_ref(&id).is_some() { Pending::DiscardRun } else { Pending::Discard };
-                self.mode = Mode::Confirm(Confirm { id, what });
-            }
-            KeyCode::Char('c') => {
-                let id = v.id.clone();
-                match self.comment_block(&id) {
-                    None => self.open_comment(id),
-                    Some(why) => cx.notify(why),
-                }
-            }
-            KeyCode::Char('T') => {
-                let id = v.id.clone();
-                self.open_try(&id, cx);
-            }
-            KeyCode::Enter => {
-                let id = v.id.clone();
-                if self.live(&id).pane {
-                    let tag = self.task(&id).map(|t| t.tag()).unwrap_or_default();
-                    cx.act(Action::FocusTag(tag));
-                }
-            }
-            _ => return false,
-        }
-        true
-    }
-
     fn form_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
         let Mode::Form(mut form) = std::mem::replace(&mut self.mode, Mode::Board) else { return false };
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -2775,11 +2936,65 @@ fn ui_short(s: &str, n: usize) -> String {
     crate::ui::fit(s, n)
 }
 
-/// The lead planner: a headless read-only Claude run that splits a goal into independent task cards.
-fn run_planner(bin: &Path, repo: &Path, goal: &str) -> Result<(Vec<(String, String)>, f64), String> {
-    let prompt = format!(
-        "You are the lead planner for several coding agents that will work in parallel on this repository, each alone in its own git worktree.\n\nGoal: {goal}\n\nLook at the code as much as you need, then reply with ONLY a JSON array (no prose, no code fence) of 2 to 6 independent tasks. Each item: {{\"title\": \"short imperative title, under 50 characters\", \"prompt\": \"complete, self-contained instructions for one agent: what to change, where, and how to check it works\"}}. Tasks must not depend on each other or edit the same lines."
+//// What the planner (P) came back with, checked by plan.rs like a lead's plan.
+pub(super) struct PlanOut {
+    /// In an order their depends_on allow; `worker` set when the planner's thread assigned one.
+    items: Vec<plan::Item>,
+    /// plan.rs's notes (a scaffold the rest waits for, two tasks one after the other)
+    notes: Vec<String>,
+    /// What still doesn't check out after a second go: the cards arrive, but unmarked.
+    problems: Vec<String>,
+    cost: f64,
+}
+
+/// P: the planner splits the goal into cards that own files and say how to check them, and plan.rs checks them
+/// (disjoint files for what runs at the same time, hotspots in one scaffold task, small sizes). A plan that
+/// doesn't check out goes back to the planner once with what's wrong. `names` = who the cards go to, in turn.
+fn plan_checked(bin: &Path, repo: &Path, goal: &str, names: &[String]) -> Result<PlanOut, String> {
+    let shell = git::gate_shell().2;
+    plan_checked_with(&|feedback: &str| run_planner(bin, repo, goal, shell, feedback), names)
+}
+
+/// `plan_checked` with any planner (`feedback` → its cards and what they cost).
+fn plan_checked_with(planner: &dyn Fn(&str) -> Result<(Vec<plan::Item>, f64), String>, names: &[String]) -> Result<PlanOut, String> {
+    let assign = |items: &mut Vec<plan::Item>| {
+        for (i, it) in items.iter_mut().enumerate() {
+            it.worker = names[i % names.len().max(1)].clone();
+        }
+    };
+    let (mut items, mut cost) = planner("")?;
+    assign(&mut items);
+    let errs = match plan::check(items.clone(), &[], names) {
+        Ok(c) => return Ok(PlanOut { items: c.items, notes: c.notes, problems: vec![], cost }),
+        Err(e) => e,
+    };
+    let before: Vec<serde_json::Value> = items.iter().map(|it| serde_json::json!({"id": it.key, "title": it.title, "owns": it.owns, "depends_on": it.depends_on})).collect();
+    let feedback = format!("Your last list was rejected:\n- {}\nIt was: {}\nFix those problems and reply with the whole list again.", errs.join("\n- "), serde_json::Value::Array(before));
+    match planner(&feedback) {
+        Ok((mut again, more)) => {
+            cost += more;
+            assign(&mut again);
+            match plan::check(again.clone(), &[], names) {
+                Ok(c) => Ok(PlanOut { items: c.items, notes: c.notes, problems: vec![], cost }),
+                Err(e) => Ok(PlanOut { items: again, notes: vec![], problems: e, cost }),
+            }
+        }
+        Err(_) => Ok(PlanOut { items, notes: vec![], problems: errs, cost }),
+    }
+}
+
+/// The lead planner: a headless read-only Claude run that splits a goal into task cards. `feedback` = what was
+/// wrong with its last answer.
+fn run_planner(bin: &Path, repo: &Path, goal: &str, shell: &str, feedback: &str) -> Result<(Vec<plan::Item>, f64), String> {
+    let mut prompt = format!(
+        "You are the lead planner for several coding agents that will work in parallel on this repository, each alone in its own git worktree.\n\nGoal: {goal}\n\n\
+         Look at the code as much as you need, then reply with ONLY a JSON array (no prose, no code fence) of 2 to 6 tasks. Each item: {{\"id\": \"a short id\", \"title\": \"short imperative title, under 50 characters\", \"prompt\": \"complete, self-contained instructions for one agent: what to change, where, and how to check it works\", \"owns\": [\"globs of the only files it may edit, e.g. src/cli/**\"], \"acceptance\": \"a {shell} command, run from the repo root, that passes once it's done (or empty)\", \"depends_on\": [\"ids of tasks it must wait for\"]}}.\n\
+         Tasks that can run at the same time must not own the same files. Manifests, lockfiles, module registries (mod.rs, lib.rs, index.ts) and migrations belong to ONE task that the others depend on. Prefer independent tasks, each touching at most 8 files."
     );
+    if !feedback.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(feedback);
+    }
     let p = bin.to_string_lossy().to_string();
     let args = ["-p", &prompt, "--output-format", "json", "--permission-mode", "plan", "--max-turns", "8"];
     let mut cmd = if cfg!(windows) && (p.to_lowercase().ends_with(".cmd") || p.to_lowercase().ends_with(".bat")) {
@@ -2803,19 +3018,24 @@ fn run_planner(bin: &Path, repo: &Path, goal: &str) -> Result<(Vec<(String, Stri
     })
 }
 
-/// Pull `[{title, prompt}]` out of `claude -p --output-format json` output.
-pub fn parse_plan(stdout: &str) -> Option<(Vec<(String, String)>, f64)> {
+/// Pull `[{id, title, prompt, owns, acceptance, depends_on}]` out of `claude -p --output-format json` output (a
+/// card without a prompt gets its title).
+pub fn parse_plan(stdout: &str) -> Option<(Vec<plan::Item>, f64)> {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
     let text = v["result"].as_str()?;
     let (a, b) = (text.find('[')?, text.rfind(']')?);
     let arr: serde_json::Value = serde_json::from_str(text.get(a..=b)?).ok()?;
-    let items: Vec<(String, String)> = arr
+    let items: Vec<plan::Item> = arr
         .as_array()?
         .iter()
-        .filter_map(|it| {
-            let title = it["title"].as_str()?.trim().to_string();
-            let prompt = it["prompt"].as_str().unwrap_or(&title).trim().to_string();
-            (!title.is_empty()).then_some((title, prompt))
+        .enumerate()
+        .map(|(i, it)| plan::parse_item(it, i))
+        .filter(|it| !it.title.is_empty())
+        .map(|mut it| {
+            if it.goal.is_empty() {
+                it.goal = it.title.clone();
+            }
+            it
         })
         .collect();
     Some((items, v["total_cost_usd"].as_f64().unwrap_or(0.0)))
@@ -2928,6 +3148,7 @@ impl Pane for Agents {
             Mode::Batch(_) => self.batch_key(k, cx),
             Mode::Dirty(_) => self.dirty_key(k, cx),
             Mode::Try(_) => self.try_key(k, cx),
+            Mode::PlanReview(_) => self.plan_review_key(k, cx),
             Mode::Confirm(_) => {
                 let Mode::Confirm(c) = std::mem::replace(&mut self.mode, Mode::Board) else { return true };
                 // throwing something away (or stopping a run) takes a real y; enter only confirms merges
@@ -2950,6 +3171,14 @@ impl Pane for Agents {
                 let back = |s: &mut Self, id: Option<String>, inp: Input| s.mode = if plan { Mode::Plan(inp) } else { Mode::Comment(id.unwrap_or_default(), inp) };
                 match k.code {
                     KeyCode::Esc => {
+                        // opened from the diff view (its comments): back there
+                        if let Some(back) = id.clone().filter(|i| self.comment_back.as_deref() == Some(i.as_str())) {
+                            if self.run_ref(&back).is_some() {
+                                self.open_run_diff(&back, cx);
+                            } else {
+                                self.open_diff(&back, cx);
+                            }
+                        }
                         // kept for the next P / c on the same card
                         if !inp.text.trim().is_empty() {
                             match id {
@@ -3020,8 +3249,12 @@ impl Pane for Agents {
             self.set_draft_aside();
         }
         self.restored = false;
+        if matches!(self.mode, Mode::PlanReview(_)) {
+            return self.plan_review_paste(text);
+        }
         match &mut self.mode {
             Mode::Batch(v) if v.editing => v.gate.insert(text.trim()),
+            Mode::Diff(DiffView { typing: Some(i), .. }) => i.insert(text),
             Mode::Try(v) => v.input.insert(text.trim()),
             // a form asked for before the repo was known takes what's pasted meanwhile (/task, /lead)
             Mode::Board if self.pending_form.is_some() => {
@@ -3113,19 +3346,29 @@ impl Pane for Agents {
             (MouseEventKind::Down(MouseButton::Left), Some(Hit::Column(c))) => self.col = c,
             (MouseEventKind::Down(MouseButton::Left), Some(Hit::File(i))) => {
                 if let Mode::Diff(v) = &mut self.mode {
-                    v.file = i;
-                    v.scroll = 0;
+                    if v.typing.is_none() {
+                        v.set_file(i);
+                    }
+                }
+            }
+            // a click puts the cursor on that line (c then comments on it)
+            (MouseEventKind::Down(MouseButton::Left), Some(Hit::DiffLine(i))) => {
+                if let Mode::Diff(v) = &mut self.mode {
+                    if v.typing.is_none() {
+                        v.cursor = i;
+                        v.step(0);
+                    }
                 }
             }
             (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp, Some(h)) => {
                 let down = ev.kind == MouseEventKind::ScrollDown;
                 match (&mut self.mode, h) {
                     (Mode::Diff(v), Hit::File(_)) => {
-                        let n = v.data.as_ref().and_then(|d| d.as_ref().ok()).map(|d| d.files.len()).unwrap_or(0);
-                        v.file = if down { (v.file + 1).min(n.saturating_sub(1)) } else { v.file.saturating_sub(1) };
-                        v.scroll = 0;
+                        let n = v.files().len();
+                        v.set_file(if down { (v.file + 1).min(n.saturating_sub(1)) } else { v.file.saturating_sub(1) });
                     }
-                    (Mode::Diff(v), _) => v.scroll = if down { v.scroll + 3 } else { v.scroll.saturating_sub(3) },
+                    // the wheel moves the cursor (the view follows it)
+                    (Mode::Diff(v), _) => v.step(if down { 3 } else { -3 }),
                     (Mode::Board, Hit::Card(c, _) | Hit::Column(c)) => {
                         self.col = c;
                         let n = self.column(c).len();

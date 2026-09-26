@@ -139,8 +139,12 @@ impl Agents {
         let proto = if run.protocol == "mcp" { "MCP tools" } else { "text protocol" };
         let title = format!("⚑ lead · {}{} · {}", run.agent, if run.model.is_empty() { String::new() } else { format!(" {}", run.model) }, proto);
         let feedback = if self.feedback_block(&run).is_none() { "c feedback · " } else { "" };
-        let hints = if !focus {
+        let hints = if !focus && !run.held.is_empty() {
+            "↑ then enter: its plan waits for you".to_string()
+        } else if !focus {
             "↑ select".to_string()
+        } else if !run.held.is_empty() {
+            "enter review the plan · w watch · s stop".to_string()
         } else if run.state.active() {
             "enter transcript · w watch · s stop · d diff so far".to_string()
         } else if run.state == RunState::Stopped && run.branch.is_empty() {
@@ -150,7 +154,7 @@ impl Agents {
         } else {
             format!("enter transcript · {feedback}d review · T try it · m merge · x discard")
         };
-        let border = if focus { t.accent } else if run.state == RunState::Review { t.shine } else { t.frame };
+        let border = if focus { t.accent } else if run.state == RunState::Review || !run.held.is_empty() { t.shine } else { t.frame };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -251,6 +255,7 @@ impl Agents {
             parallel: Input::new(&self.lead_cfg.max_parallel.clamp(1, 5).to_string(), false),
             budget: Input::new(&format!("{:.2}", self.lead_cfg.run_budget_usd), false),
             gate: Input::new(&self.gate_prefill().0, false),
+            approve: self.store.approve_plan,
             retry: None,
             err: String::new(),
         }
@@ -264,7 +269,7 @@ impl Agents {
             let agent = KINDS[form.agent].0;
             let par = form.parallel.text.trim().parse::<u32>().unwrap_or(3).clamp(1, 5);
             let budget = form.budget.text.trim().trim_start_matches('$').parse::<f64>().unwrap_or(s.lead_cfg.run_budget_usd).max(0.0);
-            match s.start_run(&form.goal.text, agent, &form.model.text, par, budget, &form.gate.text, cx) {
+            match s.start_run(&form.goal.text, agent, &form.model.text, par, budget, &form.gate.text, form.approve, cx) {
                 Ok(_) => {
                     // it replaces a run that never started
                     if let Some(old) = &form.retry {
@@ -300,8 +305,8 @@ impl Agents {
                 self.open_prompt_pick(&text);
                 return true;
             }
-            KeyCode::Tab => form.field = (form.field + 1) % 7,
-            KeyCode::BackTab => form.field = (form.field + 6) % 7,
+            KeyCode::Tab => form.field = (form.field + 1) % 8,
+            KeyCode::BackTab => form.field = (form.field + 7) % 8,
             KeyCode::Up | KeyCode::Down if form.field == 0 && self.recall_key(k, &mut form.goal) => {}
             _ => {
                 let used = match form.field {
@@ -314,11 +319,12 @@ impl Agents {
                 };
                 if !used {
                     match k.code {
-                        KeyCode::Enter if form.field == 6 => {
+                        KeyCode::Enter if form.field == 7 => {
                             submit(self, form, cx);
                             return true;
                         }
-                        KeyCode::Enter | KeyCode::Down => form.field = (form.field + 1).min(6),
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 6 => form.approve = !form.approve,
+                        KeyCode::Enter | KeyCode::Down => form.field = (form.field + 1).min(7),
                         KeyCode::Up => form.field = form.field.saturating_sub(1),
                         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 1 => {
                             let any = self.agents.iter().any(|a| a.1.is_some()) && self.fake_lead.is_none();
@@ -342,7 +348,7 @@ impl Agents {
     pub(super) fn draw_lead_form(&self, f: &mut Frame, area: Rect, cx: &Cx) {
         let t = cx.theme;
         let Mode::LeadForm(form) = &self.mode else { return };
-        let inner = ui::popup(f, area, 92, 29, if form.retry.is_some() { "⚑ lead run · again" } else { "⚑ new lead run" }, t);
+        let inner = ui::popup(f, area, 92, 31, if form.retry.is_some() { "⚑ lead run · again" } else { "⚑ new lead run" }, t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let repo = self.repo.as_ref().map(|r| format!("{} · a lead agent plans the goal and hands it to workers on a new branch off {}", r.name, r.branch)).unwrap_or_default();
         f.render_widget(Paragraph::new(Span::styled(ui::fit(&repo, inner.width as usize), ui::muted(t))), Rect { height: 1, ..inner });
@@ -406,7 +412,23 @@ impl Agents {
         let r = ui::frame(f, gr, "gate (runs on every merged result)", note, form.field == 5, t);
         let ph = if prefill.is_empty() { why.clone() } else { "none — merges get only a conflict check".to_string() };
         super::view::draw_input(f, r, &form.gate, &ph, form.field == 5, t);
-        y += 4;
+        y += 3;
+        // approve the plan first: the lead's tasks come to you as cards before any worker starts
+        if y < bottom {
+            let on = form.field == 6;
+            let (box_, st) = if form.approve { ("[x]", bold(t.accent)) } else { ("[ ]", Style::default().fg(t.fg)) };
+            let mut spans = vec![
+                Span::styled(if on { "› " } else { "  " }, bold(t.accent)),
+                Span::styled(box_, if on { st.bg(tint(t.accent, 0.2)) } else { st }),
+                Span::styled(" approve the plan first", if on { bold(t.fg) } else { Style::default().fg(t.fg) }),
+                Span::styled(" — its tasks come to you as cards (x drops · e edits · a starts them)", ui::muted(t)),
+            ];
+            if on {
+                spans.push(Span::styled("  space toggles", ui::muted(t)));
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)), Rect { y, height: 1, ..inner });
+        }
+        y += 2;
         // the roster, briefly
         if y + 1 < bottom {
             let roster = self.roster();
@@ -426,7 +448,7 @@ impl Agents {
             y += 2;
         }
         if y < bottom {
-            let btn = if form.field == 6 { Span::styled(" start lead run ", Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD)) } else { Span::styled("[start lead run]", bold(t.accent)) };
+            let btn = if form.field == 7 { Span::styled(" start lead run ", Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD)) } else { Span::styled("[start lead run]", bold(t.accent)) };
             let mut spans = vec![btn];
             if !form.err.is_empty() {
                 spans.push(Span::styled(format!("   {}", form.err), Style::default().fg(t.danger)));

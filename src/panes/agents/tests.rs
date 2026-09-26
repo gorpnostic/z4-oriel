@@ -295,11 +295,19 @@ fn agents_cost_from_transcript_dedupes() {
     assert!((c.usd - (1.0 + 0.1 + 1.2)).abs() < 1e-6, "{}", c.usd);
 }
 
+/// The planner's cards (P), as its thread would send them: no worker yet (the board spreads them).
+pub(super) fn plan_out(items: &[(&str, &str)], cost: f64) -> PlanOut {
+    let items = items.iter().enumerate().map(|(i, (t, g))| plan::Item { key: format!("t{}", i + 1), title: t.to_string(), goal: g.to_string(), ..Default::default() }).collect();
+    PlanOut { items, notes: vec![], problems: vec![], cost }
+}
+
 #[test]
 fn agents_plan_parse_and_args() {
-    let out = r#"{"type":"result","result":"Here you go:\n[{\"title\":\"Fix resize\",\"prompt\":\"Do it\"},{\"title\":\"Add tests\"}]","total_cost_usd":0.12}"#;
+    let out = r#"{"type":"result","result":"Here you go:\n[{\"title\":\"Fix resize\",\"prompt\":\"Do it\",\"owns\":[\"src/term.rs\"],\"acceptance\":\"cargo test term\"},{\"id\":\"t\",\"title\":\"Add tests\",\"depends_on\":[\"t1\"]}]","total_cost_usd":0.12}"#;
     let (items, usd) = parse_plan(out).unwrap();
-    assert_eq!(items, vec![("Fix resize".into(), "Do it".into()), ("Add tests".into(), "Add tests".into())]);
+    assert_eq!(items.iter().map(|i| (i.key.as_str(), i.title.as_str(), i.goal.as_str())).collect::<Vec<_>>(), vec![("t1", "Fix resize", "Do it"), ("t", "Add tests", "Add tests")]);
+    assert_eq!((items[0].owns.clone(), items[0].acceptance.as_str()), (vec!["src/term.rs".to_string()], "cargo test term"));
+    assert_eq!(items[1].depends_on, vec!["t1".to_string()]);
     assert_eq!(usd, 0.12);
     assert_eq!(agent_args("claude", "sonnet", "go", false), vec!["--model", "sonnet", "go"]);
     assert_eq!(agent_args("claude", "", "more", true), vec!["--continue", "more"]);
@@ -398,7 +406,7 @@ fn agents_snapshots_board_form_diff() {
     let id = p.store.tasks[4].id.clone();
     p.store.tasks[4].branch = "oriel/usage-sink-status-li-t4".into();
     p.store.tasks[4].base_branch = "master".into();
-    p.mode = Mode::Diff(DiffView { id, data: Some(Ok(git::Diff { files, conflicts: Some(vec![]), target: "master".into() })), file: 0, scroll: 0 });
+    p.mode = Mode::Diff(DiffView { data: Some(Ok(git::Diff { files, conflicts: Some(vec![]), target: "master".into() })), ..DiffView::new(&id) });
     let diff = snap(&mut k, &mut p, "diff");
     println!("{diff}");
     assert!(diff.contains("merges cleanly") && diff.contains("serde_json::Value") && diff.contains("usage.rs"));
@@ -551,7 +559,7 @@ fn agents_marks_and_plans_stay_with_their_repo() {
     let here = p.repo_key();
     let other = if cfg!(windows) { r"C:\code\website" } else { "/home/you/code/website" }.to_string();
     p.col = 2;
-    with_cx(&mut k, |cx| p.on_msg(Msg::Plan(other.clone(), Ok((vec![("Hero image".into(), "add it".into())], 0.0))), cx));
+    with_cx(&mut k, |cx| p.on_msg(Msg::Plan(other.clone(), Ok(plan_out(&[("Hero image", "add it")], 0.0))), cx));
     assert_eq!(p.store.tasks.iter().find(|t| t.title == "Hero image").map(|t| t.repo.clone()), Some(other.clone()));
     assert_eq!(p.col, 2, "the cursor stayed");
     assert!(k.notices().iter().any(|n| n.contains("planned 1 tasks in website")), "{:?}", k.notices());
@@ -572,7 +580,7 @@ fn agents_busy_task_refuses_and_done_stays_done() {
     let id = id_of(&p, "Usage sink status line");
     p.task_mut(&id).unwrap().worktree = dir.display().to_string();
     p.live(&id).busy = true;
-    p.mode = Mode::Diff(DiffView { id: id.clone(), data: None, file: 0, scroll: 0 });
+    p.mode = Mode::Diff(DiffView::new(&id));
     for key in ['c', 'm', 'x'] {
         k.key(&mut p, KeyCode::Char(key));
         assert!(matches!(p.mode, Mode::Diff(_)), "{key} refused in the diff view");
