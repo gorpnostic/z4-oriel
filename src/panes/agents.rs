@@ -13,7 +13,7 @@
 mod batch;
 mod cost;
 mod git;
-mod input;
+pub(crate) mod input;
 mod lead;
 #[cfg(test)]
 mod lead_tests;
@@ -34,6 +34,19 @@ pub fn usage_limits() -> Vec<(String, roster::Window)> {
     let now = crate::panes::files::clock::now_secs();
     let l = roster::read(&roster::LimitPaths::real(), now);
     l.claude.into_iter().map(|w| ("claude".to_string(), w)).chain(l.codex.into_iter().map(|w| ("codex".to_string(), w))).collect()
+}
+
+/// For the settings app: which of KINDS this machine has.
+pub fn installed_kinds() -> Vec<&'static str> {
+    KINDS.iter().filter(|k| find_agent(k.0).is_some()).map(|k| k.0).collect()
+}
+
+/// For the settings app (a background thread): the git repo `dir` is in (its top folder), and the gate a merge
+/// there runs when the config names none.
+pub fn repo_and_gate(dir: &Path) -> Option<(PathBuf, Option<String>)> {
+    let root = git::repo_info(dir).ok()?.root;
+    let gate = git::detect_gate(&root);
+    Some((root, gate))
 }
 
 /// "2h 10m" until a unix time.
@@ -421,6 +434,7 @@ impl Agents {
         a.lead_cfg = cfg.lead.clone();
         a.roster = cfg.roster.clone();
         a.stagger = Duration::from_secs(cfg.lead.stagger_s as u64);
+        a.hung_after = Duration::from_secs(cfg.lead.hung_after_s.max(60) as u64);
         a.limit_paths = Some(roster::LimitPaths::real());
         a
     }
@@ -1850,6 +1864,14 @@ impl Pane for Agents {
     fn poll(&mut self, cx: &mut Cx) {
         self.sync(cx);
     }
+    /// The roster or [lead] changed elsewhere (a hand edit, another window, this app's own save coming back): the
+    /// next roster call, worker start and lead run use it.
+    fn config_changed(&mut self, cfg: &crate::config::Config) {
+        self.lead_cfg = cfg.lead.clone();
+        self.roster = cfg.roster.clone();
+        self.stagger = Duration::from_secs(cfg.lead.stagger_s as u64);
+        self.hung_after = Duration::from_secs(cfg.lead.hung_after_s.max(60) as u64);
+    }
     fn tagged_panes(&mut self, live: &[(String, Option<Activity>)]) {
         let mine: Vec<(String, Option<Activity>)> = live.iter().filter(|(t, _)| t.starts_with("agent-task:")).cloned().collect();
         if self.tagged.as_ref() != Some(&mine) {
@@ -1875,7 +1897,7 @@ impl Pane for Agents {
             Mode::Form(_) => self.form_key(k, cx),
             Mode::Repo(_) => self.picker_key(k, cx),
             Mode::LeadForm(_) => self.lead_form_key(k, cx),
-            Mode::Roster(_) => self.roster_key(k),
+            Mode::Roster(_) => self.roster_key(k, cx),
             Mode::Watch(_) => self.watch_key(k, cx),
             Mode::Log(_) => self.log_key(k, cx),
             Mode::Batch => {

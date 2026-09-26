@@ -875,6 +875,12 @@ impl Pane for Ais {
     fn icon(&self) -> &'static str {
         "gauge"
     }
+    /// A new Ollama address (settings › providers) is used from the next scan.
+    fn config_changed(&mut self, cfg: &crate::config::Config) {
+        if self.live {
+            self.paths.ollama = cfg.ai.ollama_url.clone();
+        }
+    }
 
     fn subtitle(&self) -> Option<String> {
         let (inst, checked) = self.installed_count();

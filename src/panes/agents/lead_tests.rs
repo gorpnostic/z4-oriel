@@ -241,8 +241,10 @@ fn agents_batch_runs_without_a_lead() {
     assert!(r.manual && r.merged == 3, "{r:?}
 {:#?}", p.store.tasks);
     assert!(r.branch.contains("batch-"), "{}", r.branch);
-    let first = seen.lock().unwrap().first().cloned().unwrap_or_default();
-    assert!(first.contains(&c), "the urgent one started first: {first}");
+    // two start together (the order their threads report in is up to the OS): the urgent one is one of them,
+    // though it was added last
+    let first_two: Vec<String> = seen.lock().unwrap().iter().take(2).cloned().collect();
+    assert!(first_two.iter().any(|s| s.contains(&c)), "the urgent one started first: {first_two:?}");
     assert_eq!(p.task(&b).unwrap().attempts, 1, "b failed the gate once and went back to its worker");
     for (f, want) in [("a.txt", "aaa"), ("b.txt", "fixed"), ("c.txt", "sea")] {
         assert_eq!(sh(&repo, &["show", &format!("{}:{f}", r.branch)]), want);
@@ -792,5 +794,58 @@ fn agents_lead_live_claude_haiku() {
     let hello = sh(&repo, &["show", &format!("{}:hello.txt", r.branch)]);
     assert_eq!(hello.trim(), "hi");
     assert_eq!(r.protocol, "mcp");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Roster edits and the lead choice are saved through the app (its one config writer), each touching only its own
+/// fields; and an open agents app follows a roster or [lead] changed elsewhere (a hand edit, another window).
+#[test]
+fn agents_config_goes_through_the_app() {
+    let dir = scratch("lead-config");
+    let mut k = Kit::new();
+    k.config.lead.gate = "cargo check".into(); // set by hand: not the lead form's to touch
+    let mut p = Agents::with_paths(Paths { agents: dir.join("agents"), wt: dir.join("wt") });
+    p.roster = roster();
+    k.key(&mut p, KeyCode::Char('R'));
+    k.key(&mut p, KeyCode::Char(' ')); // w1 off
+    assert_eq!(k.apply_config(&mut p), 1, "saved right away, through the app");
+    assert_eq!((k.config.roster.len(), k.config.roster[0].enabled), (3, false));
+    // the lead choice: agent, model, parallel and budget, nothing else
+    p.lead_cfg.agent = "codex".into();
+    p.lead_cfg.max_parallel = 2;
+    p.lead_cfg.gate = String::new();
+    let mut acts = vec![];
+    {
+        let mut cx = crate::pane::Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut acts, focused: true, time: 1.0 };
+        p.save_config(&mut cx);
+    }
+    k.actions.extend(acts);
+    assert_eq!(k.apply_config(&mut p), 1);
+    assert_eq!((k.config.lead.agent.as_str(), k.config.lead.max_parallel, k.config.lead.gate.as_str()), ("codex", 2, "cargo check"));
+    assert_eq!(p.lead_cfg.gate, "cargo check", "the pane took the saved [lead] back");
+    // removing every worker saves an empty roster (= the defaults from what's installed), not nothing
+    for _ in 0..3 {
+        k.key(&mut p, KeyCode::Char('x'));
+    }
+    assert_eq!(k.apply_config(&mut p), 3);
+    assert!(k.config.roster.is_empty() && p.roster.is_empty());
+    // a roster edited somewhere else reaches the open pane
+    let mut cfg = k.config.clone();
+    cfg.roster = roster();
+    cfg.lead.stagger_s = 0;
+    cfg.lead.hung_after_s = 120;
+    p.config_changed(&cfg);
+    assert_eq!((p.roster().len(), p.stagger, p.hung_after), (3, Duration::ZERO, Duration::from_secs(120)));
+    // a budget that doesn't read is said in the form, not quietly saved as $1.50
+    k.config = cfg;
+    k.key(&mut p, KeyCode::Enter);
+    for _ in 0..6 {
+        k.key(&mut p, KeyCode::Tab);
+    }
+    k.typ(&mut p, ".5");
+    k.key_mod(&mut p, KeyCode::Char('s'), crossterm::event::KeyModifiers::CONTROL);
+    assert_eq!(k.apply_config(&mut p), 0, "nothing saved");
+    let s = k.render(&mut p, 150, 44);
+    assert!(s.contains("isn't an amount like 1.50"), "{s}");
     let _ = std::fs::remove_dir_all(&dir);
 }

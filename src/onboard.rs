@@ -1,5 +1,6 @@
-//! First run: a welcome screen, three quick setup steps (theme, icons, AIs) and an interactive tour that waits
-//! for you to actually do each thing. Replay any time: palette → "take the tour", or `oriel --tour`.
+//! First run: a welcome screen, a few quick setup steps (theme, icons, folders, defaults, AIs) and an interactive
+//! tour that waits for you to actually do each thing. The tour replays any time (palette → "take the tour", or
+//! `oriel --tour`); the setup pages start from your current settings and only save what you change.
 
 use crate::theme::{self, Theme};
 use crate::ui;
@@ -11,6 +12,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Clear, Paragraph, Wrap},
 };
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// What the app looks like right now, for checking tour steps.
 #[derive(Clone, Default, PartialEq)]
@@ -23,6 +26,17 @@ pub struct Probe {
     pub tab_named: bool,
     pub ctx_seen: usize,
     pub palette_seen: usize,
+    /// a right-click menu or the tab rename box is open (esc is theirs, not the tour's)
+    pub menu_open: bool,
+    /// a terminal has the keyboard: esc belongs to the program in it (Claude Code, vim), not the tour
+    pub in_terminal: bool,
+}
+
+impl Probe {
+    /// Does esc end the tour right now?
+    fn esc_ends_tour(&self) -> bool {
+        !self.palette_open && !self.menu_open && !self.in_terminal
+    }
 }
 
 struct Step {
@@ -42,7 +56,7 @@ const STEPS: &[Step] = &[
     },
     Step {
         title: "chat with any AI",
-        body: "F1 is chat. /provider picks the AI (Claude Code, Codex, Ollama\u{2026}), /model its model, /perms what coding agents may do \u{2014} all remembered. Go back to chat.",
+        body: "F1 is chat. /provider picks the AI (Claude Code, Codex, Ollama\u{2026}), /model its model, /perms what coding agents may do; alt , has every setting. Go back to chat.",
         keys: "F1",
         done: Some(|now, _| now.app == Some("ai")),
     },
@@ -147,14 +161,16 @@ pub enum Stage {
 const STARTS: &[(&str, &str)] = &[("ai", "chat"), ("agents", "agents"), ("home", "home screen"), ("terminal", "terminal"), ("music", "music")];
 const STEPS_SETUP: usize = 6; // theme, icons, music, notes, defaults, AIs
 
-/// What the app should do after a key/click.
+/// What the app should do after a key/click. Setup pages only send a value you actually changed.
 pub enum Out {
     None,
     /// preview (save=false) or pick (save=true) a theme
     Theme(String, bool),
     Icons(bool),
+    /// the first music folder (the others are kept)
     MusicFolder(String),
     NotesFolder(String),
+    /// empty = unchanged
     Defaults { startup: String, provider: String },
     /// the setup finished or was skipped: write the marker
     Finished,
@@ -165,17 +181,33 @@ pub struct Onboard {
     themes: Vec<String>,
     theme_before: String,
     ais: Vec<(&'static str, bool)>,
-    /// provider ids this machine has (for the default-AI choice)
+    /// provider ids for the default-AI choice: the ones this machine has, then the saved one if it isn't among them
     ai_ids: Vec<&'static str>,
+    /// how many of ai_ids were found on this machine
+    ai_found: usize,
+    /// what oriel can open on: STARTS, plus the saved startup app if it's another one
+    starts: Vec<(String, String)>,
+    /// the saved choices, where the Defaults page starts (Enter without changing them saves nothing)
+    start_was: usize,
+    ai_was: usize,
+    /// icons as they are now: Enter on the icons page keeps them
+    nerd_was: bool,
     music_default: String,
     notes_default: String,
     /// the audio-player app's library exists (Windows): music uses it automatically
     audio_player: Option<usize>,
+    /// the song count under the music field: worked out on a thread a moment after typing stops (a network
+    /// drive can take seconds to walk), so typing never waits on the disk
+    count_due: Option<(String, Instant)>,
+    counted: Arc<Mutex<Vec<(String, Option<usize>)>>>,
+    counting: bool,
+    /// esc ends the tour right now (not while a terminal has the keyboard): the card's end button says which
+    esc_ends: bool,
     hits: Vec<(Rect, Btn)>,
 }
 
-/// Quick count of audio files under a folder (bounded, so typing a huge path stays instant).
-fn count_audio(dir: &str) -> Option<usize> {
+/// Quick count of audio files under a folder (bounded: at most 20k entries, 4 levels down). None = no such folder.
+pub(crate) fn count_audio(dir: &str) -> Option<usize> {
     let root = std::path::Path::new(dir.trim());
     if !root.is_dir() {
         return None;
@@ -191,7 +223,8 @@ fn count_audio(dir: &str) -> Option<usize> {
                 return Some(n);
             }
             let p = e.path();
-            if p.is_dir() {
+            // the entry's own type: no extra stat per file
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
                 if depth < 4 {
                     stack.push((p, depth + 1));
                 }
@@ -206,7 +239,7 @@ fn count_audio(dir: &str) -> Option<usize> {
 }
 
 /// Tab-complete a folder path: extend to the longest common prefix of matching sub-folders.
-fn complete_dir(input: &str) -> String {
+pub(crate) fn complete_dir(input: &str) -> String {
     let path = std::path::Path::new(input);
     let (parent, stem) = if input.ends_with(['/', '\\']) {
         (path.to_path_buf(), String::new())
@@ -276,30 +309,115 @@ pub fn mark_done() {
 }
 
 impl Onboard {
+    /// The first run: welcome, setup, then the tour. Every setup page starts from `cfg`.
     pub fn new(theme_now: &str, cfg: &crate::config::Config) -> Onboard {
+        use crate::panes::chat::providers;
         let themes = theme::names();
-        let avail = crate::panes::chat::providers::available(&cfg.ai);
-        let ais = crate::panes::chat::providers::PROVIDERS.iter().map(|p| (p.1, avail.contains(&p.0))).collect();
+        // tests never probe this machine for AIs (TCP) or read its audio-player library
+        let avail = if cfg!(test) { vec![] } else { providers::available(&cfg.ai) };
+        let ais = providers::PROVIDERS.iter().map(|p| (p.1, avail.contains(&p.0))).collect();
         let music_default = cfg.music.folders.first().cloned().unwrap_or_else(|| dirs::audio_dir().map(|d| d.to_string_lossy().to_string()).unwrap_or_default());
         let notes_default = if cfg.notes_folder.is_empty() { crate::config::data_dir().join("notes").to_string_lossy().to_string() } else { cfg.notes_folder.clone() };
         // the audio-player app (Windows): its library is picked up automatically
         let audio_player = std::env::var_os("APPDATA")
+            .filter(|_| !cfg!(test))
             .map(|a| std::path::PathBuf::from(a).join("audio-player").join("library.json"))
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .map(|v| v.get("tracks").and_then(|t| t.as_array()).map(|a| a.len()).or_else(|| v.as_array().map(|a| a.len())).unwrap_or(0));
-        Onboard { stage: Stage::Welcome, themes, theme_before: theme_now.to_string(), ais, ai_ids: avail, music_default, notes_default, audio_player, hits: vec![] }
+        // the saved startup app and default AI are always on offer, so pressing enter keeps them
+        let mut starts: Vec<(String, String)> = STARTS.iter().map(|s| (s.0.to_string(), s.1.to_string())).collect();
+        if !cfg.startup.is_empty() && !starts.iter().any(|s| s.0 == cfg.startup) {
+            starts.push((cfg.startup.clone(), cfg.startup.clone()));
+        }
+        let start_was = starts.iter().position(|s| s.0 == cfg.startup).unwrap_or(0);
+        let ai_found = avail.len();
+        let mut ai_ids = avail;
+        if let Some(p) = providers::PROVIDERS.iter().find(|p| p.0 == cfg.ai.provider).filter(|p| !ai_ids.contains(&p.0)) {
+            ai_ids.push(p.0);
+        }
+        let ai_was = ai_ids.iter().position(|p| *p == cfg.ai.provider).unwrap_or(0);
+        Onboard {
+            stage: Stage::Welcome,
+            themes,
+            theme_before: theme_now.to_string(),
+            ais,
+            ai_ids,
+            ai_found,
+            starts,
+            start_was,
+            ai_was,
+            nerd_was: ui::NERD.load(std::sync::atomic::Ordering::Relaxed),
+            music_default,
+            notes_default,
+            audio_player,
+            count_due: None,
+            counted: Arc::default(),
+            counting: false,
+            esc_ends: true,
+            hits: vec![],
+        }
+    }
+
+    /// Straight into the tour (a replay: palette "take the tour", `oriel --tour`). The setup pages can't be
+    /// reached from here, so none of their data is gathered (no looking for AIs on the network).
+    pub fn tour(theme_now: &str, probe: &Probe) -> Onboard {
+        Onboard {
+            stage: Stage::Tour { step: 0, start: probe.clone() },
+            themes: vec![],
+            theme_before: theme_now.to_string(),
+            ais: vec![],
+            ai_ids: vec![],
+            ai_found: 0,
+            starts: vec![],
+            start_was: 0,
+            ai_was: 0,
+            nerd_was: ui::NERD.load(std::sync::atomic::Ordering::Relaxed),
+            music_default: String::new(),
+            notes_default: String::new(),
+            audio_player: None,
+            count_due: None,
+            counted: Arc::default(),
+            counting: false,
+            esc_ends: true,
+            hits: vec![],
+        }
     }
 
     fn to_music(&mut self) {
         let input = self.music_default.clone();
-        let found = count_audio(&input);
-        self.stage = Stage::Music { input, found };
+        self.recount(&input, Duration::ZERO);
+        self.stage = Stage::Music { input, found: None };
     }
 
-    /// The welcome animates (ultra's rainbow) even when the app theme doesn't.
+    /// Count the songs under `path` once `after` has passed without another change.
+    fn recount(&mut self, path: &str, after: Duration) {
+        self.count_due = Some((path.to_string(), Instant::now() + after));
+        self.counting = true;
+    }
+
+    /// Start a count that's due, and take in the ones that finished (called as the music page draws).
+    fn pump_count(&mut self) {
+        let Stage::Music { input, found } = &mut self.stage else { return };
+        for (p, n) in std::mem::take(&mut *self.counted.lock().unwrap()) {
+            if p == *input {
+                *found = n;
+                self.counting = self.count_due.is_some();
+            }
+        }
+        if let Some((p, _)) = self.count_due.take_if(|(_, at)| Instant::now() >= *at) {
+            let out = self.counted.clone();
+            std::thread::spawn(move || {
+                let n = count_audio(&p);
+                out.lock().unwrap().push((p, n));
+            });
+        }
+    }
+
+    /// The welcome animates (ultra's rainbow) even when the app theme doesn't; the music page redraws until its
+    /// song count is in.
     pub fn animating(&self) -> bool {
-        matches!(self.stage, Stage::Welcome)
+        matches!(self.stage, Stage::Welcome) || (matches!(self.stage, Stage::Music { .. }) && self.counting)
     }
 
     pub fn is_modal(&self) -> bool {
@@ -310,7 +428,8 @@ impl Onboard {
         self.stage = Stage::Tour { step: 0, start: probe.clone() };
     }
 
-    /// Keys while a setup screen is up (modal) or during the tour (only F10/F11 are ours).
+    /// Keys while a setup screen is up (modal) or during the tour (only F10, esc and enter on a read-only step
+    /// are ours; F11 still ends it too, though Windows Terminal keeps F11 for fullscreen).
     pub fn key(&mut self, k: KeyEvent, probe: &Probe) -> (bool, Out) {
         let plain = !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match &mut self.stage {
@@ -343,43 +462,52 @@ impl Onboard {
                 }
                 _ => {}
             },
-            Stage::Icons => match k.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
+            Stage::Icons => {
+                // enter keeps what you have; y / n say which, and only a change is saved
+                let pick = match k.code {
+                    KeyCode::Char('y') => Some(true),
+                    KeyCode::Char('n') => Some(false),
+                    KeyCode::Enter | KeyCode::Esc => Some(self.nerd_was),
+                    _ => None,
+                };
+                if let Some(nerd) = pick {
                     self.to_music();
-                    return (true, Out::Icons(true));
+                    if nerd != self.nerd_was {
+                        return (true, Out::Icons(nerd));
+                    }
                 }
-                KeyCode::Char('n') => {
-                    self.to_music();
-                    return (true, Out::Icons(false));
-                }
-                KeyCode::Esc => self.to_music(),
-                _ => {}
-            },
-            Stage::Music { input, found } => match k.code {
+            }
+            Stage::Music { input, .. } => match k.code {
                 KeyCode::Enter => {
                     let path = input.trim().to_string();
                     self.stage = Stage::Notes { input: self.notes_default.clone() };
-                    if !path.is_empty() && std::path::Path::new(&path).is_dir() {
+                    self.count_due = None;
+                    self.counting = false;
+                    if !path.is_empty() && path != self.music_default.trim() && std::path::Path::new(&path).is_dir() {
                         return (true, Out::MusicFolder(path));
                     }
                 }
-                KeyCode::Esc => self.stage = Stage::Notes { input: self.notes_default.clone() },
+                KeyCode::Esc => {
+                    self.stage = Stage::Notes { input: self.notes_default.clone() };
+                    self.count_due = None;
+                    self.counting = false;
+                }
                 _ => {
                     if edit_line(input, &k) {
-                        *found = count_audio(input);
+                        let path = input.clone();
+                        self.recount(&path, Duration::from_millis(300));
                     }
                 }
             },
             Stage::Notes { input } => match k.code {
                 KeyCode::Enter => {
                     let path = input.trim().to_string();
-                    let start = STARTS.iter().position(|s| s.0 == "ai").unwrap_or(0);
-                    self.stage = Stage::Defaults { row: 0, start, ai: 0 };
+                    self.stage = Stage::Defaults { row: 0, start: self.start_was, ai: self.ai_was };
                     if !path.is_empty() && path != self.notes_default {
                         return (true, Out::NotesFolder(path));
                     }
                 }
-                KeyCode::Esc => self.stage = Stage::Defaults { row: 0, start: 0, ai: 0 },
+                KeyCode::Esc => self.stage = Stage::Defaults { row: 0, start: self.start_was, ai: self.ai_was },
                 _ => {
                     edit_line(input, &k);
                 }
@@ -388,22 +516,27 @@ impl Onboard {
                 KeyCode::Up | KeyCode::Down | KeyCode::Tab => *row = 1 - (*row).min(1),
                 KeyCode::Left | KeyCode::Char('h') => {
                     if *row == 0 {
-                        *start = (*start + STARTS.len() - 1) % STARTS.len();
+                        *start = (*start + self.starts.len() - 1) % self.starts.len();
                     } else if !self.ai_ids.is_empty() {
                         *ai = (*ai + self.ai_ids.len() - 1) % self.ai_ids.len();
                     }
                 }
                 KeyCode::Right | KeyCode::Char('l') => {
                     if *row == 0 {
-                        *start = (*start + 1) % STARTS.len();
+                        *start = (*start + 1) % self.starts.len();
                     } else if !self.ai_ids.is_empty() {
                         *ai = (*ai + 1) % self.ai_ids.len();
                     }
                 }
                 KeyCode::Enter => {
-                    let out = Out::Defaults { startup: STARTS[*start].0.to_string(), provider: self.ai_ids.get(*ai).map(|s| s.to_string()).unwrap_or_default() };
+                    // only what you changed: the rest stays as it's saved
+                    let startup = if *start != self.start_was { self.starts[*start].0.clone() } else { String::new() };
+                    let provider = if *ai != self.ai_was { self.ai_ids.get(*ai).map(|s| s.to_string()).unwrap_or_default() } else { String::new() };
                     self.stage = Stage::Ais;
-                    return (true, out);
+                    if startup.is_empty() && provider.is_empty() {
+                        return (true, Out::None);
+                    }
+                    return (true, Out::Defaults { startup, provider });
                 }
                 KeyCode::Esc => self.stage = Stage::Ais,
                 _ => {}
@@ -418,6 +551,9 @@ impl Onboard {
                 KeyCode::F(10) => {
                     return (true, self.advance(probe));
                 }
+                // esc ends it, unless the palette, a menu or the rename box is open (esc closes those first) or
+                // a terminal has the keyboard (its program gets esc; the card's × still ends the tour)
+                KeyCode::Esc if probe.esc_ends_tour() => return (true, self.finish()),
                 KeyCode::F(11) => return (true, self.finish()),
                 KeyCode::Enter if STEPS[*step].done.is_none() => {
                     let _ = start;
@@ -446,6 +582,7 @@ impl Onboard {
 
     /// Called after every event batch during the tour: moves on when the step's action happened.
     pub fn check(&mut self, probe: &Probe) -> Out {
+        self.esc_ends = probe.esc_ends_tour();
         if let Stage::Tour { step, start } = &self.stage {
             if let Some(done) = STEPS[*step].done {
                 if done(probe, start) {
@@ -477,6 +614,7 @@ impl Onboard {
     // ------------------------------------------------------------------ drawing
     pub fn draw(&mut self, f: &mut Frame, area: Rect, t: &Theme, time: f64) {
         self.hits.clear();
+        self.pump_count();
         let (n, title) = match &self.stage {
             // the welcome is always ultra, whatever theme is set
             Stage::Welcome => return self.draw_welcome(f, area, &theme::get("ultra"), time),
@@ -531,7 +669,7 @@ impl Onboard {
                 lines.push(Line::raw(""));
                 lines.push(Line::styled("Boxes or question marks mean your terminal font has no icons. Pick plain text,", ui::muted(t)));
                 lines.push(Line::styled("or install a Nerd Font (nerdfonts.com) and switch back from the palette later.", ui::muted(t)));
-                hints = vec![("y", "yes, pictures"), ("n", "boxes: plain text")];
+                hints = vec![("y", "yes, pictures"), ("n", "boxes: plain text"), ("enter", if self.nerd_was { "keep pictures" } else { "keep plain text" })];
             }
             Stage::Music { input, found } => {
                 if let Some(n) = self.audio_player {
@@ -544,6 +682,7 @@ impl Onboard {
                 lines.extend(field(input, t, body.width));
                 lines.push(Line::raw(""));
                 lines.push(match found {
+                    _ if self.counting => Line::styled("  looking for songs…", ui::muted(t)),
                     Some(0) => Line::styled("  no songs found there yet (that's ok)", ui::muted(t)),
                     Some(n) => Line::styled(format!("  ✓ {n}{} songs found", if *n >= 20_000 { "+" } else { "" }), Style::default().fg(t.good)),
                     None => Line::styled("  that folder doesn't exist", Style::default().fg(t.danger)),
@@ -575,13 +714,17 @@ impl Onboard {
                     Line::from(spans)
                 };
                 lines.push(Line::styled("open oriel on", Style::default().add_modifier(Modifier::BOLD)));
-                lines.push(choice(*row == 0, STARTS.iter().map(|s| s.1.to_string()).collect(), *start));
+                lines.push(choice(*row == 0, self.starts.iter().map(|s| s.1.clone()).collect(), *start));
                 lines.push(Line::raw(""));
                 lines.push(Line::styled("default AI for chat", Style::default().add_modifier(Modifier::BOLD)));
                 if self.ai_ids.is_empty() {
                     lines.push(Line::styled("  none found yet — the next page shows how to add one", ui::muted(t)));
                 } else {
-                    lines.push(choice(*row == 1, self.ai_ids.iter().map(|id| crate::panes::chat::providers::label(id).to_string()).collect(), *ai));
+                    let label = |i: usize, id: &str| {
+                        let l = crate::panes::chat::providers::label(id);
+                        if i < self.ai_found { l.to_string() } else { format!("{l} (not found here)") }
+                    };
+                    lines.push(choice(*row == 1, self.ai_ids.iter().enumerate().map(|(i, id)| label(i, id)).collect(), *ai));
                 }
                 hints = vec![("↑↓", "row"), ("←→", "choose"), ("enter", "next")];
             }
@@ -659,6 +802,12 @@ impl Onboard {
         f.render_widget(Clear, r);
         let title = format!("tour · {}/{} · {}", step + 1, STEPS.len(), s.title);
         let inner = ui::frame(f, r, &title, None, true, t);
+        // a × on the frame, like a pane's
+        if r.width > 12 {
+            let x = Rect { x: r.right() - 5, y: r.y, width: 3, height: 1 };
+            f.render_widget(Paragraph::new(Span::styled(" × ", Style::default().fg(t.accent))), x);
+            self.hits.push((x, Btn::End));
+        }
         let mut lines = vec![Line::raw(s.body)];
         if !s.keys.is_empty() {
             lines.push(Line::raw(""));
@@ -668,7 +817,8 @@ impl Onboard {
         // buttons on the bottom row
         let by = inner.bottom().saturating_sub(1);
         let next = if s.done.is_none() { if step + 1 == STEPS.len() { " enter  finish " } else { " enter  next › " } } else if s.title == HELP_STEP { " skip step › " } else { " F10  skip step › " };
-        let end = " F11  end tour ";
+        // in a terminal esc is the program's, so the button is the way out (as is the ×)
+        let end = if self.esc_ends { " esc  end tour " } else { " end tour " };
         let rn = Rect { x: inner.x, y: by, width: next.chars().count() as u16, height: 1 };
         let re = Rect { x: inner.x + rn.width + 2, y: by, width: end.chars().count() as u16, height: 1 };
         f.render_widget(Paragraph::new(Span::styled(next, Style::default().fg(t.accent).add_modifier(Modifier::REVERSED | Modifier::BOLD))), rn);
@@ -726,4 +876,124 @@ fn field(input: &str, t: &Theme, width: u16) -> Vec<Line<'static>> {
         ]),
         Line::styled(format!("╰{}╯", "─".repeat(w)), Style::default().fg(t.accent)),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn key(o: &mut Onboard, c: KeyCode) -> Out {
+        o.key(KeyEvent::new(c, KeyModifiers::NONE), &Probe::default()).1
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::path::absolute(format!("target/test-scratch/config/{name}")).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Setup starts from what's saved, and enter on a page you didn't change saves nothing.
+    #[test]
+    fn onboard_setup_starts_from_your_settings() {
+        let (a, b) = (scratch("onboard-a"), scratch("onboard-b"));
+        let mut cfg = crate::config::Config::default();
+        cfg.startup = "files".into(); // a fine startup app, just not one of setup's five
+        cfg.ai.provider = "anthropic".into(); // kept on offer even if this machine doesn't have it
+        cfg.music.folders = vec![a.to_string_lossy().into(), b.to_string_lossy().into()];
+        cfg.notes_folder = b.to_string_lossy().into();
+        let mut o = Onboard::new("oriel", &cfg);
+        o.nerd_was = false; // plain icons, picked before
+        o.stage = Stage::Icons;
+        assert!(matches!(key(&mut o, KeyCode::Enter), Out::None), "enter keeps plain icons");
+        assert!(matches!(&o.stage, Stage::Music { input, .. } if *input == cfg.music.folders[0]));
+        assert!(matches!(key(&mut o, KeyCode::Enter), Out::None), "the same music folder: nothing to save");
+        assert!(matches!(key(&mut o, KeyCode::Enter), Out::None), "the same notes folder");
+        let Stage::Defaults { start, ai, .. } = o.stage else { panic!("on the defaults page") };
+        assert_eq!((o.starts[start].0.as_str(), o.ai_ids[ai]), ("files", "anthropic"));
+        assert!(matches!(key(&mut o, KeyCode::Enter), Out::None), "defaults untouched: nothing to save");
+        // change one thing and only that is sent
+        o.stage = Stage::Defaults { row: 0, start: o.start_was, ai: o.ai_was };
+        key(&mut o, KeyCode::Right);
+        match key(&mut o, KeyCode::Enter) {
+            Out::Defaults { startup, provider } => assert_eq!((startup.as_str(), provider.as_str()), (STARTS[0].0, "")),
+            _ => panic!("expected the new startup app"),
+        }
+        o.stage = Stage::Icons;
+        assert!(matches!(key(&mut o, KeyCode::Char('y')), Out::Icons(true)));
+        o.stage = Stage::Music { input: b.to_string_lossy().into(), found: None };
+        match key(&mut o, KeyCode::Enter) {
+            Out::MusicFolder(p) => assert_eq!(p, b.to_string_lossy()),
+            _ => panic!("a different folder is sent"),
+        }
+    }
+
+    /// The song count under the music field is worked out on a thread a moment after typing stops, so a slow
+    /// drive never holds up typing.
+    #[test]
+    fn onboard_counts_songs_in_the_background() {
+        let d = scratch("onboard-songs");
+        for f in ["a.mp3", "b.flac", "notes.txt"] {
+            std::fs::write(d.join(f), "").unwrap();
+        }
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub").join("c.ogg"), "").unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.music.folders = vec![d.to_string_lossy().into()];
+        let mut o = Onboard::new("oriel", &cfg);
+        o.stage = Stage::Icons;
+        key(&mut o, KeyCode::Enter);
+        assert!(o.counting && o.animating(), "the page redraws until the count is in");
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let t = theme::get("oriel");
+        let mut wait = |o: &mut Onboard| {
+            let t0 = Instant::now();
+            while o.counting && t0.elapsed() < Duration::from_secs(5) {
+                term.draw(|f| {
+                    let a = f.area();
+                    o.draw(f, a, &t, 0.0)
+                })
+                .unwrap();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait(&mut o);
+        assert!(matches!(o.stage, Stage::Music { found: Some(3), .. }), "a.mp3, b.flac and sub/c.ogg");
+        assert!(!o.animating());
+        // type on: counted again once you pause, and a folder that isn't there says so
+        key(&mut o, KeyCode::Char('x'));
+        assert!(o.counting, "a new count is due");
+        wait(&mut o);
+        assert!(matches!(o.stage, Stage::Music { found: None, .. }));
+    }
+
+    /// During the tour esc ends it, except while a terminal has the keyboard (Claude Code and vim need esc):
+    /// then esc goes to the program and the card's button just says "end tour".
+    #[test]
+    fn onboard_tour_esc_leaves_terminals_alone() {
+        let mut o = Onboard::tour("oriel", &Probe::default());
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let t = theme::get("oriel");
+        let mut shot = |o: &mut Onboard| -> String {
+            term.draw(|f| {
+                let a = f.area();
+                o.draw(f, a, &t, 0.0)
+            })
+            .unwrap();
+            let b = term.backend().buffer();
+            (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        };
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let in_term = Probe { in_terminal: true, ..Probe::default() };
+        o.check(&in_term);
+        let s = shot(&mut o);
+        assert!(s.contains(" end tour ") && !s.contains("esc  end tour"), "{s}");
+        let (used, out) = o.key(esc, &in_term);
+        assert!(!used && matches!(out, Out::None), "the terminal gets esc");
+        // back in one of oriel's own panes: esc ends it
+        o.check(&Probe::default());
+        assert!(shot(&mut o).contains("esc  end tour"));
+        assert!(matches!(o.key(esc, &Probe::default()), (true, Out::Finished)));
+    }
 }

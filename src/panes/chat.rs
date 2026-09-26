@@ -41,7 +41,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/provider", "<ai>", "switch AI: claude, codex, ollama, openai, anthropic — remembered"),
     ("/model", "<model>", "switch model for the current AI — remembered per AI"),
     ("/cwd", "<folder>", "folder Claude Code / Codex work in for this chat"),
-    ("/perms", "<ask|edits|auto|plan|bypass>", "what coding agents may do — remembered for every chat (shift+tab cycles)"),
+    ("/perms", "<ask|edits|auto|plan|bypass>", "what coding agents may do in this chat (shift+tab cycles) · /perms default <mode> for new chats"),
     ("/effort", "<low|medium|high|xhigh|max|ultracode>", "how hard coding agents think — remembered for every chat"),
     ("/key", "<openai|anthropic> <key>", "save an API key"),
     ("/note", "", "save the last reply to notes"),
@@ -51,8 +51,9 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/next", "", "music: next song"),
     ("/prev", "", "music: previous song"),
     ("/music", "", "go to the music app"),
-    ("/sidebar", "", "hide / show the sidebar"),
-    ("/icons", "", "nerd font icons on / off"),
+    ("/sidebar", "", "hide / show the sidebar — remembered"),
+    ("/icons", "", "nerd font icons on / off — remembered"),
+    ("/settings", "[setting]", "every setting in one place (alt ,) · /settings perms opens that one"),
     ("/info", "", "what's running: AI, model, folder"),
     ("/delete", "", "delete this chat"),
     ("/help", "", "keys and commands (F10: the full guide)"),
@@ -69,8 +70,9 @@ struct MenuItem {
     run: bool,
 }
 
-/// The permission modes for coding agents in chat (Claude Code's own modes). Remembered in the config.
-const PERMS: &[(&str, &str)] = &[
+/// The permission modes for coding agents in chat (Claude Code's own modes). The default for new chats is in the
+/// config (settings, /perms default); shift+tab and /perms change one chat.
+pub(crate) const PERMS: &[(&str, &str)] = &[
     ("ask", "asks you before each edit or command (y allow · n deny · a always allow that tool)"),
     ("edits", "edits files in the chat's folder; anything else is refused (default)"),
     ("auto", "auto mode: Claude decides what's safe and asks you about the rest"),
@@ -79,7 +81,7 @@ const PERMS: &[(&str, &str)] = &[
 ];
 
 /// Canonical permission name; the old "full" / "read" still work.
-fn norm_perms(s: &str) -> Option<&'static str> {
+pub(crate) fn norm_perms(s: &str) -> Option<&'static str> {
     match s.trim().to_lowercase().as_str() {
         "ask" | "default" => Some("ask"),
         "edits" | "acceptedits" | "accept" => Some("edits"),
@@ -90,8 +92,21 @@ fn norm_perms(s: &str) -> Option<&'static str> {
     }
 }
 
+/// `<dir>/<title>.md` for /note and /save, or `<title> 2.md`, `<title> 3.md`… so nothing is overwritten.
+fn free_md_path(dir: &std::path::Path, title: &str) -> PathBuf {
+    let name: String = title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
+    let name = name.trim();
+    let mut path = dir.join(format!("{name}.md"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{name} {n}.md"));
+        n += 1;
+    }
+    path
+}
+
 /// /effort levels, like Claude Code's. ultracode = max plus its multi-agent mode.
-const EFFORTS: &[(&str, &str)] = &[
+pub(crate) const EFFORTS: &[(&str, &str)] = &[
     ("low", "quick answers, fewest tokens"),
     ("medium", "a balance"),
     ("high", "thinks it through"),
@@ -103,6 +118,38 @@ const EFFORTS: &[(&str, &str)] = &[
 
 /// shift+tab walks through these, like Claude Code.
 const PERM_CYCLE: &[&str] = &["ask", "edits", "auto", "plan", "bypass"];
+
+/// The models oriel knows for an AI, with a word on each (the /model menu and settings suggest them). Ollama's
+/// come from what's installed there, so they aren't here.
+pub(crate) fn known_models(p: &str) -> &'static [(&'static str, &'static str)] {
+    match p {
+        "claude" => &[
+            ("default", "Claude Code's default"),
+            ("opus", "most capable (always the newest Opus)"),
+            ("sonnet", "balanced speed and smarts"),
+            ("haiku", "fastest and cheapest"),
+            ("claude-opus-5-5", "Opus 5.5"),
+            ("claude-sonnet-5", "Sonnet 5"),
+            ("claude-haiku-4-5", "Haiku 4.5"),
+            ("claude-fable-5-1", "Fable 5.1"),
+        ],
+        "codex" => &[
+            ("default", "Codex's default"),
+            ("gpt-5.6-sol", "most capable"),
+            ("gpt-5.6-terra", "balanced"),
+            ("gpt-5.6-luna", "fast and cheap"),
+            ("gpt-5.3-codex", "older coding model"),
+        ],
+        "anthropic" => &[
+            ("claude-sonnet-5", "Sonnet 5 — balanced"),
+            ("claude-opus-5-5", "Opus 5.5 — most capable"),
+            ("claude-haiku-4-5", "Haiku 4.5 — fastest"),
+            ("claude-fable-5-1", "Fable 5.1"),
+        ],
+        "openai" => &[("gpt-5.6-terra", "balanced"), ("gpt-5.6-sol", "most capable"), ("gpt-5.6-luna", "fast and cheap")],
+        _ => &[],
+    }
+}
 
 /// The mode line on the input box, Claude Code style: glyph, words, colour.
 fn perm_badge(p: &str, t: &crate::theme::Theme) -> (&'static str, &'static str, ratatui::style::Color) {
@@ -165,7 +212,9 @@ pub struct Chat {
     menu_sel: usize,
     cache: HashMap<usize, (u64, Vec<Line<'static>>, Vec<(usize, String)>)>,
     provider: String,
+    /// This chat's permission mode (shift+tab, /perms); new chats start from `default_perms` (the config's).
     perms: String,
+    default_perms: String,
     /// /effort ("" = the agent's default)
     effort: String,
     keys: HashMap<String, String>,
@@ -239,6 +288,7 @@ impl Chat {
             cache: HashMap::new(),
             provider,
             perms: norm_perms(&cfg.ai.perms).unwrap_or("edits").to_string(),
+            default_perms: norm_perms(&cfg.ai.perms).unwrap_or("edits").to_string(),
             effort: cfg.ai.effort.clone(),
             keys: HashMap::new(),
             expanded: false,
@@ -300,6 +350,7 @@ impl Chat {
         let p = self.provider_of();
         self.chat = store::Chat::new(&p);
         self.chat.model = self.models.get(&p).cloned().filter(|m| !m.is_empty());
+        self.perms = self.default_perms.clone(); // a mode picked for the last chat stays with it
         self.cache.clear();
         self.scroll = 0;
         self.info.clear();
@@ -315,6 +366,7 @@ impl Chat {
         self.persist_if_changed();
         let Some(c) = self.chats.iter().find(|c| c.id == id).cloned() else { return };
         self.chat = c;
+        self.perms = self.default_perms.clone();
         self.cache.clear();
         self.scroll = 0;
         self.info.clear();
@@ -563,9 +615,10 @@ impl Chat {
                 self.chat.model = model.clone();
                 self.chat.state.remove(&p); // a CLI session is tied to its model
                 self.models.insert(p.clone(), model.clone().unwrap_or_default());
-                let mut c = crate::config::load();
-                c.ai.models.insert(p.clone(), model.clone().unwrap_or_default());
-                crate::config::save(&c);
+                let (id, m) = (p.clone(), model.clone().unwrap_or_default());
+                cx.edit_config(move |c| {
+                    c.ai.models.insert(id, m);
+                });
                 cx.notify(format!("{}{} · {} · remembered", ui::lead("ai"), providers::label(&p), model.unwrap_or_else(|| "default model".into())));
             }
             "/model" if arg.is_empty() => {
@@ -592,7 +645,7 @@ impl Chat {
                             "claude" => "  install Claude Code: npm i -g @anthropic-ai/claude-code, then run `claude` once to sign in".into(),
                             "codex" => "  install Codex: npm i -g @openai/codex, then `codex login`".into(),
                             "ollama" => "  install Ollama from ollama.com and pull a model (ollama pull llama3.2)".into(),
-                            _ => format!("  add a key: /key {id} <key>"),
+                            _ => format!("  add a key in settings (alt ,) › providers & keys, or /key {id} <key>"),
                         });
                     } else if providers::PROVIDERS.iter().any(|p| p.0 == id) {
                         // an explicit model, else the one remembered for this AI
@@ -600,13 +653,16 @@ impl Chat {
                         self.chat.provider = Some(id.clone());
                         self.chat.model = model.clone();
                         self.provider = id.clone();
-                        let mut c = crate::config::load();
-                        c.ai.provider = id.clone();
                         if let Some(m) = &model {
-                            c.ai.models.insert(id.clone(), m.clone());
                             self.models.insert(id.clone(), m.clone());
                         }
-                        crate::config::save(&c);
+                        let (pid, m) = (id.clone(), model.clone());
+                        cx.edit_config(move |c| {
+                            if let Some(m) = m {
+                                c.ai.models.insert(pid.clone(), m);
+                            }
+                            c.ai.provider = pid;
+                        });
                         cx.notify(format!("{}{} · {} · remembered", ui::lead("ai"), providers::label(&id), model.unwrap_or_else(|| "default model".into())));
                     } else {
                         self.info.push(format!("no AI called {id} — try /provider"));
@@ -627,9 +683,8 @@ impl Chat {
                 let want = arg.trim().to_lowercase();
                 if let Some((level, what)) = EFFORTS.iter().find(|(l, _)| *l == want) {
                     self.effort = if *level == "default" { String::new() } else { level.to_string() };
-                    let mut c = crate::config::load();
-                    c.ai.effort = self.effort.clone();
-                    crate::config::save(&c);
+                    let e = self.effort.clone();
+                    cx.edit_config(move |c| c.ai.effort = e);
                     cx.notify(format!("effort: {level} · {what}"));
                 } else {
                     self.info.push(format!("effort now: {}. Choose one:", if self.effort.is_empty() { "default" } else { &self.effort }));
@@ -638,17 +693,30 @@ impl Chat {
                     }
                 }
             }
+            // /perms default <mode>: where every new chat starts (saved); /perms <mode>: just this chat
+            // (a bare "/perms default" says where they start: it isn't "ask", the way Claude Code names that mode)
+            "/perms" if arg.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("default")) => {
+                let mode = arg.get(7..).unwrap_or("").trim();
+                match norm_perms(mode) {
+                    Some(p) => {
+                        self.default_perms = p.to_string();
+                        if self.chat.messages.is_empty() {
+                            self.perms = p.to_string();
+                        }
+                        cx.edit_config(move |c| c.ai.perms = p.to_string());
+                        cx.notify(format!("new chats start in {p} · saved (settings › AI chat has it too)"));
+                    }
+                    None if mode.is_empty() => self.info.push(format!("new chats start in {} · /perms default <ask|edits|auto|plan|bypass> changes it", self.default_perms)),
+                    None => self.info.push(format!("no mode called {mode} — ask · edits · auto · plan · bypass")),
+                }
+            }
             "/perms" => match norm_perms(&arg) {
                 Some(p) => {
                     self.perms = p.to_string();
-                    // remembered: every new chat (and the next time oriel starts) uses it
-                    let mut c = crate::config::load();
-                    c.ai.perms = p.to_string();
-                    crate::config::save(&c);
-                    cx.notify(format!("agent permissions: {p} · saved for every chat"));
+                    cx.notify(format!("agent permissions: {p} · this chat (/perms default {p} for every new one)"));
                 }
                 None => {
-                    self.info.push(format!("permissions now: {} (saved for every chat). Choose one:", self.perms));
+                    self.info.push(format!("permissions in this chat: {} · new chats start in {} (/perms default <mode>). Choose one:", self.perms, self.default_perms));
                     for (k, what) in PERMS {
                         self.info.push(format!("  /perms {k:<7} {what}"));
                     }
@@ -677,13 +745,14 @@ impl Chat {
                 let mut a = arg.split_whitespace();
                 match (a.next(), a.next()) {
                     (Some(p @ ("openai" | "anthropic")), Some(key)) => {
-                        let mut c = crate::config::load();
-                        if p == "openai" {
-                            c.ai.openai_key = key.to_string();
-                        } else {
-                            c.ai.anthropic_key = key.to_string();
-                        }
-                        crate::config::save(&c);
+                        let (openai, k) = (p == "openai", key.to_string());
+                        cx.edit_config(move |c| {
+                            if openai {
+                                c.ai.openai_key = k;
+                            } else {
+                                c.ai.anthropic_key = k;
+                            }
+                        });
                         self.keys.insert(p.to_string(), key.to_string());
                         let id: &'static str = if p == "openai" { "openai" } else { "anthropic" };
                         if !self.avail.contains(&id) {
@@ -695,20 +764,15 @@ impl Chat {
                         }
                         cx.notify(format!("{p} key saved"));
                     }
-                    _ => self.info.push("/key openai <key> · /key anthropic <key>  (saved in oriel's config file)".into()),
+                    _ => self.info.push("/key openai <key> · /key anthropic <key>  (saved in oriel's config file; settings › providers & keys types it out of sight)".into()),
                 }
             }
             "/note" => match self.chat.messages.iter().rev().find(|m| m.role == "assistant" && !m.content.is_empty()) {
                 Some(m) => {
-                    let dir = crate::config::data_dir().join("notes");
+                    // the folder the notes app shows (notes_folder, else oriel's own)
+                    let dir = crate::config::notes_dir(cx.config);
                     let _ = std::fs::create_dir_all(&dir);
-                    let name: String = self.chat.title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
-                    let mut path = dir.join(format!("{}.md", name.trim()));
-                    let mut n = 2;
-                    while path.exists() {
-                        path = dir.join(format!("{} {n}.md", name.trim()));
-                        n += 1;
-                    }
+                    let path = free_md_path(&dir, &self.chat.title);
                     match std::fs::write(&path, format!("# {}\n\n{}\n", self.chat.title, m.content)) {
                         Ok(_) => cx.notify(format!("saved to notes: {}", path.file_name().unwrap_or_default().to_string_lossy())),
                         Err(e) => self.info.push(format!("couldn't save: {e}")),
@@ -722,8 +786,8 @@ impl Chat {
                 } else {
                     let dir = dirs::document_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default()).join("oriel chats");
                     let _ = std::fs::create_dir_all(&dir);
-                    let name: String = self.chat.title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
-                    let path = dir.join(format!("{}.md", name.trim()));
+                    // two chats with the same title each get their own file
+                    let path = free_md_path(&dir, &self.chat.title);
                     let mut md = format!("# {}\n\n", self.chat.title);
                     for m in &self.chat.messages {
                         let who = if m.role == "user" { "you".to_string() } else { providers::label(m.model.as_deref().unwrap_or("ai")).to_lowercase() };
@@ -741,6 +805,10 @@ impl Chat {
             "/music" => cx.act(Action::GotoApp("music")),
             "/sidebar" => cx.act(Action::ToggleSidebar),
             "/icons" => cx.act(Action::ToggleIcons),
+            "/settings" => {
+                crate::panes::settings::jump(&arg);
+                cx.act(Action::GotoApp("settings"));
+            }
             "/quit" => cx.act(Action::Quit),
             "/info" => {
                 let p = self.provider_of();
@@ -773,30 +841,7 @@ impl Chat {
     fn models_for(&self, p: &str) -> Vec<(String, String)> {
         let s = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
         let mut v = match p {
-            "claude" => s(&[
-                ("default", "Claude Code's default"),
-                ("opus", "most capable (always the newest Opus)"),
-                ("sonnet", "balanced speed and smarts"),
-                ("haiku", "fastest and cheapest"),
-                ("claude-opus-5-5", "Opus 5.5"),
-                ("claude-sonnet-5", "Sonnet 5"),
-                ("claude-haiku-4-5", "Haiku 4.5"),
-                ("claude-fable-5-1", "Fable 5.1"),
-            ]),
-            "codex" => s(&[
-                ("default", "Codex's default"),
-                ("gpt-5.6-sol", "most capable"),
-                ("gpt-5.6-terra", "balanced"),
-                ("gpt-5.6-luna", "fast and cheap"),
-                ("gpt-5.3-codex", "older coding model"),
-            ]),
-            "anthropic" => s(&[
-                ("claude-sonnet-5", "Sonnet 5 — balanced"),
-                ("claude-opus-5-5", "Opus 5.5 — most capable"),
-                ("claude-haiku-4-5", "Haiku 4.5 — fastest"),
-                ("claude-fable-5-1", "Fable 5.1"),
-            ]),
-            "openai" => s(&[("gpt-5.6-terra", "balanced"), ("gpt-5.6-sol", "most capable"), ("gpt-5.6-luna", "fast and cheap")]),
+            "claude" | "codex" | "anthropic" | "openai" => s(known_models(p)),
             "ollama" => {
                 let got = self.ollama_models.lock().unwrap().clone();
                 if got.is_empty() {
@@ -830,6 +875,7 @@ impl Chat {
             "/perms" => PERMS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
             "/effort" => EFFORTS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
             "/key" => pairs(&[("openai", "OpenAI-compatible key"), ("anthropic", "Anthropic API key")]),
+            "/settings" => crate::panes::settings::topics(),
             "/theme" => {
                 let mut v: Vec<(String, String)> = vec![("edit".into(), "open the theme editor".into()), ("new ".into(), "make your own theme from this one".into())];
                 v.extend(crate::theme::names().into_iter().map(|n| {
@@ -1295,6 +1341,35 @@ impl Pane for Chat {
         self.stream.as_ref().map(|_| Duration::from_millis(100))
     }
 
+    /// Something was remembered elsewhere (another chat's /perms or /model, setup, a hand edit): new chats here use
+    /// it, and so does this one while it's still empty.
+    fn config_changed(&mut self, cfg: &crate::config::Config) {
+        self.models = cfg.ai.models.clone();
+        self.effort = cfg.ai.effort.clone();
+        // the default mode for new chats; the open one follows only while it's empty (a mode picked for a
+        // conversation with shift+tab stays)
+        if let Some(p) = norm_perms(&cfg.ai.perms) {
+            if p != self.default_perms && self.chat.messages.is_empty() && self.stream.is_none() {
+                self.perms = p.to_string();
+            }
+            self.default_perms = p.to_string();
+        }
+        // a key saved with /key makes that AI usable here too
+        for (id, key) in [("openai", &cfg.ai.openai_key), ("anthropic", &cfg.ai.anthropic_key)] {
+            if !key.is_empty() && !self.avail.contains(&id) {
+                self.avail.push(id);
+            }
+        }
+        if let Some(p) = self.avail.iter().find(|p| **p == cfg.ai.provider) {
+            self.provider = p.to_string();
+        }
+        if self.chat.messages.is_empty() && self.stream.is_none() {
+            let p = self.provider.clone();
+            self.chat.model = self.models.get(&p).cloned().filter(|m| !m.is_empty());
+            self.chat.provider = Some(p);
+        }
+    }
+
     fn poll(&mut self, cx: &mut Cx) {
         let who = providers::label(&self.provider_of()).to_lowercase();
         let Some(s) = &mut self.stream else { return };
@@ -1371,7 +1446,7 @@ impl Pane for Chat {
         }
         if let Some(d) = denied_hint {
             self.info.push(format!(
-                "{d} action{} blocked by the permission mode ({}). /perms ask to approve each one, /perms bypass to allow everything — saved for every chat.",
+                "{d} action{} blocked by the permission mode ({}). /perms ask to approve each one, /perms bypass to allow everything (this chat; /perms default <mode> for new ones).",
                 if d == 1 { " was" } else { "s were" },
                 self.perms
             ));
@@ -1651,13 +1726,11 @@ impl Pane for Chat {
         let items = self.menu();
         match k.code {
             KeyCode::Char('x') if ctrl => self.chord_x = true,
-            // shift+tab: the next permission mode, remembered like /perms
+            // shift+tab: the next permission mode, for this chat only (a bypass for one throwaway chat mustn't
+            // become every chat's; the default is in settings, or /perms default <mode>)
             KeyCode::BackTab => {
                 let i = PERM_CYCLE.iter().position(|p| *p == self.perms).map(|i| (i + 1) % PERM_CYCLE.len()).unwrap_or(0);
                 self.perms = PERM_CYCLE[i].to_string();
-                let mut c = crate::config::load();
-                c.ai.perms = self.perms.clone();
-                crate::config::save(&c);
             }
             KeyCode::Up if self.input.is_empty() && self.queue.iter().any(|q| !q.sent) => {
                 let i = self.queue.iter().rposition(|q| !q.sent).unwrap_or(0);
@@ -2002,6 +2075,94 @@ mod tests {
         k.typ(&mut c, "/model codex gpt-5.6-luna");
         k.key(&mut c, KeyCode::Enter);
         assert_eq!((c.provider_of().as_str(), c.chat.model.as_deref()), ("codex", Some("gpt-5.6-luna")));
+    }
+
+    /// Run a slash command, then do what the app does with the config changes it asked for.
+    fn run_cmd(k: &mut Kit, c: &mut Chat, line: &str) -> usize {
+        let mut acts = vec![];
+        {
+            let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut acts, focused: true, time: 1.0 };
+            c.run_command(line, &mut cx);
+        }
+        k.actions.extend(acts);
+        k.apply_config(c)
+    }
+
+    /// /perms, /effort, /model, /provider, /key and shift+tab never write config.toml themselves: they ask the
+    /// app (its one writer), so a later theme change can't undo them, and chats that are already open follow.
+    #[test]
+    fn chat_settings_go_through_the_app() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.avail = vec!["claude", "codex"];
+        c.provider = "claude".into();
+        c.chat.provider = Some("claude".into());
+        for cmd in ["/perms default bypass", "/effort high", "/model opus", "/key anthropic sk-test", "/provider codex"] {
+            assert_eq!(run_cmd(&mut k, &mut c, cmd), 1, "{cmd} asks the app to save it");
+        }
+        let a = &k.config.ai;
+        assert_eq!((a.perms.as_str(), a.effort.as_str(), a.anthropic_key.as_str(), a.provider.as_str()), ("bypass", "high", "sk-test", "codex"));
+        assert_eq!(a.models.get("claude").map(String::as_str), Some("opus"));
+        // shift+tab and /perms <mode> change this chat only: a bypass for one chat isn't every chat's
+        k.key_mod(&mut c, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(k.apply_config(&mut c), 0);
+        assert_eq!(c.perms, "ask");
+        assert_eq!(run_cmd(&mut k, &mut c, "/perms plan"), 0);
+        assert_eq!((c.perms.as_str(), k.config.ai.perms.as_str()), ("plan", "bypass"));
+        c.new_chat();
+        assert_eq!(c.perms, "bypass", "a new chat starts from the default");
+        assert_eq!(run_cmd(&mut k, &mut c, "/perms default ask"), 1);
+        assert_eq!(k.config.ai.perms, "ask");
+        // a bare /perms default says where new chats start, and changes nothing
+        run_cmd(&mut k, &mut c, "/perms plan");
+        assert_eq!(run_cmd(&mut k, &mut c, "/perms Default"), 0);
+        assert!(c.info.iter().any(|l| l.contains("new chats start in ask")), "{:?}", c.info);
+        assert_eq!(c.perms, "plan", "not taken as ask");
+        // a chat that was open all along follows (its empty chat switches AI too) ...
+        let mut before = Chat::new(&crate::config::Config::default());
+        before.avail = vec!["claude", "codex"];
+        before.config_changed(&k.config);
+        assert_eq!((before.perms.as_str(), before.effort.as_str(), before.provider.as_str()), ("ask", "high", "codex"));
+        assert_eq!(before.chat.provider.as_deref(), Some("codex"));
+        assert!(before.avail.contains(&"anthropic"), "the saved key makes the Anthropic API usable here too");
+        assert_eq!(before.models.get("claude").map(String::as_str), Some("opus"));
+        // ... but one with a conversation in it keeps its AI
+        let mut busy = Chat::new(&crate::config::Config::default());
+        busy.avail = vec!["claude", "codex"];
+        busy.chat.provider = Some("claude".into());
+        busy.chat.messages.push(store::Msg { role: "user".into(), content: "hi".into(), ..Default::default() });
+        busy.config_changed(&k.config);
+        assert_eq!(busy.chat.provider.as_deref(), Some("claude"));
+        // ... and its own mode: an unrelated setting changing doesn't touch it, a new default does not either
+        busy.perms = "bypass".into();
+        k.config.theme = "ocean".into();
+        busy.config_changed(&k.config);
+        k.config.ai.perms = "plan".into();
+        busy.config_changed(&k.config);
+        assert_eq!((busy.perms.as_str(), busy.default_perms.as_str()), ("bypass", "plan"));
+        // and a chat opened now starts from it
+        assert_eq!(Chat::new(&k.config).perms, "plan");
+    }
+
+    /// /note saves where the notes app looks (notes_folder), and neither /note nor /save overwrites a file.
+    #[test]
+    fn chat_note_goes_to_the_notes_folder() {
+        let dir = std::path::absolute("target/test-scratch/config/chat-notes").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut k = Kit::new();
+        k.config.notes_folder = dir.to_string_lossy().to_string();
+        let mut c = Chat::new(&k.config);
+        c.chat.title = "fix the tests".into();
+        c.chat.messages.push(store::Msg { role: "user".into(), content: "why do they fail".into(), ..Default::default() });
+        c.chat.messages.push(store::Msg { role: "assistant".into(), content: "a stale fixture".into(), ..Default::default() });
+        run_cmd(&mut k, &mut c, "/note");
+        run_cmd(&mut k, &mut c, "/note");
+        assert!(std::fs::read_to_string(dir.join("fix the tests.md")).unwrap().contains("a stale fixture"));
+        assert!(dir.join("fix the tests 2.md").exists(), "the second one gets its own file");
+        assert!(k.notices().iter().any(|n| n.contains("fix the tests 2.md")), "{:?}", k.notices());
+        // /save names its export the same way
+        assert_eq!(free_md_path(&dir, "fix the tests"), dir.join("fix the tests 3.md"));
+        assert_eq!(free_md_path(&dir, "a/b: c?"), dir.join("a_b_ c_.md"));
     }
 
     /// enter while a reply runs queues the message; Claude Code gets it mid-reply and it lands inline, others get

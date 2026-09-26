@@ -333,7 +333,7 @@ impl Pane for Themes {
 }
 
 /// Open a text file to edit: Notepad on Windows (a .toml may have no app), the system's default elsewhere.
-fn open_in_editor(path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn open_in_editor(path: &std::path::Path) -> Result<(), String> {
     if cfg!(test) {
         return Ok(());
     }

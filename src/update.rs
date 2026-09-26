@@ -106,6 +106,12 @@ pub fn check(force: bool) -> Result<Vec<Release>, String> {
     Ok(rs)
 }
 
+/// The releases from the last check, however old, without asking GitHub (None = never checked).
+pub fn cached() -> Option<Vec<Release>> {
+    let c = std::fs::read_to_string(state_dir().join("checked.json")).ok().and_then(|s| serde_json::from_str::<Checked>(&s).ok())?;
+    (!c.releases.is_empty()).then_some(c.releases)
+}
+
 /// The newest release if it's newer than this one.
 pub fn available(rs: &[Release]) -> Option<Release> {
     rs.iter().filter(|r| newer(&r.version, VERSION)).max_by_key(|r| parse(&r.version)).cloned()

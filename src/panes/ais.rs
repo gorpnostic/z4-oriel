@@ -34,6 +34,51 @@ use std::time::{Duration, Instant};
 use usage::{SrcSum, Stats};
 use util::Paths;
 
+/// What the settings app shows about your AIs: the token saver in use, Claude Code's own model and effort (which
+/// oriel's chat settings override), and the tools installed.
+#[derive(Clone, Debug, Default)]
+pub struct Glance {
+    /// "Balanced (Claude) · oriel-balanced (Codex)", or "not set up"
+    pub saver: String,
+    /// Claude Code's own settings, e.g. "sonnet · low (Frugal preset)"; None = it uses its defaults
+    pub claude_own: Option<String>,
+    /// "3 installed, 1 not signed in"
+    pub tools: String,
+}
+
+/// Blocking (reads Claude's and Codex's settings, looks for each CLI): background threads only.
+pub fn glance(cfg: &crate::config::Config) -> Glance {
+    let paths = Paths::real(cfg);
+    let r = saver::readouts(&paths);
+    let cur = |k: &str| r.current.iter().find(|(key, _)| key == k).map(|(_, v)| v.trim_matches('"').to_string()).filter(|v| v != "(not set)");
+    let own: Vec<String> = [cur("model"), cur("effortLevel")].into_iter().flatten().collect();
+    let claude_own = (!own.is_empty()).then(|| format!("{}{}", own.join(" · "), r.matches.map(|m| format!(" ({m} preset)")).unwrap_or_default()));
+    let codex: Vec<&String> = r.codex_profiles.iter().filter(|p| p.starts_with("oriel-")).collect();
+    let mut saver = vec![];
+    if let Some(m) = r.matches {
+        saver.push(format!("{m} (Claude)"));
+    }
+    if !codex.is_empty() {
+        saver.push(format!("{} (Codex)", codex.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    // existence checks only: no --version runs, no credentials read
+    let (mut installed, mut signed_out) = (0, 0);
+    for c in CLIS {
+        if catalog::locate(c.bin, &paths.home).is_some() {
+            installed += 1;
+            if catalog::signed_in(c, &paths, None).is_none() {
+                signed_out += 1;
+            }
+        }
+    }
+    let tools = match (installed, signed_out) {
+        (0, _) => "none installed".to_string(),
+        (n, 0) => format!("{n} installed"),
+        (n, s) => format!("{n} installed, {s} not signed in"),
+    };
+    Glance { saver: if saver.is_empty() { "not set up".into() } else { saver.join(" · ") }, claude_own, tools }
+}
+
 /// `oriel usage-sink` — Claude Code's statusLine command (reads its JSON on stdin). Returns the exit code.
 pub fn cli(args: &[String]) -> i32 {
     limits::cli(args)

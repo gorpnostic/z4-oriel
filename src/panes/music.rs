@@ -108,6 +108,9 @@ pub struct Music {
     by_id: HashMap<String, usize>,
     load: Arc<Mutex<Load>>,
     load_gen: u64,
+    /// What the library was loaded from ([music] folders and source): a change in settings loads it again.
+    folders: Vec<String>,
+    source: String,
     status: String,
     loaded: bool,
     state: Arc<Mutex<State>>,
@@ -143,8 +146,10 @@ impl Music {
         let waker = Arc::new(Mutex::new(None));
         let engine = Engine::new(state.clone(), waker.clone(), true);
         let load = Arc::new(Mutex::new(Load::default()));
-        spawn_loader(cfg.music.folders.clone(), load.clone(), waker.clone());
-        Self::build(state, waker, engine, load)
+        spawn_loader(cfg.music.folders.clone(), &cfg.music.source, load.clone(), waker.clone());
+        let mut m = Self::build(state, waker, engine, load);
+        (m.folders, m.source) = (cfg.music.folders.clone(), cfg.music.source.clone());
+        m
     }
 
     fn build(state: Arc<Mutex<State>>, waker: Arc<Mutex<Option<Waker>>>, engine: Engine, load: Arc<Mutex<Load>>) -> Self {
@@ -153,6 +158,8 @@ impl Music {
             by_id: HashMap::new(),
             load,
             load_gen: 0,
+            folders: vec![],
+            source: "auto".into(),
             status: "loading your library…".into(),
             loaded: false,
             state,
@@ -632,7 +639,7 @@ impl Music {
             } else if !self.query.is_empty() {
                 (format!("nothing matches “{}”", self.query), "esc clears the search".into())
             } else if self.lib.tracks.is_empty() {
-                (format!("no songs found{}", if self.lib.source.is_empty() { String::new() } else { format!(" in {}", self.lib.source) }), "add folders under [music] in config.toml".into())
+                (format!("no songs found{}", if self.lib.source.is_empty() { String::new() } else { format!(" in {}", self.lib.source) }), "add a music folder in settings (alt ,) › folders".into())
             } else if most {
                 ("nothing played yet".into(), String::new())
             } else {
@@ -725,9 +732,15 @@ impl Music {
     }
 }
 
-/// Load the library off the UI thread: audio-player's library.json when it's there, else a folder scan (names
-/// first, tags filled in as they're read).
-fn spawn_loader(folders: Vec<String>, slot: Arc<Mutex<Load>>, waker: Arc<Mutex<Option<Waker>>>) {
+/// Is the audio-player app's library on this computer? (settings says which source wins)
+pub fn audio_player_library() -> bool {
+    library::app_dir().is_some()
+}
+
+/// Load the library off the UI thread: audio-player's library.json when it's there (unless `source` is
+/// "folders"), else a folder scan (names first, tags filled in as they're read).
+fn spawn_loader(folders: Vec<String>, source: &str, slot: Arc<Mutex<Load>>, waker: Arc<Mutex<Option<Waker>>>) {
+    let app_lib = source != "folders";
     std::thread::Builder::new()
         .name("oriel-music-scan".into())
         .spawn(move || {
@@ -743,7 +756,7 @@ fn spawn_loader(folders: Vec<String>, slot: Arc<Mutex<Load>>, waker: Arc<Mutex<O
                 wake(&waker);
             };
             let mut note = String::new();
-            if let Some(dir) = library::app_dir() {
+            if let Some(dir) = library::app_dir().filter(|_| app_lib) {
                 match library::load_app(&dir) {
                     Ok(lib) => return publish(Some(lib), String::new(), true),
                     Err(e) => note = e,
@@ -804,6 +817,21 @@ impl Pane for Music {
     }
     fn poll(&mut self, cx: &mut Cx) {
         self.sync(cx);
+    }
+
+    /// Other music folders or source (settings › folders): load the library again. It goes into a fresh slot,
+    /// so a scan still running for the old folders is simply ignored; the old list stays until the new one is in.
+    fn config_changed(&mut self, cfg: &crate::config::Config) {
+        if cfg.music.folders == self.folders && cfg.music.source == self.source {
+            return;
+        }
+        (self.folders, self.source) = (cfg.music.folders.clone(), cfg.music.source.clone());
+        let load = Arc::new(Mutex::new(Load::default()));
+        self.load = load.clone();
+        self.load_gen = 0;
+        self.loaded = false;
+        self.status = "loading your library…".into();
+        spawn_loader(self.folders.clone(), &self.source, load, self.waker.clone());
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
@@ -1011,6 +1039,35 @@ mod tests {
         Music::build(state, waker, engine, load)
     }
 
+    /// A folder added in settings is scanned at once; source = "folders" skips the audio-player library.
+    #[test]
+    fn music_rescans_when_the_folders_change() {
+        let d = std::path::absolute("target/test-scratch/config/music-rescan").unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("one.mp3"), "").unwrap();
+        std::fs::write(d.join("two.flac"), "").unwrap();
+        let mut k = Kit::new();
+        let mut p = fake(&k, 3);
+        k.render(&mut p, 120, 30);
+        assert_eq!(p.lib.tracks.len(), 3);
+        k.config.music.source = "folders".into();
+        k.config.music.folders = vec![d.to_string_lossy().to_string()];
+        p.config_changed(&k.config);
+        for _ in 0..50 {
+            k.render(&mut p, 120, 30);
+            if p.loaded {
+                break;
+            }
+            k.wait_wake(&mut p, 100);
+        }
+        assert!(p.loaded);
+        assert_eq!(p.lib.tracks.len(), 2, "the new folder's songs");
+        // nothing changed: no rescan
+        p.config_changed(&k.config);
+        assert!(p.loaded);
+    }
+
     #[test]
     fn music_layout_search_views() {
         let mut k = Kit::new();
@@ -1081,7 +1138,7 @@ mod tests {
         let waker = Arc::new(Mutex::new(None));
         let engine = Engine::new(state.clone(), waker.clone(), false);
         let load = Arc::new(Mutex::new(Load::default()));
-        spawn_loader(k.config.music.folders.clone(), load.clone(), waker.clone());
+        spawn_loader(k.config.music.folders.clone(), &k.config.music.source, load.clone(), waker.clone());
         let mut p = Music::build(state.clone(), waker, engine, load);
         for _ in 0..50 {
             k.render(&mut p, 150, 44);

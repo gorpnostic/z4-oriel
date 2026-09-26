@@ -45,6 +45,7 @@ pub const SIDEBAR: &[(&str, &str, &str, &str)] = &[
     ("terminal", "term", "terminal", "F9"),
     // ── pinned to the bottom of the sidebar
     ("alerts", "bell", "alerts", ""),
+    ("settings", "cog", "settings", "alt ,"),
     ("themes", "theme", "themes", ""),
     ("help", "search", "help", "F10"),
 ];
@@ -70,6 +71,8 @@ enum Cmd {
     Tour,
     Open(&'static str, Place),
     Theme(String),
+    /// open settings on this row (the palette's "setting: …" entries)
+    Setting(String),
     SplitRight,
     SplitDown,
     Close,
@@ -141,6 +144,8 @@ pub struct App {
     notice: Option<(String, Instant)>,
     prefix_armed: bool,
     palette: Option<Palette>,
+    /// The pane showing a theme it hasn't saved (settings' live preview): only while it has the keyboard.
+    theme_preview: Option<PaneId>,
     quit: bool,
     start: Instant,
     last_tick: HashMap<PaneId, Instant>,
@@ -175,16 +180,32 @@ pub struct App {
     done: std::collections::HashSet<PaneId>,
     _watcher: Option<notify::RecommendedWatcher>,
     _theme_watcher: Option<notify::RecommendedWatcher>,
+    _config_watcher: Option<notify::RecommendedWatcher>,
+    /// Where the config is read and written (see edit_config); None = memory only (tests).
+    cfg_path: Option<std::path::PathBuf>,
+    /// config.toml changed on disk: re-read it at this point (editors write in two steps).
+    config_reload_at: Option<Instant>,
     /// A newer version is out: shown at the bottom of the sidebar.
     update_ready: Option<String>,
     /// Is the terminal the window you're in? (desktop notifications only when it isn't)
     term_focused: bool,
+    /// The memory/usage watcher's thresholds (settings › alerts changes them live).
+    alert_th: std::sync::Arc<crate::alerts::Thresholds>,
 }
 
 impl App {
+    /// Tests: opens on config.startup (main.rs uses with_start).
+    #[cfg(test)]
     pub fn new(config: Config, tx: Sender<Event>) -> App {
+        App::with_start(config, tx, None)
+    }
+
+    /// `start`: the app named on the command line (`oriel music`), opened instead of config.startup this once.
+    pub fn with_start(config: Config, tx: Sender<Event>, start: Option<String>) -> App {
         let theme = theme::get(&config.theme);
         ui::NERD.store(std::env::var("ORIEL_PLAIN").is_err() && !config.plain_icons, std::sync::atomic::Ordering::Relaxed);
+        let alert_th = crate::alerts::Thresholds::new(&config.alerts);
+        let sidebar = config.sidebar;
         let mut app = App {
             panes: HashMap::new(),
             tabs: vec![],
@@ -196,6 +217,7 @@ impl App {
             notice: None,
             prefix_armed: false,
             palette: None,
+            theme_preview: None,
             quit: false,
             start: Instant::now(),
             last_tick: HashMap::new(),
@@ -203,7 +225,7 @@ impl App {
             outer: vec![],
             side_hits: vec![],
             side_area: None,
-            sidebar: true,
+            sidebar,
             body: Rect::default(),
             drag: None,
             sel: None,
@@ -212,8 +234,12 @@ impl App {
             hover: Position { x: u16::MAX, y: u16::MAX },
             _watcher: None,
             _theme_watcher: None,
+            _config_watcher: None,
+            cfg_path: if cfg!(test) { None } else { Some(config::path()) },
+            config_reload_at: None,
             update_ready: None,
             term_focused: true,
+            alert_th: alert_th.clone(),
             renaming: None,
             ctx: None,
             onboard: None,
@@ -226,18 +252,21 @@ impl App {
         };
         app._watcher = watch_omarchy(tx.clone());
         app._theme_watcher = watch_themes(tx.clone());
+        app._config_watcher = watch_config(tx.clone());
         if !cfg!(test) {
             *crate::alerts::CENTER.lock().unwrap() = crate::alerts::load();
             let t2 = tx.clone();
-            crate::alerts::watch(move |k, s| {
+            crate::alerts::watch(alert_th, move |k, s| {
                 let _ = t2.send(Event::Alert(k, s));
             });
-            // once a day: is there a newer oriel? (in the background; quiet if offline)
-            std::thread::spawn(move || {
-                if let Some(r) = crate::update::check(false).ok().and_then(|rs| crate::update::available(&rs)) {
-                    let _ = tx.send(Event::UpdateAvailable(r.version));
-                }
-            });
+            // once a day: is there a newer oriel? (in the background; quiet if offline; settings › tools turns it off)
+            if app.config.update_check {
+                std::thread::spawn(move || {
+                    if let Some(r) = crate::update::check(false).ok().and_then(|rs| crate::update::available(&rs)) {
+                        let _ = tx.send(Event::UpdateAvailable(r.version));
+                    }
+                });
+            }
             if let Some((from, to)) = crate::update::just_updated() {
                 app.notify(format!("{}updated {from} → {to} · alt p → updates for what's new", ui::lead("package")));
             }
@@ -245,17 +274,28 @@ impl App {
         if !cfg!(test) && !crate::onboard::done_before() {
             app.onboard = Some(crate::onboard::Onboard::new(&app.theme.name, &app.config));
         }
-        if !cfg!(test) && startup_needs_calendar(&app.config.startup) {
+        let startup = start.unwrap_or_else(|| app.config.startup.clone());
+        if !cfg!(test) && startup_needs_calendar(&startup) {
             app.goto_app("calendar");
         }
-        let startup = app.config.startup.clone();
-        if SIDEBAR.iter().any(|a| a.0 == startup) {
-            app.goto_app(SIDEBAR.iter().find(|a| a.0 == startup).unwrap().0);
+        if let Some(a) = SIDEBAR.iter().find(|a| a.0 == startup) {
+            app.goto_app(a.0);
         } else {
-            let first = panes::open(&startup, &app.config).unwrap_or_else(|| Box::new(panes::home::Home::new()));
-            app.new_tab(first);
+            let first = panes::open(&startup, &app.config);
+            if first.is_none() {
+                let why = if panes::known(&startup) { "isn't installed" } else { "isn't an app oriel has" };
+                app.notify(format!("{startup} {why}: the home screen instead"));
+            }
+            app.new_tab(first.unwrap_or_else(|| Box::new(panes::home::Home::new())));
         }
         app
+    }
+
+    /// config.toml didn't parse at start (main.rs): say so. Settings still change for this session, but nothing
+    /// is written over the file until it's fixed (it's re-read as soon as it is).
+    pub fn config_error(&mut self, e: String) {
+        self.notify(format!("⚠ {e} · running on defaults, and not saving over it"));
+        config::set_broken(Some(e)); // nothing is written until it parses; settings shows why
     }
 
     fn add(&mut self, p: Box<dyn Pane>) -> PaneId {
@@ -305,10 +345,11 @@ impl App {
         self.goto_app("help");
     }
 
-    /// Tabs you made (not the pinned apps), with their index in self.tabs.
-    /// Replay the welcome + tour (palette "take the tour", `oriel --tour`).
+    /// Replay the tour (palette "take the tour", `oriel --tour`). Straight to the tour: the setup pages are for
+    /// the first run, and walking through them again would only risk resetting what you've set since.
     pub fn start_tour(&mut self) {
-        self.onboard = Some(crate::onboard::Onboard::new(&self.theme.name, &self.config));
+        let probe = self.probe();
+        self.onboard = Some(crate::onboard::Onboard::tour(&self.theme.name, &probe));
     }
 
     fn probe(&self) -> crate::onboard::Probe {
@@ -324,6 +365,8 @@ impl App {
             tab_named: t.app.is_none() && t.name.is_some(),
             ctx_seen: self.ctx_seen,
             palette_seen: self.palette_seen,
+            menu_open: self.ctx.is_some() || self.renaming.is_some(),
+            in_terminal: self.panes.get(&t.focus).is_some_and(|p| p.is_terminal()),
         }
     }
 
@@ -332,26 +375,22 @@ impl App {
         match out {
             Out::None => {}
             Out::Theme(name, save) => self.set_theme(&name, save),
-            Out::Icons(nerd) => {
-                ui::NERD.store(nerd, std::sync::atomic::Ordering::Relaxed);
-                self.config.plain_icons = !nerd;
-                config::save(&self.config);
-            }
-            Out::MusicFolder(p) => {
-                self.config.music.folders = vec![p];
-                config::save(&self.config);
-            }
-            Out::NotesFolder(p) => {
-                self.config.notes_folder = p;
-                config::save(&self.config);
-            }
-            Out::Defaults { startup, provider } => {
-                self.config.startup = startup;
-                if !provider.is_empty() {
-                    self.config.ai.provider = provider;
+            Out::Icons(nerd) => self.set_icons(nerd),
+            // the first music folder; any others you added stay
+            Out::MusicFolder(p) => self.edit_config(move |c| match c.music.folders.first_mut() {
+                Some(f) => *f = p,
+                None => c.music.folders.push(p),
+            }),
+            Out::NotesFolder(p) => self.edit_config(move |c| c.notes_folder = p),
+            // empty = left as it was
+            Out::Defaults { startup, provider } => self.edit_config(move |c| {
+                if !startup.is_empty() {
+                    c.startup = startup;
                 }
-                config::save(&self.config);
-            }
+                if !provider.is_empty() {
+                    c.ai.provider = provider;
+                }
+            }),
             Out::Finished => {
                 self.onboard = None;
                 crate::onboard::mark_done();
@@ -440,16 +479,101 @@ impl App {
         let in_view = self.term_focused && pane.is_some_and(|p| self.visible().contains(&p));
         crate::alerts::push(crate::alerts::Alert { at: crate::alerts::now(), kind, text: text.clone(), app: app.map(String::from), read: in_view, pane });
         self.notify(format!("{} {text}", kind.label().0));
-        if !self.term_focused && kind.loud() && self.config.desktop_notifications {
+        if !self.term_focused && kind.loud(&self.config) {
             crate::alerts::desktop("oriel", &text);
         }
     }
 
     fn set_theme(&mut self, name: &str, save: bool) {
         self.theme = theme::get(name);
-        if save {
-            self.config.theme = name.to_string();
-            config::save(&self.config);
+        if save && self.config.theme != name {
+            let name = name.to_string();
+            self.edit_config(move |c| c.theme = name);
+        }
+    }
+
+    /// A theme settings is previewing lasts while settings has the keyboard: go to another app (or close it) and
+    /// the saved theme is back, the way closing the palette puts it back. Unsaved looks never linger.
+    fn end_left_preview(&mut self) {
+        let Some(id) = self.theme_preview else { return };
+        if self.theme.name == self.config.theme {
+            self.theme_preview = None; // kept (saved), or already back
+        } else if self.focused() != id {
+            self.theme_preview = None;
+            self.theme = theme::get(&self.config.theme);
+        }
+    }
+
+    /// Nerd Font glyphs on or off, now and from the next start (palette, /icons, setup).
+    fn set_icons(&mut self, nerd: bool) {
+        ui::NERD.store(nerd, std::sync::atomic::Ordering::Relaxed);
+        if self.config.plain_icons == nerd {
+            self.edit_config(move |c| c.plain_icons = !nerd);
+        }
+    }
+
+    /// The one writer of config.toml (panes reach it with `cx.edit_config`). It re-reads the file so a hand edit,
+    /// another window or a pane's change since start isn't undone by a stale copy, applies `f`, writes it back
+    /// and tells every pane. If the file doesn't parse, `f` still holds for this session but nothing is written.
+    fn edit_config(&mut self, f: impl FnOnce(&mut Config)) {
+        let (c, saved) = match &self.cfg_path {
+            Some(p) => config::update_at(p, &self.config, f),
+            None => {
+                let mut c = self.config.clone();
+                f(&mut c);
+                (c, Ok(()))
+            }
+        };
+        match saved {
+            Ok(()) => config::set_broken(None),
+            Err(e) => {
+                self.notify(format!("⚠ not saved: {e}"));
+                config::set_broken(Some(e));
+            }
+        }
+        self.set_config(c);
+    }
+
+    /// A new config is in effect: what the app shows follows it at once (theme, icons, sidebar, the watcher's
+    /// thresholds; the prefix is read on every key), and every open pane hears about it.
+    fn set_config(&mut self, c: Config) {
+        if c.theme != self.config.theme && self.palette.is_none() {
+            self.theme = theme::get(&c.theme);
+        }
+        if c.plain_icons != self.config.plain_icons && std::env::var("ORIEL_PLAIN").is_err() {
+            ui::NERD.store(!c.plain_icons, std::sync::atomic::Ordering::Relaxed);
+        }
+        if c.sidebar != self.config.sidebar {
+            self.sidebar = c.sidebar;
+        }
+        self.alert_th.set(&c.alerts);
+        self.config = c;
+        for p in self.panes.values_mut() {
+            p.config_changed(&self.config);
+        }
+    }
+
+    /// config.toml changed on disk (a hand edit, another window, or our own save): take it in, look included.
+    fn reload_config(&mut self) {
+        self.config_reload_at = None;
+        let Some(p) = &self.cfg_path else { return };
+        match config::load_from(p) {
+            Ok(c) => {
+                if config::broken().is_some() {
+                    config::set_broken(None);
+                    self.notify("✓ config.toml reads fine again: settings loaded");
+                }
+                if c == self.config {
+                    return; // our own save coming back
+                }
+                self.set_config(c);
+            }
+            Err(e) => {
+                if config::broken().as_ref() != Some(&e) {
+                    self.notify(format!("⚠ {e} · keeping the settings you had, and not saving over it"));
+                }
+                config::set_broken(Some(e));
+            }
         }
     }
 
@@ -474,6 +598,9 @@ impl App {
             }
             self.reap();
             self.track_agents();
+            if self.config_reload_at.is_some_and(|t| Instant::now() >= t) {
+                self.reload_config();
+            }
             if self.onboard.is_some() {
                 let probe = self.probe();
                 let out = self.onboard.as_mut().unwrap().check(&probe);
@@ -494,6 +621,9 @@ impl App {
         }
         if let Some((_, t)) = &self.notice {
             d = d.min(Duration::from_secs(4).saturating_sub(t.elapsed()) + Duration::from_millis(10));
+        }
+        if let Some(t) = self.config_reload_at {
+            d = d.min(t.saturating_duration_since(Instant::now()));
         }
         let mut ids = self.visible();
         ids.extend(self.panes.iter().filter(|(_, p)| p.is_terminal() || p.ticks_hidden()).map(|(id, _)| *id));
@@ -653,8 +783,8 @@ impl App {
                 }
                 Action::SetTheme(t) => {
                     if theme::names().iter().any(|n| *n == t) {
-                        self.set_theme(&t, true);
                         self.notify(format!("{}theme: {t}", ui::lead("theme")));
+                        self.set_theme(&t, true);
                     } else {
                         self.notify(format!("no theme called {t} — /theme lists them"));
                     }
@@ -665,6 +795,11 @@ impl App {
                         self.notify(format!("⚠ {p}"));
                     }
                 }
+                Action::PreviewTheme(t) => {
+                    self.set_theme(&t, false);
+                    self.theme_preview = Some(from);
+                }
+                Action::Config(f) => self.edit_config(f),
                 Action::Palette(q) => {
                     self.open_palette();
                     if let Some(p) = &mut self.palette {
@@ -703,8 +838,9 @@ impl App {
                         self.close(id);
                     }
                 }
-                Action::ToggleSidebar => self.sidebar = !self.sidebar,
+                Action::ToggleSidebar => self.toggle_sidebar(),
                 Action::ToggleIcons => self.run_cmd(Cmd::Icons),
+                Action::Tour => self.start_tour(),
                 Action::Quit => self.quit = true,
             }
         }
@@ -724,6 +860,8 @@ impl App {
                 let id = self.focused();
                 self.with_pane(id, |p, cx| p.paste(&s, cx));
             }
+            Event::Input(CEvent::FocusGained) => self.term_focused = true,
+            Event::Input(CEvent::FocusLost) => self.term_focused = false,
             Event::Input(_) => {}
             Event::Wake(id) => {
                 self.with_pane(id, |p, cx| p.poll(cx));
@@ -752,8 +890,8 @@ impl App {
                 };
                 self.raise(k, s, app, None);
             }
-            Event::Input(CEvent::FocusGained) => self.term_focused = true,
-            Event::Input(CEvent::FocusLost) => self.term_focused = false,
+            // a moment later, once the writer is done (the run loop re-reads it then)
+            Event::ConfigFileChanged => self.config_reload_at = Some(Instant::now() + Duration::from_millis(150)),
             Event::ThemeFilesChanged => {
                 if self.theme.name == "omarchy" {
                     std::thread::sleep(Duration::from_millis(150)); // let omarchy finish swapping files
@@ -786,9 +924,19 @@ impl App {
         }
     }
 
+    /// alt s, /sidebar: hide or show the sidebar, and remember it for the next start.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar = !self.sidebar;
+        let on = self.sidebar;
+        if self.config.sidebar != on {
+            self.edit_config(move |c| c.sidebar = on);
+        }
+    }
+
     // ------------------------------------------------------------------ keys
     fn is_prefix(&self, k: &KeyEvent) -> bool {
-        let spec = self.config.prefix.to_lowercase();
+        // a bare key or alt+… in the config would break typing: ctrl+space then (settings shows why)
+        let spec = config::prefix(&self.config);
         let (need_ctrl, key) = match spec.strip_prefix("ctrl+") {
             Some(rest) => (true, rest.to_string()),
             None => (false, spec.clone()),
@@ -935,12 +1083,12 @@ impl App {
                         self.cur = t;
                     }
                 }
-                's' => self.sidebar = !self.sidebar,
+                's' => self.toggle_sidebar(),
                 'p' => self.open_palette(),
                 'z' => self.run_cmd(Cmd::Zoom),
                 'w' => self.run_cmd(Cmd::Close),
                 't' => self.run_cmd(Cmd::NewTab),
-                '[' | ',' if false => {}
+                ',' => self.goto_app("settings"),
                 _ => return false,
             },
             _ => return false,
@@ -1020,8 +1168,9 @@ impl App {
                 None => self.notify(format!("{name} isn't installed")),
             },
             Cmd::Theme(t) => {
-                self.set_theme(&t, true);
+                // the toast first, so a "not saved" from set_theme is the one you see
                 self.notify(format!("{}theme: {t}", ui::lead("theme")));
+                self.set_theme(&t, true);
             }
             Cmd::SplitRight => self.run_cmd(Cmd::Open("terminal", Place::SplitRight)),
             Cmd::SplitDown => self.run_cmd(Cmd::Open("terminal", Place::SplitDown)),
@@ -1033,11 +1182,15 @@ impl App {
             Cmd::NewTab => self.new_tab(Box::new(panes::home::Home::new())),
             Cmd::Icons => {
                 let n = !ui::NERD.load(std::sync::atomic::Ordering::Relaxed);
-                ui::NERD.store(n, std::sync::atomic::Ordering::Relaxed);
-                self.notify(if n { "nerd font icons" } else { "plain icons (no nerd font)" });
+                self.notify(if n { "nerd font icons · remembered" } else { "plain icons (no nerd font) · remembered" });
+                self.set_icons(n);
             }
             Cmd::Help => self.open_help(),
             Cmd::Tour => self.start_tour(),
+            Cmd::Setting(id) => {
+                panes::settings::jump(&id);
+                self.goto_app("settings");
+            }
             Cmd::Quit => self.quit = true,
         }
     }
@@ -1075,9 +1228,13 @@ impl App {
             let yours = if theme::is_custom(&t) { "  · yours" } else { "" };
             items.push((format!("{}theme {t}{yours}", ui::lead("theme")), Cmd::Theme(t)));
         }
-        items.push(("toggle nerd font icons".into(), Cmd::Icons));
+        items.push((format!("{}toggle nerd font icons", ui::lead("theme")), Cmd::Icons));
         items.push((format!("{}help: every key, command and how-to  F10", ui::lead("search")), Cmd::Help));
         items.push((format!("{}take the tour", ui::lead("window")), Cmd::Tour));
+        // every setting, by name: opens settings on its row
+        for (label, id) in panes::settings::palette_items(&self.config) {
+            items.push((format!("{}setting: {label}", ui::lead("cog")), Cmd::Setting(id)));
+        }
         items.push((format!("{}quit oriel", ui::lead("quit")), Cmd::Quit));
         self.palette = Some(Palette { query: String::new(), sel: 0, items, theme_before: self.theme.name.clone() });
         self.palette_seen += 1;
@@ -1311,6 +1468,7 @@ impl App {
 
     // ------------------------------------------------------------------ draw
     fn draw(&mut self, f: &mut Frame) {
+        self.end_left_preview();
         let area = f.area();
         let t = self.theme.clone();
         if !matches!(t.bg, ratatui::style::Color::Reset) {
@@ -1563,8 +1721,9 @@ impl App {
                 ui::rule(f, Rect { y, height: 1, ..inner }, t);
                 y += 1;
             }
-            if y + 1 < inner.bottom() {
-                let r = Rect { y: y + 1, height: inner.bottom() - y - 1, ..inner };
+            // straight under the rule, like your tabs under theirs (a tall list, like help's topics, needs the row)
+            if y < inner.bottom() {
+                let r = Rect { y, height: inner.bottom() - y, ..inner };
                 let id = self.tabs[self.cur].focus;
                 let mut actions = vec![];
                 if let Some(p) = self.panes.get_mut(&id) {
@@ -1671,6 +1830,25 @@ fn watch_themes(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
     let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if res.is_ok_and(|e| e.kind.is_modify() || e.kind.is_create()) {
             let _ = tx.send(Event::ThemeFilesChanged);
+        }
+    })
+    .ok()?;
+    w.watch(&dir, RecursiveMode::NonRecursive).ok()?;
+    Some(w)
+}
+
+/// config.toml: a hand edit or another oriel window applies here live, instead of being overwritten later.
+fn watch_config(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
+    use notify::{RecursiveMode, Watcher};
+    if cfg!(test) {
+        return None;
+    }
+    let dir = config::dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        // config.toml itself (a save lands as config.toml.tmp renamed over it), not the themes folder beside it
+        if res.is_ok_and(|e| !e.kind.is_access() && e.paths.iter().any(|p| p.file_name().is_some_and(|n| n == "config.toml"))) {
+            let _ = tx.send(Event::ConfigFileChanged);
         }
     })
     .ok()?;
@@ -1844,8 +2022,12 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut cfg = Config::default();
         cfg.theme = "ultra".into(); // what a first run looks like
+        // the music page counts songs in this folder, not your real one
+        let music = std::path::absolute("target/test-scratch/config/onboard-flow-music").unwrap();
+        let _ = std::fs::create_dir_all(&music);
+        cfg.music.folders = vec![music.to_string_lossy().to_string()];
         let mut app = App::new(cfg, tx);
-        app.start_tour();
+        app.onboard = Some(crate::onboard::Onboard::new(&app.theme.name, &app.config)); // the first run
         let key = |app: &mut App, c: KeyCode| app.key(KeyEvent::new(c, KeyModifiers::NONE));
         let mut term = Terminal::new(TestBackend::new(150, 42)).unwrap();
         let mut shot = |app: &mut App, name: &str| -> String {
@@ -1868,6 +2050,8 @@ mod tests {
         assert!(shot(&mut app, "defaults").contains("open oriel on"));
         key(&mut app, KeyCode::Right);
         key(&mut app, KeyCode::Enter);
+        assert_eq!(app.config.startup, "agents", "the startup app you picked");
+        assert_eq!(app.config.ai.provider, "", "the default AI you didn't touch stays as it was");
         assert!(shot(&mut app, "ais").contains("your AIs"));
         key(&mut app, KeyCode::Enter); // into the tour
         assert!(shot(&mut app, "tour1").contains("switch apps"));
@@ -1892,11 +2076,204 @@ mod tests {
         let out = app.onboard.as_mut().unwrap().check(&p);
         app.onboard_out(out);
         let s = shot(&mut app, "tour-last");
-        assert!(s.contains("you're set") && s.contains("help ·"), "{s}");
+        assert!(s.contains("you're set") && s.contains("help ·") && s.contains("esc  end tour"), "{s}");
         // end it
-        key(&mut app, KeyCode::F(11));
+        key(&mut app, KeyCode::Esc);
         assert!(app.onboard.is_none());
         let _ = rx;
+    }
+
+    /// "take the tour" and `oriel --tour` go straight to the tour (the setup pages would only reset settings);
+    /// esc ends it unless the palette has esc, and so does the × on its card.
+    #[test]
+    fn app_tour_replay() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "ultra".into();
+        cfg.startup = "files".into();
+        let mut app = App::new(cfg, tx);
+        let mut term = Terminal::new(TestBackend::new(150, 42)).unwrap();
+        let mut shot = |app: &mut App| -> Vec<String> {
+            term.draw(|f| app.draw(f)).unwrap();
+            let b = term.backend().buffer();
+            (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>()).collect()
+        };
+        app.run_cmd(Cmd::Tour);
+        let s = shot(&mut app).join("\n");
+        assert!(s.contains("tour · 1/") && s.contains("switch apps") && !s.contains("pick a look"), "{s}");
+        // esc with the palette open closes the palette, not the tour
+        app.open_palette();
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.palette.is_none() && app.onboard.is_some());
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.onboard.is_none(), "esc ends the tour");
+        assert_eq!(app.config.startup, "files", "nothing was reset");
+        // the × on the card
+        app.start_tour();
+        let lines = shot(&mut app);
+        let (row, line) = lines.iter().enumerate().find(|(_, l)| l.contains("tour · 1/")).unwrap();
+        let col = line[..line.rfind('×').unwrap()].chars().count() as u16;
+        app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: col, row: row as u16, modifiers: KeyModifiers::NONE });
+        assert!(app.onboard.is_none(), "× ends the tour");
+    }
+
+    fn scratch_config(name: &str, text: &str) -> std::path::PathBuf {
+        let d = std::path::absolute(format!("target/test-scratch/config/{name}")).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("config.toml");
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// The app writes config.toml by re-reading it and changing one field: a theme pick can't undo what a chat
+    /// saved (/key, /perms), and `oriel music` is never saved as the startup app.
+    #[test]
+    fn app_config_single_writer() {
+        let p = scratch_config("app-writer", "theme = \"oriel\"\n");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "oriel".into();
+        let mut app = App::with_start(cfg, tx, Some("music".into()));
+        app.cfg_path = Some(p.clone());
+        assert_eq!(app.tabs[app.cur].app, Some("music"), "oriel music opens music");
+        // a chat saves a key and a mode (through the app, as chats now do)
+        let chat = app.focused();
+        app.apply(chat, vec![Action::Config(Box::new(|c| c.ai.anthropic_key = "sk-test".into())), Action::Config(Box::new(|c| c.ai.perms = "bypass".into()))]);
+        assert_eq!(app.config.ai.perms, "bypass", "new panes are built from this");
+        // meanwhile another window (or a hand edit) adds a roster
+        let mut disk = config::load_from(&p).unwrap();
+        disk.roster.push(crate::config::RosterEntry { name: "kimi".into(), agent: "kimi".into(), ..Default::default() });
+        config::save_to(&p, &disk).unwrap();
+        // then a theme pick from the palette
+        app.run_cmd(Cmd::Theme("ocean".into()));
+        let disk = config::load_from(&p).unwrap();
+        assert_eq!(disk.theme, "ocean");
+        assert_eq!((disk.ai.anthropic_key.as_str(), disk.ai.perms.as_str()), ("sk-test", "bypass"), "the chat's settings survive");
+        assert_eq!(disk.roster.len(), 1, "the other window's roster survives");
+        assert_eq!(disk.startup, "ai", "`oriel music` wasn't saved as the startup app");
+        assert_eq!(app.config, disk, "the app's copy is what's on disk");
+        // the icons toggle is saved too (the config says plain, the screen shows glyphs: make it glyphs)
+        config::save_to(&p, &Config { plain_icons: true, ..disk }).unwrap();
+        app.config.plain_icons = true;
+        app.set_icons(true);
+        assert!(!config::load_from(&p).unwrap().plain_icons, "remembered");
+        app.open_palette();
+        let item = app.palette.as_ref().unwrap().items.iter().find(|i| i.0.contains("toggle nerd font icons")).unwrap().0.clone();
+        assert!(item.starts_with(&ui::lead("theme")), "{item}");
+    }
+
+    /// config.toml edited by hand: applied live; a typo is reported with its line and nothing is written over it.
+    #[test]
+    fn app_config_hand_edits() {
+        let p = scratch_config("app-hand", "theme = \"oriel\"\n");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "oriel".into();
+        let mut app = App::new(cfg, tx);
+        app.cfg_path = Some(p.clone());
+        std::fs::write(&p, "theme = \"dracula\"\n[ai]\nperms = \"plan\"\n").unwrap();
+        app.handle(Event::ConfigFileChanged);
+        assert!(app.config_reload_at.is_some(), "re-read a moment later, once the editor is done");
+        app.reload_config();
+        assert_eq!((app.theme.name.as_str(), app.config.ai.perms.as_str()), ("dracula", "plan"));
+        // a typo: keep what we have, say where it is, don't write over it
+        let broken = "theme = \"dracula\"\nprefix = ctrl+b\n[ai]\nperms = \"plan\"\n";
+        std::fs::write(&p, broken).unwrap();
+        app.reload_config();
+        assert!(config::broken().as_deref().is_some_and(|e| e.contains("line 2")));
+        assert!(app.notice.as_ref().unwrap().0.contains("line 2"));
+        app.run_cmd(Cmd::Theme("ocean".into()));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), broken, "never written over");
+        assert!(app.notice.as_ref().unwrap().0.contains("not saved"));
+        assert_eq!(app.theme.name, "ocean", "it still applies for now");
+        // fixed: picked up, and saving works again
+        std::fs::write(&p, "theme = \"dracula\"\nprefix = \"ctrl+b\"\n").unwrap();
+        app.reload_config();
+        assert!(config::broken().is_none() && app.config.prefix == "ctrl+b");
+        assert!(app.notice.as_ref().unwrap().0.contains("reads fine again"));
+    }
+
+    /// Settings: alt , opens it, the palette has a row per setting that opens on it, a change applies live (the
+    /// sidebar, the prefix), alt s is remembered, and a theme preview isn't saved.
+    #[test]
+    fn app_settings_app() {
+        let p = scratch_config("app-settings", "theme = \"oriel\"\n");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config { theme: "oriel".into(), ..Config::default() }, tx);
+        app.cfg_path = Some(p.clone());
+        let mut term = Terminal::new(TestBackend::new(160, 44)).unwrap();
+        app.key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::ALT));
+        assert_eq!(app.tabs[app.cur].app, Some("settings"));
+        term.draw(|f| app.draw(f)).unwrap();
+        crate::testkit::save_html(term.backend().buffer(), "target/snap/app-settings.html");
+        let b = term.backend().buffer();
+        let s: String = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>() + "\n").collect();
+        assert!(s.contains("settings") && s.contains("alt ,") && s.contains("prefix key") && s.contains("providers & keys"), "{s}");
+        // the palette: one row per setting, opening on it
+        app.goto_app("files");
+        app.open_palette();
+        let item = app.palette.as_ref().unwrap().items.iter().find(|i| i.0.contains("setting: permissions · edits")).cloned().expect("a palette row per setting");
+        app.palette = None;
+        app.run_cmd(item.1);
+        assert_eq!(app.tabs[app.cur].app, Some("settings"));
+        term.draw(|f| app.draw(f)).unwrap();
+        let settings = app.focused();
+        assert!(app.panes[&settings].title().contains("AI chat"));
+        // a change from settings applies at once, and only it is saved
+        app.apply(settings, vec![Action::Config(Box::new(|c| c.prefix = "ctrl+b".into())), Action::Config(Box::new(|c| c.sidebar = false))]);
+        assert!(!app.sidebar, "the sidebar follows at once");
+        assert!(app.is_prefix(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)), "so does the prefix");
+        assert!(!app.is_prefix(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        assert_eq!(config::load_from(&p).unwrap().prefix, "ctrl+b");
+        // alt s is remembered
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(app.sidebar && config::load_from(&p).unwrap().sidebar);
+        // a preview shows a theme without saving it
+        app.apply(settings, vec![Action::PreviewTheme("ocean".into())]);
+        assert_eq!(app.theme.name, "ocean");
+        assert_eq!(config::load_from(&p).unwrap().theme, "oriel");
+        term.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.theme.name, "ocean", "still previewing while settings has the keyboard");
+        // ... and going to another app mid-preview puts the saved one back (nothing unsaved lingers)
+        app.goto_app("files");
+        term.draw(|f| app.draw(f)).unwrap();
+        assert_eq!((app.theme.name.as_str(), app.theme_preview), ("oriel", None));
+        // a bare-key prefix from a hand edit can't eat every b typed: ctrl+space then
+        app.config.prefix = "b".into();
+        assert!(!app.is_prefix(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)));
+        assert!(app.is_prefix(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+    }
+
+    /// Focus changes reach the app (they used to fall into the catch-all input arm), so desktop notifications know
+    /// when the terminal isn't the window you're in.
+    #[test]
+    fn app_tracks_terminal_focus() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config { theme: "oriel".into(), ..Config::default() }, tx);
+        app.handle(Event::Input(CEvent::FocusLost));
+        assert!(!app.term_focused);
+        app.handle(Event::Input(CEvent::FocusGained));
+        assert!(app.term_focused);
+    }
+
+    /// Setup's music page changes the first folder and keeps the rest; an unknown app on the command line or in
+    /// the config says so instead of quietly showing the home screen.
+    #[test]
+    fn app_setup_folders_and_unknown_startup() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "oriel".into();
+        cfg.music.folders = vec!["A".into(), "B".into()];
+        let mut app = App::with_start(cfg, tx, Some("claud".into()));
+        assert!(app.notice.as_ref().unwrap().0.contains("claud isn't an app oriel has"));
+        app.onboard_out(crate::onboard::Out::MusicFolder("C".into()));
+        assert_eq!(app.config.music.folders, vec!["C".to_string(), "B".to_string()]);
+        app.config.music.folders.clear();
+        app.onboard_out(crate::onboard::Out::MusicFolder("D".into()));
+        assert_eq!(app.config.music.folders, vec!["D".to_string()]);
+        assert!(panes::known("music") && panes::known("claude") && panes::known("home"));
+        assert!(!panes::known("claud") && !panes::known("-v"));
     }
 
     #[test]

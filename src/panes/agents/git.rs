@@ -566,15 +566,41 @@ pub fn gate_checkout(repo: &Path, gate_wt: &Path, sha: &str) -> Result<(), Strin
 }
 
 /// The gate for a repo when the config doesn't name one: a quick compile check for the ecosystems where a
-/// fresh checkout can build without an install step.
+/// fresh checkout can build without an install step, and a JS project's own build script (after installing
+/// with the package manager its lockfile names: the gate's checkout has no node_modules).
 pub fn detect_gate(dir: &Path) -> Option<String> {
     if dir.join("Cargo.toml").is_file() {
         Some("cargo check --quiet".into())
     } else if dir.join("go.mod").is_file() {
         Some("go build ./...".into())
+    } else if let Some(pm) = js_build(dir) {
+        Some(match pm {
+            "pnpm" => "pnpm install --frozen-lockfile && pnpm run build",
+            "yarn" => "yarn install --frozen-lockfile && yarn build",
+            "bun" => "bun install --frozen-lockfile && bun run build",
+            _ if dir.join("package-lock.json").is_file() => "npm ci && npm run build",
+            _ => "npm install && npm run build",
+        }
+        .into())
     } else {
         None
     }
+}
+
+/// package.json has a "build" script: which package manager the repo uses.
+fn js_build(dir: &Path) -> Option<&'static str> {
+    let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("scripts")?.get("build")?.as_str()?;
+    Some(if dir.join("pnpm-lock.yaml").is_file() {
+        "pnpm"
+    } else if dir.join("yarn.lock").is_file() {
+        "yarn"
+    } else if dir.join("bun.lockb").is_file() || dir.join("bun.lock").is_file() {
+        "bun"
+    } else {
+        "npm"
+    })
 }
 
 /// The shell gates and acceptance commands run in: what agents write commands for. On Windows that's Git for
@@ -760,4 +786,27 @@ pub fn branch_diff(repo: &Path, base_sha: &str, branch: &str) -> Result<Diff, St
     let target = ok(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".into());
     let conflicts = ok(repo, &["rev-parse", "HEAD"]).ok().and_then(|head| merge_tree(repo, &head, &tip).ok()).map(|r| r.err().unwrap_or_default());
     Ok(Diff { files, conflicts, target })
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// With no gate in the config, a JS repo with a build script is built (after an install, since the gate's
+    /// checkout has no node_modules) instead of merging unchecked.
+    #[test]
+    fn agents_detect_gate_knows_js_builds() {
+        let d = std::path::absolute("target/test-scratch/config/detect-gate").unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(detect_gate(&d), None);
+        std::fs::write(d.join("package.json"), r#"{"scripts": {"test": "vitest"}}"#).unwrap();
+        assert_eq!(detect_gate(&d), None, "no build script: nothing to run");
+        std::fs::write(d.join("package.json"), r#"{"scripts": {"build": "vite build"}}"#).unwrap();
+        assert_eq!(detect_gate(&d).as_deref(), Some("npm install && npm run build"));
+        std::fs::write(d.join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(detect_gate(&d).as_deref(), Some("pnpm install --frozen-lockfile && pnpm run build"));
+        std::fs::write(d.join("Cargo.toml"), "").unwrap();
+        assert_eq!(detect_gate(&d).as_deref(), Some("cargo check --quiet"), "Cargo first");
+    }
 }

@@ -29,6 +29,7 @@ const ICONS: &[(&str, &str, &str)] = &[
     ("theme", "\u{F03D8}", "&"),   // md-palette
     ("calendar", "\u{F00ED}", "="), // md-calendar
     ("bell", "\u{F009A}", "!"),     // md-bell
+    ("cog", "\u{F0493}", "="),      // md-cog
     ("play", "\u{F040A}", ">"),
     ("pause", "\u{F03E4}", "||"),
     ("prev", "\u{F04AE}", "|<"),

@@ -428,19 +428,20 @@ impl Agents {
         }
     }
 
-    /// Roster edits are saved to the config right away (the lead reads them on its next roster call).
-    fn set_roster(&mut self, r: Vec<RosterEntry>) {
-        self.roster = r;
-        self.save_config();
+    /// Roster edits are saved to the config right away (the lead reads them on its next roster call). Only the
+    /// roster: an empty one (every worker removed) is saved too, and means the defaults from what's installed.
+    fn set_roster(&mut self, r: Vec<RosterEntry>, cx: &mut Cx) {
+        self.roster = r.clone();
+        cx.edit_config(move |c| c.roster = r);
     }
 
-    pub(super) fn roster_key(&mut self, k: KeyEvent) -> bool {
+    pub(super) fn roster_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
         let Mode::Roster(mut v) = std::mem::replace(&mut self.mode, Mode::Board) else { return false };
         let mut roster = self.roster();
         if let Some(mut e) = v.edit.take() {
             e.err.clear();
             let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-            let save = |s: &mut Self, e: &mut RosterEdit, roster: &mut Vec<RosterEntry>| -> bool {
+            let save = |s: &mut Self, e: &mut RosterEdit, roster: &mut Vec<RosterEntry>, cx: &mut Cx| -> bool {
                 let name = e.name.text.trim().to_string();
                 if name.is_empty() {
                     e.err = "give it a name".into();
@@ -451,21 +452,35 @@ impl Agents {
                     e.err = format!("{name} is already on the roster");
                     return false;
                 }
+                // an empty field is its placeholder; a number that doesn't read is said, not quietly swapped for one
+                let d = RosterEntry::default();
+                let turns = e.turns.text.trim();
+                let Ok(max_turns) = (if turns.is_empty() { Ok(d.max_turns) } else { turns.parse::<u32>() }) else {
+                    e.err = format!("max turns: '{turns}' isn't a whole number (0 = no cap)");
+                    e.field = 5;
+                    return false;
+                };
+                let budget = e.budget.text.trim().trim_start_matches('$');
+                let Some(budget_usd) = (if budget.is_empty() { Some(d.budget_usd) } else { budget.parse::<f64>().ok().filter(|b| b.is_finite() && *b >= 0.0) }) else {
+                    e.err = format!("budget: '{budget}' isn't an amount like 1.50 (0 = none)");
+                    e.field = 6;
+                    return false;
+                };
                 let w = RosterEntry {
                     name,
                     agent: KINDS[e.agent].0.into(),
                     model: e.model.text.trim().into(),
                     tier: TIERS[e.tier].into(),
                     good_at: e.good_at.text.trim().into(),
-                    max_turns: e.turns.text.trim().parse().unwrap_or(40),
-                    budget_usd: e.budget.text.trim().trim_start_matches('$').parse().unwrap_or(1.5),
+                    max_turns,
+                    budget_usd,
                     enabled: e.enabled,
                 };
                 match e.idx {
                     Some(i) if i < roster.len() => roster[i] = w,
                     _ => roster.push(w),
                 }
-                s.set_roster(roster.clone());
+                s.set_roster(roster.clone(), cx);
                 true
             };
             match k.code {
@@ -474,7 +489,7 @@ impl Agents {
                     return true;
                 }
                 KeyCode::Char('s') if ctrl => {
-                    if save(self, &mut e, &mut roster) {
+                    if save(self, &mut e, &mut roster, cx) {
                         v.sel = e.idx.unwrap_or(roster.len() - 1);
                         self.mode = Mode::Roster(v);
                         return true;
@@ -494,7 +509,7 @@ impl Agents {
                     if !used {
                         match k.code {
                             KeyCode::Enter if e.field == 7 => {
-                                if save(self, &mut e, &mut roster) {
+                                if save(self, &mut e, &mut roster, cx) {
                                     v.sel = e.idx.unwrap_or(roster.len() - 1);
                                     self.mode = Mode::Roster(v);
                                     return true;
@@ -524,24 +539,24 @@ impl Agents {
             KeyCode::Down | KeyCode::Char('j') => v.sel = (v.sel + 1).min(n.saturating_sub(1)),
             KeyCode::Char(' ') if n > 0 => {
                 roster[v.sel].enabled = !roster[v.sel].enabled;
-                self.set_roster(roster);
+                self.set_roster(roster, cx);
             }
             KeyCode::Enter | KeyCode::Char('e') if n > 0 => v.edit = Some(self.roster_edit(Some(v.sel))),
             KeyCode::Char('a') | KeyCode::Char('n') => v.edit = Some(self.roster_edit(None)),
             KeyCode::Char('x') | KeyCode::Delete if n > 0 => {
                 roster.remove(v.sel);
                 v.sel = v.sel.min(roster.len().saturating_sub(1));
-                self.set_roster(roster);
+                self.set_roster(roster, cx);
             }
             KeyCode::Char('J') if v.sel + 1 < n => {
                 roster.swap(v.sel, v.sel + 1);
                 v.sel += 1;
-                self.set_roster(roster);
+                self.set_roster(roster, cx);
             }
             KeyCode::Char('K') if v.sel > 0 => {
                 roster.swap(v.sel, v.sel - 1);
                 v.sel -= 1;
-                self.set_roster(roster);
+                self.set_roster(roster, cx);
             }
             _ => {}
         }
@@ -557,7 +572,11 @@ impl Agents {
         let inner = ui::popup(f, area, 110, h, "⚑ roster · the workers a lead can use", t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let w = inner.width as usize;
-        let src = if self.roster.is_empty() { "defaults from what's installed — any edit saves them to the config".to_string() } else { "saved in oriel's config.toml under [[roster]] (oriel --config prints where)".to_string() };
+        let src = if self.roster.is_empty() {
+            "using defaults from what's installed — any edit saves them as your roster".to_string()
+        } else {
+            "your roster, saved as you edit · settings (alt ,) › roster resets it to the defaults from what's installed".to_string()
+        };
         f.render_widget(Paragraph::new(Span::styled(ui::fit(&src, w), ui::muted(t))), Rect { height: 1, ..inner });
         let mut y = inner.y + 2;
         if roster.is_empty() {
