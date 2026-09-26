@@ -2,11 +2,16 @@
 //! an approval is waiting, a build failed, a plan is about to start, an install finished, memory is running out,
 //! an AI's usage is near its limit, a new version is out). Each one is a toast, a line in the alerts app, and,
 //! when the terminal isn't the window you're in, a desktop notification.
+//!
+//! Kept in alerts.json, which every open oriel window shares: saving reads the file first and merges, so one
+//! window never wipes another's alerts, and the new file is swapped in whole, so a crash can't leave it torn.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     AgentDone,
@@ -56,41 +61,234 @@ pub struct Alert {
     pub pane: Option<u64>,
 }
 
-/// Everything so far, newest last (the app adds; the alerts app reads, marks read, dismisses).
-pub static CENTER: std::sync::Mutex<Vec<Alert>> = std::sync::Mutex::new(Vec::new());
+/// An alert's identity, the same in every window and after a restart.
+pub type Key = (i64, Kind, String);
+
+pub fn key(a: &Alert) -> Key {
+    (a.at, a.kind, a.text.clone())
+}
+
+/// The newest this many are kept.
+const KEEP: usize = 200;
+
+#[derive(Default)]
+struct Center {
+    /// newest last
+    list: Vec<Alert>,
+    /// the file as this window last read or wrote it: what's gone from it since, another window dismissed
+    base: HashSet<Key>,
+    /// the file it's kept in (None = nowhere: tests that don't give one)
+    file: Option<PathBuf>,
+    /// the file's modified time when we last read or wrote it, to notice another window's writes
+    seen: Option<std::time::SystemTime>,
+}
+
+thread_local! {
+    /// Only the UI thread adds, reads, marks and dismisses (and thread-local keeps parallel tests apart).
+    static CENTER: RefCell<Center> = RefCell::new(Center::default());
+}
+
+/// Start keeping alerts in oriel's data folder, with what's there already (the app, once at start).
+pub fn open() {
+    open_at(crate::config::data_dir().join("alerts.json"));
+}
+
+pub fn open_at(file: PathBuf) {
+    CENTER.with_borrow_mut(|c| {
+        c.list = read(&file).unwrap_or_default();
+        c.base = c.list.iter().map(key).collect();
+        c.seen = modified(&file);
+        c.file = Some(file);
+    });
+}
 
 pub fn unread() -> usize {
-    CENTER.lock().unwrap().iter().filter(|a| !a.read).count()
+    CENTER.with_borrow(|c| c.list.iter().filter(|a| !a.read).count())
+}
+
+/// Look at every alert, newest last.
+pub fn with<R>(f: impl FnOnce(&[Alert]) -> R) -> R {
+    CENTER.with_borrow(|c| f(&c.list))
 }
 
 pub fn push(a: Alert) {
-    let mut c = CENTER.lock().unwrap();
-    c.push(a);
-    let n = c.len();
-    if n > 200 {
-        c.drain(..n - 200);
-    }
-    save(&c);
+    CENTER.with_borrow_mut(|c| {
+        // the same thing again while the first is still unread ("oriel 0.8 is out" at every start): move it up
+        // instead of listing it twice. For updates, a newer version replaces the older one.
+        let same = |b: &Alert| !b.read && b.kind == a.kind && (b.text == a.text || (a.kind == Kind::Update && b.app == a.app));
+        c.list.retain(|b| !same(b));
+        c.list.push(a);
+        let n = c.list.len();
+        c.list.drain(..n.saturating_sub(KEEP));
+        save(c);
+    });
+}
+
+/// You've seen them (the alerts app is on screen).
+pub fn mark_all_read() {
+    CENTER.with_borrow_mut(|c| {
+        if c.list.iter().any(|a| !a.read) {
+            c.list.iter_mut().for_each(|a| a.read = true);
+            save(c);
+        }
+    });
+}
+
+pub fn dismiss(k: &Key) {
+    CENTER.with_borrow_mut(|c| {
+        c.list.retain(|a| key(a) != *k);
+        save(c);
+    });
+}
+
+pub fn clear() {
+    CENTER.with_borrow_mut(|c| {
+        c.list.clear();
+        save(c);
+    });
+}
+
+/// Another window saved since we last looked: take in what it added (the alerts app, as it draws).
+pub fn sync() {
+    CENTER.with_borrow_mut(|c| {
+        let Some(file) = c.file.clone() else { return };
+        let m = modified(&file);
+        if m.is_some() && m != c.seen {
+            let theirs = read(&file);
+            c.list = merge(&c.list, &c.base, theirs.as_deref());
+            if let Some(t) = theirs {
+                c.base = t.iter().map(key).collect();
+            }
+            c.seen = m;
+        }
+    });
 }
 
 pub fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-fn file() -> PathBuf {
-    if cfg!(test) {
-        return std::path::absolute("target/test-scratch/alerts.json").unwrap_or_default();
+fn modified(p: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// The file's alerts. One that doesn't parse (torn by a crash) is moved aside rather than read as empty and
+/// then overwritten.
+fn read(file: &Path) -> Option<Vec<Alert>> {
+    let s = std::fs::read_to_string(file).ok()?;
+    match serde_json::from_str(&s) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            let _ = std::fs::rename(file, file.with_extension("json.bad"));
+            None
+        }
     }
-    crate::config::data_dir().join("alerts.json")
 }
 
-pub fn load() -> Vec<Alert> {
-    std::fs::read_to_string(file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+/// Write it out without losing another window's alerts: read the file, merge, then swap the new file in whole.
+/// (Small and rare: a new alert, a dismissal, a look at the alerts app.)
+fn save(c: &mut Center) {
+    let Some(file) = c.file.clone() else { return };
+    c.list = merge(&c.list, &c.base, read(&file).as_deref());
+    if let Ok(j) = serde_json::to_vec(&c.list) {
+        if write_atomic(&file, &j).is_ok() {
+            c.base = c.list.iter().map(key).collect();
+        }
+    }
+    c.seen = modified(&file);
 }
 
-pub fn save(all: &[Alert]) {
-    let keep = &all[all.len().saturating_sub(200)..];
-    let _ = std::fs::write(file(), serde_json::to_string(keep).unwrap_or_default());
+/// Three ways: `mine` (this window's list), `base` (the file as this window last saw it) and `theirs` (the file
+/// now). What's new on either side stays, what either side dismissed or cleared goes, read in either is read.
+/// An unreadable or missing file says nothing about what anyone removed: then it's just `mine`.
+fn merge(mine: &[Alert], base: &HashSet<Key>, theirs: Option<&[Alert]>) -> Vec<Alert> {
+    let Some(theirs) = theirs else { return mine.to_vec() };
+    let on_disk: HashSet<Key> = theirs.iter().map(key).collect();
+    // here before, gone from the file now: another window dismissed it
+    let mut out: Vec<Alert> = mine.iter().filter(|a| !base.contains(&key(a)) || on_disk.contains(&key(a))).cloned().collect();
+    let mut have: HashMap<Key, usize> = out.iter().enumerate().map(|(i, a)| (key(a), i)).collect();
+    for d in theirs {
+        let k = key(d);
+        if let Some(&i) = have.get(&k) {
+            out[i].read |= d.read;
+            if out[i].app.is_none() {
+                out[i].app = d.app.clone();
+            }
+        } else if !base.contains(&k) {
+            // new from another window (in the base but not in mine = this window dismissed it)
+            have.insert(k, out.len());
+            out.push(d.clone());
+        }
+    }
+    out.sort_by_key(|a| a.at);
+    let n = out.len();
+    out.drain(..n.saturating_sub(KEEP));
+    out
+}
+
+/// Replace a file in one step (a temp file renamed over it): a crash mid-write leaves the old one whole.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+// ------------------------------------------------------------------ what's been said, across restarts
+/// What the watchers and the update check have already said, shared by every window and kept across restarts,
+/// so none of it is said again each time oriel starts.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct State {
+    /// usage warnings sent: (agent, limit window, when it resets; 0 = unknown)
+    pub usage: Vec<(String, String, i64)>,
+    /// memory is over the line and that was said (it can be said again once it drops back)
+    pub memory: bool,
+    /// the version an "is out" alert was last raised for
+    pub announced: Option<String>,
+    /// the version you rolled back from: not offered again
+    pub skipped: Option<String>,
+}
+
+fn state_file() -> PathBuf {
+    if cfg!(test) {
+        return std::path::absolute("target/test-scratch/shell/alerts-state.json").unwrap_or_default();
+    }
+    crate::config::data_dir().join("alerts-state.json")
+}
+
+pub fn state() -> State {
+    std::fs::read_to_string(state_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+/// Read, change and write back the state file.
+pub fn update_state(f: impl FnOnce(&mut State)) {
+    let mut s = state();
+    f(&mut s);
+    if let Ok(j) = serde_json::to_vec(&s) {
+        let _ = write_atomic(&state_file(), &j);
+    }
+}
+
+/// Which of `limits` (agent, window, % used, resets at) to warn about now: over the line and not said yet for
+/// this window of the limit. `said` remembers; a window drops out of it once it resets (or, with no reset time,
+/// once it's back under the line).
+fn usage_due(limits: &[(String, String, f64, Option<i64>)], said: &mut Vec<(String, String, i64)>, now: i64) -> Vec<usize> {
+    let line = |label: &str| if label == "weekly" { 90.0 } else { 85.0 };
+    said.retain(|(agent, label, resets)| *resets > now || (*resets == 0 && limits.iter().any(|l| l.0 == *agent && l.1 == *label && l.2 >= line(label))));
+    let mut due = vec![];
+    for (i, (agent, label, pct, resets)) in limits.iter().enumerate() {
+        let k = (agent.clone(), label.clone(), resets.unwrap_or(0));
+        if *pct >= line(label) && !said.contains(&k) {
+            said.push(k);
+            due.push(i);
+        }
+    }
+    due
 }
 
 /// "just now", "5m", "3h", "2d".
@@ -143,7 +341,7 @@ pub fn desktop(title: &str, body: &str) {
 
 // ------------------------------------------------------------------ watchers that run in the background
 /// Memory running out, and AI usage near its limit: checked every half minute / five minutes, each said once
-/// until it clears (or the usage window resets).
+/// until it clears (or the usage window resets), counting what earlier runs and other windows already said.
 pub fn watch(send: impl Fn(Kind, String) + Send + 'static) {
     if cfg!(test) {
         return;
@@ -151,32 +349,136 @@ pub fn watch(send: impl Fn(Kind, String) + Send + 'static) {
     std::thread::spawn(move || {
         use sysinfo::System;
         let mut sys = System::new();
-        let mut mem_warned = false;
-        let mut usage_warned: std::collections::HashSet<(String, String, i64)> = Default::default();
         let mut tick = 0u64;
         loop {
             sys.refresh_memory();
             let (used, total) = (sys.used_memory(), sys.total_memory().max(1));
             let pct = used as f64 / total as f64;
-            if pct > 0.92 && !mem_warned {
-                mem_warned = true;
+            let said = state().memory;
+            if pct > 0.92 && !said {
+                update_state(|s| s.memory = true);
                 send(Kind::Memory, format!("memory is {:.0}% full ({} of {}): the system app shows what's using it", pct * 100.0, crate::ui::human_bytes(used), crate::ui::human_bytes(total)));
-            } else if pct < 0.85 {
-                mem_warned = false;
+            } else if pct < 0.85 && said {
+                update_state(|s| s.memory = false);
             }
             if tick % 10 == 0 {
-                let limits = crate::panes::agents::usage_limits();
-                for (agent, w) in limits {
-                    let warn = if w.label == "weekly" { 90.0 } else { 85.0 };
-                    let key = (agent.clone(), w.label.clone(), w.resets_at.unwrap_or(0));
-                    if w.pct >= warn && usage_warned.insert(key) {
-                        let when = w.resets_at.map(|r| format!(", resets in {}", crate::panes::agents::until(r))).unwrap_or_default();
-                        send(Kind::Usage, format!("{agent}: {:.0}% of your {} limit used{when}", w.pct, w.label));
-                    }
+                let limits: Vec<(String, String, f64, Option<i64>)> = crate::panes::agents::usage_limits().into_iter().map(|(a, w)| (a, w.label, w.pct, w.resets_at)).collect();
+                let mut due = vec![];
+                update_state(|s| due = usage_due(&limits, &mut s.usage, now()));
+                for i in due {
+                    let (agent, label, pct, resets) = &limits[i];
+                    let when = resets.map(|r| format!(", resets in {}", crate::panes::agents::until(r))).unwrap_or_default();
+                    send(Kind::Usage, format!("{agent}: {pct:.0}% of your {label} limit used{when}"));
                 }
             }
             tick += 1;
             std::thread::sleep(std::time::Duration::from_secs(30));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alert(at: i64, kind: Kind, text: &str) -> Alert {
+        Alert { at, kind, text: text.into(), app: None, read: false, pane: None }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::path::absolute("target/test-scratch/shell").unwrap();
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join(name);
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_file(f.with_extension("json.bad"));
+        f
+    }
+
+    fn on_disk(f: &Path) -> Vec<Alert> {
+        serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap()
+    }
+
+    fn texts(l: &[Alert]) -> Vec<String> {
+        l.iter().map(|a| a.text.clone()).collect()
+    }
+
+    #[test]
+    fn alerts_same_one_twice_is_listed_once() {
+        CENTER.with_borrow_mut(|c| *c = Center::default());
+        push(alert(100, Kind::Update, "oriel 0.8.0 is out"));
+        push(alert(200, Kind::Update, "oriel 0.8.0 is out"));
+        push(alert(300, Kind::AgentDone, "claude finished"));
+        push(alert(400, Kind::AgentDone, "claude finished"));
+        push(alert(500, Kind::Update, "oriel 0.8.1 is out"));
+        let got = with(|l| l.iter().map(|a| (a.at, a.text.clone())).collect::<Vec<_>>());
+        assert_eq!(got, vec![(400, "claude finished".to_string()), (500, "oriel 0.8.1 is out".to_string())], "moved up, not repeated");
+        // once read, the same thing again is news again
+        mark_all_read();
+        push(alert(600, Kind::AgentDone, "claude finished"));
+        assert_eq!(with(|l| l.len()), 3);
+        assert_eq!(unread(), 1);
+    }
+
+    #[test]
+    fn alerts_two_windows_share_the_file() {
+        let f = scratch("alerts-two-windows.json");
+        // window A records two alerts
+        CENTER.with_borrow_mut(|c| *c = Center::default());
+        open_at(f.clone());
+        push(alert(100, Kind::AgentDone, "a1"));
+        push(alert(110, Kind::Calendar, "a2"));
+        let a = CENTER.with_borrow_mut(std::mem::take);
+        // window B, started before them, gets one of its own: A's two survive B's save
+        CENTER.with_borrow_mut(|c| c.file = Some(f.clone()));
+        push(alert(120, Kind::Download, "b1"));
+        assert_eq!(texts(&on_disk(&f)), ["a1", "a2", "b1"]);
+        // B dismisses a1 and reads the rest
+        let k = with(|l| key(&l[0]));
+        dismiss(&k);
+        mark_all_read();
+        assert_eq!(texts(&on_disk(&f)), ["a2", "b1"]);
+        let b = CENTER.with_borrow_mut(std::mem::take);
+        // back in A: it sees B's b1, drops the a1 B dismissed, and keeps B's read flags
+        CENTER.with_borrow_mut(|c| *c = a);
+        sync();
+        assert_eq!(with(texts), ["a2", "b1"]);
+        push(alert(130, Kind::Memory, "a3"));
+        assert_eq!(texts(&on_disk(&f)), ["a2", "b1", "a3"], "a1 stays dismissed");
+        assert!(on_disk(&f).iter().any(|a| a.text == "b1" && a.read), "B's read flag kept");
+        // B clears all it has seen: A's a3, newer than B's last look, survives it
+        CENTER.with_borrow_mut(|c| *c = b);
+        clear();
+        assert_eq!(texts(&on_disk(&f)), ["a3"]);
+        CENTER.with_borrow_mut(|c| *c = Center::default());
+    }
+
+    #[test]
+    fn alerts_torn_file_is_kept_aside() {
+        let f = scratch("alerts-torn.json");
+        std::fs::write(&f, r#"[{"at": 1, "kind": "agent_do"#).unwrap();
+        CENTER.with_borrow_mut(|c| *c = Center::default());
+        open_at(f.clone());
+        assert_eq!(unread(), 0);
+        assert!(f.with_extension("json.bad").exists(), "the torn file is moved aside, not overwritten");
+        push(alert(5, Kind::Calendar, "after"));
+        assert_eq!(texts(&on_disk(&f)), ["after"]);
+        let dir = f.parent().unwrap();
+        assert!(std::fs::read_dir(dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with("alerts-torn.tmp")), "no temp file left");
+        CENTER.with_borrow_mut(|c| *c = Center::default());
+    }
+
+    #[test]
+    fn alerts_usage_warned_once_per_window() {
+        let limits = |pct: f64| vec![("claude".to_string(), "5-hour".to_string(), pct, Some(1000)), ("codex".to_string(), "weekly".to_string(), 88.0, None)];
+        let mut said = vec![];
+        assert_eq!(usage_due(&limits(87.0), &mut said, 500), vec![0], "87% of 5-hour: warn; 88% weekly is under its 90% line");
+        // a restart (or another window) with the same state: quiet
+        let mut again = said.clone();
+        assert!(usage_due(&limits(95.0), &mut again, 600).is_empty());
+        // the window reset: the new one can warn again
+        let mut later = said.clone();
+        let next = vec![("claude".to_string(), "5-hour".to_string(), 90.0, Some(3000))];
+        assert_eq!(usage_due(&next, &mut later, 1500), vec![0]);
+        assert!(!later.iter().any(|k| k.2 == 1000), "the old window dropped out");
+    }
 }

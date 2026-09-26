@@ -172,6 +172,8 @@ pub struct Onboard {
     /// the audio-player app's library exists (Windows): music uses it automatically
     audio_player: Option<usize>,
     hits: Vec<(Rect, Btn)>,
+    /// the tour card, drawn over the app: clicks on it are its own, not the pane's underneath
+    card: Rect,
 }
 
 /// Quick count of audio files under a folder (bounded, so typing a huge path stays instant).
@@ -288,7 +290,7 @@ impl Onboard {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .map(|v| v.get("tracks").and_then(|t| t.as_array()).map(|a| a.len()).or_else(|| v.as_array().map(|a| a.len())).unwrap_or(0));
-        Onboard { stage: Stage::Welcome, themes, theme_before: theme_now.to_string(), ais, ai_ids: avail, music_default, notes_default, audio_player, hits: vec![] }
+        Onboard { stage: Stage::Welcome, themes, theme_before: theme_now.to_string(), ais, ai_ids: avail, music_default, notes_default, audio_player, hits: vec![], card: Rect::default() }
     }
 
     fn to_music(&mut self) {
@@ -429,6 +431,23 @@ impl Onboard {
         (true, Out::None)
     }
 
+    /// Pasted text (ctrl+v of a folder path) into the folder field that's up; swallowed by any other setup
+    /// screen, so it never lands in the pane behind.
+    pub fn paste(&mut self, text: &str) {
+        let text = text.trim();
+        // Explorer's "copy as path" wraps it in quotes
+        let text = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(text);
+        let clean = |input: &mut String| input.extend(text.chars().filter(|c| !c.is_control()));
+        match &mut self.stage {
+            Stage::Music { input, found } => {
+                clean(input);
+                *found = count_audio(input);
+            }
+            Stage::Notes { input } => clean(input),
+            _ => {}
+        }
+    }
+
     fn advance(&mut self, probe: &Probe) -> Out {
         if let Stage::Tour { step, start } = &mut self.stage {
             if *step + 1 >= STEPS.len() {
@@ -471,12 +490,13 @@ impl Onboard {
                 });
             }
         }
-        (self.is_modal(), Out::None)
+        (self.is_modal() || self.card.contains(pos), Out::None)
     }
 
     // ------------------------------------------------------------------ drawing
     pub fn draw(&mut self, f: &mut Frame, area: Rect, t: &Theme, time: f64) {
         self.hits.clear();
+        self.card = Rect::default();
         let (n, title) = match &self.stage {
             // the welcome is always ultra, whatever theme is set
             Stage::Welcome => return self.draw_welcome(f, area, &theme::get("ultra"), time),
@@ -656,6 +676,7 @@ impl Onboard {
         let body_lines = (s.body.chars().count() as u16).div_ceil(w.saturating_sub(4).max(1)) + 1;
         let h = 4 + body_lines + if s.keys.is_empty() { 0 } else { 2 };
         let r = Rect { x: area.right().saturating_sub(w + 2), y: area.bottom().saturating_sub(h + 1), width: w, height: h.min(area.height) };
+        self.card = r;
         f.render_widget(Clear, r);
         let title = format!("tour · {}/{} · {}", step + 1, STEPS.len(), s.title);
         let inner = ui::frame(f, r, &title, None, true, t);

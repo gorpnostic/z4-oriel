@@ -41,6 +41,9 @@ impl Pane for Home {
     fn tick_every(&self) -> Option<std::time::Duration> {
         None
     }
+    fn hover(&self) -> usize {
+        self.sel
+    }
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;

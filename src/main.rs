@@ -15,7 +15,7 @@ mod ui;
 mod update;
 
 use crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture},
     execute,
 };
 use std::sync::mpsc;
@@ -102,14 +102,21 @@ fn main() -> anyhow::Result<()> {
     });
 
     let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, crossterm::event::EnableFocusChange)?;
+    // ratatui's panic hook only undoes raw mode and the alternate screen: turn our modes off too, or a crash leaves
+    // the shell printing mouse and focus escape codes
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
+        prev(info);
+    }));
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
     let tour = args.first().map(String::as_str) == Some("--tour");
     let mut app = app::App::new(cfg, tx);
     if tour {
         app.start_tour();
     }
     let res = app.run(&mut terminal, rx);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
     ratatui::restore();
     res
 }

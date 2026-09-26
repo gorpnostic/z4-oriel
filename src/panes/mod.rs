@@ -37,9 +37,61 @@ pub const APPS: &[(&str, char, &str, &str)] = &[
 const AGENTS: &[(&str, &str, &str)] = &[("claude", "claude", "claude code"), ("codex", "codex", "codex")];
 
 pub fn available(name: &str) -> bool {
-    match AGENTS.iter().find(|a| a.0 == name) {
-        Some(a) => which(a.1).is_some(),
+    match AGENTS.iter().position(|a| a.0 == name) {
+        Some(i) => FOUND.lock().unwrap_or_else(|e| e.into_inner()).get(i, std::time::Instant::now(), |i| which(AGENTS[i].1).is_some()),
         None => true,
+    }
+}
+
+/// Look for claude/codex on PATH again next time (the palette does this when it opens).
+pub fn refresh_available() {
+    FOUND.lock().unwrap_or_else(|e| e.into_inner()).at = None;
+}
+
+/// Which AGENTS are on PATH, looked up at most every 10 s: a PATH scan costs ~9 ms for the pair on a long PATH,
+/// and the home screen asks on every draw, key and mouse move.
+static FOUND: std::sync::Mutex<Found> = std::sync::Mutex::new(Found { at: None, have: Vec::new() });
+
+struct Found {
+    at: Option<std::time::Instant>,
+    have: Vec<bool>,
+}
+
+impl Found {
+    fn get(&mut self, i: usize, now: std::time::Instant, look: impl Fn(usize) -> bool) -> bool {
+        if self.at.is_none_or(|at| now.duration_since(at) > std::time::Duration::from_secs(10)) {
+            self.have = (0..AGENTS.len()).map(&look).collect();
+            self.at = Some(now);
+        }
+        self.have.get(i).copied().unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn available_is_cached() {
+        let looks = Cell::new(0);
+        let look = |i: usize| {
+            looks.set(looks.get() + 1);
+            i == 0
+        };
+        let mut f = Found { at: None, have: vec![] };
+        let t0 = Instant::now();
+        assert!(f.get(0, t0, look) && !f.get(1, t0, look));
+        for _ in 0..100 {
+            f.get(0, t0 + Duration::from_secs(5), look);
+        }
+        assert_eq!(looks.get(), AGENTS.len(), "one PATH scan for every agent, then the cache");
+        f.get(0, t0 + Duration::from_secs(11), look);
+        assert_eq!(looks.get(), 2 * AGENTS.len(), "looked again after 10 s");
+        f.at = None; // refresh_available
+        f.get(1, t0 + Duration::from_secs(12), look);
+        assert_eq!(looks.get(), 3 * AGENTS.len());
     }
 }
 

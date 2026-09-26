@@ -239,6 +239,11 @@ impl Pane for Term {
     fn wants_mouse(&self) -> bool {
         self.parser.lock().map(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None).unwrap_or(false)
     }
+    fn wants_fkeys(&self) -> bool {
+        // full-screen programs (htop, mc, nano, vim) use the alternate screen or the mouse; a shell prompt doesn't.
+        // Coding agents (opencode is full-screen too) have no use for F-keys, and switching apps from them matters.
+        !self.agent && self.parser.lock().map(|p| p.screen().alternate_screen() || p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None).unwrap_or(false)
+    }
     fn tick_every(&self) -> Option<Duration> {
         // agents get re-checked so "working" turns into "idle/done" when they go quiet
         if self.agent { Some(Duration::from_millis(400)) } else { None }
@@ -442,4 +447,20 @@ pub fn encode_key(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
         out.insert(0, 27);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn term_fkeys_go_to_full_screen_programs() {
+        let (prog, args): (&str, Vec<String>) = if cfg!(windows) { ("cmd.exe", vec!["/c".into(), "exit".into()]) } else { ("sh", vec!["-c".into(), "true".into()]) };
+        let mut t = Term::new("htop", "term", prog, args, None);
+        assert!(!t.wants_fkeys(), "at a shell prompt F-keys switch apps");
+        t.parser.lock().unwrap().process(b"\x1b[?1049h"); // the program goes full-screen (alternate screen)
+        assert!(t.wants_fkeys());
+        t.agent = true; // a coding agent that's full-screen (opencode) still leaves F-keys to switch apps
+        assert!(!t.wants_fkeys());
+    }
 }

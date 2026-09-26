@@ -717,7 +717,8 @@ impl Files {
                 self.refilter();
                 self.request_preview(false);
             }
-            KeyCode::Char('r') | KeyCode::F(5) => {
+            // (not F5: that's the system app everywhere)
+            KeyCode::Char('r') => {
                 self.want_sel = self.sel_entry().map(|e| e.name.clone());
                 self.load();
                 self.request_preview(true);
@@ -883,6 +884,9 @@ pub(crate) mod tests {
         let ev = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: r.x + 8, row: r.y + 1, modifiers: KeyModifiers::NONE };
         k.mouse(&mut p, ev, r);
         assert_eq!(p.sel, 1);
+        // r refreshes; F5 (and shift+F5) are left to the app: F5 is the system app from everywhere
+        assert!(k.key(&mut p, KeyCode::Char('r')));
+        assert!(!k.key(&mut p, KeyCode::F(5)) && !k.key_mod(&mut p, KeyCode::F(5), KeyModifiers::SHIFT));
     }
 
     #[test]

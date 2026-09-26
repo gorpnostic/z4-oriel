@@ -51,6 +51,8 @@ pub enum Action {
     OpenTagged { pane: Box<dyn Pane>, tag: String, name: String, focus: bool },
     /// Switch to the tab holding this pane (the alerts app jumps back to where something happened).
     FocusPane(u64),
+    /// FocusPane, or this app if that pane has closed since.
+    FocusPaneOr(u64, &'static str),
     /// Switch to the tab holding the pane opened with this tag (no-op if it's gone).
     FocusTag(String),
     /// Close the pane opened with this tag.
@@ -144,9 +146,29 @@ pub trait Pane {
     fn alive(&self) -> bool {
         true
     }
-    /// True if the pane wants raw keys (terminal): only the global Alt/prefix bindings are intercepted.
+    /// True if the pane wants raw keys (terminal): only the global Alt/prefix bindings are intercepted, and the
+    /// F-keys unless `wants_fkeys`.
     fn is_terminal(&self) -> bool {
         false
+    }
+    /// A full-screen program (htop, mc, vim) is running: bare F-keys go to it instead of switching apps.
+    fn wants_fkeys(&self) -> bool {
+        false
+    }
+    /// How many agents closing this pane would stop mid-work (a live reply, running workers). Closing or quitting
+    /// asks first while it's above 0. Default: a coding agent that's working or waiting on you.
+    fn busy(&self) -> usize {
+        matches!(self.activity(), Some(Activity::Working | Activity::Blocked)) as usize
+    }
+    /// ctrl+v here should try the clipboard for an image first (pasted as a file path): chat, agents, and
+    /// terminals running a coding agent. Everywhere else ctrl+v goes straight to the program.
+    fn wants_images(&self) -> bool {
+        self.activity().is_some()
+    }
+    /// Whatever the mouse hovering changes in this pane's drawing (e.g. the highlighted row). Mouse moves that
+    /// change neither this nor the app's own hover targets skip the redraw.
+    fn hover(&self) -> usize {
+        0
     }
     /// This app's own section of the left sidebar, under the app list (nest style): the chat list, playlists,
     /// places, sort options... `area` is the space left in the sidebar. Only called for app tabs.

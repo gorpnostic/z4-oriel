@@ -1272,6 +1272,46 @@ impl Chat {
     }
 }
 
+impl Chat {
+    /// The pane is going away mid-reply: take in what the agent said since the last poll, then stop it (its
+    /// runner kills the process tree) and save the reply as stopped. False if nothing was running.
+    fn wind_down(&mut self) -> bool {
+        let Some(s) = &self.stream else { return false };
+        let evs: Vec<Ev> = std::mem::take(&mut *s.inbox.lock().unwrap());
+        if let Some(m) = self.chat.messages.last_mut().filter(|m| m.role == "assistant") {
+            for ev in evs {
+                match ev {
+                    Ev::Token(t) => activity::push_text(m, &t),
+                    Ev::Thinking { text, tokens } => activity::push_thinking(m, &text, tokens),
+                    Ev::Tool(tool) => activity::upsert_tool(m, tool),
+                    Ev::Todos(items) => activity::set_todos(m, items),
+                    Ev::Mark(text) => activity::push_mark(m, &text),
+                    _ => {}
+                }
+            }
+        }
+        if cfg!(test) {
+            // tests build chats mid-reply by hand: stop them, but never save one into the real chat list
+            if let Some(s) = self.stream.take() {
+                s.stop.store(true, Ordering::SeqCst);
+            }
+        } else {
+            self.stop();
+        }
+        true
+    }
+}
+
+/// The pane closing (or oriel quitting) mid-reply: stop the agent's process tree and keep what it said so far.
+impl Drop for Chat {
+    fn drop(&mut self) {
+        if self.wind_down() && !cfg!(test) {
+            // the runner checks its stop flag every 100 ms: let it start the kill before oriel exits
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+}
+
 impl Pane for Chat {
     fn title(&self) -> String {
         if self.chat.messages.is_empty() { "new chat".into() } else { self.chat.title.to_lowercase() }
@@ -1293,6 +1333,12 @@ impl Pane for Chat {
     }
     fn tick_every(&self) -> Option<Duration> {
         self.stream.as_ref().map(|_| Duration::from_millis(100))
+    }
+    fn busy(&self) -> usize {
+        self.stream.is_some() as usize
+    }
+    fn wants_images(&self) -> bool {
+        true
     }
 
     fn poll(&mut self, cx: &mut Cx) {
@@ -2547,6 +2593,23 @@ mod tests {
         println!("{s}");
         assert!(s.contains("hi there") && s.contains("looked it up"));
         assert!(!s.contains("retired"));
+    }
+
+    #[test]
+    fn chat_closing_mid_reply_stops_the_agent() {
+        let k = Kit::new();
+        let c = agent_chat(&k, "claude", "fix the flaky test");
+        let stop = c.stream.as_ref().unwrap().stop.clone();
+        assert_eq!(c.busy(), 1, "closing or quitting asks first");
+        drop(c); // the pane closing, or oriel quitting
+        assert!(stop.load(Ordering::SeqCst), "the agent's process tree is told to stop, not left running unseen");
+        // what it said after the last poll isn't lost with the pane
+        let mut c = agent_chat(&k, "claude", "fix the flaky test");
+        c.stream.as_ref().unwrap().inbox.lock().unwrap().push(Ev::Token("half an answer".into()));
+        assert!(c.wind_down());
+        assert!(c.stream.is_none() && c.busy() == 0);
+        assert!(serde_json::to_string(c.chat.messages.last().unwrap()).unwrap().contains("half an answer"));
+        assert!(!c.wind_down(), "nothing left running");
     }
 }
 

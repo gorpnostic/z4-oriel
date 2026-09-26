@@ -138,6 +138,9 @@ impl Node {
 
 pub fn split_rect(area: Rect, dir: Dir, ratio: f32) -> (Rect, Rect) {
     match dir {
+        // under 2 cells there's nothing to share: the first child keeps it all (clamp(1, 0) would panic)
+        Dir::Right if area.width < 2 => (area, Rect { x: area.right(), width: 0, ..area }),
+        Dir::Down if area.height < 2 => (area, Rect { y: area.bottom(), height: 0, ..area }),
         Dir::Right => {
             let w = ((area.width as f32) * ratio).round() as u16;
             let w = w.clamp(1.min(area.width), area.width.saturating_sub(1));
@@ -173,4 +176,42 @@ pub fn neighbor(rects: &[(PaneId, Rect)], from: PaneId, dx: i32, dy: i32) -> Opt
             (ox - cx).abs() + (oy - cy).abs()
         })
         .map(|(id, _)| *id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A/(B/(C/D)): three splits down, each from the new bottom pane.
+    fn chain() -> Node {
+        let mut n = Node::Leaf(1);
+        for (from, new) in [(1, 2), (2, 3), (3, 4)] {
+            n.split(from, new, Dir::Down);
+        }
+        n
+    }
+
+    #[test]
+    fn layout_tiny_areas_dont_panic() {
+        for h in 0..=8 {
+            let mut out = vec![];
+            chain().rects(Rect::new(0, 0, 80, h), &mut out);
+            assert_eq!(out.len(), 4);
+            assert!(out.iter().all(|(_, r)| r.bottom() <= h), "{h}: {out:?}");
+            let mut b = vec![];
+            chain().borders(Rect::new(0, 0, 80, h), &mut vec![], &mut b);
+        }
+        for w in 0..=3 {
+            let mut out = vec![];
+            let n = Node::Split { dir: Dir::Right, ratio: 0.1, a: Box::new(chain()), b: Box::new(Node::Leaf(5)) };
+            n.rects(Rect::new(0, 0, w, 1), &mut out);
+            assert_eq!(out.len(), 5);
+        }
+        // a 1-tall split still gives the first child the row
+        let (a, b) = split_rect(Rect::new(0, 0, 10, 1), Dir::Down, 0.5);
+        assert_eq!((a.height, b.height), (1, 0));
+        // normal sizes are unchanged
+        let (a, b) = split_rect(Rect::new(0, 0, 10, 20), Dir::Down, 0.5);
+        assert_eq!((a.height, b.height, b.y), (10, 10, 10));
+    }
 }

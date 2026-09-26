@@ -20,6 +20,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 struct Tab {
+    /// Stable for the tab's life: menus, renames and key handlers keep this, not an index that shifts as tabs
+    /// open and close in the background.
+    id: u64,
     /// Some(name) for the pinned app tabs in the sidebar (ai, music, ...); None for tabs you made.
     app: Option<&'static str>,
     /// A name you gave it (herdr style); None = named after its focused pane.
@@ -53,12 +56,13 @@ const FOOTER: usize = 10;
 /// Where each sidebar section starts: (index into SIDEBAR, heading).
 const SECTIONS: &[(usize, &str)] = &[(0, "ai"), (3, "tools")];
 
+/// Tabs in hits and commands are by Tab::id.
 #[derive(Clone, Copy)]
 enum SideHit {
     App(&'static str),
-    Tab(usize),
+    Tab(u64),
     /// the × on one of your tabs
-    CloseTab(usize),
+    CloseTab(u64),
     NewTab,
 }
 
@@ -66,7 +70,7 @@ enum SideHit {
 enum Cmd {
     App(&'static str),
     Rename,
-    CloseTab(usize),
+    CloseTab(u64),
     Tour,
     Open(&'static str, Place),
     Theme(String),
@@ -128,7 +132,23 @@ struct Palette {
     sel: usize,
     items: Vec<(String, Cmd)>,
     theme_before: String,
+    /// where it was drawn, and each visible row with its place in the matches (for the mouse)
+    rect: Rect,
+    rows: Vec<(Rect, usize)>,
 }
+
+/// Something that would stop agents mid-work, so it asks first: y (or the same key or click again) does it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Doom {
+    Close(PaneId),
+    CloseTab(u64),
+    Quit,
+}
+
+/// How long that question waits for an answer.
+const CONFIRM_FOR: Duration = Duration::from_secs(4);
+/// How long keys wait behind a ctrl+v clipboard check before they're let through anyway.
+const CLIP_WAIT: Duration = Duration::from_secs(5);
 
 pub struct App {
     panes: HashMap<PaneId, Box<dyn Pane>>,
@@ -160,8 +180,15 @@ pub struct App {
     pane_close: Vec<(Rect, PaneId)>,
     /// where the mouse is (for hover highlights)
     hover: Position,
-    /// renaming tab i: the text typed so far
-    renaming: Option<(usize, String)>,
+    /// renaming a tab (by id): the text typed so far
+    renaming: Option<(u64, String)>,
+    next_tab: u64,
+    /// close/quit is waiting for a yes because agents are at work (the toast asks)
+    confirm: Option<(Doom, Instant)>,
+    /// ctrl+v / alt+v is checking the clipboard for an image: keys for that pane wait here, in order
+    pending_clip: Option<(PaneId, Instant, Vec<KeyEvent>)>,
+    /// ORIEL_LOG: input events and draw times go to this file
+    log: Option<std::path::PathBuf>,
     ctx: Option<CtxMenu>,
     /// first-run welcome, setup and tour
     onboard: Option<crate::onboard::Onboard>,
@@ -215,6 +242,10 @@ impl App {
             update_ready: None,
             term_focused: true,
             renaming: None,
+            next_tab: 1,
+            confirm: None,
+            pending_clip: None,
+            log: std::env::var_os("ORIEL_LOG").map(std::path::PathBuf::from),
             ctx: None,
             onboard: None,
             ctx_seen: 0,
@@ -227,7 +258,7 @@ impl App {
         app._watcher = watch_omarchy(tx.clone());
         app._theme_watcher = watch_themes(tx.clone());
         if !cfg!(test) {
-            *crate::alerts::CENTER.lock().unwrap() = crate::alerts::load();
+            crate::alerts::open();
             let t2 = tx.clone();
             crate::alerts::watch(move |k, s| {
                 let _ = t2.send(Event::Alert(k, s));
@@ -239,7 +270,13 @@ impl App {
                 }
             });
             if let Some((from, to)) = crate::update::just_updated() {
-                app.notify(format!("{}updated {from} → {to} · alt p → updates for what's new", ui::lead("package")));
+                if crate::update::newer(&from, &to) {
+                    // a rollback: the version you left stays quiet until a newer one is out
+                    crate::alerts::update_state(|s| s.skipped = Some(from.clone()));
+                    app.notify(format!("{}rolled back {from} → {to} · {from} won't be offered again", ui::lead("package")));
+                } else {
+                    app.notify(format!("{}updated {from} → {to} · alt p → updates for what's new", ui::lead("package")));
+                }
             }
         }
         if !cfg!(test) && !crate::onboard::done_before() {
@@ -267,8 +304,19 @@ impl App {
 
     fn new_tab(&mut self, p: Box<dyn Pane>) {
         let id = self.add(p);
-        self.tabs.push(Tab { app: None, name: None, root: Node::Leaf(id), focus: id, zoom: false });
+        let tid = self.tab_id();
+        self.tabs.push(Tab { id: tid, app: None, name: None, root: Node::Leaf(id), focus: id, zoom: false });
         self.cur = self.tabs.len() - 1;
+    }
+
+    fn tab_id(&mut self) -> u64 {
+        self.next_tab += 1;
+        self.next_tab - 1
+    }
+
+    /// Where the tab with this id is now (tabs open and close in the background, so indices go stale).
+    fn tab_index(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
     }
 
     /// Show an app's tab, creating it the first time (like nest's F1-F6).
@@ -296,7 +344,8 @@ impl App {
         let order = |a: Option<&str>| a.and_then(|n| SIDEBAR.iter().position(|s| s.0 == n)).unwrap_or(usize::MAX);
         let me = order(Some(name));
         let at = self.tabs.iter().position(|t| order(t.app) > me).unwrap_or(self.tabs.len());
-        self.tabs.insert(at, Tab { app: Some(name), name: None, root: Node::Leaf(id), focus: id, zoom: false });
+        let tid = self.tab_id();
+        self.tabs.insert(at, Tab { id: tid, app: Some(name), name: None, root: Node::Leaf(id), focus: id, zoom: false });
         self.cur = at;
     }
 
@@ -420,14 +469,105 @@ impl App {
                 }
                 t.zoom = false;
             } else {
-                // last pane in the tab: drop the tab
+                // last pane in the tab: drop the tab (one before yours going mustn't move you to another)
                 self.tabs.remove(ti);
+                if ti < self.cur {
+                    self.cur -= 1;
+                }
                 if self.tabs.is_empty() {
                     self.goto_app("ai");
                 }
                 self.cur = self.cur.min(self.tabs.len() - 1);
             }
         }
+    }
+
+    /// Close a pane because you asked (alt w, a ×, the menus): an app tab keeps its one pane, and a pane with
+    /// agents at work asks first.
+    fn request_close(&mut self, id: PaneId) {
+        let Some(ti) = self.tabs.iter().position(|t| t.root.contains(id)) else { return };
+        if self.tabs[ti].app.is_some() && matches!(self.tabs[ti].root, Node::Leaf(_)) {
+            self.notify("app tabs stay open · F-keys switch");
+            return;
+        }
+        if self.confirmed(Doom::Close(id)) {
+            self.close(id);
+        }
+    }
+
+    /// Close one of your tabs (the sidebar ×, middle-click, prefix &, the menus). App tabs stay.
+    fn request_close_tab(&mut self, tab: u64) {
+        let Some(i) = self.tab_index(tab) else { return };
+        if self.tabs[i].app.is_some() {
+            self.notify("app tabs stay open · F-keys switch");
+            return;
+        }
+        if self.confirmed(Doom::CloseTab(tab)) {
+            self.close_tab(i);
+        }
+    }
+
+    fn request_quit(&mut self) {
+        if self.confirmed(Doom::Quit) {
+            self.quit = true;
+        }
+    }
+
+    /// How many agents `d` would stop mid-work.
+    fn doomed(&self, d: Doom) -> usize {
+        let ids: Vec<PaneId> = match d {
+            Doom::Close(id) => vec![id],
+            Doom::CloseTab(t) => {
+                let mut l = vec![];
+                if let Some(i) = self.tab_index(t) {
+                    self.tabs[i].root.leaves(&mut l);
+                }
+                l
+            }
+            Doom::Quit => self.panes.keys().copied().collect(),
+        };
+        ids.iter().filter_map(|id| self.panes.get(id)).map(|p| p.busy()).sum()
+    }
+
+    /// Go ahead with `d`? Yes if it stops nothing, or if it's the thing already being asked about (the same key
+    /// or click again). Otherwise it asks on the toast, and y does it.
+    fn confirmed(&mut self, d: Doom) -> bool {
+        if self.doomed(d) == 0 {
+            return true;
+        }
+        if self.confirm.is_some_and(|(c, at)| c == d && at.elapsed() < CONFIRM_FOR) {
+            self.confirm = None;
+            return true;
+        }
+        self.confirm = Some((d, Instant::now()));
+        false
+    }
+
+    fn doom(&mut self, d: Doom) {
+        match d {
+            Doom::Close(id) => self.close(id),
+            Doom::CloseTab(t) => {
+                if let Some(i) = self.tab_index(t) {
+                    self.close_tab(i);
+                }
+            }
+            Doom::Quit => self.quit = true,
+        }
+    }
+
+    /// The question on the toast while a close/quit waits for its yes.
+    fn confirm_text(&self) -> Option<String> {
+        let (d, _) = self.confirm.filter(|c| c.1.elapsed() < CONFIRM_FOR)?;
+        let n = self.doomed(d).max(1);
+        let agents = if n == 1 { "1 agent".to_string() } else { format!("{n} agents") };
+        Some(match d {
+            Doom::Close(id) => match self.panes.get(&id).filter(|p| p.is_terminal()) {
+                Some(p) => format!("{} is working · close it anyway? y / n", p.title()),
+                None => format!("{agents} still working here · close anyway? y / n"),
+            },
+            Doom::CloseTab(_) => format!("{agents} still working in this tab · close it anyway? y / n"),
+            Doom::Quit => format!("{agents} still working · quit anyway? y / n"),
+        })
     }
 
     fn notify(&mut self, s: impl Into<String>) {
@@ -455,18 +595,28 @@ impl App {
 
     // ------------------------------------------------------------------ loop
     pub fn run(&mut self, term: &mut DefaultTerminal, rx: Receiver<Event>) -> anyhow::Result<()> {
+        let mut dirty = true;
         loop {
-            term.draw(|f| self.draw(f))?;
+            if dirty {
+                let t0 = Instant::now();
+                term.draw(|f| self.draw(f))?;
+                if self.log.is_some() {
+                    self.log_line(&format!("draw {:.2} ms", t0.elapsed().as_secs_f64() * 1000.0));
+                }
+            }
             let timeout = self.next_deadline();
             let ev = match rx.recv_timeout(timeout) {
                 Ok(e) => e,
                 Err(RecvTimeoutError::Timeout) => Event::Tick,
                 Err(RecvTimeoutError::Disconnected) => break,
             };
+            let before = self.look();
+            let mut moves_only = is_move(&ev);
             self.handle(ev);
             // coalesce a burst (a terminal spewing output) into one redraw
             let burst = Instant::now();
             while let Ok(e) = rx.try_recv() {
+                moves_only &= is_move(&e);
                 self.handle(e);
                 if burst.elapsed() > Duration::from_millis(12) {
                     break;
@@ -482,18 +632,43 @@ impl App {
             if self.quit {
                 break;
             }
+            // the mouse just passing over (any-motion tracking reports every cell) changes nothing on screen
+            // unless it moved onto or off something that lights up
+            dirty = !moves_only || self.look() != before;
         }
         Ok(())
+    }
+
+    /// What a mouse move can change on screen: the × under it, the menu row, the hovered pane's own highlight;
+    /// plus a pane closing or a toast, in case the same batch brought one.
+    fn look(&self) -> (Option<Rect>, Option<usize>, usize, usize, bool) {
+        let pos = self.hover;
+        let side_x = self.side_hits.iter().filter(|(_, h)| matches!(h, SideHit::CloseTab(_))).map(|x| x.0);
+        let hot = self.pane_close.iter().map(|x| x.0).chain(side_x).find(|r| r.contains(pos));
+        let pane = self.outer.iter().find(|(_, r)| r.contains(pos)).and_then(|(id, _)| self.panes.get(id)).map(|p| p.hover()).unwrap_or(0);
+        (hot, self.ctx.as_ref().map(|m| m.sel), pane, self.panes.len(), self.notice.is_some())
+    }
+
+    fn log_line(&self, s: &str) {
+        use std::io::Write;
+        let Some(path) = &self.log else { return };
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{:>8.3} {s}", self.start.elapsed().as_secs_f64());
+        }
     }
 
     /// Sleep until the soonest thing that needs a redraw without an event.
     fn next_deadline(&self) -> Duration {
         let mut d = Duration::from_secs(30);
-        if self.theme.animated || self.onboard.as_ref().map(|o| o.animating()).unwrap_or(false) {
+        // an animated theme only animates while you can see it
+        if (self.theme.animated && self.term_focused) || self.onboard.as_ref().map(|o| o.animating()).unwrap_or(false) {
             d = d.min(Duration::from_millis(125));
         }
         if let Some((_, t)) = &self.notice {
             d = d.min(Duration::from_secs(4).saturating_sub(t.elapsed()) + Duration::from_millis(10));
+        }
+        if let Some((_, t)) = &self.confirm {
+            d = d.min(CONFIRM_FOR.saturating_sub(t.elapsed()) + Duration::from_millis(10));
         }
         let mut ids = self.visible();
         ids.extend(self.panes.iter().filter(|(_, p)| p.is_terminal() || p.ticks_hidden()).map(|(id, _)| *id));
@@ -516,26 +691,26 @@ impl App {
         l
     }
 
-    /// herdr's sidebar states: notice agents finishing or getting stuck in tabs you aren't looking at.
+    /// herdr's sidebar states: notice agents finishing or getting stuck where you aren't looking: another tab, a
+    /// pane hidden by zoom, or anywhere while you're in another window.
     fn track_agents(&mut self) {
-        let cur_leaves = {
-            let mut l = vec![];
-            self.tabs[self.cur].root.leaves(&mut l);
-            l
-        };
+        let visible = self.visible();
         let mut notes = vec![];
         for (id, p) in &self.panes {
             let Some(a) = p.activity() else { continue };
             let prev = self.agent_state.insert(*id, a);
-            let seen = cur_leaves.contains(id);
+            let seen = self.term_focused && visible.contains(id);
             let tab_no = self.tabs.iter().position(|t| t.root.contains(*id));
             let where_ = tab_no.map(|i| self.tab_label(i)).unwrap_or_default();
+            // where enter in the alerts app goes back to once this pane is gone: its app tab, or agents for the
+            // task tabs the orchestrator opened
+            let app = tab_no.and_then(|i| self.tabs[i].app).or_else(|| self.tags.values().any(|t| t == id).then_some("agents"));
             if prev == Some(Activity::Working) && a == Activity::Idle && !seen {
                 self.done.insert(*id);
-                notes.push((crate::alerts::Kind::AgentDone, format!("{} finished · {where_}", p.title()), *id));
+                notes.push((crate::alerts::Kind::AgentDone, format!("{} finished · {where_}", p.title()), *id, app));
             }
             if a == Activity::Blocked && prev != Some(Activity::Blocked) && !seen {
-                notes.push((crate::alerts::Kind::NeedsYou, format!("{} needs you · {where_}", p.title()), *id));
+                notes.push((crate::alerts::Kind::NeedsYou, format!("{} needs you · {where_}", p.title()), *id, app));
             }
             if seen {
                 self.done.remove(id);
@@ -552,8 +727,8 @@ impl App {
             }
         }
         self.done.retain(|id| self.panes.contains_key(id));
-        for (k, text, id) in notes {
-            self.raise(k, text, None, Some(id));
+        for (k, text, id, app) in notes {
+            self.raise(k, text, app, Some(id));
         }
     }
 
@@ -589,8 +764,8 @@ impl App {
             return;
         }
         let cur = self.tab_label(i);
-        self.renaming = Some((i, cur));
-        self.sidebar = true;
+        self.renaming = Some((self.tabs[i].id, cur));
+        self.sidebar = true; // the field is drawn in the tab's row (or a popup when the window is too narrow)
     }
 
     fn close_tab(&mut self, i: usize) {
@@ -649,6 +824,16 @@ impl App {
                     if let Some(i) = self.tabs.iter().position(|t| t.root.contains(id)) {
                         self.cur = i;
                         self.tabs[i].focus = id;
+                    } else {
+                        self.notify("that pane is closed");
+                    }
+                }
+                Action::FocusPaneOr(id, app) => {
+                    if let Some(i) = self.tabs.iter().position(|t| t.root.contains(id)) {
+                        self.cur = i;
+                        self.tabs[i].focus = id;
+                    } else {
+                        self.goto_app(app);
                     }
                 }
                 Action::SetTheme(t) => {
@@ -673,21 +858,22 @@ impl App {
                 }
                 Action::GotoApp(a) => self.goto_app(a),
                 Action::AppKey(a, c) => {
-                    let here = self.cur;
+                    // by id: opening the app inserts its tab, which can shift yours along
+                    let here = self.tabs[self.cur].id;
                     self.goto_app(a); // opens it if it isn't yet
-                    self.cur = here;
+                    self.cur = self.tab_index(here).unwrap_or(self.cur);
                     if let Some(id) = self.tabs.iter().find(|t| t.app == Some(a)).map(|t| t.focus) {
                         self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), cx));
                     }
                 }
                 Action::OpenTagged { pane, tag, name, focus } => {
-                    let here = self.cur;
+                    let here = self.tabs[self.cur].id;
                     self.new_tab(pane);
                     let id = self.tabs[self.cur].focus;
                     self.tabs[self.cur].name = Some(name);
                     self.tags.insert(tag, id);
                     if !focus {
-                        self.cur = here;
+                        self.cur = self.tab_index(here).unwrap_or(self.cur);
                     }
                 }
                 Action::FocusTag(tag) => {
@@ -705,44 +891,56 @@ impl App {
                 }
                 Action::ToggleSidebar => self.sidebar = !self.sidebar,
                 Action::ToggleIcons => self.run_cmd(Cmd::Icons),
-                Action::Quit => self.quit = true,
+                Action::Quit => self.request_quit(),
             }
         }
     }
 
     fn handle(&mut self, ev: Event) {
-        if let (Some(path), Event::Input(e)) = (std::env::var_os("ORIEL_LOG"), &ev) {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                let _ = writeln!(f, "{:>8.3} {:?}", self.start.elapsed().as_secs_f64(), e);
-            }
+        if let (Some(_), Event::Input(e)) = (&self.log, &ev) {
+            self.log_line(&format!("{e:?}"));
+        }
+        // typing or clicking here means you're here, even if the terminal missed telling us (FocusGained)
+        if let Event::Input(CEvent::Key(_) | CEvent::Mouse(MouseEvent { kind: MouseEventKind::Down(_), .. })) = &ev {
+            self.term_focused = true;
         }
         match ev {
             Event::Input(CEvent::Key(k)) if k.kind != KeyEventKind::Release => self.key(k),
             Event::Input(CEvent::Mouse(m)) => self.mouse(m),
-            Event::Input(CEvent::Paste(s)) => {
-                let id = self.focused();
-                self.with_pane(id, |p, cx| p.paste(&s, cx));
-            }
+            Event::Input(CEvent::Paste(s)) => self.paste(&s),
+            Event::Input(CEvent::FocusGained) => self.term_focused = true,
+            Event::Input(CEvent::FocusLost) => self.term_focused = false,
             Event::Input(_) => {}
             Event::Wake(id) => {
                 self.with_pane(id, |p, cx| p.poll(cx));
             }
-            Event::Clipboard(id, got, key) => match got {
-                Some(paths) => {
-                    let text = crate::clip::paste_form(&paths);
-                    self.with_pane(id, |p, cx| p.paste(&text, cx));
-                    let what = if paths.len() == 1 && paths[0].ends_with(".png") && paths[0].contains("paste-") { "image".to_string() } else { format!("{} file{}", paths.len(), if paths.len() == 1 { "" } else { "s" }) };
-                    self.notify(format!("pasted {what} as a path · Claude Code and Codex attach it"));
+            Event::Clipboard(id, got, key) => {
+                match got {
+                    Some(paths) => {
+                        let text = crate::clip::paste_form(&paths);
+                        self.with_pane(id, |p, cx| p.paste(&text, cx));
+                        let what = if paths.len() == 1 && paths[0].ends_with(".png") && paths[0].contains("paste-") { "image".to_string() } else { format!("{} file{}", paths.len(), if paths.len() == 1 { "" } else { "s" }) };
+                        self.notify(format!("pasted {what} as a path · Claude Code and Codex attach it"));
+                    }
+                    // nothing image-like: the program gets its own key (so e.g. Claude's own alt+v still works)
+                    None => {
+                        self.with_pane(id, |p, cx| p.key(key, cx));
+                    }
                 }
-                // nothing image-like: the program gets its own key (so e.g. Claude's own alt+v still works)
-                None => {
-                    self.with_pane(id, |p, cx| p.key(key, cx));
-                }
-            },
+                // then whatever was typed while the clipboard was being checked, in order
+                self.flush_clip();
+            }
             Event::UpdateAvailable(v) => {
-                self.raise(crate::alerts::Kind::Update, format!("oriel {v} is out: click it at the bottom of the sidebar, or alt p → updates"), Some("updates"), None);
-                self.update_ready = Some(v);
+                let st = crate::alerts::state();
+                // rolled back from it: stay quiet (the updates app still offers it)
+                if st.skipped.as_deref() != Some(v.as_str()) {
+                    // said once per version, not once per start
+                    if st.announced.as_deref() != Some(v.as_str()) {
+                        self.raise(crate::alerts::Kind::Update, format!("oriel {v} is out: click it at the bottom of the sidebar, or alt p → updates"), Some("updates"), None);
+                        crate::alerts::update_state(|s| s.announced = Some(v.clone()));
+                    }
+                    self.update_ready = Some(v);
+                }
             }
             Event::Alert(k, s) => {
                 let app = match k {
@@ -752,16 +950,14 @@ impl App {
                 };
                 self.raise(k, s, app, None);
             }
-            Event::Input(CEvent::FocusGained) => self.term_focused = true,
-            Event::Input(CEvent::FocusLost) => self.term_focused = false,
+            // (the watchers only send this once the files have gone quiet: omarchy swaps several, editors write
+            // in two steps)
             Event::ThemeFilesChanged => {
                 if self.theme.name == "omarchy" {
-                    std::thread::sleep(Duration::from_millis(150)); // let omarchy finish swapping files
                     self.set_theme("omarchy", false);
                     self.notify(format!("{}omarchy theme updated", ui::lead("theme")));
                 } else if theme::is_custom(&self.theme.name) {
                     // your theme file changed (the themes app, or you, in an editor): recolour
-                    std::thread::sleep(Duration::from_millis(60)); // editors write in two steps
                     let name = self.theme.name.clone();
                     self.set_theme(&name, false);
                     if let Some(p) = theme::problems(&name).into_iter().next() {
@@ -806,17 +1002,56 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) {
+        // a close/quit is asking because agents are at work: y does it, n or esc keeps them going. Anything else
+        // carries on as normal and drops the question, unless it's the same close/quit again (that's a yes too).
+        if let Some((d, at)) = self.confirm {
+            if at.elapsed() >= CONFIRM_FOR {
+                self.confirm = None;
+            } else if k.kind == KeyEventKind::Repeat {
+                return; // holding the key down isn't asking twice
+            } else if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                match k.code {
+                    KeyCode::Char('y' | 'Y') => {
+                        self.confirm = None;
+                        self.doom(d);
+                        return;
+                    }
+                    KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                        self.confirm = None;
+                        self.notify("ok · they keep working");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let asked = self.confirm.map(|c| c.1);
+        self.key_inner(k);
+        if self.confirm.map(|c| c.1) == asked && !self.prefix_armed {
+            self.confirm = None;
+        }
+    }
+
+    fn key_inner(&mut self, k: KeyEvent) {
         self.sel = None;
-        if self.onboard.is_none() && self.palette.is_none() && self.renaming.is_none() && self.ctx.is_none() && !self.prefix_armed {
+        if self.pending_clip.as_ref().is_some_and(|c| c.1.elapsed() > CLIP_WAIT) {
+            self.flush_clip(); // the clipboard check never came back: don't hold the keys hostage
+        }
+        let modal = self.onboard.as_ref().is_some_and(|o| o.is_modal());
+        if !modal && self.palette.is_none() && self.renaming.is_none() && self.ctx.is_none() && !self.prefix_armed && k.kind != KeyEventKind::Repeat {
             let v = matches!(k.code, KeyCode::Char('v') | KeyCode::Char('V'));
             let alt = k.modifiers.contains(KeyModifiers::ALT) && !k.modifiers.contains(KeyModifiers::CONTROL);
             let ctrl = k.modifiers.contains(KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT);
-            if v && (alt || ctrl) {
+            let id = self.focused();
+            // alt+v anywhere; ctrl+v only where an image path helps (chat, agents, a coding agent in a terminal):
+            // vim's visual-block, a shell's quoted-insert and the rest get their ctrl+v straight away
+            let images = self.panes.get(&id).is_some_and(|p| p.wants_images());
+            if v && (alt || (ctrl && images && !self.is_prefix(&k))) && self.pending_clip.is_none() {
                 // paste an image: windows terminal keeps ctrl+v for text, so alt+v is the reliable one there
-                let id = self.focused();
                 let tx = self.tx.clone();
+                self.pending_clip = Some((id, Instant::now(), vec![]));
                 std::thread::spawn(move || {
-                    let got = crate::clip::grab_image();
+                    let got = if cfg!(test) { None } else { crate::clip::grab_image() }; // tests never read the clipboard
                     let _ = tx.send(Event::Clipboard(id, got, k));
                 });
                 return;
@@ -834,8 +1069,8 @@ impl App {
             match k.code {
                 KeyCode::Enter => {
                     let t = text.trim().to_string();
-                    if i < self.tabs.len() {
-                        self.tabs[i].name = if t.is_empty() { None } else { Some(t) };
+                    if let Some(ti) = self.tab_index(i) {
+                        self.tabs[ti].name = if t.is_empty() { None } else { Some(t) };
                     }
                 }
                 KeyCode::Esc => {}
@@ -877,7 +1112,7 @@ impl App {
             if self.is_prefix(&k) {
                 // prefix twice: send it through (so ctrl+b ctrl+b types ctrl+b in the shell)
                 let id = self.focused();
-                self.with_pane(id, |p, cx| p.key(k, cx));
+                self.pane_key(id, k);
                 return;
             }
             self.prefix_cmd(k);
@@ -890,27 +1125,80 @@ impl App {
         if k.modifiers.contains(KeyModifiers::ALT) && self.alt_cmd(k) {
             return;
         }
-        if let KeyCode::F(n) = k.code {
-            if let Some(a) = SIDEBAR.iter().find(|a| a.3 == format!("F{n}")).filter(|_| k.modifiers.is_empty()) {
-                self.goto_app(a.0);
-                return;
-            }
-            if n == 12 {
-                // play/pause from anywhere, if the music app is open
-                if let Some(id) = self.tabs.iter().find(|t| t.app == Some("music")).map(|t| t.focus) {
-                    self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), cx));
-                }
-                return;
-            }
-        }
         let id = self.focused();
-        let used = self.with_pane(id, |p, cx| p.key(k, cx)).unwrap_or(false);
+        // bare F-keys switch apps, except in a full-screen program in a terminal (htop's F10, mc's F5...)
+        if matches!(k.code, KeyCode::F(_)) && !self.panes.get(&id).is_some_and(|p| p.wants_fkeys()) && self.fkey_app(k) {
+            return;
+        }
+        let Some(used) = self.pane_key(id, k) else { return };
         if !used && !self.panes.get(&id).map(|p| p.is_terminal()).unwrap_or(false) {
             // unused keys in app panes
             if let KeyCode::Char('?') = k.code {
                 self.open_help();
             }
         }
+    }
+
+    /// A key for a pane, unless a clipboard check for it is still out: then it waits its turn behind the paste,
+    /// so `ctrl+v j j` doesn't arrive as `j j ctrl+v`. None = it waits (or the pane is gone).
+    fn pane_key(&mut self, id: PaneId, k: KeyEvent) -> Option<bool> {
+        if let Some((pid, _, keys)) = &mut self.pending_clip {
+            if *pid == id {
+                keys.push(k);
+                return None;
+            }
+        }
+        self.with_pane(id, |p, cx| p.key(k, cx))
+    }
+
+    fn flush_clip(&mut self) {
+        if let Some((id, _, keys)) = self.pending_clip.take() {
+            for k in keys {
+                self.with_pane(id, |p, cx| p.key(k, cx));
+            }
+        }
+    }
+
+    /// Bare F1-F10 → that app, F12 → play/pause music. False if it's neither, so the pane gets the key.
+    fn fkey_app(&mut self, k: KeyEvent) -> bool {
+        let KeyCode::F(n) = k.code else { return false };
+        if !k.modifiers.is_empty() {
+            return false;
+        }
+        if let Some(a) = SIDEBAR.iter().find(|a| a.3 == format!("F{n}")) {
+            self.goto_app(a.0);
+            return true;
+        }
+        if n == 12 {
+            // play/pause from anywhere, if the music app is open
+            if let Some(id) = self.tabs.iter().find(|t| t.app == Some("music")).map(|t| t.focus) {
+                self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), cx));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Pasted text goes to whatever has the keyboard: a setup screen's folder field, the palette, a tab name
+    /// being typed. Only then the focused pane.
+    fn paste(&mut self, s: &str) {
+        if let Some(ob) = self.onboard.as_mut().filter(|o| o.is_modal()) {
+            ob.paste(s);
+            return;
+        }
+        if let Some(p) = &mut self.palette {
+            p.query.extend(s.chars().filter(|c| !c.is_control()));
+            p.sel = 0;
+            self.palette_preview();
+            return;
+        }
+        if let Some((_, text)) = &mut self.renaming {
+            let room = 40usize.saturating_sub(text.chars().count());
+            text.extend(s.chars().filter(|c| !c.is_control()).take(room));
+            return;
+        }
+        let id = self.focused();
+        self.with_pane(id, |p, cx| p.paste(s, cx));
     }
 
     /// Direct Alt bindings. Chosen to stay clear of the shell's own Alt+b/f/d/. word keys.
@@ -952,7 +1240,7 @@ impl App {
         match k.code {
             KeyCode::Char('|') | KeyCode::Char('\\') | KeyCode::Char('%') | KeyCode::Char('v') => self.run_cmd(Cmd::SplitRight),
             KeyCode::Char(',') => self.run_cmd(Cmd::Rename),
-            KeyCode::Char('&') => self.run_cmd(Cmd::CloseTab(self.cur)),
+            KeyCode::Char('&') => self.run_cmd(Cmd::CloseTab(self.tabs[self.cur].id)),
             KeyCode::Char('-') | KeyCode::Char('"') | KeyCode::Char('_') => self.run_cmd(Cmd::SplitDown),
             KeyCode::Char('x') | KeyCode::Char('w') => self.run_cmd(Cmd::Close),
             KeyCode::Char('z') => self.run_cmd(Cmd::Zoom),
@@ -981,7 +1269,18 @@ impl App {
             }
             KeyCode::Char(':') | KeyCode::Char(' ') => self.open_palette(),
             KeyCode::Char('?') => self.open_help(),
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => self.request_quit(),
+            KeyCode::F(_) => {
+                // an F-key's other meaning: from a full-screen program it switches apps; at a shell prompt it goes
+                // to the shell (PSReadLine's F2 and F8)
+                let id = self.focused();
+                let (term, full) = self.panes.get(&id).map(|p| (p.is_terminal(), p.wants_fkeys())).unwrap_or_default();
+                if term && !full {
+                    self.pane_key(id, k);
+                } else {
+                    self.fkey_app(k);
+                }
+            }
             KeyCode::Char(c) => {
                 if let Some(a) = APPS.iter().find(|a| a.1 == c && a.0 != "terminal") {
                     self.run_cmd(Cmd::Open(a.0, Place::Split));
@@ -1010,11 +1309,7 @@ impl App {
         match c {
             Cmd::App(name) => self.goto_app(name),
             Cmd::Rename => self.start_rename(self.cur),
-            Cmd::CloseTab(i) => {
-                if i < self.tabs.len() {
-                    self.close_tab(i);
-                }
-            }
+            Cmd::CloseTab(t) => self.request_close_tab(t),
             Cmd::Open(name, place) => match panes::open(name, &self.config) {
                 Some(p) => self.open(p, place, from),
                 None => self.notify(format!("{name} isn't installed")),
@@ -1025,7 +1320,7 @@ impl App {
             }
             Cmd::SplitRight => self.run_cmd(Cmd::Open("terminal", Place::SplitRight)),
             Cmd::SplitDown => self.run_cmd(Cmd::Open("terminal", Place::SplitDown)),
-            Cmd::Close => self.close(from),
+            Cmd::Close => self.request_close(from),
             Cmd::Zoom => {
                 let t = self.tab();
                 t.zoom = !t.zoom;
@@ -1038,12 +1333,19 @@ impl App {
             }
             Cmd::Help => self.open_help(),
             Cmd::Tour => self.start_tour(),
-            Cmd::Quit => self.quit = true,
+            Cmd::Quit => self.request_quit(),
         }
+    }
+
+    /// Can you close panes of the current tab? Not the one pane of an app tab (the frame shows no × there).
+    fn closable(&self) -> bool {
+        let t = &self.tabs[self.cur];
+        t.app.is_none() || matches!(t.root, Node::Split { .. })
     }
 
     // ------------------------------------------------------------------ palette
     fn open_palette(&mut self) {
+        panes::refresh_available(); // installed claude/codex a moment ago? the list below sees it
         let mut items: Vec<(String, Cmd)> = vec![];
         for &(name, icon, label, key) in SIDEBAR {
             items.push((format!("{}go to {label}  {key}", ui::lead(icon)), Cmd::App(name)));
@@ -1061,10 +1363,14 @@ impl App {
         items.push((format!("{}split right", ui::lead("split")), Cmd::SplitRight));
         items.push((format!("{}split down", ui::lead("split")), Cmd::SplitDown));
         items.push((format!("{}zoom pane", ui::lead("window")), Cmd::Zoom));
-        items.push((format!("{}close pane", ui::lead("close")), Cmd::Close));
+        if self.closable() {
+            items.push((format!("{}close pane", ui::lead("close")), Cmd::Close));
+        }
         items.push((format!("{}new tab", ui::lead("tab")), Cmd::NewTab));
-        items.push((format!("{}rename this tab", ui::lead("tab")), Cmd::Rename));
-        items.push((format!("{}close this tab", ui::lead("close")), Cmd::CloseTab(self.cur)));
+        if self.tabs[self.cur].app.is_none() {
+            items.push((format!("{}rename this tab", ui::lead("tab")), Cmd::Rename));
+            items.push((format!("{}close this tab", ui::lead("close")), Cmd::CloseTab(self.tabs[self.cur].id)));
+        }
         items.push((format!("{}theme editor: make your own", ui::lead("theme")), Cmd::App("themes")));
         let upd = match &self.update_ready {
             Some(v) => format!("{}update oriel to {v}: what's new", ui::lead("package")),
@@ -1079,7 +1385,7 @@ impl App {
         items.push((format!("{}help: every key, command and how-to  F10", ui::lead("search")), Cmd::Help));
         items.push((format!("{}take the tour", ui::lead("window")), Cmd::Tour));
         items.push((format!("{}quit oriel", ui::lead("quit")), Cmd::Quit));
-        self.palette = Some(Palette { query: String::new(), sel: 0, items, theme_before: self.theme.name.clone() });
+        self.palette = Some(Palette { query: String::new(), sel: 0, items, theme_before: self.theme.name.clone(), rect: Rect::default(), rows: vec![] });
         self.palette_seen += 1;
     }
 
@@ -1097,20 +1403,8 @@ impl App {
         let Some(p) = self.palette.as_mut() else { return };
         let m = Self::palette_matches(p);
         match k.code {
-            KeyCode::Esc => {
-                let before = p.theme_before.clone();
-                self.palette = None;
-                self.set_theme(&before, false);
-                return;
-            }
-            KeyCode::Enter => {
-                let cmd = m.get(p.sel).map(|&i| p.items[i].1.clone());
-                self.palette = None;
-                if let Some(c) = cmd {
-                    self.run_cmd(c);
-                }
-                return;
-            }
+            KeyCode::Esc => return self.palette_close(),
+            KeyCode::Enter => return self.palette_run(),
             KeyCode::Down | KeyCode::Tab => p.sel = (p.sel + 1).min(m.len().saturating_sub(1)),
             KeyCode::Up | KeyCode::BackTab => p.sel = p.sel.saturating_sub(1),
             KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => p.sel = (p.sel + 1).min(m.len().saturating_sub(1)),
@@ -1125,7 +1419,12 @@ impl App {
             }
             _ => {}
         }
-        // live preview while a theme is highlighted
+        self.palette_preview();
+    }
+
+    /// Live preview while a theme is highlighted (the theme from before comes back otherwise).
+    fn palette_preview(&mut self) {
+        let Some(p) = &self.palette else { return };
         let m = Self::palette_matches(p);
         let preview = match m.get(p.sel).map(|&i| &p.items[i].1) {
             Some(Cmd::Theme(t)) => t.clone(),
@@ -1136,8 +1435,60 @@ impl App {
         }
     }
 
+    /// Run the palette's pick (enter, or a click on its row).
+    fn palette_run(&mut self) {
+        let Some(p) = self.palette.take() else { return };
+        let m = Self::palette_matches(&p);
+        if let Some(c) = m.get(p.sel).map(|&i| p.items[i].1.clone()) {
+            self.run_cmd(c);
+        }
+    }
+
+    fn palette_close(&mut self) {
+        if let Some(p) = self.palette.take() {
+            self.set_theme(&p.theme_before, false);
+        }
+    }
+
+    /// The mouse while the palette is up: it's modal, like the keyboard. A click on a row runs it, a click
+    /// outside closes it, the wheel moves the pick.
+    fn palette_mouse(&mut self, m: MouseEvent) {
+        let pos = Position { x: m.column, y: m.row };
+        let Some(p) = &mut self.palette else { return };
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(&(_, row)) = p.rows.iter().find(|(r, _)| r.contains(pos)) {
+                    p.sel = row;
+                    self.palette_run();
+                } else if !p.rect.contains(pos) {
+                    self.palette_close();
+                }
+            }
+            MouseEventKind::Down(_) if !p.rect.contains(pos) => self.palette_close(),
+            MouseEventKind::ScrollDown => {
+                let n = Self::palette_matches(p).len();
+                p.sel = (p.sel + 1).min(n.saturating_sub(1));
+                self.palette_preview();
+            }
+            MouseEventKind::ScrollUp => {
+                p.sel = p.sel.saturating_sub(1);
+                self.palette_preview();
+            }
+            _ => {}
+        }
+    }
+
     // ------------------------------------------------------------------ mouse
     fn mouse(&mut self, m: MouseEvent) {
+        // a click elsewhere drops a close/quit question; the same × again answers yes
+        let asked = self.confirm.map(|c| c.1);
+        self.mouse_inner(m);
+        if matches!(m.kind, MouseEventKind::Down(_)) && self.confirm.map(|c| c.1) == asked {
+            self.confirm = None;
+        }
+    }
+
+    fn mouse_inner(&mut self, m: MouseEvent) {
         if self.onboard.is_some() {
             let probe = self.probe();
             let (used, out) = self.onboard.as_mut().unwrap().mouse(m, &probe);
@@ -1148,6 +1499,9 @@ impl App {
         }
         let pos = Position { x: m.column, y: m.row };
         self.hover = pos;
+        if self.palette.is_some() {
+            return self.palette_mouse(m);
+        }
         // an open right-click menu takes the mouse first
         if let Some(menu) = &mut self.ctx {
             match m.kind {
@@ -1173,13 +1527,14 @@ impl App {
             }
         }
         if let MouseEventKind::Down(MouseButton::Right) = m.kind {
-            if let Some(&(_, SideHit::Tab(i))) = self.side_hits.iter().find(|(r, _)| r.contains(pos)) {
+            if let Some(&(_, SideHit::Tab(t))) = self.side_hits.iter().find(|(r, _)| r.contains(pos)) {
+                let Some(i) = self.tab_index(t) else { return };
                 self.cur = i;
                 self.ctx_open(m.column, m.row, vec![
                     (format!("{}rename", ui::lead("tab")), Cmd::Rename),
                     (format!("{}split right", ui::lead("split")), Cmd::SplitRight),
                     (format!("{}split down", ui::lead("split")), Cmd::SplitDown),
-                    (format!("{}close tab", ui::lead("close")), Cmd::CloseTab(i)),
+                    (format!("{}close tab", ui::lead("close")), Cmd::CloseTab(t)),
                 ]);
                 return;
             }
@@ -1196,7 +1551,9 @@ impl App {
                         items.push((format!("{}rename tab", ui::lead("tab")), Cmd::Rename));
                     }
                     items.push((format!("{}new tab", ui::lead("tab")), Cmd::NewTab));
-                    items.push((format!("{}close pane", ui::lead("close")), Cmd::Close));
+                    if self.closable() {
+                        items.push((format!("{}close pane", ui::lead("close")), Cmd::Close));
+                    }
                     self.ctx_open(m.column, m.row, items);
                     return;
                 }
@@ -1204,15 +1561,15 @@ impl App {
         }
         // middle-click a tab in the sidebar: close it
         if let MouseEventKind::Down(MouseButton::Middle) = m.kind {
-            if let Some(&(_, SideHit::Tab(i) | SideHit::CloseTab(i))) = self.side_hits.iter().find(|(r, _)| r.contains(pos)) {
-                self.close_tab(i);
+            if let Some(&(_, SideHit::Tab(t) | SideHit::CloseTab(t))) = self.side_hits.iter().find(|(r, _)| r.contains(pos)) {
+                self.request_close_tab(t);
                 return;
             }
         }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
             // the × on a pane's frame
             if let Some(&(_, id)) = self.pane_close.iter().find(|(r, _)| r.contains(pos)) {
-                self.close(id);
+                self.request_close(id);
                 return;
             }
             if let Some(&(_, hit)) = self.side_hits.iter().find(|(r, _)| r.contains(pos)) {
@@ -1220,13 +1577,15 @@ impl App {
                 self.last_click = Some((Instant::now(), m.column, m.row));
                 match hit {
                     SideHit::App(a) => self.goto_app(a),
-                    SideHit::Tab(i) => {
-                        self.cur = i;
-                        if double {
-                            self.start_rename(i);
+                    SideHit::Tab(t) => {
+                        if let Some(i) = self.tab_index(t) {
+                            self.cur = i;
+                            if double {
+                                self.start_rename(i);
+                            }
                         }
                     }
-                    SideHit::CloseTab(i) => self.close_tab(i),
+                    SideHit::CloseTab(t) => self.request_close_tab(t),
                     SideHit::NewTab => self.new_tab(Box::new(panes::home::Home::new())),
                 }
                 return;
@@ -1419,8 +1778,14 @@ impl App {
                 f.render_widget(Paragraph::new(Span::styled(format!(" {:<width$}", label, width = inner.width.saturating_sub(1) as usize), st)), Rect { y: inner.y + i as u16, height: 1, ..inner });
             }
         }
-        if let Some(p) = &self.palette {
-            self.draw_palette(f, area, p, &t);
+        if let Some(p) = &mut self.palette {
+            Self::draw_palette(f, area, p, &t);
+        }
+        // renaming a tab while the sidebar (where the field lives) is too narrow to draw: a small box instead
+        if let (Some((_, text)), 0) = (&self.renaming, side_w) {
+            let inner = ui::popup(f, area, 48, 4, &format!("{}rename tab", ui::lead("tab")), &t);
+            let line = Line::from(vec![Span::styled(format!(" {text}▏"), Style::default().fg(t.accent).add_modifier(Modifier::BOLD))]);
+            f.render_widget(Paragraph::new(vec![line, Line::styled(" enter ok · esc", ui::muted(&t))]), inner);
         }
         if let Some(ob) = &mut self.onboard {
             ob.draw(f, area, &t, self.start.elapsed().as_secs_f64());
@@ -1530,8 +1895,7 @@ impl App {
                 Dot::Idle => ("○", t.muted),
                 Dot::None => (" ", t.muted),
             };
-            if let Some((ri, text)) = self.renaming.as_ref().filter(|(ri, _)| *ri == i) {
-                let _ = ri;
+            if let Some((_, text)) = self.renaming.as_ref().filter(|(rt, _)| *rt == tb.id) {
                 let line = Line::from(vec![
                     Span::styled(format!("{glyph} "), Style::default().fg(color)),
                     Span::styled(format!("{}{}", text, "▏"), Style::default().fg(t.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
@@ -1546,8 +1910,9 @@ impl App {
                 f.render_widget(Paragraph::new(Span::styled(" ×", style)), xr);
             }
             // the × first, so a click on it wins over the row
-            self.side_hits.push((xr, SideHit::CloseTab(i)));
-            self.side_hits.push((r, SideHit::Tab(i)));
+            let tid = tb.id;
+            self.side_hits.push((xr, SideHit::CloseTab(tid)));
+            self.side_hits.push((r, SideHit::Tab(tid)));
             y += 1;
         }
         if y < inner.bottom() {
@@ -1581,23 +1946,27 @@ impl App {
 
     /// Prefix hint / notices, bottom-right over everything.
     fn draw_toast(&self, f: &mut Frame, area: Rect, t: &Theme) {
-        let (text, key) = if self.prefix_armed {
-            (" | - split · hjkl move · x close · z zoom · c tab · t theme · ? help ".to_string(), true)
+        let (text, title) = if self.prefix_armed {
+            (" | - split · hjkl move · x close · z zoom · c tab · t theme · ? help ".to_string(), "prefix")
+        } else if let Some(q) = self.confirm_text() {
+            (format!(" {q} "), "careful")
         } else if let Some((n, _)) = &self.notice {
-            (format!(" {n} "), false)
+            (format!(" {n} "), "oriel")
         } else {
             return;
         };
         let w = (unicode_width::UnicodeWidthStr::width(text.as_str()) as u16 + 10).min(area.width);
-        let r = Rect { x: area.right().saturating_sub(w + 1), y: area.bottom().saturating_sub(4), width: w, height: 3 };
+        let r = Rect { x: area.right().saturating_sub(w + 1), y: area.bottom().saturating_sub(4), width: w, height: 3.min(area.height) };
         f.render_widget(ratatui::widgets::Clear, r);
-        let inner = ui::frame(f, r, if key { "prefix" } else { "oriel" }, None, true, t);
+        let inner = ui::frame(f, r, title, None, true, t);
         f.render_widget(Paragraph::new(Span::styled(text, ui::accent(t))), inner);
     }
 
-    fn draw_palette(&self, f: &mut Frame, area: Rect, p: &Palette, t: &Theme) {
+    fn draw_palette(f: &mut Frame, area: Rect, p: &mut Palette, t: &Theme) {
         let m = Self::palette_matches(p);
         let inner = ui::popup(f, area, 64, 18, &format!("{}palette", ui::lead("search")), t);
+        p.rect = Rect { x: inner.x.saturating_sub(1), y: inner.y.saturating_sub(1), width: inner.width + 2, height: inner.height + 2 };
+        p.rows.clear();
         let q = Line::from(vec![Span::styled("› ", ui::bold_accent(t)), Span::raw(p.query.clone()), Span::styled("▏", ui::accent(t))]);
         f.render_widget(Paragraph::new(q), Rect { height: 1, ..inner });
         let rows = inner.height.saturating_sub(2) as usize;
@@ -1606,7 +1975,9 @@ impl App {
             let on = start + row == p.sel;
             let style = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default() };
             let line = Line::from(vec![Span::styled(if on { "▌ " } else { "  " }, ui::accent(t)), Span::styled(p.items[i].0.clone(), style)]);
-            f.render_widget(Paragraph::new(line), Rect { y: inner.y + 2 + row as u16, height: 1, ..inner });
+            let r = Rect { y: inner.y + 2 + row as u16, height: 1, ..inner };
+            f.render_widget(Paragraph::new(line), r);
+            p.rows.push((r, start + row));
         }
         if m.is_empty() {
             f.render_widget(Paragraph::new(Span::styled("  nothing matches", ui::muted(t))), Rect { y: inner.y + 2, height: 1, ..inner });
@@ -1622,38 +1993,68 @@ fn clock() -> String {
     format!("{:02}:{:02}", s / 3600, (s % 3600) / 60)
 }
 
-/// Seconds east of UTC, asked once from the OS.
+/// Seconds east of UTC, from the OS. Asked again every hour, so the clock follows a DST change.
 pub(crate) fn local_offset_secs() -> i64 {
-    use std::sync::OnceLock;
-    static OFF: OnceLock<i64> = OnceLock::new();
-    *OFF.get_or_init(|| {
-        #[cfg(windows)]
-        {
-            let out = std::process::Command::new("powershell.exe")
-                .args(["-NoProfile", "-Command", "[int][TimeZoneInfo]::Local.GetUtcOffset([DateTime]::Now).TotalSeconds"])
-                .creation_flags(0x08000000)
-                .output();
-            out.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok()).unwrap_or(0)
+    use std::sync::Mutex;
+    static OFF: Mutex<Option<(Instant, i64)>> = Mutex::new(None);
+    let mut off = OFF.lock().unwrap_or_else(|e| e.into_inner());
+    match *off {
+        Some((at, s)) if at.elapsed() < Duration::from_secs(3600) => s,
+        _ => {
+            let s = os_offset_secs();
+            *off = Some((Instant::now(), s));
+            s
         }
-        #[cfg(not(windows))]
-        {
-            let out = std::process::Command::new("date").arg("+%z").output();
-            out.ok()
-                .and_then(|o| {
-                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    let sign = if s.starts_with('-') { -1 } else { 1 };
-                    let d = s.trim_start_matches(['+', '-']);
-                    let h: i64 = d.get(0..2)?.parse().ok()?;
-                    let m: i64 = d.get(2..4)?.parse().ok()?;
-                    Some(sign * (h * 3600 + m * 60))
-                })
-                .unwrap_or(0)
-        }
-    })
+    }
 }
 
+/// Windows: straight from the time zone settings (a PowerShell for this cost ~230 ms at every start).
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
+fn os_offset_secs() -> i64 {
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: [u16; 8],
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: [u16; 8],
+        daylight_bias: i32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetTimeZoneInformation(tzi: *mut TimeZoneInformation) -> u32;
+    }
+    // SAFETY: a plain C struct the call fills in; all-zero is a valid value for it
+    let mut tzi: TimeZoneInformation = unsafe { std::mem::zeroed() };
+    let bias = match unsafe { GetTimeZoneInformation(&mut tzi) } {
+        0 => tzi.bias,                      // no daylight saving here
+        1 => tzi.bias + tzi.standard_bias,  // standard time now
+        2 => tzi.bias + tzi.daylight_bias,  // daylight time now
+        _ => return 0,
+    };
+    // bias is minutes to add to local time for UTC
+    -(bias as i64) * 60
+}
+
+#[cfg(not(windows))]
+fn os_offset_secs() -> i64 {
+    let out = std::process::Command::new("date").arg("+%z").output();
+    out.ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let sign = if s.starts_with('-') { -1 } else { 1 };
+            let d = s.trim_start_matches(['+', '-']);
+            let h: i64 = d.get(0..2)?.parse().ok()?;
+            let m: i64 = d.get(2..4)?.parse().ok()?;
+            Some(sign * (h * 3600 + m * 60))
+        })
+        .unwrap_or(0)
+}
+
+fn is_move(e: &Event) -> bool {
+    matches!(e, Event::Input(CEvent::Mouse(m)) if m.kind == MouseEventKind::Moved)
+}
 
 /// The calendar keeps its reminders only while it runs, so open it in the background when a timed plan is coming.
 fn startup_needs_calendar(startup: &str) -> bool {
@@ -1668,9 +2069,10 @@ fn watch_themes(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
     }
     let dir = theme::themes_dir();
     std::fs::create_dir_all(&dir).ok()?;
+    let changed = debounced(tx, Duration::from_millis(100)); // editors write in two steps
     let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if res.is_ok_and(|e| e.kind.is_modify() || e.kind.is_create()) {
-            let _ = tx.send(Event::ThemeFilesChanged);
+            let _ = changed.send(());
         }
     })
     .ok()?;
@@ -1681,14 +2083,36 @@ fn watch_themes(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
 fn watch_omarchy(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
     use notify::{RecursiveMode, Watcher};
     let dir = theme::omarchy_watch_dir()?;
+    let changed = debounced(tx, Duration::from_millis(150)); // omarchy swaps several files
     let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if res.is_ok() {
-            let _ = tx.send(Event::ThemeFilesChanged);
+            let _ = changed.send(());
         }
     })
     .ok()?;
     w.watch(&dir, RecursiveMode::NonRecursive).ok()?;
     Some(w)
+}
+
+/// A burst of file events (a key held down in the themes app writes on every repeat) becomes one
+/// ThemeFilesChanged, sent once they've been quiet for `quiet` — the waiting happens here, not on the UI thread.
+fn debounced(tx: Sender<Event>, quiet: Duration) -> Sender<()> {
+    let (ping, pings) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        while pings.recv().is_ok() {
+            loop {
+                match pings.recv_timeout(quiet) {
+                    Ok(()) => continue,
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            if tx.send(Event::ThemeFilesChanged).is_err() {
+                return;
+            }
+        }
+    });
+    ping
 }
 
 #[cfg(test)]
@@ -1817,7 +2241,8 @@ mod tests {
         app.goto_app("ai");
         let mut saw_working = false;
         let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(9) {
+        // (a busy machine can take seconds just to start pwsh: the loop ends as soon as it's done)
+        while t0.elapsed() < Duration::from_secs(25) {
             while let Ok(e) = rx.try_recv() { app.handle(e); }
             app.handle(Event::Tick);
             app.track_agents();
@@ -2013,5 +2438,536 @@ mod tests {
         }
         app.new_tab(Box::new(crate::panes::home::Home::new()));
         println!("{}", snap(&mut app, "home"));
+    }
+
+    // ------------------------------------------------------------------ the shell's own behaviour, headless
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    /// A stand-in pane the test drives: an agent's activity, a terminal's full-screen state; records its keys.
+    #[derive(Clone, Default)]
+    struct Ctl {
+        act: Rc<Cell<Option<Activity>>>,
+        fkeys: Rc<Cell<bool>>,
+        keys: Rc<RefCell<Vec<KeyEvent>>>,
+        pastes: Rc<RefCell<Vec<String>>>,
+    }
+    struct Fake {
+        ctl: Ctl,
+        term: bool,
+        images: bool,
+    }
+    impl Pane for Fake {
+        fn title(&self) -> String {
+            "fake agent".into()
+        }
+        fn render(&mut self, _f: &mut Frame, _area: Rect, _cx: &mut Cx) {}
+        fn key(&mut self, k: KeyEvent, _cx: &mut Cx) -> bool {
+            self.ctl.keys.borrow_mut().push(k);
+            true
+        }
+        fn paste(&mut self, text: &str, _cx: &mut Cx) {
+            self.ctl.pastes.borrow_mut().push(text.to_string());
+        }
+        fn activity(&self) -> Option<Activity> {
+            self.ctl.act.get()
+        }
+        fn is_terminal(&self) -> bool {
+            self.term
+        }
+        fn wants_fkeys(&self) -> bool {
+            self.ctl.fkeys.get()
+        }
+        fn wants_images(&self) -> bool {
+            self.images
+        }
+    }
+    fn fake(term: bool, images: bool) -> (Box<dyn Pane>, Ctl) {
+        let ctl = Ctl::default();
+        (Box::new(Fake { ctl: ctl.clone(), term, images }), ctl)
+    }
+
+    fn new_app() -> (App, Receiver<Event>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "oriel".into();
+        (App::new(cfg, tx), rx)
+    }
+    fn press(app: &mut App, c: KeyCode, m: KeyModifiers) {
+        app.key(KeyEvent::new(c, m));
+    }
+    fn prefix(app: &mut App) {
+        press(app, KeyCode::Char(' '), KeyModifiers::CONTROL);
+    }
+    fn screen(app: &mut App, w: u16, h: u16) -> String {
+        shot(app, w, h, "")
+    }
+    /// `screen`, also saved as target/snap/app-<name>.html (tools\snap.ps1 makes a PNG of it).
+    fn shot(app: &mut App, w: u16, h: u16, name: &str) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        if !name.is_empty() {
+            crate::testkit::save_html(term.backend().buffer(), &format!("target/snap/app-{name}.html"));
+        }
+        let b = term.backend().buffer();
+        (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+    fn notice(app: &App) -> String {
+        app.notice.as_ref().map(|n| n.0.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn app_tabs_keep_their_app_pane() {
+        let (mut app, _rx) = new_app();
+        app.goto_app("help");
+        let n = app.tabs.len();
+        let id = app.focused();
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::ALT);
+        assert!(app.panes.contains_key(&id) && app.tabs.len() == n, "alt w on a lone app pane does nothing");
+        assert!(notice(&app).contains("app tabs stay open"));
+        prefix(&mut app);
+        press(&mut app, KeyCode::Char('&'), KeyModifiers::NONE);
+        assert_eq!(app.tabs.len(), n, "nor does close tab");
+        // and the menus don't offer it
+        app.open_palette();
+        assert!(!app.palette.as_ref().unwrap().items.iter().any(|(l, _)| l.contains("close pane") || l.contains("close this tab")));
+        app.palette = None;
+        screen(&mut app, 150, 42);
+        let (_, r) = app.outer[0];
+        app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Right), column: r.x + 5, row: r.y + 5, modifiers: KeyModifiers::NONE });
+        assert!(!app.ctx.as_ref().unwrap().items.iter().any(|(l, _)| l.contains("close pane")));
+        // a split in an app tab can still be closed
+        app.ctx = None;
+        let (p, _) = fake(false, false);
+        app.open(p, Place::SplitRight, id);
+        let extra = app.focused();
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::ALT);
+        assert!(!app.panes.contains_key(&extra) && app.panes.contains_key(&id));
+    }
+
+    #[test]
+    fn app_close_and_quit_ask_while_agents_work() {
+        let (mut app, _rx) = new_app();
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        let home = app.focused();
+        let (p, a) = fake(true, true);
+        app.open(p, Place::SplitRight, home);
+        let agent = app.focused();
+        // idle: closes at once
+        a.act.set(Some(Activity::Idle));
+        assert_eq!(app.doomed(Doom::Close(agent)), 0);
+        // working: alt w asks, n keeps it
+        a.act.set(Some(Activity::Working));
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::ALT);
+        assert!(app.panes.contains_key(&agent), "not closed yet");
+        let s = shot(&mut app, 150, 42, "confirm-close");
+        assert!(s.contains("fake agent is working · close it anyway? y / n"), "{s}");
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(app.panes.contains_key(&agent) && app.confirm.is_none());
+        assert!(a.keys.borrow().is_empty(), "the n answered the question, it didn't go to the agent");
+        // another key drops the question (and goes where it was going)
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::ALT);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(app.confirm.is_none() && app.panes.contains_key(&agent));
+        assert_eq!(a.keys.borrow().len(), 1);
+        // y closes it
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::ALT);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(!app.panes.contains_key(&agent), "y closed it");
+        // alt w twice does too
+        let (p, a) = fake(true, true);
+        a.act.set(Some(Activity::Blocked));
+        app.open(p, Place::SplitRight, home);
+        let agent = app.focused();
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::ALT);
+        assert!(app.panes.contains_key(&agent));
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::ALT);
+        assert!(!app.panes.contains_key(&agent), "the same key again is a yes");
+        // quitting with two agents at work: prefix q asks, prefix q again quits
+        let (p1, a1) = fake(true, true);
+        let (p2, a2) = fake(true, true);
+        a1.act.set(Some(Activity::Working));
+        a2.act.set(Some(Activity::Working));
+        app.new_tab(p1);
+        app.new_tab(p2);
+        prefix(&mut app);
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.quit);
+        assert!(screen(&mut app, 150, 42).contains("2 agents still working · quit anyway? y / n"));
+        prefix(&mut app);
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.quit, "asked twice");
+        // /quit from a chat goes through the same question
+        app.quit = false;
+        app.apply(home, vec![Action::Quit]);
+        assert!(!app.quit && app.confirm.is_some());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        // closing a tab with an agent at work: middle-click asks, a second one closes it
+        let tabs = app.tabs.len();
+        screen(&mut app, 150, 42);
+        let (r, _) = app.side_hits.iter().copied().filter(|(_, h)| matches!(h, SideHit::Tab(_))).last().unwrap();
+        let middle = |app: &mut App| app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Middle), column: r.x + 3, row: r.y, modifiers: KeyModifiers::NONE });
+        middle(&mut app);
+        assert_eq!(app.tabs.len(), tabs);
+        assert!(app.confirm_text().unwrap().contains("still working in this tab"));
+        middle(&mut app);
+        assert_eq!(app.tabs.len(), tabs - 1);
+        // nothing at work: quit is instant
+        a1.act.set(None);
+        prefix(&mut app);
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn app_agent_done_while_you_are_elsewhere() {
+        let (mut app, _rx) = new_app();
+        let (p, a) = fake(true, false);
+        app.new_tab(p);
+        let agent = app.focused();
+        a.act.set(Some(Activity::Working));
+        app.track_agents();
+        // you alt-tab to the browser; it finishes in the tab you left open
+        app.handle(Event::Input(CEvent::FocusLost));
+        assert!(!app.term_focused);
+        a.act.set(Some(Activity::Idle));
+        app.track_agents();
+        assert!(app.done.contains(&agent), "a green dot for when you're back");
+        assert!(notice(&app).contains("fake agent finished"), "{}", notice(&app));
+        assert_eq!(crate::alerts::with(|l| l.iter().filter(|x| x.pane == Some(agent) && !x.read).count()), 1, "kept as unread");
+        // back in the terminal: looking at it clears the dot
+        app.handle(Event::Input(CEvent::FocusGained));
+        app.track_agents();
+        assert!(!app.done.contains(&agent));
+        // a key typed here means you're here, even if the terminal never sent FocusGained
+        app.handle(Event::Input(CEvent::FocusLost));
+        app.handle(Event::Input(CEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))));
+        assert!(app.term_focused);
+        // zoomed onto another pane in the same tab: the hidden agent counts as out of sight too
+        let (p2, _) = fake(false, false);
+        app.open(p2, Place::SplitRight, agent);
+        app.tabs[app.cur].zoom = true;
+        a.act.set(Some(Activity::Working));
+        app.track_agents();
+        a.act.set(Some(Activity::Blocked));
+        app.notice = None;
+        app.track_agents();
+        assert!(notice(&app).contains("needs you"));
+    }
+
+    #[test]
+    fn app_tabs_stay_put_when_others_close() {
+        let (mut app, _rx) = new_app();
+        let mut ids = vec![];
+        for _ in 0..3 {
+            app.new_tab(Box::new(crate::panes::home::Home::new()));
+            ids.push(app.focused());
+        }
+        // watching (and renaming) the second; the first goes away in the background
+        let second = app.tabs.iter().position(|t| t.root.contains(ids[1])).unwrap();
+        app.cur = second;
+        app.start_rename(app.cur);
+        app.close(ids[0]);
+        assert_eq!(app.focused(), ids[1], "still on the same tab");
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        }
+        for c in "mine".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let named = |app: &App, id: PaneId| app.tabs.iter().find(|t| t.root.contains(id)).and_then(|t| t.name.clone());
+        assert_eq!((named(&app, ids[1]).as_deref(), named(&app, ids[2])), (Some("mine"), None), "the rename went to the tab it started on");
+        // the orchestrator's worker tabs: one closing doesn't move you off the one you watch
+        let origin = app.focused();
+        for t in ["w1", "w2", "w3"] {
+            let (p, _) = fake(true, false);
+            app.apply(origin, vec![Action::OpenTagged { pane: p, tag: t.into(), name: t.into(), focus: false }]);
+        }
+        assert_eq!(app.focused(), origin, "opened in the background");
+        app.apply(origin, vec![Action::FocusTag("w2".into())]);
+        let w2 = app.focused();
+        app.apply(origin, vec![Action::CloseTag("w1".into())]);
+        assert_eq!(app.focused(), w2);
+        // a chat in a tab of yours sends a key to an app that isn't open yet (its tab goes in ahead of yours)
+        app.cur = app.tabs.iter().position(|t| t.root.contains(ids[1])).unwrap();
+        app.apply(ids[1], vec![Action::AppKey("help", 'j')]);
+        assert_eq!(app.focused(), ids[1], "AppKey doesn't switch you");
+        assert!(app.tabs.iter().any(|t| t.app == Some("help")));
+    }
+
+    /// Where `needle` is on the drawn screen, in cells.
+    fn find(app: &mut App, w: u16, h: u16, needle: &str) -> Option<(u16, u16)> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let b = term.backend().buffer();
+        for y in 0..h {
+            for x in 0..w {
+                let mut s = String::new();
+                for cx in x..w {
+                    s.push_str(b[(cx, y)].symbol());
+                    if s.len() >= needle.len() {
+                        break;
+                    }
+                }
+                if s.starts_with(needle) {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn app_paste_and_clicks_go_to_the_modal() {
+        let (mut app, _rx) = new_app();
+        let (p, pane) = fake(false, false);
+        app.new_tab(p);
+        // the palette takes a paste (and previews the theme it lands on)
+        app.open_palette();
+        app.handle(Event::Input(CEvent::Paste("theme ocean".into())));
+        assert_eq!(app.palette.as_ref().unwrap().query, "theme ocean");
+        assert_eq!(app.theme.name, "ocean", "live preview");
+        assert!(pane.pastes.borrow().is_empty());
+        // a click outside closes it and puts the theme back
+        screen(&mut app, 150, 42);
+        app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 1, row: 1, modifiers: KeyModifiers::NONE });
+        assert!(app.palette.is_none() && app.theme.name == "oriel");
+        assert!(app.sel.is_none(), "the click didn't reach the sidebar or a pane");
+        // the wheel moves the pick, a click on a row runs it
+        app.open_palette();
+        app.palette.as_mut().unwrap().query = "zoom pane".into();
+        screen(&mut app, 150, 42);
+        let (r, _) = app.palette.as_ref().unwrap().rows[0];
+        let zoom = app.tabs[app.cur].zoom;
+        app.mouse(MouseEvent { kind: MouseEventKind::ScrollDown, column: r.x, row: r.y, modifiers: KeyModifiers::NONE });
+        assert_eq!(app.palette.as_ref().unwrap().sel, 0, "one match: the wheel stays on it");
+        app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: r.x + 2, row: r.y, modifiers: KeyModifiers::NONE });
+        assert!(app.palette.is_none() && app.tabs[app.cur].zoom != zoom, "clicked row ran");
+        // renaming takes it (control characters dropped, 40 at most)
+        app.start_rename(app.cur);
+        app.handle(Event::Input(CEvent::Paste("my\ttab\n".into())));
+        assert_eq!(app.renaming.as_ref().unwrap().1, "fake agentmytab");
+        // in a window too narrow for the sidebar, the rename field shows in a box
+        let s = shot(&mut app, 60, 20, "rename-narrow");
+        assert!(s.contains("rename tab") && s.contains("fake agentmytab"), "{s}");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        // setup's folder field takes a pasted path (Explorer's "copy as path" quotes included)
+        let dir = std::path::absolute("target/test-scratch/shell/music").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp3"), b"").unwrap();
+        app.start_tour();
+        let ob = app.onboard.as_mut().unwrap();
+        ob.stage = crate::onboard::Stage::Music { input: String::new(), found: None };
+        app.handle(Event::Input(CEvent::Paste(format!("\"{}\"", dir.display()))));
+        match &app.onboard.as_ref().unwrap().stage {
+            crate::onboard::Stage::Music { input, found } => {
+                assert_eq!(input, &dir.display().to_string());
+                assert_eq!(*found, Some(1));
+            }
+            _ => panic!("left the music step"),
+        }
+        assert!(pane.pastes.borrow().is_empty(), "nothing leaked into the pane behind");
+        // the tour card owns clicks on its body, not just its buttons
+        let probe = app.probe();
+        app.onboard.as_mut().unwrap().stage = crate::onboard::Stage::Tour { step: 0, start: probe };
+        let (col, row) = find(&mut app, 150, 42, "Everything lives").expect("the tour card");
+        app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: col + 3, row, modifiers: KeyModifiers::NONE });
+        assert!(app.sel.is_none(), "no selection started in the pane under the card");
+        // with nothing modal up, a paste goes to the pane
+        app.onboard = None;
+        app.handle(Event::Input(CEvent::Paste("hello".into())));
+        assert_eq!(*pane.pastes.borrow(), ["hello"]);
+    }
+
+    #[test]
+    fn app_tiny_windows_dont_crash() {
+        let (mut app, _rx) = new_app();
+        let (p, _) = fake(false, false);
+        app.new_tab(p);
+        // A/(B/(C/D)): split down three times from the new bottom pane, then right
+        for _ in 0..3 {
+            let (p, _) = fake(false, false);
+            let from = app.focused();
+            app.open(p, Place::SplitDown, from);
+        }
+        let (p, _) = fake(false, false);
+        let from = app.focused();
+        app.open(p, Place::SplitRight, from);
+        for (w, h) in [(80, 7), (80, 3), (40, 1), (10, 2), (1, 1), (3, 30)] {
+            screen(&mut app, w, h);
+        }
+        // and with the popups up: the rename box (no room for the sidebar), the palette, a toast
+        app.start_rename(app.cur);
+        app.open_palette();
+        app.notify("a toast");
+        for (w, h) in [(60, 7), (20, 3), (5, 2), (1, 1)] {
+            screen(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn app_ctrl_v_only_where_images_help() {
+        let (mut app, rx) = new_app();
+        // a plain terminal (vim, a shell): ctrl+v goes straight through, in order
+        let (p, vim) = fake(true, false);
+        app.new_tab(p);
+        let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        app.key(ctrl_v);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(app.pending_clip.is_none());
+        assert_eq!(vim.keys.borrow().iter().map(|k| k.code).collect::<Vec<_>>(), [KeyCode::Char('v'), KeyCode::Char('j')]);
+        // a coding agent: ctrl+v checks the clipboard first, and keys typed meanwhile wait behind it
+        let (p, claude) = fake(true, true);
+        app.new_tab(p);
+        let id = app.focused();
+        app.key(ctrl_v);
+        assert!(app.pending_clip.is_some());
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(claude.keys.borrow().is_empty(), "held until the clipboard answers");
+        // (the test clipboard is always empty: the key itself goes through, then the held ones)
+        let t0 = Instant::now();
+        loop {
+            let ev = rx.recv_timeout(Duration::from_secs(5)).expect("the clipboard check answers");
+            let done = matches!(ev, Event::Clipboard(i, None, _) if i == id);
+            app.handle(ev);
+            if done || t0.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+        }
+        assert_eq!(claude.keys.borrow().iter().map(|k| k.code).collect::<Vec<_>>(), [KeyCode::Char('v'), KeyCode::Char('j'), KeyCode::Char('k')]);
+        assert!(app.pending_clip.is_none());
+        // alt+v is still global; a held key doesn't start a check per repeat
+        app.goto_app("help");
+        let mut rep = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT);
+        rep.kind = KeyEventKind::Repeat;
+        app.key(rep);
+        assert!(app.pending_clip.is_none());
+        app.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+        assert!(app.pending_clip.is_some());
+    }
+
+    #[test]
+    fn app_fkeys_reach_full_screen_programs() {
+        let (mut app, _rx) = new_app();
+        let (p, htop) = fake(true, false);
+        app.new_tab(p);
+        let tab = app.tabs[app.cur].id;
+        let back = |app: &mut App| app.cur = app.tab_index(tab).unwrap();
+        // at a prompt, F10 is help...
+        press(&mut app, KeyCode::F(10), KeyModifiers::NONE);
+        assert_eq!(app.tabs[app.cur].app, Some("help"));
+        // ...in htop it's htop's
+        back(&mut app);
+        htop.fkeys.set(true);
+        press(&mut app, KeyCode::F(10), KeyModifiers::NONE);
+        assert_eq!(app.tabs[app.cur].id, tab);
+        assert_eq!(htop.keys.borrow().last().map(|k| k.code), Some(KeyCode::F(10)));
+        // prefix then the F-key switches apps from there
+        prefix(&mut app);
+        press(&mut app, KeyCode::F(10), KeyModifiers::NONE);
+        assert_eq!(app.tabs[app.cur].app, Some("help"));
+        // and at a prompt, prefix then F2 sends F2 to the shell (PSReadLine's prediction view)
+        back(&mut app);
+        htop.fkeys.set(false);
+        prefix(&mut app);
+        press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert_eq!((app.tabs[app.cur].id, htop.keys.borrow().last().map(|k| k.code)), (tab, Some(KeyCode::F(2))));
+        // F12 with no music app open goes to the program
+        press(&mut app, KeyCode::F(12), KeyModifiers::NONE);
+        assert_eq!(htop.keys.borrow().last().map(|k| k.code), Some(KeyCode::F(12)));
+    }
+
+    #[test]
+    fn app_update_is_announced_once() {
+        let _ = std::fs::remove_file("target/test-scratch/shell/alerts-state.json");
+        let (mut app, _rx) = new_app();
+        let count = || crate::alerts::with(|l| l.iter().filter(|a| a.kind == crate::alerts::Kind::Update).count());
+        app.handle(Event::UpdateAvailable("99.0.0".into()));
+        assert_eq!((count(), app.update_ready.as_deref()), (1, Some("99.0.0")));
+        // the next start (the check is cached, so it says the same thing): quiet, but the sidebar still offers it
+        let (mut app, _rx) = new_app();
+        app.handle(Event::UpdateAvailable("99.0.0".into()));
+        assert_eq!(count(), 1, "not again");
+        assert_eq!(app.update_ready.as_deref(), Some("99.0.0"));
+        // after rolling back from it: not offered at all
+        crate::alerts::update_state(|s| s.skipped = Some("99.0.0".into()));
+        let (mut app, _rx) = new_app();
+        app.handle(Event::UpdateAvailable("99.0.0".into()));
+        assert!(app.update_ready.is_none() && count() == 1);
+        // a newer one than that: said as usual
+        app.handle(Event::UpdateAvailable("99.0.1".into()));
+        assert_eq!(app.update_ready.as_deref(), Some("99.0.1"));
+        assert_eq!(count(), 1, "it replaces the older unread one");
+        let _ = std::fs::remove_file("target/test-scratch/shell/alerts-state.json");
+    }
+
+    #[test]
+    fn app_alert_jumps_back_or_says_why_not() {
+        let (mut app, _rx) = new_app();
+        let from = app.focused();
+        app.apply(from, vec![Action::FocusPane(12345)]);
+        assert_eq!(notice(&app), "that pane is closed");
+        app.apply(from, vec![Action::FocusPaneOr(12345, "help")]);
+        assert_eq!(app.tabs[app.cur].app, Some("help"), "falls back to the alert's app");
+        // an orchestrator task tab's agent finishing out of sight: the alert remembers agents
+        let (p, a) = fake(true, false);
+        app.apply(from, vec![Action::OpenTagged { pane: p, tag: "agent-task:7".into(), name: "task 7".into(), focus: false }]);
+        a.act.set(Some(Activity::Working));
+        app.track_agents();
+        a.act.set(Some(Activity::Idle));
+        app.track_agents();
+        let got = crate::alerts::with(|l| l.last().map(|x| (x.kind, x.app.clone())));
+        assert_eq!(got, Some((crate::alerts::Kind::AgentDone, Some("agents".to_string()))));
+    }
+
+    #[test]
+    fn app_idle_redraws_less() {
+        let (mut app, _rx) = new_app();
+        app.theme = theme::get("ultra");
+        assert!(app.theme.animated);
+        assert_eq!(app.next_deadline(), Duration::from_millis(125), "animated while you look");
+        app.term_focused = false;
+        assert!(app.next_deadline() > Duration::from_secs(1), "not while you're in another window");
+        // a mouse move over nothing that lights up changes nothing on screen
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        let (p, _) = fake(false, false);
+        let from = app.focused();
+        app.open(p, Place::SplitRight, from);
+        screen(&mut app, 150, 42);
+        let at = |app: &mut App, x: u16, y: u16| app.mouse(MouseEvent { kind: MouseEventKind::Moved, column: x, row: y, modifiers: KeyModifiers::NONE });
+        let (_, r) = *app.outer.last().unwrap();
+        at(&mut app, r.x + 4, r.y + 4);
+        let before = app.look();
+        at(&mut app, r.x + 5, r.y + 6);
+        assert_eq!(app.look(), before);
+        // onto a pane's ×: that lights up
+        let (x, _) = app.pane_close[0];
+        at(&mut app, x.x + 1, x.y);
+        assert_ne!(app.look(), before);
+    }
+
+    #[test]
+    fn app_theme_file_bursts_become_one_event() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ping = debounced(tx, Duration::from_millis(40));
+        for _ in 0..8 {
+            ping.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(2)), Ok(Event::ThemeFilesChanged)));
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "just the one");
+    }
+
+    #[test]
+    fn app_local_offset_without_a_process() {
+        let t = Instant::now();
+        let off = os_offset_secs();
+        if cfg!(windows) {
+            assert!(t.elapsed() < Duration::from_millis(50), "no process spawned for it");
+        }
+        assert!(off.abs() <= 14 * 3600 && off % 900 == 0, "{off}");
+        assert_eq!(local_offset_secs(), off);
     }
 }

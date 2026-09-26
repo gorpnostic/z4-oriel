@@ -1850,6 +1850,13 @@ impl Pane for Agents {
     fn poll(&mut self, cx: &mut Cx) {
         self.sync(cx);
     }
+    fn busy(&self) -> usize {
+        // headless workers and the lead runs this pane drives: they stop when it goes
+        self.live.values().filter(|l| l.stop.is_some()).count() + self.runs_live.values().filter(|l| l.driving).count()
+    }
+    fn wants_images(&self) -> bool {
+        true
+    }
     fn tagged_panes(&mut self, live: &[(String, Option<Activity>)]) {
         let mine: Vec<(String, Option<Activity>)> = live.iter().filter(|(t, _)| t.starts_with("agent-task:")).cloned().collect();
         if self.tagged.as_ref() != Some(&mine) {
