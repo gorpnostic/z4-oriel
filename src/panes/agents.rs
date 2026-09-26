@@ -2354,8 +2354,9 @@ impl Agents {
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
                 if let DirtyThen::Run(id) = &d.then {
+                    let manual = self.run_ref(id).is_some_and(|r| r.manual);
                     self.cancel_dirty_run(id);
-                    cx.notify("not started — L brings your goal back");
+                    cx.notify(if manual { "not started — your tasks are marked again (enter runs them)" } else { "not started — L brings your goal back" });
                 }
                 return true;
             }
@@ -2919,7 +2920,8 @@ impl Agents {
             KeyCode::Up => p.sel = p.sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Tab => p.sel = (p.sel + 1).min(n),
             KeyCode::Enter => {
-                let path = if p.sel == 0 { expand(p.input.text.trim()) } else { PathBuf::from(&rows[(p.sel - 1).min(n.saturating_sub(1))].0) };
+                // (the chats' folders arrive in the background: the list may have changed under the cursor)
+                let path = if p.sel == 0 { expand(p.input.text.trim()) } else { rows.get(p.sel - 1).map(|r| PathBuf::from(&r.0)).unwrap_or_default() };
                 if path.as_os_str().is_empty() {
                     p.err = "type a path to a git repo".into();
                 } else {
@@ -2957,7 +2959,7 @@ fn ui_short(s: &str, n: usize) -> String {
     crate::ui::fit(s, n)
 }
 
-//// What the planner (P) came back with, checked by plan.rs like a lead's plan.
+/// What the planner (P) came back with, checked by plan.rs like a lead's plan.
 pub(super) struct PlanOut {
     /// In an order their depends_on allow; `worker` set when the planner's thread assigned one.
     items: Vec<plan::Item>,

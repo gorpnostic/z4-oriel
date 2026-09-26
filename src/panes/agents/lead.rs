@@ -1568,6 +1568,9 @@ impl Agents {
             0.0
         };
         let wt = PathBuf::from(&t.worktree);
+        // a node_modules T borrowed from your checkout goes before the worker is back: an install it runs mustn't
+        // land in your checkout through the link
+        git::unlink_deps(&wt);
         let mut spec = run::worker_spec(&t.agent, &bin, &t.model, prompt, resume, t.max_turns, cap, &wt, &self.paths.agents.join("tmp"));
         if t.port > 0 {
             // its checkout's own port, for a dev server or a test that needs one (project.rs)

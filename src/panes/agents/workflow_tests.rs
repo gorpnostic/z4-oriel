@@ -398,6 +398,32 @@ fn agents_borrowed_node_modules_survive_removal() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A worker going back to work in a checkout where T borrowed your node_modules gets the link taken out first: an
+/// install it runs can't reach your checkout's node_modules through it.
+#[test]
+fn agents_worker_never_runs_on_borrowed_node_modules() {
+    let dir = scratch("deps-worker");
+    let repo = temp_repo(&dir);
+    std::fs::create_dir_all(repo.join("node_modules").join("left-pad")).unwrap();
+    let mut k = Kit::new();
+    let mut p = super::lead_tests::lead_pane(&dir, &repo, super::lead_tests::fake_worker(Arc::default()), super::lead_tests::fake_worker(Arc::default()));
+    let wt = dir.join("wt").join("deps");
+    let s = git::start(&repo, &wt, "deps-1", "t1", None).unwrap();
+    std::fs::write(wt.join("package.json"), "{}").unwrap();
+    git::link_deps(&repo, &wt);
+    assert!(wt.join("node_modules").join("left-pad").is_dir(), "T borrowed them");
+    let here = repo.display().to_string();
+    p.store.runs.push(store::Run { id: "r1".into(), repo: here.clone(), goal: "g".into(), agent: "claude".into(), state: store::RunState::Running, branch: "oriel/lead-g".into(), created: store::now(), ..Default::default() });
+    p.store.tasks.push(Task { id: "k1".into(), key: "a".into(), run: "r1".into(), repo: here, title: "Deps".into(), prompt: "x".into(), agent: "claude".into(), mode: "headless".into(), status: Status::Review, worktree: wt.display().to_string(), base_sha: s.base_sha.clone(), branch: s.branch.clone(), created: store::now(), ..Default::default() });
+    p.runs_live.insert("r1".into(), lead::RunLive::new());
+    with_cx(&mut k, |cx| p.worker_again("k1", "one more thing", cx));
+    assert_eq!(p.task("k1").unwrap().status, Status::Running);
+    assert!(wt.join("node_modules").symlink_metadata().is_err(), "the link went before the worker started");
+    assert!(repo.join("node_modules").join("left-pad").is_dir(), "yours are untouched");
+    until(&mut k, &mut p, 10_000, "the round is over", |p| p.task("k1").is_some_and(|t| t.status != Status::Running) && !p.live.get("k1").is_some_and(|l| l.checking));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// T opens a terminal tab in the task's checkout (tagged, so it closes before the checkout goes), starting the
 /// command remembered for the repo; the shell keeps running after it.
 #[test]

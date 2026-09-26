@@ -484,9 +484,7 @@ pub fn merge(repo: &Path, wt: &Path, branch: &str, base_branch: &str, title: &st
 pub fn remove(repo: &Path, wt: &Path, branch: &str) -> Result<(), String> {
     let mut last = String::new();
     // a borrowed node_modules goes first: nothing may delete through it into the main checkout's
-    if !wt.as_os_str().is_empty() {
-        unlink_deps(wt);
-    }
+    unlink_deps(wt);
     for i in 0..15 {
         if !wt.exists() {
             break;
@@ -722,8 +720,9 @@ fn py_gate(dir: &Path) -> (Option<String>, String) {
             std::fs::read_dir(v.join("lib")).into_iter().flatten().flatten().any(|e| e.path().join("site-packages").join("pytest").is_dir())
         };
         if py.is_file() && pytest {
-            // forward slashes read the same in bash, PowerShell and cmd
-            return (Some(format!("\"{}\" -m pytest -q -x", py.display().to_string().replace('\\', "/"))), format!("detected: pytest in {venv}"));
+            // forward slashes read the same in bash, PowerShell and cmd; PowerShell runs a quoted path only with &
+            let call = if gate_shell().2 == "PowerShell" { "& " } else { "" };
+            return (Some(format!("{call}\"{}\" -m pytest -q -x", py.display().to_string().replace('\\', "/"))), format!("detected: pytest in {venv}"));
         }
     }
     (None, "a Python project, but no .venv with pytest in it — type a gate (e.g. pytest -q)".into())
@@ -734,7 +733,8 @@ fn py_gate(dir: &Path) -> (Option<String>, String) {
 /// checkout has its own, or there's nothing to borrow. `remove` takes the link out before deleting a checkout.
 pub fn link_deps(repo: &Path, checkout: &Path) {
     let (from, to) = (repo.join("node_modules"), checkout.join("node_modules"));
-    if !from.is_dir() || !checkout.join("package.json").is_file() || to.symlink_metadata().is_ok() {
+    // (an empty path would mean oriel's own folder)
+    if checkout.as_os_str().is_empty() || !from.is_dir() || !checkout.join("package.json").is_file() || to.symlink_metadata().is_ok() {
         return;
     }
     #[cfg(windows)]
@@ -750,7 +750,7 @@ pub fn link_deps(repo: &Path, checkout: &Path) {
 /// Take `link_deps`' link out of a checkout (only a link: a real node_modules stays).
 pub fn unlink_deps(checkout: &Path) {
     let to = checkout.join("node_modules");
-    if to.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+    if !checkout.as_os_str().is_empty() && to.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
         // a junction or a directory symlink goes with remove_dir on Windows, remove_file elsewhere; neither
         // touches what it points to
         let _ = std::fs::remove_dir(&to).or_else(|_| std::fs::remove_file(&to));

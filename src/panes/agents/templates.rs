@@ -27,7 +27,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -470,7 +470,7 @@ impl Agents {
         f.render_widget(Paragraph::new(Span::styled(ui::fit(&format!("runs saved to run again · {root}"), w), ui::muted(t))), Rect { height: 1, ..inner });
         let mut y = inner.y + 2;
         if v.items.is_empty() {
-            let lines = vec![Line::styled("none yet", bold_fg(t)), Line::styled("S on the lead panel saves a run of your tasks (or a finished lead run) as one.", ui::muted(t))];
+            let lines = vec![Line::styled("none yet", bold(t.fg)), Line::styled("S on the lead panel saves a run of your tasks (or a finished lead run) as one.", ui::muted(t))];
             f.render_widget(Paragraph::new(lines), Rect { y, height: 2, ..inner });
         }
         for (i, (p, tpl)) in v.items.iter().enumerate() {
@@ -494,11 +494,11 @@ impl Agents {
                         v
                     };
                     (
-                        Line::from(vec![Span::styled(format!("{} {file}", if on { "›" } else { " " }), if on { bold_accent(t) } else { bold_fg(t) }), Span::styled(format!("  {} task{} · {}{args}", x.tasks.len(), if x.tasks.len() == 1 { "" } else { "s" }, agents.join(", ")), ui::muted(t))]),
+                        Line::from(vec![Span::styled(format!("{} {file}", if on { "›" } else { " " }), if on { bold(t.accent) } else { bold(t.fg) }), Span::styled(format!("  {} task{} · {}{args}", x.tasks.len(), if x.tasks.len() == 1 { "" } else { "s" }, agents.join(", ")), ui::muted(t))]),
                         Line::styled(ui::fit(&format!("    {}", x.description), w), ui::muted(t)),
                     )
                 }
-                Err(e) => (Line::from(vec![Span::styled(format!("{} {file}", if on { "›" } else { " " }), if on { bold_accent(t) } else { bold_fg(t) })]), Line::styled(ui::fit(&format!("    ✗ {e}"), w), Style::default().fg(t.danger))),
+                Err(e) => (Line::from(vec![Span::styled(format!("{} {file}", if on { "›" } else { " " }), if on { bold(t.accent) } else { bold(t.fg) })]), Line::styled(ui::fit(&format!("    ✗ {e}"), w), Style::default().fg(t.danger))),
             };
             f.render_widget(Paragraph::new(vec![l1.style(bg), l2.style(bg)]), Rect { y, height: 2, ..inner });
             y += 2;
@@ -534,17 +534,13 @@ impl Agents {
 }
 
 /// A colour faded towards the terminal black (selected rows).
-fn tint(c: ratatui::style::Color, amount: f32) -> ratatui::style::Color {
+fn tint(c: Color, amount: f32) -> Color {
     match c {
-        ratatui::style::Color::Rgb(..) => crate::theme::mix(ratatui::style::Color::Rgb(14, 14, 14), c, amount),
-        _ => ratatui::style::Color::Reset,
+        Color::Rgb(..) => crate::theme::mix(Color::Rgb(14, 14, 14), c, amount),
+        _ => Color::Reset,
     }
 }
 
-fn bold_fg(t: &crate::theme::Theme) -> Style {
-    Style::default().fg(t.fg).add_modifier(Modifier::BOLD)
-}
-
-fn bold_accent(t: &crate::theme::Theme) -> Style {
-    Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+fn bold(c: Color) -> Style {
+    Style::default().fg(c).add_modifier(Modifier::BOLD)
 }

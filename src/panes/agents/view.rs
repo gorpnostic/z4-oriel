@@ -1060,16 +1060,17 @@ impl Agents {
         }
         let Some(task) = self.task(&c.id) else { return };
         let (title, body, yes, danger): (&str, Vec<String>, &str, bool) = match c.what {
-            Pending::Merge if !task.run.is_empty() => (
-                "merge into the run",
-                vec![
-                    format!("Queue \"{}\" for the run's integration branch?", task.title),
-                    "It's conflict-checked and gated (build/tests) on the merged result".into(),
-                    format!("first; nothing reaches {} until you merge the run.", self.run_ref(&task.run).map(|r| r.base_branch.clone()).unwrap_or_default()),
-                ],
-                "queue merge",
-                false,
-            ),
+            Pending::Merge if !task.run.is_empty() => {
+                // what the merge is actually checked with: the run's gate, or only a conflict check
+                let run = self.run_ref(&task.run);
+                let mut body = vec![format!("Queue \"{}\" for the run's integration branch?", task.title)];
+                match run.and_then(|r| self.run_gate(r)) {
+                    Some(g) => body.extend(["Checked first: conflicts, then the run's gate".to_string(), format!("(`{}`) on the merged result.", ui::fit(&g, 40))]),
+                    None => body.push("Checked first: conflicts only (the run has no gate).".into()),
+                }
+                body.push(format!("Nothing reaches {} until you merge the run.", run.map(|r| r.base_branch.clone()).unwrap_or_default()));
+                ("merge into the run", body, "queue merge", false)
+            }
             Pending::StopRun | Pending::MergeRun | Pending::DiscardRun => return,
             Pending::Merge => (
                 "merge",
