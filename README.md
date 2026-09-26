@@ -93,6 +93,7 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | copy text | drag over it with the mouse. It's copied when you let go (`shift`+drag in programs that use the mouse) |
 | paste a screenshot into Claude Code | copy the image, then press `alt v`. oriel saves it as a file and pastes the path, which Claude Code and Codex attach. Windows Terminal keeps `ctrl v` for text only, which is why it's `alt v` |
 | add something while the AI is working | just type and press `enter`: it's queued. Claude Code reads it at its next step, mid-reply, and it shows in the transcript where it landed; other AIs get it when the reply ends. `ctrl+x` then `s` stops the reply and sends it now, `↑` edits a queued message, and `esc` stops and puts it back in the box |
+| answer Claude's questions (or take a quiz) | when Claude Code asks you to pick something, the question appears above the input box: `↑↓` or `1-9` to choose, `space` to tick several, type your own answer, `esc` to skip. Ask it to "quiz me on Rust" and it works the same way |
 | switch AI or model | `/provider codex`, `/model opus`. Both menus list your choices as you type, and both are remembered |
 | stop the AI asking for permission | `/perms bypass` (lets it do anything; only in folders you trust) or `/perms edits` (edits files, refuses the rest) |
 | make the AI ask before every change | `/perms ask`. Then `y` allows, `n` denies, `a` always allows that tool |
