@@ -268,6 +268,8 @@ fn icon(status: &str, t: &Theme, time: f64) -> Span<'static> {
     }
 }
 
+/// Code colours from the theme: keywords in its accent, functions in its shine, strings in its inline colour, and
+/// numbers between the two (not the "added" colour, or they'd vanish on an added line).
 fn tok_style(tk: crate::panes::files::preview::Tok, t: &Theme) -> Style {
     use crate::panes::files::preview::Tok;
     match tk {
@@ -275,25 +277,121 @@ fn tok_style(tk: crate::panes::files::preview::Tok, t: &Theme) -> Style {
         Tok::Kw => Style::default().fg(t.accent),
         Tok::Str => Style::default().fg(t.inline),
         Tok::Com => Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
-        Tok::Num => Style::default().fg(t.good),
+        Tok::Num => Style::default().fg(crate::theme::mix(t.inline, t.accent, 0.5)),
         Tok::Func => Style::default().fg(t.shine),
         Tok::Head => Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
         Tok::Bold => Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
     }
 }
 
-/// A diff line's background band (Claude Code tints whole added / removed lines).
-fn band(t: &Theme, add: bool) -> Option<ratatui::style::Color> {
+/// A diff line's background: the whole line tinted with the theme's added / removed colour, and the words that
+/// actually changed a stronger tint of it. None on themes without RGB colours (the terminal's own ANSI).
+fn band(t: &Theme, add: bool) -> Option<(ratatui::style::Color, ratatui::style::Color)> {
     use ratatui::style::Color;
     let base = match t.bg {
         Color::Rgb(..) => t.bg,
-        _ => Color::Rgb(14, 14, 16),
+        _ => Color::Rgb(14, 14, 17),
     };
     let tint = if add { t.good } else { t.danger };
     match (base, tint) {
-        (Color::Rgb(..), Color::Rgb(..)) => Some(crate::theme::mix(base, tint, if add { 0.16 } else { 0.22 })),
+        (Color::Rgb(..), Color::Rgb(..)) => {
+            let (line, word) = if add { (0.15, 0.36) } else { (0.18, 0.42) };
+            Some((crate::theme::mix(base, tint, line), crate::theme::mix(base, tint, word)))
+        }
         _ => None,
     }
+}
+
+/// What changed between a removed line and the added line that replaced it: the middle left after trimming the
+/// common start and end, widened to whole words. None when most of the line changed (the band says it all).
+fn changed_span(old: &str, new: &str) -> Option<((usize, usize), (usize, usize))> {
+    let (a, b): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
+    let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let room = a.len().min(b.len()) - pre;
+    let suf = a.iter().rev().zip(b.iter().rev()).take(room).take_while(|(x, y)| x == y).count();
+    let word = |c: &char| c.is_alphanumeric() || *c == '_';
+    let snap = |v: &[char], (mut s, mut e): (usize, usize)| {
+        while s > 0 && word(&v[s - 1]) && v.get(s).is_some_and(word) {
+            s -= 1;
+        }
+        while e < v.len() && e > 0 && word(&v[e]) && word(&v[e - 1]) {
+            e += 1;
+        }
+        (s, e)
+    };
+    let (ra, rb) = (snap(&a, (pre, a.len() - suf)), snap(&b, (pre, b.len() - suf)));
+    let solid = |v: &[char]| v.iter().filter(|c| !c.is_whitespace()).count().max(1);
+    let changed = (ra.1 - ra.0).max(rb.1 - rb.0);
+    if changed == 0 || changed * 10 > solid(&a).max(solid(&b)) * 7 {
+        return None;
+    }
+    Some((ra, rb))
+}
+
+/// Pair each run of removed lines with the added lines right after it, line by line, and find what changed.
+fn word_changes(body: &[String]) -> Vec<Option<(usize, usize)>> {
+    let mut out = vec![None; body.len()];
+    let kind = |i: usize| split_line(&body[i]).0;
+    let mut i = 0;
+    while i < body.len() {
+        if kind(i) != '-' {
+            i += 1;
+            continue;
+        }
+        let del = i;
+        while i < body.len() && kind(i) == '-' {
+            i += 1;
+        }
+        let add = i;
+        while i < body.len() && kind(i) == '+' {
+            i += 1;
+        }
+        for k in 0..(add - del).min(i - add) {
+            let (o, n) = (split_line(&body[del + k]).2.replace('\t', "    "), split_line(&body[add + k]).2.replace('\t', "    "));
+            if let Some((ro, rn)) = changed_span(&o, &n) {
+                out[del + k] = Some(ro);
+                out[add + k] = Some(rn);
+            }
+        }
+    }
+    out
+}
+
+/// One line of highlighted code on its band, the changed words on the stronger tint, cut to `avail` columns.
+fn code_spans(tokens: &[(crate::panes::files::preview::Tok, String)], changed: Option<(usize, usize)>, bg: Option<(ratatui::style::Color, ratatui::style::Color)>, avail: usize, t: &Theme) -> (Vec<Span<'static>>, usize) {
+    let mut out: Vec<Span<'static>> = vec![];
+    let (mut used, mut ci) = (0usize, 0usize);
+    let style_of = |base: Style, hot: bool| match bg {
+        Some((line, word)) => base.bg(if hot { word } else { line }),
+        None => base,
+    };
+    'all: for (tk, piece) in tokens {
+        let base = tok_style(*tk, t);
+        let (mut cur, mut hot) = (String::new(), false);
+        for ch in piece.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            let in_change = changed.is_some_and(|(a, b)| ci >= a && ci < b);
+            if in_change != hot && !cur.is_empty() {
+                out.push(Span::styled(std::mem::take(&mut cur), style_of(base, hot)));
+            }
+            hot = in_change;
+            if used + w + 1 > avail && used + w > avail.saturating_sub(1) {
+                if !cur.is_empty() {
+                    out.push(Span::styled(std::mem::take(&mut cur), style_of(base, hot)));
+                }
+                out.push(Span::styled("…", style_of(base, false)));
+                used += 1;
+                break 'all;
+            }
+            cur.push(ch);
+            used += w;
+            ci += 1;
+        }
+        if !cur.is_empty() {
+            out.push(Span::styled(cur, style_of(base, hot)));
+        }
+    }
+    (out, used)
 }
 
 fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out: &mut Vec<Line<'static>>, hits: &mut Vec<(usize, String)>) {
@@ -341,11 +439,12 @@ fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out:
     let new_file = is_new_file(tool);
     let ext = std::path::Path::new(tool.target.split(", ").next().unwrap_or("")).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let colored = if code {
-        let texts: Vec<String> = body.iter().map(|l| split_line(l).2.to_string()).collect();
+        let texts: Vec<String> = body.iter().map(|l| split_line(l).2.replace('\t', "    ")).collect();
         crate::panes::files::preview::highlight(&texts, &ext)
     } else {
         vec![]
     };
+    let words = if code && !new_file { word_changes(body) } else { vec![] };
     for (n, l) in body.iter().enumerate() {
         let (k, num, text) = split_line(l);
         let prefix = if first { lead.clone() } else { cont.clone() };
@@ -355,7 +454,7 @@ fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out:
         match k {
             '+' | '-' | ' ' if code => {
                 let bg = if new_file || k == ' ' { None } else { band(t, k == '+') };
-                let with_bg = |st: Style| if let Some(b) = bg { st.bg(b) } else { st };
+                let with_bg = |st: Style| if let Some((b, _)) = bg { st.bg(b) } else { st };
                 let (numc, mark) = match k {
                     '+' if !new_file => (t.good, "+"),
                     '-' => (t.danger, "-"),
@@ -368,17 +467,8 @@ fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out:
                     sp.push(Span::styled(mark.to_string(), with_bg(Style::default().fg(numc).add_modifier(Modifier::BOLD))));
                 }
                 // the code, syntax coloured, cut to fit, the band carried to the edge
-                let mut used = 0;
-                for (tk, piece) in colored.get(n).cloned().unwrap_or_default() {
-                    let piece = piece.replace('\t', "    ");
-                    let left = avail.saturating_sub(used);
-                    if left == 0 {
-                        break;
-                    }
-                    let piece = if piece.width() > left { ui::fit(&piece, left) } else { piece };
-                    used += piece.width();
-                    sp.push(Span::styled(piece, with_bg(tok_style(tk, t))));
-                }
+                let (code_sp, used) = code_spans(&colored.get(n).cloned().unwrap_or_default(), words.get(n).copied().flatten(), bg, avail, t);
+                sp.extend(code_sp);
                 if bg.is_some() {
                     sp.push(Span::styled(" ".repeat(avail.saturating_sub(used)), with_bg(Style::default())));
                 }
@@ -596,6 +686,37 @@ pub fn render(parts: &[Part], width: usize, t: &Theme, v: &View, out: &mut Vec<L
                 out.push(Line::from(Span::styled(format!("  {side} {text} {side}"), muted)));
                 prev = Some("mark");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Diffs take the theme's own added / removed colours, and the words that changed get a stronger tint.
+    #[test]
+    fn chat_diff_colors() {
+        let old = "for (let k = k0; k <= k1; k++) {\n  const h1 = hash(k * 3.1 + side * 71), h2 = hash(k * 7.7);\n  if (h1 < 0.2) continue;\n  ctx.globalAlpha = a;\n}";
+        let new = "for (let k = k0; k <= k1; k++) {\n  const h1 = hash(k * 3.1 + side * 71), h2 = hash(k * 7.7), h3 = hash(k * 1.9);\n  if (h1 < -0.15) continue;\n  ctx.globalAlpha = a * 0.6;\n}";
+        let body = agent::diff(old, new);
+        let tool = Tool { id: "e".into(), name: "Edit".into(), label: "Update".into(), target: "scene.js".into(), status: "done".into(), summary: "+3 -3".into(), body, ..Default::default() };
+        let words = word_changes(&tool.body);
+        assert!(words.iter().flatten().count() >= 4, "similar lines get word highlights: {words:?}");
+        for name in ["ultra", "ocean", "dracula", "mono"] {
+            let t = crate::theme::get(name);
+            let (mut out, mut hits) = (vec![], vec![]);
+            let open = HashSet::new();
+            let v = View { expanded: false, open: &open, live: false, time: 0.0 };
+            tool_lines(&tool, 0, 100, &t, &v, &mut out, &mut hits);
+            let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 100, out.len() as u16));
+            for (y, l) in out.iter().enumerate() {
+                buf.set_line(0, y as u16, l, 100);
+            }
+            crate::testkit::save_html(&buf, &format!("target/snap/diff-{name}.html"));
+            let (line, word) = band(&t, true).unwrap();
+            let has = |c| (0..buf.area.height).any(|y| (0..100).any(|x| buf[(x, y)].bg == c));
+            assert!(has(line) && has(word), "{name}: bands and word highlights drawn");
         }
     }
 }

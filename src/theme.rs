@@ -23,19 +23,20 @@ pub struct Theme {
     pub animated: bool, // rainbow logo (ultra)
 }
 
-// name, accent, shine, frame, muted, user, inline
-const PALETTES: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
-    ("oriel", "#d4884a", "#ffd2a8", "#3c3c3c", "#6e6e6e", "#555555", "#e6b673"),
-    ("ember", "#ff5f3a", "#ffc7a8", "#4a2a24", "#7a5c55", "#6a3a30", "#ff9b6b"),
-    ("ocean", "#4aa8d4", "#b8e6ff", "#24384a", "#5c6e7a", "#35556a", "#7fd0ff"),
-    ("forest", "#6fbf73", "#c8f5c0", "#2a3d2b", "#5e7360", "#3f5a41", "#a6e3a1"),
-    ("sakura", "#f28fb5", "#ffd6e7", "#4a2d3a", "#86697a", "#6a4256", "#ffb3d0"),
-    ("synthwave", "#ff4fd8", "#7df9ff", "#3a2360", "#7a6a9a", "#5a3a90", "#7df9ff"),
-    ("matrix", "#39ff6a", "#c8ffd5", "#12361d", "#3f7a52", "#1f5a30", "#7dff9e"),
-    ("amber", "#ffb000", "#ffe0a0", "#4a3500", "#8a6a2a", "#6a4c00", "#ffcc55"),
-    ("dracula", "#bd93f9", "#ffb86c", "#44475a", "#6272a4", "#5a5e7a", "#50fa7b"),
-    ("mono", "#e0e0e0", "#ffffff", "#444444", "#777777", "#5a5a5a", "#cfcfcf"),
-    ("ultra", "#b48cff", "#8be9fd", "#3d3852", "#7d7896", "#5c5480", "#ff9ad5"),
+// name, accent, shine, frame, muted, user, inline, good, danger. good/danger are each theme's own "added" and
+// "removed" (diffs, success and error dots), picked to sit with its accent rather than one green and red for all.
+const PALETTES: &[(&str, &str, &str, &str, &str, &str, &str, &str, &str)] = &[
+    ("oriel", "#d4884a", "#ffd2a8", "#3c3c3c", "#6e6e6e", "#555555", "#e6b673", "#9cc46a", "#e0694a"),
+    ("ember", "#ff5f3a", "#ffc7a8", "#4a2a24", "#7a5c55", "#6a3a30", "#ff9b6b", "#c2cc5a", "#ff4a3a"),
+    ("ocean", "#4aa8d4", "#b8e6ff", "#24384a", "#5c6e7a", "#35556a", "#7fd0ff", "#4fd6b0", "#ff7a8a"),
+    ("forest", "#6fbf73", "#c8f5c0", "#2a3d2b", "#5e7360", "#3f5a41", "#a6e3a1", "#8fe07a", "#e08a5a"),
+    ("sakura", "#f28fb5", "#ffd6e7", "#4a2d3a", "#86697a", "#6a4256", "#ffb3d0", "#8fe0bc", "#ff5f8f"),
+    ("synthwave", "#ff4fd8", "#7df9ff", "#3a2360", "#7a6a9a", "#5a3a90", "#7df9ff", "#5af2c0", "#ff4f7b"),
+    ("matrix", "#39ff6a", "#c8ffd5", "#12361d", "#3f7a52", "#1f5a30", "#7dff9e", "#39ff6a", "#ff5a4a"),
+    ("amber", "#ffb000", "#ffe0a0", "#4a3500", "#8a6a2a", "#6a4c00", "#ffcc55", "#c8d65a", "#ff6a3a"),
+    ("dracula", "#bd93f9", "#ffb86c", "#44475a", "#6272a4", "#5a5e7a", "#50fa7b", "#50fa7b", "#ff5555"),
+    ("mono", "#e0e0e0", "#ffffff", "#444444", "#777777", "#5a5a5a", "#cfcfcf", "#d8d8d8", "#8c8c8c"),
+    ("ultra", "#b48cff", "#8be9fd", "#3d3852", "#7d7896", "#5c5480", "#ff9ad5", "#7dffc8", "#ff6b9d"),
 ];
 
 pub fn names() -> Vec<String> {
@@ -81,8 +82,8 @@ pub fn get(name: &str) -> Theme {
                 muted: c(p.4),
                 user: c(p.5),
                 inline: c(p.6),
-                danger: Color::Rgb(0xe0, 0x5a, 0x5a),
-                good: Color::Rgb(0x6f, 0xbf, 0x73),
+                good: c(p.7),
+                danger: c(p.8),
                 animated: p.0 == "ultra",
             }
         }
