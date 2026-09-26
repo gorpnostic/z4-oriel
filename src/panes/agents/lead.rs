@@ -464,6 +464,9 @@ impl Agents {
                 run.state = RunState::Running;
                 let msg = format!("integration branch {} off {}", run.branch, run.base_branch);
                 run.log(&msg);
+                if run.manual {
+                    return self.begin_batch(id, cx);
+                }
                 let goal = format!("Goal: {}\n\nStart with roster, then submit one plan.", run.goal);
                 self.launch_lead(id, goal, String::new(), cx);
             }
@@ -557,6 +560,11 @@ impl Agents {
         let cut: Vec<String> = self.run_tasks(id).iter().filter(|t| t.headless() && t.status == Status::Review && t.last.starts_with("stopped")).map(|t| t.id.clone()).collect();
         for t in &cut {
             self.worker_again(t, "oriel was restarted while you worked. Continue the task where you left off and finish with your report.", cx);
+        }
+        if r.manual {
+            // no lead to wake: just carry on
+            self.schedule(cx);
+            return;
         }
         let state = json!({"board": self.board_json(id), "tasks": self.run_tasks(id).iter().map(|t| self.card(t)).collect::<Vec<_>>()});
         let first = format!("oriel restarted and resumed this run. Goal (unchanged): {}\n\nCurrent state:\n{state}\n\nCarry on: wait for events, merge what's ready, finish with done.", r.goal);
@@ -668,7 +676,7 @@ impl Agents {
                     "id": if arg(a, "id").is_empty() { format!("s{}", self.run_tasks(&run.id).len() + 1) } else { arg(a, "id").to_string() },
                     "title": a["title"], "goal": if a["goal"].is_string() { a["goal"].clone() } else { a["prompt"].clone() },
                     "worker": a["worker"], "owns": if a["owns"].is_null() { a["files"].clone() } else { a["owns"].clone() },
-                    "depends_on": a["depends_on"], "acceptance": a["acceptance"], "size": a["size"],
+                    "depends_on": a["depends_on"], "acceptance": a["acceptance"], "size": a["size"], "priority": a["priority"],
                 }]});
                 self.call_plan(&run, &one, cx)
             }
@@ -852,6 +860,7 @@ impl Agents {
                 acceptance: it.acceptance.clone(),
                 size: it.size.clone(),
                 kind: it.kind.clone(),
+                priority: it.priority,
                 created: store::now(),
                 last: "queued".into(),
                 ..Default::default()
@@ -1042,7 +1051,8 @@ impl Agents {
                     break;
                 }
                 let mut ready: Vec<&Task> = self.store.tasks.iter().filter(|t| t.run == run && t.status == Status::Todo && t.queued && !self.paused.contains_key(&t.agent)).filter(|t| self.waiting_for(t).is_empty()).collect();
-                ready.sort_by_key(|t| (t.created, t.id.clone()));
+                // highest priority first, then oldest
+                ready.sort_by_key(|t| (std::cmp::Reverse(t.priority), t.created, t.id.clone()));
                 let pick = ready.iter().find(|t| self.last_start.get(&(t.agent.clone(), t.model.clone())).is_none_or(|s| s.elapsed() >= self.stagger)).map(|t| t.id.clone());
                 let Some(id) = pick else { break };
                 if self.check_budget(&run, cx).is_err() {
@@ -1313,6 +1323,20 @@ impl Agents {
             return;
         }
         let worker = t.worker.clone();
+        if self.run_ref(&t.run).is_some_and(|r| r.manual) {
+            if !t.error.is_empty() {
+                // it failed: one fresh start with the same agent and model, then it waits for you
+                self.record(&worker).failed += 1;
+                cx.alert(crate::alerts::Kind::BuildFailed, format!("{} failed: {}", t.title, t.error.lines().next().unwrap_or("")));
+                return self.redispatch_keeping(id, &t.error.clone(), cx);
+            }
+            if t.blocked {
+                cx.alert(crate::alerts::Kind::NeedsYou, format!("{} is blocked: {} (c answers it)", t.title, t.questions.first().cloned().unwrap_or_default()));
+                return self.event(id, "blocked");
+            }
+            let _ = self.queue_merge(id);
+            return;
+        }
         if !t.error.is_empty() {
             self.record(&worker).failed += 1;
             if t.want_merge && t.attempts > 0 {
@@ -1454,6 +1478,7 @@ impl Agents {
                 cx.notify(format!("✓ {} · {summary}", t.title));
                 self.event(id, "merged");
                 self.schedule(cx);
+                self.batch_check(&t.run, cx);
             }
             Err(git::MergeErr::Conflicts(files)) => {
                 self.record(&t.worker).conflicts += 1;
@@ -1531,9 +1556,18 @@ impl Agents {
         cx.alert(crate::alerts::Kind::BuildFailed, format!("a task's merge check failed: {}", why.lines().next().unwrap_or("")));
     }
 
+    /// Start one of your tasks over in a fresh worktree with the agent and model you picked for it.
+    fn redispatch_keeping(&mut self, id: &str, why: &str, cx: &mut Cx) {
+        self.redispatch_with(id, why, true, cx)
+    }
+
     /// Start a task over with a fresh worker (a premium one, if the roster has another), carrying notes about
     /// what went wrong. The second time, it's blocked for the lead or the user to decide.
     fn redispatch(&mut self, id: &str, why: &str, cx: &mut Cx) {
+        self.redispatch_with(id, why, false, cx)
+    }
+
+    fn redispatch_with(&mut self, id: &str, why: &str, keep: bool, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
         if t.redispatches >= 1 {
             self.record(&t.worker).failed += 1;
@@ -1543,18 +1577,23 @@ impl Agents {
                 tm.blocked = true;
             }
             cx.alert(crate::alerts::Kind::NeedsYou, format!("{} is blocked after several attempts", t.title));
-            return self.event(id, "blocked");
+            self.event(id, "blocked");
+            return self.batch_check(&t.run.clone(), cx);
         }
         let roster = self.roster();
         let usable = |w: &&crate::config::RosterEntry| w.enabled && (self.fake_worker.is_some() || self.installed(&w.agent).is_some()) && !self.paused.contains_key(&w.agent);
-        let next = roster
-            .iter()
-            .filter(usable)
-            .filter(|w| w.tier == "premium" && w.name != t.worker)
-            .next()
-            .or_else(|| roster.iter().filter(usable).find(|w| w.agent != t.agent))
-            .cloned()
-            .unwrap_or_else(|| roster.iter().find(|w| w.name == t.worker).cloned().unwrap_or_default());
+        let next = if keep {
+            crate::config::RosterEntry { name: t.worker.clone(), agent: t.agent.clone(), model: t.model.clone(), tier: t.tier.clone(), max_turns: t.max_turns, budget_usd: t.budget_usd, enabled: true, ..Default::default() }
+        } else {
+            roster
+                .iter()
+                .filter(usable)
+                .filter(|w| w.tier == "premium" && w.name != t.worker)
+                .next()
+                .or_else(|| roster.iter().filter(usable).find(|w| w.agent != t.agent))
+                .cloned()
+                .unwrap_or_else(|| roster.iter().find(|w| w.name == t.worker).cloned().unwrap_or_default())
+        };
         let note = format!("{} ({}) tried and failed: {}", t.worker, t.agent, crate::ui::fit(why.lines().next().unwrap_or(""), 200));
         if let Some(tm) = self.task_mut(id) {
             tm.history.push(note);
@@ -1601,6 +1640,13 @@ impl Agents {
         t.tier = w.tier;
         t.max_turns = w.max_turns;
         t.budget_usd = w.budget_usd;
+        // in a run of yours, a fixed task still merges by itself
+        let manual = self.store.runs.iter().any(|r| r.manual && r.id == self.task(id).map(|t| t.run.clone()).unwrap_or_default());
+        if manual {
+            if let Some(t) = self.task_mut(id) {
+                t.want_merge = true;
+            }
+        }
         self.event(id, "redispatched");
         self.schedule(cx);
     }

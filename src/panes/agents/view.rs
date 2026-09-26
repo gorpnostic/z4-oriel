@@ -126,13 +126,57 @@ impl Agents {
             Mode::Repo(_) => self.draw_picker(f, area, cx),
             Mode::LeadForm(_) => self.draw_lead_form(f, area, cx),
             Mode::Roster(_) => self.draw_roster(f, area, cx),
+            Mode::Batch => self.draw_batch(f, area, cx),
             _ => {}
         }
+    }
+
+    /// Run the marked tasks together: which, how, and where their work ends up.
+    fn draw_batch(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
+        let t = cx.theme;
+        let n = self.marked.len();
+        let inner = ui::popup(f, area, 76, (n as u16 + 12).min(26), &format!("{}run {n} task{} together", ui::lead("robot"), if n == 1 { "" } else { "s" }), t);
+        let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+        let mut lines = vec![];
+        for (i, id) in self.marked.iter().enumerate() {
+            let Some(task) = self.task(id) else { continue };
+            let model = if task.model.is_empty() { "default" } else { &task.model };
+            let pri = match task.priority {
+                2 => " ‼ urgent",
+                1 => " ↑ high",
+                -1 => " ↓ low",
+                _ => "",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:>2}. ", i + 1), bold(t.accent)),
+                Span::styled(ui::fit(&task.title, 40), Style::default().fg(t.fg).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {} · {model}{pri}", task.agent), ui::muted(t)),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        let par = self.lead_cfg.max_parallel.clamp(1, 5);
+        lines.push(Line::from(vec![Span::styled(" p ", Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD)), Span::styled(format!("  all at once: up to {par} at a time, highest priority first"), Style::default().fg(t.fg))]));
+        lines.push(Line::from(vec![Span::styled(" s ", Style::default().fg(Color::Black).bg(t.shine).add_modifier(Modifier::BOLD)), Span::styled("  one after another, in the order you marked them", Style::default().fg(t.fg))]));
+        lines.push(Line::raw(""));
+        let budget = self.lead_cfg.run_budget_usd;
+        for l in [
+            "Each runs in its own worktree with its own AI and model. Finished work".to_string(),
+            "is merged one at a time into a new branch: a conflict check and your".to_string(),
+            format!("build/tests first (a failure goes back to it, then one fresh try)."),
+            format!("Budget ${budget:.2} for the run. When they're all in: d reviews, m merges."),
+        ] {
+            lines.push(Line::from(Span::styled(l, ui::muted(t))));
+        }
+        lines.push(Line::from(Span::styled("esc cancels", ui::muted(t))));
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     fn board_hints(&self) -> Vec<(&'static str, &'static str)> {
         if self.repo.is_none() {
             return vec![("o", "open a repo")];
+        }
+        if !self.marked.is_empty() {
+            return vec![("space", "mark more"), ("enter", "run the marked together"), ("esc", "unmark")];
         }
         if self.lead_focus {
             if let Some(r) = self.current_run() {
@@ -326,7 +370,24 @@ impl Agents {
             _ => Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
         };
         let (glyph, gstyle) = if task.headless() && task.status == Status::Review && (task.blocked || !task.error.is_empty()) { ("▲", bold(t.danger)) } else { (glyph, gstyle) };
-        let mut lines = vec![Line::from(vec![Span::styled(format!("{glyph} "), gstyle), Span::styled(ui::fit(&task.title, w.saturating_sub(2)), title_style)])];
+        let mark = self.marked.iter().position(|m| *m == task.id);
+        let pri = match task.priority {
+            2 => Some(("‼ ", bold(t.danger))),
+            1 => Some(("↑ ", bold(t.shine))),
+            -1 => Some(("↓ ", ui::muted(t))),
+            _ => None,
+        };
+        let mut head = vec![];
+        if let Some(i) = mark {
+            head.push(Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD)));
+        }
+        head.push(Span::styled(format!("{glyph} "), gstyle));
+        if let Some((g, st)) = pri {
+            head.push(Span::styled(g, st));
+        }
+        let used: usize = head.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
+        head.push(Span::styled(ui::fit(&task.title, w.saturating_sub(used)), title_style));
+        let mut lines = vec![Line::from(head)];
         // 2: agent · model (a lead run's worker: ⚑ worker · tier), and time on the right
         let model = if task.model.is_empty() { "default" } else { &task.model };
         let icon = KINDS.iter().find(|k| k.0 == task.agent).map(|k| k.1).unwrap_or("robot");
@@ -549,7 +610,7 @@ impl Agents {
         let t = cx.theme;
         let Mode::Form(form) = &self.mode else { return };
         let title = if form.editing.is_some() { "edit task" } else { "new task" };
-        let inner = ui::popup(f, area, 86, 28, &format!("{}{title}", ui::lead("new")), t);
+        let inner = ui::popup(f, area, 86, 37, &format!("{}{title}", ui::lead("new")), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let repo = self.repo.as_ref().map(|r| format!("{} · a new branch off {}", r.name, r.branch)).unwrap_or_default();
         f.render_widget(Paragraph::new(Span::styled(repo, ui::muted(t))), Rect { height: 1, ..inner });
@@ -564,7 +625,7 @@ impl Agents {
         let r = field(f, "title", 3, 0, &mut y);
         draw_input(f, r, &form.title, "what should it be called?", form.field == 0, t);
         // prompt
-        let ph = (bottom.saturating_sub(y + 12)).clamp(3, 12);
+        let ph = (bottom.saturating_sub(y + 21)).clamp(3, 12);
         let r = field(f, "prompt", ph + 2, 1, &mut y);
         draw_input(f, r, &form.prompt, "what should the agent do? (enter = new line, paste works)", form.field == 1, t);
         // agent chooser
@@ -599,11 +660,30 @@ impl Agents {
             _ => "default",
         };
         draw_input(f, r, &form.model, ph, form.field == 3, t);
+        // priority
+        let r = field(f, "priority", 3, 4, &mut y);
+        let mut spans = vec![];
+        for (i, (_, name)) in super::PRIORITIES.iter().enumerate() {
+            let on = form.priority == i;
+            let st = if on { Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default().fg(t.fg) };
+            spans.push(Span::styled(format!(" {name} "), st));
+            spans.push(Span::raw("  "));
+        }
+        if form.field == 4 {
+            spans.push(Span::styled("←/→ choose · waiting tasks start highest first", ui::muted(t)));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+        // after
+        let r = field(f, "after (waits for these to be merged)", 3, 5, &mut y);
+        draw_input(f, r, &form.after, "task ids or the start of their titles, comma separated · empty = no wait", form.field == 5, t);
+        // budget
+        let r = field(f, "budget $ (stops it past this)", 3, 6, &mut y);
+        draw_input(f, r, &form.budget, "empty = the roster's cap for this agent", form.field == 6, t);
         // buttons
         y += 1;
         if y < bottom {
             let btn = |label: &str, on: bool| {
-                if on && form.field == 4 {
+                if on && form.field == 7 {
                     Span::styled(format!(" {label} "), Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD))
                 } else if on {
                     Span::styled(format!("[{label}]"), bold(t.accent))

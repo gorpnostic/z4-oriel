@@ -20,6 +20,22 @@ pub struct Item {
     /// S | M
     pub size: String,
     pub kind: String,
+    /// -1 low … 2 urgent
+    pub priority: i8,
+}
+
+/// "urgent" / "high" / 2 -> 2; "low" -> -1; anything else normal.
+pub fn priority_of(v: &Value) -> i8 {
+    match v {
+        Value::Number(n) => n.as_i64().unwrap_or(0).clamp(-1, 2) as i8,
+        Value::String(s) => match s.trim().to_lowercase().as_str() {
+            "urgent" | "critical" | "p0" => 2,
+            "high" | "p1" => 1,
+            "low" | "p3" => -1,
+            _ => 0,
+        },
+        _ => 0,
+    }
 }
 
 /// A task already in the run that new ones must not collide with.
@@ -49,7 +65,7 @@ pub fn parse_item(v: &Value, i: usize) -> Item {
         owns = list("files");
     }
     let key = if s("id").is_empty() { format!("t{}", i + 1) } else { s("id") };
-    Item { key, title: s("title"), goal, worker: s("worker"), owns, reads: list("reads"), depends_on: list("depends_on"), acceptance: s("acceptance"), size: s("size").to_uppercase(), kind: s("kind").to_lowercase() }
+    Item { key, title: s("title"), goal, worker: s("worker"), owns, reads: list("reads"), depends_on: list("depends_on"), acceptance: s("acceptance"), size: s("size").to_uppercase(), kind: s("kind").to_lowercase(), priority: priority_of(&v["priority"]) }
 }
 
 // ------------------------------------------------------------------ globs

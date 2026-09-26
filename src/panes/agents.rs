@@ -10,6 +10,7 @@
 //! Nothing slow runs on the UI thread: git, transcript parsing and status-file reads all happen on background
 //! threads that send a `Msg` back and wake the pane.
 
+mod batch;
 mod cost;
 mod git;
 mod input;
@@ -235,14 +236,23 @@ struct Confirm {
     what: Pending,
 }
 
+/// Task priority: (value, name). Waiting tasks start highest first.
+pub(super) const PRIORITIES: &[(i8, &str)] = &[(-1, "low"), (0, "normal"), (1, "high"), (2, "urgent")];
+
 struct Form {
     /// Some = editing this TODO task
     editing: Option<String>,
-    field: usize, // 0 title, 1 prompt, 2 agent, 3 model, 4 buttons
+    field: usize, // 0 title, 1 prompt, 2 agent, 3 model, 4 priority, 5 after, 6 budget, 7 buttons
     title: Input,
     prompt: Input,
     agent: usize,
     model: Input,
+    /// index into PRIORITIES
+    priority: usize,
+    /// tasks it waits for: ids or the start of their titles, comma separated
+    after: Input,
+    /// spend cap in USD ("" = the roster's)
+    budget: Input,
     button: usize, // 0 add, 1 add & start
     err: String,
 }
@@ -327,6 +337,8 @@ enum Mode {
     Roster(RosterView),
     Watch(WatchView),
     Log(LogView),
+    /// Run the marked tasks together: all at once or one after another.
+    Batch,
 }
 
 #[derive(Clone)]
@@ -394,6 +406,8 @@ pub struct Agents {
     hung_after: Duration,
     /// The lead panel at the top of the board has the keyboard.
     lead_focus: bool,
+    /// Tasks marked with space, in the order they were marked (enter runs them together).
+    marked: Vec<String>,
     /// Tests: run these instead of real workers / leads.
     fake_worker: Option<run::Fake>,
     fake_lead: Option<run::Fake>,
@@ -475,6 +489,7 @@ impl Agents {
             stagger: Duration::from_secs(5),
             hung_after: Duration::from_secs(300),
             lead_focus: false,
+            marked: vec![],
             fake_worker: None,
             fake_lead: None,
             mcp_exe: None,
@@ -1327,11 +1342,40 @@ impl Agents {
                 prompt: Input::new(&t.prompt, true),
                 agent: KINDS.iter().position(|k| k.0 == t.agent).unwrap_or(0),
                 model: Input::new(&t.model, false),
+                priority: PRIORITIES.iter().position(|p| p.0 == t.priority).unwrap_or(1),
+                after: Input::new(&t.depends_on.join(", "), false),
+                budget: Input::new(&if t.budget_usd > 0.0 { format!("{}", t.budget_usd) } else { String::new() }, false),
                 button: 0,
                 err: String::new(),
             },
-            None => Form { editing: None, field: 0, title: Input::new("", false), prompt: Input::new("", true), agent: self.default_agent(), model: Input::new("", false), button: 1, err: String::new() },
+            None => Form {
+                editing: None,
+                field: 0,
+                title: Input::new("", false),
+                prompt: Input::new("", true),
+                agent: self.default_agent(),
+                model: Input::new("", false),
+                priority: 1,
+                after: Input::new("", false),
+                budget: Input::new("", false),
+                button: 1,
+                err: String::new(),
+            },
         }
+    }
+
+    /// "a1b2, fix the parser" -> task ids: exact ids, or the TODO task whose title starts with it.
+    fn resolve_after(&self, text: &str, me: Option<&str>) -> Result<Vec<String>, String> {
+        let mut out = vec![];
+        for part in text.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()) {
+            let low = part.to_lowercase();
+            let hit = self.store.tasks.iter().filter(|t| Some(t.id.as_str()) != me && t.status != Status::Done).find(|t| t.id == part || t.title.to_lowercase().starts_with(&low));
+            match hit {
+                Some(t) => out.push(t.id.clone()),
+                None => return Err(format!("no open task called '{part}'")),
+            }
+        }
+        Ok(out)
     }
 
     fn submit_form(&mut self, mut form: Form, start: bool, cx: &mut Cx) {
@@ -1342,6 +1386,28 @@ impl Agents {
             return;
         }
         let prompt = if form.prompt.text.trim().is_empty() { form.title.text.clone() } else { form.prompt.text.clone() };
+        let after = match self.resolve_after(&form.after.text, form.editing.as_deref()) {
+            Ok(a) => a,
+            Err(e) => {
+                form.err = e;
+                form.field = 5;
+                self.mode = Mode::Form(form);
+                return;
+            }
+        };
+        let budget = match form.budget.text.trim().trim_start_matches('$') {
+            "" => 0.0,
+            b => match b.parse::<f64>() {
+                Ok(v) if v >= 0.0 => v,
+                _ => {
+                    form.err = "the budget is a number of dollars, like 1.5".into();
+                    form.field = 6;
+                    self.mode = Mode::Form(form);
+                    return;
+                }
+            },
+        };
+        let priority = PRIORITIES[form.priority.min(PRIORITIES.len() - 1)].0;
         let id = match &form.editing {
             Some(id) => {
                 let id = id.clone();
@@ -1360,6 +1426,12 @@ impl Agents {
             }
             None => self.add_task(&form.title.text, &prompt, form.agent, &form.model.text),
         };
+        if let Some(t) = self.task_mut(&id) {
+            t.priority = priority;
+            t.depends_on = after;
+            t.budget_usd = budget;
+        }
+        self.save();
         self.mode = Mode::Board;
         self.select(&id);
         if start {
@@ -1393,6 +1465,20 @@ impl Agents {
     }
 
     fn board_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
+        // marked tasks: enter runs them, esc unmarks, whatever panel has focus
+        if !self.marked.is_empty() {
+            match k.code {
+                KeyCode::Enter => {
+                    self.mode = Mode::Batch;
+                    return true;
+                }
+                KeyCode::Esc => {
+                    self.marked.clear();
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if self.lead_focus {
             if self.lead_key(k, cx) {
                 return true;
@@ -1443,6 +1529,30 @@ impl Agents {
                 }
             }
             KeyCode::Enter => self.activate(cx),
+            KeyCode::Char(' ') => {
+                if let Some(t) = self.selected().and_then(|id| self.task(&id).cloned()) {
+                    if t.status == Status::Todo && t.run.is_empty() {
+                        if let Some(i) = self.marked.iter().position(|m| *m == t.id) {
+                            self.marked.remove(i);
+                        } else {
+                            self.marked.push(t.id.clone());
+                        }
+                    } else {
+                        cx.notify("only tasks waiting in TODO can be marked to run together");
+                    }
+                }
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') => {
+                if let Some(id) = self.selected() {
+                    let up = k.code != KeyCode::Char('-');
+                    if let Some(t) = self.task_mut(&id).filter(|t| t.status != Status::Done) {
+                        t.priority = (t.priority + if up { 1 } else { -1 }).clamp(-1, 2);
+                        let name = PRIORITIES.iter().find(|p| p.0 == t.priority).map(|p| p.1).unwrap_or("normal");
+                        cx.notify(format!("priority: {name}"));
+                    }
+                    self.save();
+                }
+            }
             _ => {
                 let Some(id) = self.selected() else { return matches!(k.code, KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't')) };
                 let t = self.task(&id).unwrap().clone();
@@ -1531,23 +1641,27 @@ impl Agents {
                 self.submit_form(form, false, cx);
                 return true;
             }
-            KeyCode::Tab => form.field = (form.field + 1) % 5,
-            KeyCode::BackTab => form.field = (form.field + 4) % 5,
+            KeyCode::Tab => form.field = (form.field + 1) % 8,
+            KeyCode::BackTab => form.field = (form.field + 7) % 8,
             _ => {
                 let used = match form.field {
                     0 => form.title.key(k),
                     1 => form.prompt.key(k),
                     3 => form.model.key(k),
+                    5 => form.after.key(k),
+                    6 => form.budget.key(k),
                     _ => false,
                 };
                 if !used {
                     match k.code {
-                        KeyCode::Enter if form.field == 4 => {
+                        KeyCode::Enter if form.field == 7 => {
                             let start = form.button == 1;
                             self.submit_form(form, start, cx);
                             return true;
                         }
-                        KeyCode::Enter | KeyCode::Down => form.field = (form.field + 1).min(4),
+                        KeyCode::Enter | KeyCode::Down => form.field = (form.field + 1).min(7),
+                        KeyCode::Left if form.field == 4 => form.priority = form.priority.saturating_sub(1),
+                        KeyCode::Right | KeyCode::Char(' ') if form.field == 4 => form.priority = (form.priority + 1).min(PRIORITIES.len() - 1),
                         KeyCode::Up => form.field = form.field.saturating_sub(1),
                         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 2 => {
                             // cycle through installed agents (all of them if none are)
@@ -1560,7 +1674,7 @@ impl Agents {
                                 }
                             }
                         }
-                        KeyCode::Left | KeyCode::Right if form.field == 4 => form.button = 1 - form.button,
+                        KeyCode::Left | KeyCode::Right if form.field == 7 => form.button = 1 - form.button,
                         _ => {}
                     }
                 }
@@ -1764,6 +1878,29 @@ impl Pane for Agents {
             Mode::Roster(_) => self.roster_key(k),
             Mode::Watch(_) => self.watch_key(k, cx),
             Mode::Log(_) => self.log_key(k, cx),
+            Mode::Batch => {
+                self.mode = Mode::Board;
+                let serial = match k.code {
+                    KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Enter => Some(false),
+                    KeyCode::Char('s') | KeyCode::Char('S') => Some(true),
+                    KeyCode::Esc => None,
+                    _ => {
+                        self.mode = Mode::Batch;
+                        return true;
+                    }
+                };
+                if let Some(serial) = serial {
+                    let ids = std::mem::take(&mut self.marked);
+                    match self.start_batch(&ids, serial, cx) {
+                        Ok(_) => cx.notify(format!("running {} task{} {}", ids.len(), if ids.len() == 1 { "" } else { "s" }, if serial { "one after another" } else { "together" })),
+                        Err(e) => {
+                            self.marked = ids;
+                            cx.notify(e);
+                        }
+                    }
+                }
+                true
+            }
             Mode::Confirm(_) => {
                 let Mode::Confirm(c) = std::mem::replace(&mut self.mode, Mode::Board) else { return true };
                 match k.code {

@@ -204,6 +204,64 @@ fn by_key<'a>(p: &'a Agents, key: &str) -> &'a Task {
     p.store.tasks.iter().find(|t| t.key == key).unwrap_or_else(|| panic!("no task {key}"))
 }
 
+/// Your own tasks, run together without a lead: marked with space, enter, p. They run two at a time, the urgent
+/// one first; one fails the gate, goes back to its worker and merges on the second try; all three land in one
+/// branch and the run waits for review. Then two more, one after another (s).
+#[test]
+fn agents_batch_runs_without_a_lead() {
+    let dir = scratch("batch");
+    let repo = temp_repo(&dir);
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(seen.clone()), fake_text_lead(json!([]), 0, Arc::default()));
+    p.lead_cfg.gate = gate_cmd();
+    p.lead_cfg.max_parallel = 2;
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    let a = p.add_task("Add a", "write a.txt: aaa", 0, "");
+    let b = p.add_task("Add b", "write b.txt: BROKEN", 0, "");
+    let c = p.add_task("Add c", "write c.txt: sea", 0, "");
+    p.task_mut(&c).unwrap().priority = 2;
+    // space marks the selected TODO card
+    p.col = 0;
+    p.row[0] = 0;
+    k.key(&mut p, KeyCode::Char(' '));
+    assert_eq!(p.marked.len(), 1);
+    p.marked = vec![a.clone(), b.clone(), c.clone()];
+    let s = k.render_html(&mut p, 150, 44, "target/snap/agents-batch-marked.html");
+    assert!(s.contains("[1]") && s.contains("[3]") && s.contains("run the marked together"), "{s}");
+    k.key(&mut p, KeyCode::Enter);
+    assert!(matches!(p.mode, Mode::Batch));
+    let s = k.render_html(&mut p, 150, 44, "target/snap/agents-batch.html");
+    assert!(s.contains("run 3 tasks together") && s.contains("one after another"), "{s}");
+    k.key(&mut p, KeyCode::Char('p'));
+    assert!(p.marked.is_empty() && p.store.runs.len() == 1);
+    until(&mut k, &mut p, 60_000, "the run is ready", |p| p.store.runs[0].state == store::RunState::Review);
+    let r = run0(&p);
+    assert!(r.manual && r.merged == 3, "{r:?}
+{:#?}", p.store.tasks);
+    assert!(r.branch.contains("batch-"), "{}", r.branch);
+    let first = seen.lock().unwrap().first().cloned().unwrap_or_default();
+    assert!(first.contains(&c), "the urgent one started first: {first}");
+    assert_eq!(p.task(&b).unwrap().attempts, 1, "b failed the gate once and went back to its worker");
+    for (f, want) in [("a.txt", "aaa"), ("b.txt", "fixed"), ("c.txt", "sea")] {
+        assert_eq!(sh(&repo, &["show", &format!("{}:{f}", r.branch)]), want);
+    }
+    assert_eq!(sh(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "master", "your branch is untouched until you merge");
+    assert!(k.notices().iter().any(|n| n.contains("your run is ready")), "{:?}", k.notices());
+
+    // one after another: the second waits for the first
+    let d = p.add_task("Add d", "write d.txt: dee", 0, "");
+    let e = p.add_task("Add e", "write e.txt: eee", 0, "");
+    p.marked = vec![d.clone(), e.clone()];
+    k.key(&mut p, KeyCode::Enter);
+    k.key(&mut p, KeyCode::Char('s'));
+    until(&mut k, &mut p, 60_000, "the second run is ready", |p| p.store.runs.len() == 2 && p.store.runs[1].state == store::RunState::Review);
+    let (td, te) = (p.task(&d).unwrap(), p.task(&e).unwrap());
+    assert!(te.depends_on.contains(&d), "{te:?}");
+    assert!(te.started >= td.finished, "e started after d was done");
+}
+
 /// The whole thing through the text protocol: plan → 4 workers (3 at a time) → merge queue, where one task
 /// conflicts (a worker edited outside its files) and one fails the gate; both go back to their workers and merge
 /// on the second try → done → the user merges the integration branch into master with `m`.

@@ -39,6 +39,8 @@ pub struct Task {
     pub repo: String,
     pub title: String,
     pub prompt: String,
+    /// -1 low, 0 normal, 1 high, 2 urgent: waiting tasks start highest first.
+    pub priority: i8,
     /// claude | codex | kimi
     pub agent: String,
     /// Empty = the agent's default.
@@ -218,6 +220,10 @@ pub struct Run {
     pub merged: u32,
     pub created: i64,
     pub finished: i64,
+    /// A run of your own tasks, no lead (batch.rs): these tasks, in parallel or `serial`.
+    pub manual: bool,
+    pub serial: bool,
+    pub batch: Vec<String>,
 }
 
 impl Run {
