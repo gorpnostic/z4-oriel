@@ -202,9 +202,10 @@ pub struct App {
     theme: Theme,
     config: Config,
     tx: Sender<Event>,
-    /// toasts, newest last (at most TOASTS), and where each was drawn (by index; a click goes to its pane)
+    /// toasts, newest last (at most TOASTS), and where each was drawn (by its `at`, which a toast arriving since
+    /// can't shift the way it shifts indices; a click goes to its pane)
     notices: Vec<Notice>,
-    toast_hits: Vec<(Rect, usize)>,
+    toast_hits: Vec<(Rect, Instant)>,
     prefix_armed: bool,
     palette: Option<Palette>,
     quit: bool,
@@ -434,9 +435,11 @@ impl App {
         }
     }
 
-    /// Bring a saved session back. False if there was nothing to put you in.
+    /// Bring a saved session back. False if there was nothing to put you in (a tab opened for other reasons, like
+    /// the calendar for a coming reminder, doesn't count).
     fn restore(&mut self, s: crate::session::Session) -> bool {
         self.sidebar = s.sidebar;
+        let mut placed = false;
         // the chat and note you had open, in their apps
         for (app, id) in [("ai", &s.chat), ("notes", &s.note)] {
             if let Some(id) = id {
@@ -445,6 +448,7 @@ impl App {
                 if let Some(p) = self.panes.get_mut(&f) {
                     p.resume(id);
                 }
+                placed = true;
             }
         }
         let mut mine = vec![];
@@ -460,12 +464,12 @@ impl App {
         let app = s.app.as_deref().and_then(|a| SIDEBAR.iter().map(|x| x.0).chain(["updates"]).find(|x| *x == a));
         if let Some(a) = app {
             self.goto_app(a);
-        } else if let Some(&(_, i)) = mine.iter().find(|(n, _)| Some(*n) == s.tab) {
+        } else if let Some(&(_, i)) = mine.iter().find(|(n, _)| Some(*n) == s.tab).or(mine.first()) {
             self.cur = i;
-        } else if let Some(&(_, i)) = mine.first() {
-            self.cur = i;
+        } else {
+            return placed;
         }
-        !self.tabs.is_empty()
+        true
     }
 
     /// Write the session if it changed (checked every couple of seconds while oriel runs, and at quit).
@@ -996,7 +1000,10 @@ impl App {
             }
             self.reap();
             self.track_agents();
-            self.set_title();
+            if !moves_only {
+                // (it asks every pane what's open: not for the mouse passing over, which can't change that)
+                self.set_title();
+            }
             self.autosave(false);
             if self.onboard.is_some() {
                 let probe = self.probe();
@@ -1140,7 +1147,8 @@ impl App {
             return n.clone();
         }
         if let Some(a) = t.app {
-            return a.to_string();
+            // as the sidebar names it ("chat", "your AIs"), not the internal id
+            return SIDEBAR.iter().find(|x| x.0 == a).map(|x| x.2).unwrap_or(a).to_string();
         }
         self.panes.get(&t.focus).map(|p| p.title()).unwrap_or_default()
     }
@@ -1152,7 +1160,8 @@ impl App {
         }
         let cur = self.tab_label(i);
         self.renaming = Some((self.tabs[i].id, cur));
-        self.sidebar = true; // the field is drawn in the tab's row (or a popup when the window is too narrow)
+        self.sidebar = true; // the field is drawn in the tab's row (or a popup when that row isn't drawn)
+        self.tab_scrolled_for = 0; // (no tab has id 0) the tab list scrolls back to the tab being renamed
     }
 
     fn close_tab(&mut self, i: usize) {
@@ -1177,6 +1186,10 @@ impl App {
             self.close(id);
         }
         self.notices.retain(|n| n.at.elapsed() <= TOAST_FOR);
+        // a close/quit question nobody answered: gone (left in place, its deadline would wake the loop every 10 ms)
+        if self.confirm.is_some_and(|c| c.1.elapsed() >= CONFIRM_FOR) {
+            self.confirm = None;
+        }
     }
 
     /// Run `f` on pane `id` with a Cx, then apply whatever actions it asked for.
@@ -1946,8 +1959,9 @@ impl App {
         let mut m: Vec<(u8, usize)> = (0..p.items.len())
             .filter_map(|i| {
                 let it = &p.items[i];
-                // the key counts too ("alt z" finds zoom), a notch below a label that starts with it
-                let s = Self::score(&it.label, &q).max(Self::score(&it.key, &q).map(|s| s.min(3)))?;
+                // the key counts too ("alt z" finds zoom), a notch below a label that starts with it; only as a
+                // run of letters, since "ctrl+space |" holds most of the alphabet scattered
+                let s = Self::score(&it.label, &q).max(Self::score(&it.key, &q).filter(|&s| s >= 2).map(|s| s.min(3)))?;
                 Some((s, i))
             })
             .collect();
@@ -2021,6 +2035,9 @@ impl App {
 
     /// Run the palette's pick (enter, or a click on its row).
     fn palette_run(&mut self) {
+        // a click can land on a row without the pick moving there first: a theme previewed on the way stays only if
+        // the pick is that theme
+        self.palette_preview();
         let Some(p) = self.palette.take() else { return };
         let m = Self::palette_matches(&p);
         if let Some(c) = m.get(p.sel).map(|&i| p.items[i].cmd.clone()) {
@@ -2113,8 +2130,8 @@ impl App {
         }
         // a click on a toast goes to what it's about (and puts it away)
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-            if let Some(&(_, i)) = self.toast_hits.iter().find(|(r, _)| r.contains(pos)) {
-                let pane = (i < self.notices.len()).then(|| self.notices.remove(i)).and_then(|n| n.pane);
+            if let Some(&(_, at)) = self.toast_hits.iter().find(|(r, _)| r.contains(pos)) {
+                let pane = self.notices.iter().position(|n| n.at == at).map(|i| self.notices.remove(i)).and_then(|n| n.pane);
                 self.toast_hits.clear();
                 if let Some(p) = pane {
                     match self.tabs.iter().position(|t| t.root.contains(p)) {
@@ -2434,8 +2451,10 @@ impl App {
         if let Some(p) = &mut self.palette {
             Self::draw_palette(f, area, p, &t);
         }
-        // renaming a tab while the sidebar (where the field lives) is too narrow to draw: a small box instead
-        if let (Some((_, text)), 0) = (&self.renaming, side_w) {
+        // renaming a tab whose sidebar row (where the field lives) isn't drawn (no sidebar, no room, scrolled out
+        // of view): a small box instead
+        let in_sidebar = |id: u64| side_w > 0 && self.side_hits.iter().any(|(_, h)| matches!(h, SideHit::Tab(t) if *t == id));
+        if let Some((_, text)) = self.renaming.as_ref().filter(|(id, _)| !in_sidebar(*id)) {
             let inner = ui::popup(f, area, 48, 4, &format!("{}rename tab", ui::lead("tab")), &t);
             let line = Line::from(vec![Span::styled(format!(" {text}▏"), Style::default().fg(t.accent).add_modifier(Modifier::BOLD))]);
             f.render_widget(Paragraph::new(vec![line, Line::styled(" enter ok · esc", ui::muted(&t))]), inner);
@@ -2718,7 +2737,7 @@ impl App {
         self.toast_hits.clear();
         let area = self.body;
         // (title, colour, lines of (glyph, text), the notice it is)
-        let mut boxes: Vec<(String, ratatui::style::Color, Vec<(String, String)>, Option<usize>)> = vec![];
+        let mut boxes: Vec<(String, ratatui::style::Color, Vec<(String, String)>, Option<Instant>)> = vec![];
         if self.prefix_armed {
             let lines = vec![
                 ("".into(), "| - split · hjkl move · x close · z zoom · c new tab · 1-9 n p ; tabs".into()),
@@ -2729,13 +2748,13 @@ impl App {
         if let Some(q) = self.confirm_text() {
             boxes.push(("careful".into(), t.danger, vec![("".into(), q)], None));
         }
-        for (i, n) in self.notices.iter().enumerate().rev() {
+        for n in self.notices.iter().rev() {
             match n.kind {
                 Some(k) => {
                     let (glyph, name) = k.label();
-                    boxes.push((name.to_string(), panes::alerts::color(k, t), vec![(glyph.to_string(), n.text.clone())], Some(i)));
+                    boxes.push((name.to_string(), panes::alerts::color(k, t), vec![(glyph.to_string(), n.text.clone())], Some(n.at)));
                 }
-                None => boxes.push(("oriel".into(), t.accent, vec![("".into(), n.text.clone())], Some(i))),
+                None => boxes.push(("oriel".into(), t.accent, vec![("".into(), n.text.clone())], Some(n.at))),
             }
         }
         let mut y = area.y + 1;
@@ -2772,8 +2791,8 @@ impl App {
                 })
                 .collect();
             f.render_widget(Paragraph::new(rows), inner);
-            if let Some(i) = notice {
-                self.toast_hits.push((r, i));
+            if let Some(at) = notice {
+                self.toast_hits.push((r, at));
             }
             y += h;
         }
@@ -3625,6 +3644,24 @@ mod tests {
         assert_eq!(app.palette.as_ref().unwrap().sel, 0, "one match: the wheel stays on it");
         app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: r.x + 2, row: r.y, modifiers: KeyModifiers::NONE });
         assert!(app.palette.is_none() && app.tabs[app.cur].zoom != zoom, "clicked row ran");
+        // a theme previewed with the wheel, then a click on a row that isn't a theme: the theme goes back
+        app.open_palette();
+        {
+            let p = app.palette.as_mut().unwrap();
+            let m = App::palette_matches(p);
+            p.sel = m.iter().position(|&i| matches!(&p.items[i].cmd, Cmd::Theme(t) if t == "ocean")).unwrap();
+        }
+        app.palette_preview();
+        assert_eq!(app.theme.name, "ocean");
+        screen(&mut app, 150, 42);
+        let p = app.palette.as_ref().unwrap();
+        let m = App::palette_matches(p);
+        let (r, _) = *p.rows.iter().find(|(_, k)| matches!(p.items[m[*k]].cmd, Cmd::Sidebar)).expect("toggle sidebar drawn near the themes");
+        let side = app.sidebar;
+        app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: r.x + 2, row: r.y, modifiers: KeyModifiers::NONE });
+        assert!(app.palette.is_none() && app.sidebar != side, "clicked row ran");
+        assert_eq!(app.theme.name, "oriel", "the preview didn't stay on unsaved");
+        app.sidebar = side;
         // renaming takes it (control characters dropped, 40 at most)
         app.start_rename(app.cur);
         app.handle(Event::Input(CEvent::Paste("my\ttab\n".into())));
@@ -3811,6 +3848,10 @@ mod tests {
         assert_eq!(app.next_deadline(), Duration::from_millis(125), "animated while you look");
         app.term_focused = false;
         assert!(app.next_deadline() > Duration::from_secs(1), "not while you're in another window");
+        // a close/quit question left unanswered goes away, and stops waking the loop
+        app.confirm = Some((Doom::Quit, Instant::now().checked_sub(CONFIRM_FOR + Duration::from_secs(1)).unwrap()));
+        app.reap();
+        assert!(app.confirm.is_none() && app.next_deadline() > Duration::from_secs(1));
         // a mouse move over nothing that lights up changes nothing on screen
         app.new_tab(Box::new(crate::panes::home::Home::new()));
         let (p, _) = fake(false, false);
@@ -3898,6 +3939,11 @@ mod tests {
         let (mut again, _rx) = new_app();
         again.restore(back.session());
         assert_eq!((again.tabs[again.cur].app, again.user_tabs().len()), (Some("help"), 2));
+        // nothing in it can come back: not restored, even with a tab already open (chat, here; at a real start
+        // the calendar for a coming reminder), so the start goes to chat as on a first run
+        let (mut none, _rx) = new_app();
+        let lost = crate::session::Session { tabs: vec![crate::session::Tab { name: None, root: crate::session::Node::Leaf { kind: "uninstalled-agent".into(), cwd: None, id: None }, focus: 0 }], ..Default::default() };
+        assert!(!none.restore(lost));
     }
 
     #[test]
@@ -4003,6 +4049,8 @@ mod tests {
         app.new_tab(p);
         let (agent_tab, agent) = (app.tabs[app.cur].id, app.focused());
         app.goto_app("help");
+        app.notify("older one");
+        app.notify("old one");
         a.act.set(Some(Activity::Working));
         app.track_agents();
         a.act.set(Some(Activity::Idle));
@@ -4017,10 +4065,13 @@ mod tests {
         assert_eq!(b[(r.x, r.y)].fg, app.theme.good, "a finished agent's colour");
         let row: String = (r.x..r.right()).map(|x| b[(x, r.y)].symbol()).collect();
         assert!(row.contains(" finished "), "titled with the kind: {row}");
-        // a click on it goes to that agent
+        // a click on it goes to that agent, even with a toast in since it was drawn (the oldest went to keep three,
+        // so the drawn one's place in the list moved)
+        app.notify("late one");
         app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: r.x + 3, row: r.y + 1, modifiers: KeyModifiers::NONE });
         assert_eq!((app.tabs[app.cur].id, app.focused()), (agent_tab, agent));
-        assert!(app.notices.is_empty(), "and puts it away");
+        assert!(!app.notices.iter().any(|n| n.text.contains("finished")), "and puts it away");
+        app.notices.clear();
         // three at most, newest on top, a failure in its own colour
         app.raise(crate::alerts::Kind::BuildFailed, "build failed · w1".into(), None, None);
         let s = shot(&mut app, 150, 42, "toast-failed");
@@ -4057,6 +4108,10 @@ mod tests {
         assert_eq!(top(&mut app, "split right").1, "ctrl+space |", "the prefix keys, from the config");
         assert_eq!(top(&mut app, "config").0, "open config.toml");
         assert_eq!(top(&mut app, "split: open chat").0, "split: open chat beside this", "one name for chat");
+        // a key matches as a run of letters, not scattered ones ("ctrl+space |" has most of the alphabet)
+        let p = app.palette.as_mut().unwrap();
+        p.query = "trlspc".into();
+        assert!(App::palette_matches(p).is_empty(), "{:?}", App::palette_matches(p).iter().map(|&i| &p.items[i].label).collect::<Vec<_>>());
         app.palette = None;
         // prefix t starts on the theme you have, so the preview moves on from it
         prefix(&mut app);
@@ -4100,6 +4155,20 @@ mod tests {
         let (m, _) = app.side_hits.iter().copied().find(|(_, h)| matches!(h, SideHit::MoreTabs)).unwrap();
         app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: m.x + 3, row: m.y, modifiers: KeyModifiers::NONE });
         assert!(screen(&mut app, 120, 30).contains("task 5"));
+        assert_eq!(app.tab_label(app.cur), "your AIs", "an app tab by the sidebar's name (toasts, the open-now list)");
+        // renaming a tab scrolled out of view: the list scrolls back to it, and the field is in its row
+        let t0 = app.user_tabs()[0];
+        app.cur = t0;
+        app.tab_scrolled_for = app.tabs[t0].id; // arrived before the wheel scrolled away from it
+        assert!(!screen(&mut app, 120, 30).contains("task 0"));
+        app.start_rename(t0);
+        let s = screen(&mut app, 120, 30);
+        assert!(s.contains("task 0▏") && !s.contains("rename tab"), "{s}");
+        // no room for any tab row: the field comes up in a box instead of taking keys unseen
+        let s = shot(&mut app, 120, 9, "rename-no-room");
+        assert!(s.contains("rename tab") && s.contains("task 0▏"), "{s}");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.goto_app("ais");
         // shorter still: the tools fold into one row of icons, and the new-alerts count moves to the title
         app.raise(crate::alerts::Kind::Update, "something new".into(), None, None);
         let s = shot(&mut app, 120, 16, "sidebar-120x16");
