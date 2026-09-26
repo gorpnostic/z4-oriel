@@ -44,6 +44,8 @@ pub enum Action {
     GotoApp(&'static str),
     /// Send a key to an app's pane without switching to it (/play → the music app), opening it if needed.
     AppKey(&'static str, char),
+    /// Paste text into an app's pane (opening it if needed), and switch to it.
+    AppPaste(&'static str, String),
     ToggleSidebar,
     ToggleIcons,
     /// Open a pane in a new tab of its own, named `name` and remembered by `tag` (e.g. an orchestrator task id),

@@ -1,5 +1,6 @@
 //! A small soft-wrapping text editor: a Vec of lines, a cursor (line, char index), word-wrapped layout for
-//! drawing and for mapping clicks / up / down through wrapped rows, and snapshot undo.
+//! drawing and for mapping clicks / up / down through wrapped rows, and snapshot undo. The notes app edits with
+//! it, and the chat's composer borrows it for each keystroke (see `load`).
 
 use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
@@ -118,6 +119,35 @@ impl Editor {
 
     pub fn text(&self) -> String {
         self.lines.join("\n")
+    }
+
+    /// Take `text` as it is (tabs and all) with the cursor at char index `at`: for a caller that keeps its own
+    /// String. The same text and cursor as last time keep the goal column; undo history is kept either way.
+    pub fn load(&mut self, text: &str, at: usize) {
+        if self.char_index() == at && self.lines.len() == text.split('\n').count() && self.text() == text {
+            return;
+        }
+        self.lines = text.split('\n').map(String::from).collect();
+        self.goal_x = None;
+        let mut left = at;
+        for (row, l) in self.lines.iter().enumerate() {
+            let n = char_len(l);
+            if left <= n || row + 1 == self.lines.len() {
+                (self.row, self.col) = (row, left.min(n));
+                return;
+            }
+            left -= n + 1;
+        }
+    }
+
+    /// The cursor as a char index into `text()`.
+    pub fn char_index(&self) -> usize {
+        self.lines[..self.row.min(self.lines.len())].iter().map(|l| char_len(l) + 1).sum::<usize>() + self.col
+    }
+
+    /// Remember the text as it is now, so an undo can come back to it (before a change made from outside).
+    pub fn checkpoint(&mut self) {
+        self.snapshot(EditKind::Other);
     }
 
     fn line_len(&self) -> usize {
@@ -457,7 +487,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn notes_editor_wrap_and_move() {
+    fn editor_wrap_and_move() {
         assert_eq!(wrap_line("hello world foo", 11), vec![(0, 12), (12, 15)]);
         assert_eq!(wrap_line("abcdefghij", 4), vec![(0, 4), (4, 8), (8, 10)]);
         assert_eq!(wrap_line("", 10), vec![(0, 0)]);
@@ -481,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn notes_editor_edit_and_undo() {
+    fn editor_edit_and_undo() {
         let mut e = Editor::new("");
         for c in "- milk".chars() {
             e.insert_char(c);
@@ -505,5 +535,20 @@ mod tests {
         let mut e = Editor::new("1. first");
         e.newline();
         assert_eq!(e.text(), "1. first\n2. ");
+    }
+
+    /// A caller with its own String hands it over with a char-index cursor and reads both back.
+    #[test]
+    fn editor_load_and_char_index() {
+        let mut e = Editor::new("");
+        e.load("ab\ncd\n\tx", 4);
+        assert_eq!((e.row, e.col, e.char_index()), (1, 1, 4));
+        assert_eq!(e.text(), "ab\ncd\n\tx", "tabs kept as they are");
+        e.load("ab\ncd\n\tx", 99);
+        assert_eq!((e.row, e.col), (2, 2), "past the end: the end");
+        e.load("ab", 2);
+        e.checkpoint();
+        e.insert_char('c');
+        assert!(e.undo() && e.text() == "ab");
     }
 }

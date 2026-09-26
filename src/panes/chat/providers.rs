@@ -97,6 +97,8 @@ pub enum Ev {
     Plan(String),
     /// You approved a plan: the permission mode it now runs in.
     Perms(String),
+    /// What the reply cost so far, in dollars (the chat keeps a running total).
+    Cost(f64),
     Done { note: Option<String> },
     Error(String),
 }
@@ -646,6 +648,9 @@ fn claude(req: &Request, stop: &AtomicBool, send: Arc<dyn Fn(Ev) + Send + Sync>,
     // it printed some of the turn, then died: that's not a finished reply
     if !p.finished && !stop.load(Ordering::SeqCst) {
         return Err(exit.cut_short("claude code"));
+    }
+    if p.cost() > 0.0 {
+        send(Ev::Cost(p.cost()));
     }
     send(Ev::Done { note: Some(p.note(t0.elapsed())) });
     Ok(())

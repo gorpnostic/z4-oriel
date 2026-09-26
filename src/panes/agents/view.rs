@@ -135,7 +135,7 @@ impl Agents {
     fn draw_batch(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
         let n = self.marked.len();
-        let inner = ui::popup(f, area, 76, (n as u16 + 12).min(26), &format!("{}run {n} task{} together", ui::lead("robot"), if n == 1 { "" } else { "s" }), t);
+        let inner = ui::popup(f, area, 76, (n as u16 + 13).min(27), &format!("{}run {n} task{} together", ui::lead("robot"), if n == 1 { "" } else { "s" }), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let mut lines = vec![];
         for (i, id) in self.marked.iter().enumerate() {
@@ -147,11 +147,17 @@ impl Agents {
                 -1 => " ↓ low",
                 _ => "",
             };
-            lines.push(Line::from(vec![
+            let mut row = vec![
                 Span::styled(format!("{:>2}. ", i + 1), bold(t.accent)),
                 Span::styled(ui::fit(&task.title, 40), Style::default().fg(t.fg).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  {} · {model}{pri}", task.agent), ui::muted(t)),
-            ]));
+            ];
+            // how full that agent's plan window is (red past 85%, or while it's rate-limited)
+            if let Some((note, hot)) = self.limit_note(&task.agent) {
+                let note = note.strip_prefix(&format!("{} ", task.agent)).unwrap_or(&note).split(" · resets").next().unwrap_or("").to_string();
+                row.push(Span::styled(format!(" · {note}"), if hot { Style::default().fg(t.danger).add_modifier(Modifier::BOLD) } else { ui::muted(t) }));
+            }
+            lines.push(Line::from(row));
         }
         lines.push(Line::raw(""));
         let par = self.lead_cfg.max_parallel.clamp(1, 5);
@@ -159,11 +165,15 @@ impl Agents {
         lines.push(Line::from(vec![Span::styled(" s ", Style::default().fg(Color::Black).bg(t.shine).add_modifier(Modifier::BOLD)), Span::styled("  one after another, in the order you marked them", Style::default().fg(t.fg))]));
         lines.push(Line::raw(""));
         let budget = self.lead_cfg.run_budget_usd;
+        // what the tasks' own caps come to, next to the run's budget
+        let own: f64 = self.marked.iter().filter_map(|id| self.task(id)).map(|t| t.budget_usd.max(0.0)).sum();
+        let own = if own > 0.0 { format!(" (their own caps: ${own:.2})") } else { String::new() };
         for l in [
             "Each runs in its own worktree with its own AI and model. Finished work".to_string(),
             "is merged one at a time into a new branch: a conflict check and your".to_string(),
             format!("build/tests first (a failure goes back to it, then one fresh try)."),
-            format!("Budget ${budget:.2} for the run. When they're all in: d reviews, m merges."),
+            format!("Budget ${budget:.2} for the run{own}."),
+            "When they're all in: d reviews, m merges.".to_string(),
         ] {
             lines.push(Line::from(Span::styled(l, ui::muted(t))));
         }

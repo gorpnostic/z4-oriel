@@ -4,6 +4,7 @@ mod alerts;
 mod app;
 mod clip;
 mod config;
+mod editor;
 mod font;
 mod layout;
 mod onboard;
@@ -15,7 +16,7 @@ mod ui;
 mod update;
 
 use crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     execute,
 };
 use std::sync::mpsc;
@@ -92,6 +93,12 @@ fn main() -> anyhow::Result<()> {
     while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
         let _ = crossterm::event::read();
     }
+    let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, crossterm::event::EnableFocusChange)?;
+    // terminals with the kitty keyboard protocol can tell shift+enter from enter (a new line in the chat box).
+    // Asked before the input thread starts reading, which would swallow the answer.
+    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(std::io::stdout(), PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)).is_ok();
     let input_tx = tx.clone();
     std::thread::spawn(move || {
         while let Ok(ev) = crossterm::event::read() {
@@ -100,15 +107,15 @@ fn main() -> anyhow::Result<()> {
             }
         }
     });
-
-    let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, crossterm::event::EnableFocusChange)?;
     let tour = args.first().map(String::as_str) == Some("--tour");
     let mut app = app::App::new(cfg, tx);
     if tour {
         app.start_tour();
     }
     let res = app.run(&mut terminal, rx);
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     res

@@ -203,7 +203,51 @@ fn closer(chars: &[char], from: usize, c: char, n: usize) -> Option<usize> {
 
 /// Render a whole markdown reply into wrapped lines, each prefixed with `indent`.
 pub fn render(text: &str, width: usize, indent: &str, t: &Theme) -> Vec<Line<'static>> {
+    draw(text, width, indent, t, false).0
+}
+
+/// A fenced code block as the reply wrote it: its language ("" when none) and its lines, unwrapped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Code {
+    pub lang: String,
+    pub text: String,
+}
+
+/// The fenced code blocks in a reply, in order (an unclosed one runs to the end, as it's drawn).
+pub fn fenced_blocks(text: &str) -> Vec<Code> {
     let mut out = vec![];
+    let mut cur: Option<(String, Vec<&str>)> = None;
+    for line in text.split('\n').map(|l| l.trim_end_matches('\r')) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            match cur.take() {
+                Some((lang, lines)) => out.push(Code { lang, text: lines.join("\n") }),
+                None => cur = Some((trimmed.trim_start_matches('`').trim().to_string(), vec![])),
+            }
+            continue;
+        }
+        if let Some((_, lines)) = &mut cur {
+            lines.push(line);
+        }
+    }
+    if let Some((lang, mut lines)) = cur {
+        while lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.pop();
+        }
+        out.push(Code { lang, text: lines.join("\n") });
+    }
+    out
+}
+
+/// `render`, plus where each code block's `┌─ lang` header landed: (line index, the block). The headers say a
+/// click copies them (the chat does that).
+pub fn render_full(text: &str, width: usize, indent: &str, t: &Theme) -> (Vec<Line<'static>>, Vec<(usize, Code)>) {
+    draw(text, width, indent, t, true)
+}
+
+fn draw(text: &str, width: usize, indent: &str, t: &Theme, copy_hint: bool) -> (Vec<Line<'static>>, Vec<(usize, Code)>) {
+    let mut out = vec![];
+    let mut heads: Vec<usize> = vec![];
     let mut in_code = false;
     let code_style = Style::default().fg(t.inline);
     let body = Style::default().fg(t.fg);
@@ -233,18 +277,22 @@ pub fn render(text: &str, width: usize, indent: &str, t: &Theme) -> Vec<Line<'st
                 in_code = true;
                 let lang = trimmed.trim_start_matches('`').trim().to_string();
                 let label = if lang.is_empty() { "code".to_string() } else { lang };
+                heads.push(out.len());
                 out.push(Line::from(vec![
                     Span::styled(format!("{indent}┌─ "), Style::default().fg(t.frame)),
                     Span::styled(label, Style::default().fg(t.muted)),
+                    Span::styled(if copy_hint { "  click to copy" } else { "" }, Style::default().fg(t.frame)),
                 ]));
             }
             continue;
         }
         if in_code {
-            // code keeps its spacing; long lines are cut, not wrapped
-            let room = width.saturating_sub(indent.width() + 2);
-            let shown = crate::ui::fit(&line.replace('\t', "    "), room);
-            out.push(Line::from(vec![Span::styled(format!("{indent}│ "), Style::default().fg(t.frame)), Span::styled(shown, code_style)]));
+            // code keeps its spacing; a long line carries on under ↪ rather than being cut
+            let room = width.saturating_sub(indent.width() + 2).max(4);
+            for (n, piece) in hard_wrap(&line.replace('\t', "    "), room).into_iter().enumerate() {
+                let gutter = if n == 0 { format!("{indent}│ ") } else { format!("{indent}│↪") };
+                out.push(Line::from(vec![Span::styled(gutter, Style::default().fg(t.frame)), Span::styled(piece, code_style)]));
+            }
             continue;
         }
         if trimmed.is_empty() {
@@ -298,6 +346,23 @@ pub fn render(text: &str, width: usize, indent: &str, t: &Theme) -> Vec<Line<'st
     // no trailing blank lines
     while out.last().map(|l| l.width() == 0 || l.spans.iter().all(|s| s.content.trim().is_empty())).unwrap_or(false) {
         out.pop();
+    }
+    let codes = if heads.is_empty() { vec![] } else { heads.into_iter().zip(fenced_blocks(text)).collect() };
+    (out, codes)
+}
+
+/// Cut a line into pieces of at most `room` columns (code: no word breaks, every character kept).
+fn hard_wrap(s: &str, room: usize) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut used = 0;
+    for c in s.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > room && used > 0 {
+            out.push(String::new());
+            used = 0;
+        }
+        out.last_mut().unwrap().push(c);
+        used += w;
     }
     out
 }
@@ -496,5 +561,39 @@ mod tests {
         let many = "| one | two | three | four |\n|---|---|---|---|\n| alpha beta | gamma delta | epsilon zeta | eta theta |";
         let rows: Vec<String> = render(many, 24, "", &t).iter().map(|l| l.spans.iter().map(|s| s.content.to_string()).collect()).collect();
         assert!(rows.iter().any(|r| r.contains("one: alpha beta")) && !rows.iter().any(|r| r.contains('│')), "{rows:?}");
+    }
+
+    /// A long code line carries on under ↪ with nothing cut; the blocks come back as written, with their headers.
+    #[test]
+    fn chat_md_code_wraps_and_blocks() {
+        let t = crate::theme::get("oriel");
+        let long = format!("let x = \"{}\";", "abcdefghij".repeat(6));
+        let md = format!("Run:
+
+```rust
+{long}
+short();
+```
+
+and
+
+```
+ls -la
+");
+        let (lines, codes) = render_full(&md, 40, "  ", &t);
+        let rows: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.to_string()).collect()).collect();
+        println!("{}", rows.join("
+"));
+        assert!(rows.iter().all(|r| r.width() <= 40), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains('…')), "nothing cut: {rows:?}");
+        let joined: String = rows.iter().filter(|r| r.starts_with("  │")).map(|r| r.trim_start_matches("  │ ").trim_start_matches("  │↪").to_string()).collect();
+        assert!(joined.contains(&long), "every character is there: {joined}");
+        assert!(rows.iter().filter(|r| r.starts_with("  │↪")).count() >= 1, "{rows:?}");
+        assert_eq!(codes.len(), 2);
+        assert!(rows[codes[0].0].contains("┌─ rust") && rows[codes[0].0].contains("click to copy"));
+        assert_eq!(codes[0].1, Code { lang: "rust".into(), text: format!("{long}
+short();") });
+        assert_eq!(codes[1].1, Code { lang: String::new(), text: "ls -la".into() }, "an unclosed block runs to the end");
+        assert!(!render(&md, 40, "", &t).iter().any(|l| l.spans.iter().any(|s| s.content.contains("click"))), "plain render: no hint");
     }
 }

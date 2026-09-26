@@ -35,8 +35,21 @@ fn cmd(prog: &str) -> Command {
     c
 }
 
+#[cfg(test)]
+thread_local! {
+    static LAST: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: what the last `copy` on this thread would have put on the clipboard (the real one is never touched).
+#[cfg(test)]
+pub fn last_copied() -> Option<String> {
+    LAST.with(|l| l.borrow().clone())
+}
+
 /// Put text on the clipboard. Never blocks the UI: the OS tool runs on its own thread.
 pub fn copy(text: &str) {
+    #[cfg(test)]
+    LAST.with(|l| *l.borrow_mut() = Some(text.to_string()));
     if cfg!(test) {
         return;
     }

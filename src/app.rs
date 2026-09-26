@@ -692,6 +692,12 @@ impl App {
                         self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), cx));
                     }
                 }
+                Action::AppPaste(a, text) => {
+                    self.goto_app(a); // opens it if it isn't yet
+                    if let Some(id) = self.tabs.iter().find(|t| t.app == Some(a)).map(|t| t.focus) {
+                        self.with_pane(id, |p, cx| p.paste(&text, cx));
+                    }
+                }
                 Action::OpenTagged { pane, tag, name, focus } => {
                     let here = self.cur;
                     self.new_tab(pane);

@@ -17,8 +17,10 @@ pub(crate) fn render_markdown(text: &str, width: usize, t: &crate::theme::Theme)
     md::render(text, width, "", t)
 }
 
+use crate::editor::Editor;
 use crate::pane::{Action, Cx, Pane};
 use crate::ui;
+use activity::{Block, Hit};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use providers::Ev;
 use ratatui::{
@@ -29,7 +31,8 @@ use ratatui::{
     widgets::Paragraph,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,9 +46,16 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/cwd", "<folder>", "folder Claude Code / Codex work in for this chat"),
     ("/perms", "<ask|edits|auto|plan|bypass|reset>", "what coding agents may do — remembered for every chat (shift+tab cycles) · reset forgets this chat's always-allows"),
     ("/effort", "<low|medium|high|xhigh|max|ultracode>", "how hard coding agents think — remembered for every chat"),
+    ("/open", "<chat>", "open a saved chat: type to search its title (or /chats) · ctrl+pgup/pgdn the previous / next"),
+    ("/rename", "<title>", "rename this chat"),
+    ("/copy", "[code [n]|all]", "copy the last reply · code: its last code block (n = further back) · all: the whole chat"),
+    ("/prompts", "<prompt>", "your earlier prompts from every chat: type to search, enter puts it in the box"),
+    ("/lead", "[goal]", "agents: a lead run with this goal (or the last reply) — it plans and hands out the work"),
+    ("/task", "<text>", "agents: a new task card with this prompt"),
+    ("/tasks", "[goal]", "agents: split this goal (or the last reply) into task cards with the planner"),
     ("/key", "<openai|anthropic> <key>", "save an API key"),
     ("/note", "", "save the last reply to notes"),
-    ("/save", "", "export this chat as a markdown file"),
+    ("/save", "", "export this chat as a markdown file (tool calls folded in; never over an earlier export)"),
     ("/theme", "<name|edit|new>", "switch theme · edit opens the theme editor · new <name> makes your own"),
     ("/play", "", "music: play / pause"),
     ("/next", "", "music: next song"),
@@ -62,11 +72,41 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
 /// One row of the / menu: what it shows, and what picking it does.
 struct MenuItem {
     left: String,
+    /// Shown muted after `left`: a command's arguments.
+    args: String,
     desc: String,
     /// The composer text after picking it.
     fill: String,
     /// Picking runs it (false = a command that still needs its argument typed).
     run: bool,
+    /// Picking puts this in the box instead, unsent (an earlier prompt).
+    put: Option<String>,
+}
+
+impl MenuItem {
+    fn pick(left: String, desc: String, fill: String, run: bool) -> MenuItem {
+        MenuItem { left, args: String::new(), desc, fill, run, put: None }
+    }
+}
+
+/// How many rows the composer grows to before it scrolls.
+const COMPOSER_ROWS: usize = 8;
+
+/// A folder a coding agent shouldn't be let loose in by accident: your home folder, a drive root, the system.
+fn risky_dir(p: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['/', '\\']).to_lowercase().replace('/', "\\");
+    let me = norm(p);
+    if p.parent().is_none() || me.is_empty() || me.ends_with(':') || dirs::home_dir().is_some_and(|h| norm(&h) == me) {
+        return true;
+    }
+    let sys = if cfg!(windows) {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()).to_lowercase();
+        let drive = root.get(..2).unwrap_or("c:").to_string();
+        vec![root, format!(r"{drive}\program files"), format!(r"{drive}\program files (x86)"), format!(r"{drive}\programdata"), format!(r"{drive}\users")]
+    } else {
+        ["\\usr", "\\etc", "\\bin", "\\sbin", "\\var", "\\opt", "\\system", "\\library", "\\home", "\\users"].map(String::from).to_vec()
+    };
+    sys.iter().any(|s| me == *s || me.starts_with(&format!("{s}\\")) && !s.ends_with("\\users") && !s.ends_with("\\home"))
 }
 
 /// The permission modes for coding agents in chat (Claude Code's own modes). Remembered in the config.
@@ -185,6 +225,13 @@ struct Queued {
     sent: bool,
 }
 
+/// A click on the new-chat screen: a suggested prompt, or a folder for the agent to work in.
+#[derive(Clone)]
+enum HeroHit {
+    Say(String),
+    Folder(String),
+}
+
 #[derive(Clone)]
 enum SideItem {
     New,
@@ -197,10 +244,17 @@ pub struct Chat {
     chat: store::Chat,
     input: String,
     cursor: usize, // char index into input
+    /// The composer's editing: `input` and `cursor` go through it for each key (moves by line and word, undo).
+    ed: Editor,
+    /// The composer's text width last frame (↑↓ move through its wrapped rows).
+    comp_w: usize,
     scroll: usize, // lines up from the bottom; 0 = follow the end
     stream: Option<Stream>,
     menu_sel: usize,
-    cache: HashMap<usize, (u64, Vec<Line<'static>>, Vec<(usize, String)>)>,
+    /// Finished messages, drawn once: by index, (what they were drawn from, the lines).
+    cache: HashMap<usize, (u64, Block)>,
+    /// The reply streaming on screen, drawn a block at a time: (chat id, message index) and its blocks.
+    live: (String, usize, activity::BlockCache),
     provider: String,
     perms: String,
     /// /effort ("" = the agent's default)
@@ -210,8 +264,8 @@ pub struct Chat {
     expanded: bool,
     /// Calls clicked open (closed, when expanded).
     open: HashSet<String>,
-    /// Screen row -> call id, for clicks.
-    tool_hits: Vec<(u16, String)>,
+    /// Screen row -> what a click there does (open a call, copy a code block).
+    click_hits: Vec<(u16, Hit)>,
     /// Claude Code waiting for a yes/no (/perms ask), oldest first.
     asks: VecDeque<approve::Ask>,
     /// What you said "always" to, per chat, until oriel closes: approve::rule's `Bash(npm test:*)`, `Edit`...
@@ -243,9 +297,22 @@ pub struct Chat {
     confirm_delete: bool,
     side_hits: Vec<(Rect, SideItem)>,
     side_scroll: usize,
-    hero_hits: Vec<(Rect, String)>,
+    /// The chat the list last scrolled to (it follows the open chat, and leaves the wheel alone otherwise).
+    side_follow: String,
+    hero_hits: Vec<(Rect, HeroHit)>,
     launch_dir: PathBuf,
+    /// You said yes to running this chat's agent in a risky folder (home, a drive root, the system); and you were
+    /// told once (enter again says yes).
+    risky_ok: bool,
+    risky_armed: bool,
+    /// Git repos under the usual code folders, found once in the background (the new chat's folder picker).
+    repos: Arc<Mutex<Option<Vec<String>>>>,
+    /// Where ↑ is in your earlier prompts (0 = the newest), and the chat the recalled one came from if it's another.
     history_pos: Option<usize>,
+    history_from: Option<String>,
+    /// Plan windows for Claude Code / Codex, (agent, window, used %), read in the background now and then.
+    usage: Arc<Mutex<Vec<(String, String, f64)>>>,
+    usage_read: Option<Instant>,
     offset: i64,
     /// Messages typed while the AI was replying, oldest first (enter queues, ctrl+x s sends now).
     queue: Vec<Queued>,
@@ -285,17 +352,20 @@ impl Chat {
             ollama_models,
             input: String::new(),
             cursor: 0,
+            ed: Editor::new(""),
+            comp_w: 80,
             scroll: 0,
             stream: None,
             menu_sel: 0,
             cache: HashMap::new(),
+            live: (String::new(), 0, HashMap::new()),
             provider,
             perms: norm_perms(&cfg.ai.perms).unwrap_or("edits").to_string(),
             effort: cfg.ai.effort.clone(),
             keys: HashMap::new(),
             expanded: false,
             open: HashSet::new(),
-            tool_hits: vec![],
+            click_hits: vec![],
             asks: VecDeque::new(),
             always: HashMap::new(),
             questions: VecDeque::new(),
@@ -312,9 +382,16 @@ impl Chat {
             confirm_delete: false,
             side_hits: vec![],
             side_scroll: 0,
+            side_follow: String::new(),
             hero_hits: vec![],
             launch_dir: std::env::current_dir().unwrap_or_default(),
+            risky_ok: false,
+            risky_armed: false,
+            repos: Arc::default(),
             history_pos: None,
+            history_from: None,
+            usage: Arc::default(),
+            usage_read: None,
             offset: crate::app::local_offset_secs(),
             queue: vec![],
             chord_x: false,
@@ -387,10 +464,25 @@ impl Chat {
     /// A different chat on screen: its own lines, scrolled to the end.
     fn fresh_view(&mut self) {
         self.cache.clear();
+        self.live.2.clear();
         self.scroll = 0;
         self.unseen = 0;
         self.anchor = None;
         self.info.clear();
+        self.history_pos = None;
+        self.history_from = None;
+        self.risky_ok = false;
+        self.risky_armed = false;
+    }
+
+    /// The chat's folder as the agent will get it, without touching the disk (it's drawn every frame).
+    fn workdir_label(&self) -> PathBuf {
+        self.chat.cwd.clone().map(PathBuf::from).unwrap_or_else(|| self.launch_dir.clone())
+    }
+
+    /// A new Claude Code / Codex chat that would start in your home folder, a drive root or a system folder.
+    fn needs_folder(&self) -> bool {
+        self.chat.messages.is_empty() && self.chat.cwd.is_none() && !self.risky_ok && matches!(self.provider_of().as_str(), "claude" | "codex") && risky_dir(&self.launch_dir)
     }
 
     /// The chat on screen's run, out of the pane's fields.
@@ -687,6 +779,22 @@ impl Chat {
             self.enqueue(text);
             return;
         }
+        if self.needs_folder() {
+            // not in your home folder or System32 by accident: pick a folder, or enter again says yes to this one
+            if !self.risky_armed {
+                self.risky_armed = true;
+                self.set_input(text);
+                if !self.info.is_empty() {
+                    // the picker only shows on an empty screen: say it here too
+                    self.info.push(format!("{} would work in {} — enter again sends it from there, or /cwd <folder> first", providers::label(&self.provider_of()), self.launch_dir.display()));
+                }
+                return;
+            }
+            self.risky_ok = true;
+        }
+        if let Some(warn) = self.effort_warning() {
+            self.info.push(warn);
+        }
         if self.chat.messages.is_empty() {
             self.chat.title = store::title_from(&text);
             if self.chat.cwd.is_none() {
@@ -703,8 +811,50 @@ impl Chat {
         self.chat.messages.push(msg);
         self.stream = Some(stream);
         self.ran = true;
-        self.info.clear();
+        // a warning about the plan window stays up while the reply runs
+        self.info.retain(|l| l.starts_with('⚠'));
         self.scroll = 0;
+    }
+
+    /// Sending at effort max / ultracode with the AI's plan window nearly used up: say so, once, in the info area.
+    fn effort_warning(&self) -> Option<String> {
+        if !matches!(self.effort.as_str(), "max" | "ultracode") {
+            return None;
+        }
+        let p = self.provider_of();
+        let (label, pct) = self.usage.lock().unwrap().iter().filter(|u| u.0 == p).map(|u| (u.1.clone(), u.2)).fold(None, |a: Option<(String, f64)>, u| if a.as_ref().is_some_and(|a| a.1 >= u.1) { a } else { Some(u) })?;
+        (pct > 85.0).then(|| format!("⚠ {} {label} window at {pct:.0}% — effort {} uses it up fast (/effort high is lighter)", providers::label(&p).to_lowercase(), self.effort))
+    }
+
+    /// "5h 72%" for the chat's AI (its fullest plan window), and whether that's close to the limit.
+    fn usage_text(&self) -> Option<(String, bool)> {
+        let p = self.provider_of();
+        let u = self.usage.lock().unwrap();
+        let w = u.iter().filter(|u| u.0 == p).max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))?;
+        let short = match w.1.as_str() {
+            "5-hour" => "5h".to_string(),
+            "weekly" => "wk".to_string(),
+            l => l.replace("-hour", "h").replace("-day", "d"),
+        };
+        Some((format!("{short} {:.0}%", w.2), w.2 > 85.0))
+    }
+
+    /// Plan windows, re-read in the background every minute while a Claude Code / Codex chat is on screen.
+    fn refresh_usage(&mut self) {
+        if cfg!(test) || !matches!(self.provider_of().as_str(), "claude" | "codex") || self.usage_read.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        self.usage_read = Some(Instant::now());
+        let into = self.usage.clone();
+        std::thread::spawn(move || {
+            let got = crate::panes::agents::usage_limits().into_iter().map(|(a, w)| (a, w.label, w.pct)).collect();
+            *into.lock().unwrap() = got;
+        });
+    }
+
+    /// What this chat's replies have cost so far.
+    fn spend(&self) -> f64 {
+        self.chat.messages.iter().map(|m| m.cost()).sum()
     }
 
     /// Start a reply to `chat` (its last message is the user's): the run, and the empty reply to add to the chat.
@@ -789,6 +939,32 @@ impl Chat {
         match cmd {
             "/new" => self.new_chat(),
             "/retry" => self.retry(cx),
+            "/open" | "/chats" if arg.is_empty() => self.info.push("type /open and part of a chat's title: the list narrows as you type (ctrl+pgup / ctrl+pgdn step through them)".into()),
+            "/open" | "/chats" => {
+                let q = arg.to_lowercase();
+                let found = self.chats.iter().find(|c| c.id == arg).or_else(|| self.chats.iter().find(|c| c.title.to_lowercase().contains(&q))).map(|c| c.id.clone());
+                match found {
+                    Some(id) => self.open_chat(&id),
+                    None => self.info.push(format!("no chat called \"{arg}\"")),
+                }
+            }
+            "/rename" if arg.is_empty() => self.info.push(format!("/rename <title> — this one is \"{}\"", self.chat.title)),
+            "/rename" if self.chat.messages.is_empty() => self.info.push("a new chat takes its title from your first message: send one, then /rename it".into()),
+            "/rename" => {
+                self.chat.title = arg.trim_matches('"').trim().to_string();
+                self.persist();
+                cx.notify(format!("renamed: {}", self.chat.title));
+            }
+            "/copy" => self.copy_command(&arg, cx),
+            "/prompts" => {
+                let q = arg.to_lowercase();
+                match self.prompt_history().into_iter().find(|(p, _)| q.is_empty() || p.to_lowercase().contains(&q)) {
+                    Some((p, _)) => self.set_input(p),
+                    None if q.is_empty() => self.info.push("no earlier prompts yet: what you send is kept, in every chat".into()),
+                    None => self.info.push(format!("none of your earlier prompts has \"{arg}\" in it")),
+                }
+            }
+            "/lead" | "/tasks" | "/task" => self.to_agents(cmd, &arg, cx),
             // /model <name>: a model for the current AI; the old "/model <ai> [model]" still works
             "/model" if !arg.is_empty() && !providers::PROVIDERS.iter().any(|p| p.0 == arg.split_whitespace().next().unwrap_or("").to_lowercase()) => {
                 let p = self.provider_of();
@@ -847,6 +1023,9 @@ impl Chat {
                 }
             }
             "/cwd" => {
+                // a completed folder ends in a separator: C:\Code\ is C:\Code (a root stays a root)
+                let trimmed = arg.trim_end_matches(['/', '\\']);
+                let arg = if trimmed.is_empty() || trimmed.ends_with(':') { arg.clone() } else { trimmed.to_string() };
                 let p = PathBuf::from(if arg.starts_with('~') { arg.replacen('~', &dirs::home_dir().unwrap_or_default().to_string_lossy(), 1) } else { arg.clone() });
                 if p.is_dir() {
                     self.chat.cwd = Some(p.to_string_lossy().to_string());
@@ -963,14 +1142,9 @@ impl Chat {
                 } else {
                     let dir = dirs::document_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default()).join("oriel chats");
                     let _ = std::fs::create_dir_all(&dir);
-                    let name: String = self.chat.title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
-                    let path = dir.join(format!("{}.md", name.trim()));
-                    let mut md = format!("# {}\n\n", self.chat.title);
-                    for m in &self.chat.messages {
-                        let who = if m.role == "user" { "you".to_string() } else { providers::label(m.model.as_deref().unwrap_or("ai")).to_lowercase() };
-                        md.push_str(&format!("**{who}:**\n\n{}\n\n", m.content));
-                    }
-                    match std::fs::write(&path, md) {
+                    // never over an earlier export: "title 2.md", like /note
+                    let path = free_path(&dir, &self.chat.title);
+                    match std::fs::write(&path, self.export_md()) {
                         Ok(_) => cx.notify(format!("saved {}", path.display())),
                         Err(e) => self.info.push(format!("couldn't save: {e}")),
                     }
@@ -1001,7 +1175,10 @@ impl Chat {
                     [
                         "enter send · esc clears the box, then stops the reply · ctrl+r regenerate · ctrl+n new chat · ctrl+d delete chat",
                         "switching chats never stops a reply: it keeps going in the background (a spinner in the list, ? when it needs you)",
-                        "pgup/pgdn or the wheel scroll · ctrl+end back to the end · ctrl+home the top · ↑ in an empty box recalls your last message",
+                        "pgup/pgdn or the wheel scroll · ctrl+end back to the end · ctrl+home the top · ↑ in an empty box recalls your earlier prompts (then other chats')",
+                        "ctrl+j or shift+enter new line · ↑↓ move between lines · ctrl+←/→ a word · ctrl+w or ctrl+backspace delete a word · ctrl+z undo",
+                        "ctrl+y copies the last reply's last code block (or the reply) · click a code block's ┌─ header to copy it · /copy for more",
+                        "ctrl+pgup / ctrl+pgdn the previous / next chat · /open searches them · /rename",
                         "ctrl+o shows every tool call in full (diffs, output) · click a tool line to open just that one",
                         "/perms ask: Claude Code asks first · y allow · n deny · a always allow that command in this chat",
                         "F1-F9 apps · F12 play/pause · alt p palette · alt n terminal beside this",
@@ -1077,6 +1254,17 @@ impl Chat {
             "/model" => self.models_for(&self.provider_of()),
             "/perms" => PERMS.iter().chain(&[("reset", "forget what you said \"always allow\" to in this chat")]).map(|(k, w)| (k.to_string(), w.to_string())).collect(),
             "/effort" => EFFORTS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
+            "/copy" => {
+                let mut v = vec![("reply".to_string(), "the last reply, as markdown".to_string())];
+                if let Some(m) = self.last_reply() {
+                    for (n, b) in md::fenced_blocks(&m.content).iter().rev().enumerate() {
+                        let what = format!("{} · {}", if b.lang.is_empty() { "code" } else { &b.lang }, ui::fit(b.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim(), 44));
+                        v.push(if n == 0 { ("code".into(), format!("its last code block: {what}")) } else { (format!("code {}", n + 1), what) });
+                    }
+                }
+                v.push(("all".into(), "the whole chat as markdown (what /save writes)".into()));
+                v
+            }
             "/key" => pairs(&[("openai", "OpenAI-compatible key"), ("anthropic", "Anthropic API key")]),
             "/theme" => {
                 let mut v: Vec<(String, String)> = vec![("edit".into(), "open the theme editor".into()), ("new ".into(), "make your own theme from this one".into())];
@@ -1119,60 +1307,441 @@ impl Chat {
                 .iter()
                 .filter(|c| c.0.starts_with(self.input.as_str()))
                 .map(|(c, a, d)| MenuItem {
-                    left: format!("{c} {a}"),
+                    left: c.to_string(),
+                    args: a.to_string(),
                     desc: d.to_string(),
                     fill: if a.contains('<') { format!("{c} ") } else { c.to_string() },
                     run: !a.contains('<'),
+                    put: None,
                 })
                 .collect(),
             Some((cmd, rest)) => {
-                let q = rest.trim_start().to_lowercase();
+                let raw = rest.trim_start();
+                let q = raw.to_lowercase();
+                // starts with what you typed, or has it anywhere once you've typed two letters
+                let hit = |s: &str| {
+                    let s = s.to_lowercase();
+                    s.starts_with(&q) || (q.chars().count() >= 2 && s.contains(&q))
+                };
+                // these search as you type, spaces and all
+                match cmd {
+                    "/open" | "/chats" => {
+                        return self.chats.iter().filter(|c| hit(&c.title)).take(200).map(|c| MenuItem::pick(c.title.clone(), self.chat_desc(c), format!("/open {}", c.id), true)).collect();
+                    }
+                    "/prompts" => {
+                        return self
+                            .prompt_history()
+                            .into_iter()
+                            .filter(|(p, _)| hit(p))
+                            .take(200)
+                            .map(|(p, from)| {
+                                let first = p.trim().lines().next().unwrap_or("").to_string();
+                                let n = p.trim().lines().count();
+                                let more = if n > 1 { format!(" · {n} lines") } else { String::new() };
+                                let desc = format!("{}{more}", from.map(|t| format!("from {t}")).unwrap_or_else(|| "this chat".into()));
+                                MenuItem { left: first, args: String::new(), desc, fill: String::new(), run: false, put: Some(p) }
+                            })
+                            .collect();
+                    }
+                    "/cwd" => return self.cwd_options(raw),
+                    _ => {}
+                }
                 if q.contains(' ') {
                     return vec![]; // past the argument (e.g. /key openai sk-...)
                 }
                 self.arg_options(cmd)
                     .into_iter()
-                    .filter(|(v, _)| v.to_lowercase().starts_with(&q) || (q.len() >= 2 && v.to_lowercase().contains(&q)))
-                    .map(|(v, d)| MenuItem {
-                        left: v.clone(),
-                        desc: d,
+                    .filter(|(v, _)| hit(v))
+                    .map(|(v, d)| {
                         // /key still needs the key after the provider
-                        fill: if cmd == "/key" { format!("{cmd} {v} ") } else { format!("{cmd} {v}") },
-                        run: cmd != "/key",
+                        let fill = if cmd == "/key" { format!("{cmd} {v} ") } else { format!("{cmd} {v}") };
+                        MenuItem::pick(v, d, fill, cmd != "/key")
                     })
                     .collect()
             }
         }
     }
 
+    /// A saved chat's line in the /open menu: "yesterday · claude code · 4 messages".
+    fn chat_desc(&self, c: &store::Chat) -> String {
+        let n = c.messages.iter().filter(|m| m.role == "user").count();
+        let here = if c.id == self.chat.id { " · open now" } else { "" };
+        format!("{} · {} · {n} message{}{here}", store::bucket(c.updated, store::now(), self.offset), providers::label(&self.provider_for(c)).to_lowercase(), if n == 1 { "" } else { "s" })
+    }
+
+    /// Your earlier prompts, newest first: this chat's, then every other chat's (newest chat first), each once,
+    /// with the title of the chat it came from when that's another one.
+    fn prompt_history(&self) -> Vec<(String, Option<String>)> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = vec![];
+        let mine = self.chat.messages.iter().rev().map(|m| (m, None));
+        let others = self.chats.iter().filter(|c| c.id != self.chat.id).flat_map(|c| c.messages.iter().rev().map(move |m| (m, Some(c.title.as_str()))));
+        for (m, from) in mine.chain(others) {
+            let text = m.content.trim();
+            if m.role != "user" || text.is_empty() || !seen.insert(text.to_string()) {
+                continue;
+            }
+            out.push((m.content.clone(), from.map(String::from)));
+            if out.len() >= 300 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// /cwd's choices: the folder you're typing (and the folders inside it, so tab completes a path a segment at a
+    /// time), then folders chats have used.
+    fn cwd_options(&self, typed: &str) -> Vec<MenuItem> {
+        let mut out: Vec<MenuItem> = vec![];
+        let pathy = typed.starts_with(['~', '/', '\\', '.']) || typed.contains(['/', '\\']) || typed.get(1..2) == Some(":");
+        if pathy {
+            let home = dirs::home_dir().unwrap_or_default().to_string_lossy().to_string();
+            let real = |s: &str| if let Some(rest) = s.strip_prefix('~') { format!("{home}{rest}") } else { s.to_string() };
+            let sep = typed.chars().rev().find(|c| *c == '/' || *c == '\\').unwrap_or(std::path::MAIN_SEPARATOR);
+            // "C:\Co" lists C:\ for names starting "Co"; "C:\Code\" lists C:\Code
+            let cut = typed.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+            let (parent, stem) = typed.split_at(cut);
+            if !stem.is_empty() || Path::new(&real(typed)).is_dir() {
+                if stem.is_empty() {
+                    out.push(MenuItem::pick(typed.to_string(), "this folder".into(), format!("/cwd {typed}"), true));
+                } else if Path::new(&real(typed)).is_dir() {
+                    out.push(MenuItem::pick(format!("{typed}{sep}"), "this folder".into(), format!("/cwd {typed}{sep}"), true));
+                }
+            }
+            let dir = if parent.is_empty() { ".".to_string() } else { real(parent) };
+            let low = stem.to_lowercase();
+            let mut subs: Vec<String> = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .filter(|n| n.to_lowercase().starts_with(&low) && (low.starts_with('.') || !n.starts_with('.')) && n.to_lowercase() != low)
+                        .collect()
+                })
+                .unwrap_or_default();
+            subs.sort_by_key(|n| n.to_lowercase());
+            for n in subs.into_iter().take(40) {
+                let full = format!("{parent}{n}{sep}");
+                out.push(MenuItem::pick(full.clone(), "folder · tab goes in".into(), format!("/cwd {full}"), true));
+            }
+        }
+        let q = typed.to_lowercase();
+        for (d, what) in self.arg_options("/cwd") {
+            let dl = d.to_lowercase();
+            if (q.is_empty() || dl.starts_with(&q) || (q.chars().count() >= 2 && dl.contains(&q))) && !out.iter().any(|m| m.left.trim_end_matches(['/', '\\']).eq_ignore_ascii_case(&d)) {
+                out.push(MenuItem::pick(d.clone(), what, format!("/cwd {d}"), true));
+            }
+        }
+        out
+    }
+
+    /// Where a new agent chat could work: folders chats have used, then git repos under the usual code folders
+    /// (found once, in the background).
+    fn folder_choices(&self) -> Vec<(String, &'static str)> {
+        let mut v: Vec<(String, &'static str)> = self.arg_options("/cwd").into_iter().map(|(d, _)| (d, "used before")).collect();
+        let repos = self.repos.lock().unwrap().clone();
+        match repos {
+            Some(r) => {
+                for d in r {
+                    if !v.iter().any(|x| x.0.eq_ignore_ascii_case(&d)) {
+                        v.push((d, "git repo"));
+                    }
+                }
+            }
+            None if !cfg!(test) => {
+                *self.repos.lock().unwrap() = Some(vec![]);
+                let into = self.repos.clone();
+                std::thread::spawn(move || {
+                    let found = find_repos();
+                    *into.lock().unwrap() = Some(found);
+                });
+            }
+            None => {}
+        }
+        v
+    }
+
     fn insert(&mut self, s: &str) {
-        let byte = self.input.char_indices().nth(self.cursor).map(|x| x.0).unwrap_or(self.input.len());
-        self.input.insert_str(byte, s);
-        self.cursor += s.chars().count();
+        self.edit(|e| {
+            let mut cs = s.chars();
+            match (cs.next(), cs.next()) {
+                (Some(c), None) if c != '\n' => e.insert_char(c),
+                _ => e.insert_str(s),
+            }
+        });
         self.menu_sel = 0;
     }
 
+    /// Run an edit or a move on the box through the editor (`input` and `cursor` stay the truth).
+    fn edit<R>(&mut self, f: impl FnOnce(&mut Editor) -> R) -> R {
+        self.ed.load(&self.input, self.cursor);
+        let r = f(&mut self.ed);
+        self.input = self.ed.text();
+        self.cursor = self.ed.char_index();
+        r
+    }
+
+    /// ↑ / ↓ inside a box of several rows: moves the cursor a row and says true; on the first / last row it's
+    /// false (history, scrolling).
+    fn row_move(&mut self, dy: isize) -> bool {
+        let w = self.comp_w;
+        self.edit(|e| {
+            let segs = e.layout(w);
+            let (v, _) = e.cursor_visual(&segs);
+            let room = if dy < 0 { v > 0 } else { v + 1 < segs.len() };
+            if room {
+                e.vmove(&segs, dy);
+            }
+            room
+        })
+    }
+
+    /// Replace what's in the box, the cursor at its end (ctrl+z brings the old text back).
+    fn set_input(&mut self, text: String) {
+        self.ed.load(&self.input, self.cursor);
+        if !self.input.is_empty() {
+            self.ed.checkpoint();
+        }
+        self.cursor = text.chars().count();
+        self.input = text;
+        self.menu_sel = 0;
+    }
+
+    /// ↑ / ↓ through your earlier prompts (`older` = further back). Past the newest, the box empties again.
+    fn recall(&mut self, older: bool) -> bool {
+        let hist = self.prompt_history();
+        let pos = match (self.history_pos, older) {
+            (None, true) => 0,
+            (None, false) => return false,
+            (Some(p), true) => p + 1,
+            (Some(0), false) => {
+                self.history_pos = None;
+                self.history_from = None;
+                self.set_input(String::new());
+                return true;
+            }
+            (Some(p), false) => p - 1,
+        };
+        let Some((text, from)) = hist.get(pos).cloned() else { return self.history_pos.is_some() };
+        self.history_pos = Some(pos);
+        self.history_from = from;
+        self.set_input(text);
+        true
+    }
+
+    /// ctrl+pgup / ctrl+pgdn: the chat above or below this one in the list (a new chat sits above them all).
+    fn step_chat(&mut self, down: bool) {
+        let at = self.chats.iter().position(|c| c.id == self.chat.id);
+        let next = match (at, down) {
+            (None, true) => 0,
+            (None, false) => return,
+            (Some(0), false) => return self.new_chat(),
+            (Some(i), false) => i - 1,
+            (Some(i), true) => i + 1,
+        };
+        if let Some(id) = self.chats.get(next).map(|c| c.id.clone()) {
+            self.open_chat(&id);
+        }
+    }
+
+    /// The newest reply with any text.
+    fn last_reply(&self) -> Option<&store::Msg> {
+        self.chat.messages.iter().rev().find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+    }
+
+    /// ctrl+y: the last reply's last code block, or the whole reply when it has none.
+    fn copy_quick(&mut self, cx: &mut Cx) {
+        let Some(content) = self.last_reply().map(|m| m.content.clone()) else {
+            cx.notify("no reply to copy yet");
+            return;
+        };
+        match md::fenced_blocks(&content).pop() {
+            Some(b) => {
+                crate::clip::copy(&b.text);
+                cx.notify(copied_code(&b));
+            }
+            None => {
+                crate::clip::copy(content.trim());
+                cx.notify(format!("copied the last reply ({})", lines_of(content.trim())));
+            }
+        }
+    }
+
+    /// /copy (the last reply as markdown) · /copy code [n] (its nth code block from the end) · /copy all (the chat).
+    fn copy_command(&mut self, arg: &str, cx: &mut Cx) {
+        let mut a = arg.split_whitespace();
+        let (what, n) = (a.next().unwrap_or(""), a.next());
+        if what == "all" {
+            if self.chat.messages.is_empty() {
+                self.info.push("nothing to copy yet".into());
+                return;
+            }
+            let md = self.export_md();
+            crate::clip::copy(&md);
+            cx.notify(format!("copied the whole chat ({} of markdown)", lines_of(&md)));
+            return;
+        }
+        let Some(content) = self.last_reply().map(|m| m.content.clone()) else {
+            self.info.push("no reply to copy yet".into());
+            return;
+        };
+        match what {
+            "" | "reply" => {
+                crate::clip::copy(content.trim());
+                cx.notify(format!("copied the last reply ({})", lines_of(content.trim())));
+            }
+            "code" => {
+                let blocks = md::fenced_blocks(&content);
+                let k = n.and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).max(1);
+                match blocks.len().checked_sub(k).map(|i| &blocks[i]) {
+                    Some(b) => {
+                        crate::clip::copy(&b.text);
+                        cx.notify(copied_code(b));
+                    }
+                    None if blocks.is_empty() => self.info.push("the last reply has no code blocks — /copy copies all of it".into()),
+                    None => self.info.push(format!("the last reply has {} code block{}", blocks.len(), if blocks.len() == 1 { "" } else { "s" })),
+                }
+            }
+            _ => self.info.push("/copy the last reply · /copy code [n] its last code block (2 = the one before) · /copy all the whole chat".into()),
+        }
+    }
+
+    /// /lead, /tasks, /task: hand the plan to the agents app (F2) with its form filled in. It goes on the clipboard
+    /// too, in case agents wasn't ready to take it (still finding its repo, say).
+    fn to_agents(&mut self, cmd: &str, arg: &str, cx: &mut Cx) {
+        let text = if arg.is_empty() && cmd != "/task" { self.last_reply().map(|m| m.content.trim().to_string()) } else { Some(arg.trim().to_string()) };
+        let Some(text) = text.filter(|t| !t.is_empty()) else {
+            self.info.push(match cmd {
+                "/task" => "/task <what the agent should do> — a new card on the agents board (F2)".to_string(),
+                _ => format!("{cmd} <goal> — or talk it through here first: with no goal it takes the last reply"),
+            });
+            return;
+        };
+        let (key, what) = match cmd {
+            "/lead" => ('L', "a lead run with this goal · ctrl+s starts it"),
+            "/tasks" => ('P', "the planner has the goal · enter splits it into task cards"),
+            _ => ('n', "a new task with it · ctrl+s adds it"),
+        };
+        cx.act(Action::AppKey("agents", key));
+        cx.act(Action::AppPaste("agents", text.clone()));
+        crate::clip::copy(&text);
+        cx.notify(format!("agents: {what} (also on the clipboard)"));
+    }
+
+    /// The chat as markdown (/save, /copy all): every message, and each run of tool calls as a folded list.
+    fn export_md(&self) -> String {
+        fn tool_line(t: &store::Tool, depth: usize, md: &mut String) {
+            let target = if t.target.is_empty() { String::new() } else if t.target.contains('`') { format!(" {}", t.target) } else { format!(" `{}`", t.target) };
+            let summary = if t.summary.is_empty() { String::new() } else { format!(" · {}", t.summary) };
+            let status = if matches!(t.status.as_str(), "error" | "stopped") { format!(" ({})", t.status) } else { String::new() };
+            md.push_str(&format!("{}- {}{target}{summary}{status}\n", "  ".repeat(depth), t.label));
+            for c in &t.children {
+                tool_line(c, depth + 1, md);
+            }
+        }
+        fn fold(tools: &mut Vec<&store::Tool>, md: &mut String) {
+            if tools.is_empty() {
+                return;
+            }
+            let names: Vec<&str> = tools.iter().map(|t| t.label.as_str()).collect();
+            let mut kinds: Vec<&str> = vec![];
+            for n in names {
+                if !kinds.contains(&n) {
+                    kinds.push(n);
+                }
+            }
+            md.push_str(&format!("<details><summary>{} tool call{}: {}</summary>\n\n", tools.len(), if tools.len() == 1 { "" } else { "s" }, kinds.join(", ")));
+            for t in tools.drain(..) {
+                tool_line(t, 0, md);
+            }
+            md.push_str("\n</details>\n\n");
+        }
+        let mut md = format!("# {}\n\n", self.chat.title);
+        for m in &self.chat.messages {
+            let who = if m.role == "user" { "you".to_string() } else { providers::label(m.model.as_deref().unwrap_or("ai")).to_lowercase() };
+            md.push_str(&format!("**{who}:**\n\n"));
+            if m.parts.is_empty() {
+                md.push_str(&format!("{}\n\n", m.content.trim_end()));
+                continue;
+            }
+            // text and calls in the order they happened
+            let mut tools: Vec<&store::Tool> = vec![];
+            for p in &m.parts {
+                match p {
+                    store::Part::Text { text } if !text.trim().is_empty() => {
+                        fold(&mut tools, &mut md);
+                        md.push_str(&format!("{}\n\n", text.trim()));
+                    }
+                    store::Part::Tool(t) => tools.push(t),
+                    store::Part::User { text } => {
+                        fold(&mut tools, &mut md);
+                        md.push_str(&format!("> **you, while it worked:** {}\n\n", text.trim()));
+                    }
+                    _ => {}
+                }
+            }
+            fold(&mut tools, &mut md);
+        }
+        md
+    }
+
     // ------------------------------------------------------------ drawing helpers
-    /// A message's lines, plus (line index, call id) for each tool line in it.
-    fn msg_lines(&mut self, i: usize, width: usize, cx: &Cx) -> (Vec<Line<'static>>, Vec<(usize, String)>) {
-        let t = cx.theme;
+    /// The transcript as shared blocks: message by message (a finished one drawn once and kept, the live reply a
+    /// block at a time), then the info lines. Only the lines on screen ever get copied out of them.
+    fn transcript(&mut self, width: usize, cx: &Cx) -> Vec<Block> {
+        let mut out = vec![lines_block(vec![Line::raw("")], vec![])];
+        for i in 0..self.chat.messages.len() {
+            self.msg_blocks(i, width, cx, &mut out);
+        }
+        let mut info = vec![];
+        for l in &self.info {
+            info.extend(md::wrap(vec![Span::styled(l.clone(), ui::muted(cx.theme))], width, "  ", "    "));
+        }
+        if !info.is_empty() {
+            out.push(lines_block(info, vec![]));
+        }
+        out
+    }
+
+    /// Message `i`'s blocks onto `out`.
+    fn msg_blocks(&mut self, i: usize, width: usize, cx: &Cx, out: &mut Vec<Block>) {
+        if self.stream.is_some() && i + 1 == self.chat.messages.len() {
+            // the live reply: whatever hasn't changed since the last frame comes from its block cache
+            if self.live.0 != self.chat.id || self.live.1 != i {
+                self.live = (self.chat.id.clone(), i, HashMap::new());
+            }
+            let mut cache = std::mem::take(&mut self.live.2);
+            out.extend(self.draw_msg(i, width, cx, Some(&mut cache)));
+            self.live.2 = cache;
+            return;
+        }
         let m = &self.chat.messages[i];
-        let streaming_last = self.stream.is_some() && i + 1 == self.chat.messages.len();
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            (m.content.len(), m.note.as_deref().unwrap_or(""), m.steps.len(), m.parts.len(), width, streaming_last, t.name.as_str()).hash(&mut h);
+            (m.content.len(), m.note.as_deref().unwrap_or(""), m.steps.len(), m.parts.len(), width, cx.theme.name.as_str()).hash(&mut h);
             h.finish()
         };
-        if !streaming_last {
-            if let Some((k, lines, hits)) = self.cache.get(&i) {
-                if *k == key {
-                    return (lines.clone(), hits.clone());
-                }
+        if let Some((k, b)) = self.cache.get(&i) {
+            if *k == key {
+                out.push(b.clone());
+                return;
             }
         }
+        let b = join_blocks(self.draw_msg(i, width, cx, None));
+        self.cache.insert(i, (key, b.clone()));
+        out.push(b);
+    }
+
+    /// Draw message `i`. A live reply (`cache` given) comes out as several blocks, its parts cached one by one;
+    /// anything else as one.
+    fn draw_msg(&self, i: usize, width: usize, cx: &Cx, cache: Option<&mut activity::BlockCache>) -> Vec<Block> {
+        let t = cx.theme;
+        let m = &self.chat.messages[i];
+        let streaming_last = cache.is_some();
+        let mut blocks: Vec<Block> = vec![];
         let mut out: Vec<Line<'static>> = vec![];
-        let mut hits: Vec<(usize, String)> = vec![];
+        let mut hits: Vec<(usize, Hit)> = vec![];
         let agent_chat = matches!(self.provider_of().as_str(), "claude" | "codex");
         if m.role == "user" && agent_chat {
             // like the Claude Code TUI: the prompt on a full-width grey band, "❯ " in front
@@ -1249,9 +1818,35 @@ impl Chat {
             }
             if !m.parts.is_empty() {
                 let view = activity::View { expanded: self.expanded, open: &self.open, live: streaming_last, time: cx.time };
-                activity::render(&m.parts, width, t, &view, &mut out, &mut hits);
+                match cache {
+                    Some(c) => {
+                        blocks.push(lines_block(std::mem::take(&mut out), std::mem::take(&mut hits)));
+                        blocks.extend(activity::render_blocks(&m.parts, width, t, &view, Some(c)));
+                    }
+                    None => activity::render(&m.parts, width, t, &view, &mut out, &mut hits),
+                }
             } else if !m.content.is_empty() {
-                out.extend(md::render(&m.content, width.saturating_sub(1), "  ", t));
+                // a plain reply's markdown, its code blocks clickable (streaming, it's drawn again only as it grows)
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (&m.content, width, t.name.as_str()).hash(&mut h);
+                    h.finish()
+                };
+                let draw = || {
+                    let (lines, codes) = md::render_full(&m.content, width.saturating_sub(1), "  ", t);
+                    lines_block(lines, codes.into_iter().map(|(n, c)| (n, Hit::Code(c))).collect())
+                };
+                let b = match cache {
+                    Some(c) => {
+                        let b = c.get(&usize::MAX).filter(|(k, _)| *k == key).map(|(_, b)| b.clone()).unwrap_or_else(draw);
+                        c.insert(usize::MAX, (key, b.clone()));
+                        b
+                    }
+                    None => draw(),
+                };
+                blocks.push(lines_block(std::mem::take(&mut out), std::mem::take(&mut hits)));
+                blocks.push(b);
             }
             if let Some(n) = &m.note {
                 out.push(Line::raw(""));
@@ -1273,10 +1868,8 @@ impl Chat {
             }
         }
         out.push(Line::raw(""));
-        if !streaming_last {
-            self.cache.insert(i, (key, out.clone(), hits.clone()));
-        }
-        (out, hits)
+        blocks.push(lines_block(out, hits));
+        blocks
     }
 
     /// Pinned above the composer while a reply streams: a pending approval, the live status line
@@ -1509,33 +2102,153 @@ impl Chat {
         let logo = crate::font::render(word);
         let lw = logo.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
         let info = match p.as_str() {
-            "claude" | "codex" => format!("{} · {} · works in {} ({})", providers::label(&p).to_lowercase(), self.chat.model.clone().unwrap_or("default".into()), self.workdir().display(), self.perms),
+            "claude" | "codex" => format!("{} · {} · works in {} ({})", providers::label(&p).to_lowercase(), self.chat.model.clone().unwrap_or("default".into()), self.workdir_label().display(), self.perms),
             _ => format!("{} · {}", providers::label(&p).to_lowercase(), self.chat.model.clone().unwrap_or("default".into())),
         };
-        let block_h = 8 + 2 + 2 + 1 + SUGGESTIONS.len() as u16;
+        // a coding agent about to start in your home folder or System32: where should it work instead?
+        let pick = self.needs_folder();
+        let mut folders = if pick { self.folder_choices() } else { vec![] };
+        folders.truncate(8);
+        folders.push((self.launch_dir.display().to_string(), "where oriel started · use it anyway"));
+        let rows = if pick { folders.len() as u16 + 2 } else { SUGGESTIONS.len() as u16 };
+        let block_h = 8 + 2 + 2 + 1 + rows;
         let y0 = area.y + area.height.saturating_sub(block_h) / 2;
         let mut y = y0;
         if area.width > lw + 2 && area.height >= block_h {
             ui::big_logo(f, &logo, area.x + (area.width - lw) / 2, y, t, cx.time);
             y += 10;
         }
-        let tx = area.x + area.width.saturating_sub(lw.max(40)) / 2;
+        let tx = area.x + area.width.saturating_sub(lw.max(if pick { 64 } else { 40 })) / 2;
         let tw = area.width.saturating_sub(tx - area.x);
         f.render_widget(Paragraph::new(Span::styled(ui::fit(&info, tw as usize), ui::muted(t))), Rect { x: tx, y, width: tw, height: 1 });
         y += 2;
+        self.hero_hits.clear();
+        if pick {
+            let who = providers::label(&p);
+            f.render_widget(Paragraph::new(Span::styled(format!("where should {who} work? it can change files there"), Style::default().add_modifier(Modifier::BOLD))), Rect { x: tx, y, width: tw, height: 1 });
+            y += 2;
+            let lw = folders.iter().map(|(d, _)| d.width()).max().unwrap_or(0).min(tw as usize / 2 + 8);
+            for (d, what) in &folders {
+                if y + 1 >= area.bottom() {
+                    break;
+                }
+                let r = Rect { x: tx, y, width: tw, height: 1 };
+                let shown = ui::fit(d, lw);
+                let pad = " ".repeat(lw.saturating_sub(shown.width()) + 2);
+                f.render_widget(Paragraph::new(Line::from(vec![Span::styled("› ", ui::accent(t)), Span::raw(shown), Span::raw(pad), Span::styled(*what, ui::muted(t))])), r);
+                self.hero_hits.push((r, HeroHit::Folder(d.clone())));
+                y += 1;
+            }
+            if y < area.bottom() {
+                let (say, st) = if self.risky_armed {
+                    (format!("enter again sends it from {} · or click a folder first", self.launch_dir.display()), Style::default().fg(t.shine).add_modifier(Modifier::BOLD))
+                } else {
+                    ("click one · or /cwd <folder> (tab completes)".to_string(), ui::muted(t))
+                };
+                f.render_widget(Paragraph::new(Span::styled(ui::fit(&say, tw as usize), st)), Rect { x: tx, y, width: tw, height: 1 });
+            }
+            return;
+        }
         f.render_widget(Paragraph::new(Span::styled("what can I help with?", Style::default().add_modifier(Modifier::BOLD))), Rect { x: tx, y, width: tw, height: 1 });
         y += 2;
-        self.hero_hits.clear();
         for s in SUGGESTIONS {
             if y >= area.bottom() {
                 break;
             }
             let r = Rect { x: tx, y, width: (s.len() as u16 + 2).min(tw), height: 1 };
             f.render_widget(Paragraph::new(Line::from(vec![Span::styled("› ", ui::accent(t)), Span::raw(*s)])), r);
-            self.hero_hits.push((r, s.to_string()));
+            self.hero_hits.push((r, HeroHit::Say(s.to_string())));
             y += 1;
         }
     }
+}
+
+fn lines_block(lines: Vec<Line<'static>>, hits: Vec<(usize, Hit)>) -> Block {
+    Block { lines: Rc::new(lines), hits: Rc::new(hits) }
+}
+
+/// Blocks run together into one.
+fn join_blocks(blocks: Vec<Block>) -> Block {
+    if blocks.len() == 1 {
+        return blocks.into_iter().next().unwrap_or_default();
+    }
+    let (mut lines, mut hits) = (vec![], vec![]);
+    for b in blocks {
+        let off = lines.len();
+        hits.extend(b.hits.iter().map(|(n, h)| (n + off, h.clone())));
+        lines.extend(b.lines.iter().cloned());
+    }
+    lines_block(lines, hits)
+}
+
+/// "title.md" in `dir`, or "title 2.md", "title 3.md"... if that's taken (an export never overwrites another).
+fn free_path(dir: &Path, title: &str) -> PathBuf {
+    let name: String = title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
+    let name = name.trim();
+    let mut path = dir.join(format!("{name}.md"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{name} {n}.md"));
+        n += 1;
+    }
+    path
+}
+
+/// "12 lines" / "1 line".
+fn lines_of(text: &str) -> String {
+    let n = text.lines().count().max(1);
+    format!("{n} line{}", if n == 1 { "" } else { "s" })
+}
+
+/// The toast for a copied code block: "copied 42 lines of rust".
+fn copied_code(c: &md::Code) -> String {
+    format!("copied {} of {}", lines_of(&c.text), if c.lang.is_empty() { "code" } else { &c.lang })
+}
+
+/// Git repos under the usual code folders (home's Code, src, projects... and a drive's own), two levels deep,
+/// most recently touched first. Only folder names are listed: nothing is read.
+fn find_repos() -> Vec<String> {
+    let mut roots: Vec<PathBuf> = vec![];
+    if let Some(h) = dirs::home_dir() {
+        for d in ["Code", "code", "src", "dev", "projects", "Projects", "repos", "git", "GitHub", "Documents/GitHub", "source/repos", "work"] {
+            roots.push(h.join(d));
+        }
+    }
+    if cfg!(windows) {
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        for d in ["Code", "code", "dev", "src", "projects", "repos"] {
+            roots.push(PathBuf::from(format!("{drive}\\{d}")));
+        }
+    }
+    let mut seen_roots: Vec<PathBuf> = vec![];
+    let mut found: Vec<(std::time::SystemTime, String)> = vec![];
+    let mut visited = 0;
+    let subdirs = |d: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(d).map(|rd| rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with('.')).map(|e| e.path()).collect()).unwrap_or_default()
+    };
+    for root in roots {
+        // Code and code are one folder on Windows and macOS
+        let canon = std::fs::canonicalize(&root).unwrap_or(root.clone());
+        if !root.is_dir() || seen_roots.contains(&canon) {
+            continue;
+        }
+        seen_roots.push(canon);
+        let mut stack: Vec<(PathBuf, usize)> = subdirs(&root).into_iter().map(|p| (p, 1)).collect();
+        while let Some((d, depth)) = stack.pop() {
+            visited += 1;
+            if visited > 3000 || found.len() >= 60 {
+                break;
+            }
+            if d.join(".git").exists() {
+                let t = std::fs::metadata(&d).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                found.push((t, d.to_string_lossy().to_string()));
+            } else if depth < 2 {
+                stack.extend(subdirs(&d).into_iter().map(|p| (p, depth + 1)));
+            }
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|f| f.1).collect()
 }
 
 /// A reply that was stopped: running calls end as stopped, and it says so.
@@ -1652,6 +2365,7 @@ fn absorb(chat: &mut store::Chat, run: &mut Run, evs: Vec<Ev>, always: Option<&B
                 out.perms = Some(p);
             }
             Ev::Status(st) => run.stream.status = st,
+            Ev::Cost(c) => m.cost_usd = Some(c),
             Ev::Question(q) => {
                 let head = q.qs.first().map(|x| x.question.clone()).unwrap_or_default();
                 out.waiting.push(format!("{who} is asking you: {}", ui::fit(&head, 80)));
@@ -1749,7 +2463,8 @@ impl Pane for Chat {
         let p = self.provider_of();
         let mut s = providers::label(&p).to_lowercase();
         match p.as_str() {
-            "claude" | "codex" => s.push_str(&format!(" · {} · {}", self.chat.model.clone().unwrap_or("default".into()), ui::fit(&self.workdir().to_string_lossy(), 40))),
+            // drawn every frame: the folder as set, no disk check (workdir() can create oriel's work folder)
+            "claude" | "codex" => s.push_str(&format!(" · {} · {}", self.chat.model.clone().unwrap_or("default".into()), ui::fit(&self.workdir_label().to_string_lossy(), 40))),
             _ => s.push_str(&format!(" · {}", self.chat.model.clone().unwrap_or("default".into()))),
         }
         Some(s)
@@ -1861,6 +2576,9 @@ impl Pane for Chat {
             v
         } else {
             let mut v = vec![("enter", "send"), ("ctrl+r", "regenerate"), ("ctrl+n", "new chat"), ("/", "commands")];
+            if self.last_reply().is_some() {
+                v.push(("ctrl+y", "copy"));
+            }
             if has_activity {
                 v.push(("ctrl+o", expand_hint));
             }
@@ -1871,31 +2589,29 @@ impl Pane for Chat {
         if area.height < 5 {
             return;
         }
-        let comp = Rect { y: area.bottom() - 3, height: 3, ..area };
-        let above = Rect { height: area.height - 3, ..area };
+        self.refresh_usage();
+        // ---- the composer grows with what you type (up to COMPOSER_ROWS rows, then it scrolls)
+        let text_w = (area.width as usize).saturating_sub(5).max(4); // the borders, "› ", a column for the cursor
+        self.comp_w = text_w;
+        self.ed.load(&self.input, self.cursor);
+        let segs = self.ed.layout(text_w);
+        let rows = if self.input.is_empty() { 1 } else { segs.len() };
+        let shown = rows.min(COMPOSER_ROWS.min((area.height as usize).saturating_sub(7).max(1)));
+        let comp_h = shown as u16 + 2;
+        let comp = Rect { y: area.bottom() - comp_h, height: comp_h, ..area };
+        let above = Rect { height: area.height - comp_h, ..area };
         let above = Rect { x: above.x + 1, width: above.width.saturating_sub(2), ..above };
-        self.tool_hits.clear();
-        // the transcript's lines (none on a new chat: the hero shows instead)
+        self.click_hits.clear();
+        // the transcript (none on a new chat: the hero shows instead), as blocks: only what's on screen is copied out
         let hero = self.chat.messages.is_empty() && self.info.is_empty();
         let width = above.width as usize;
-        let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
-        let mut hits: Vec<(usize, String)> = vec![];
-        if !hero {
-            for i in 0..self.chat.messages.len() {
-                let (l, h) = self.msg_lines(i, width, cx);
-                let off = lines.len();
-                hits.extend(h.into_iter().map(|(n, id)| (n + off, id)));
-                lines.extend(l);
-            }
-            for l in &self.info {
-                lines.extend(md::wrap(vec![Span::styled(l.clone(), ui::muted(t))], width, "  ", "    "));
-            }
-        }
+        let blocks = if hero { vec![] } else { self.transcript(width, cx) };
+        let total: usize = blocks.iter().map(|b| b.lines.len()).sum();
         // scrolled up while a reply streams: count what arrived below (not what opening a call added)
         let anchor = self.anchor.take().filter(|a| a.0 == self.chat.id && a.1 == above.width && !hero);
         if let Some((_, _, _, prev_len)) = anchor {
             if self.scroll > 0 && self.stream.is_some() && !self.relayout {
-                self.unseen += lines.len().saturating_sub(prev_len);
+                self.unseen += total.saturating_sub(prev_len);
             }
         }
         if self.scroll == 0 {
@@ -1925,7 +2641,7 @@ impl Pane for Chat {
             self.draw_hero(f, body, cx);
         } else {
             let h = body.height as usize;
-            let max_scroll = lines.len().saturating_sub(h);
+            let max_scroll = total.saturating_sub(h);
             // scrolled up, what you're reading stays put while lines arrive below (or the box above the composer
             // grows); at the bottom it follows the end as ever
             if let (Some((_, _, prev_max, _)), true) = (anchor, self.scroll > 0) {
@@ -1935,11 +2651,25 @@ impl Pane for Chat {
                     self.scroll = self.scroll.saturating_sub(prev_max - max_scroll).max(1);
                 }
             }
-            self.anchor = Some((self.chat.id.clone(), body.width, max_scroll, lines.len()));
+            self.anchor = Some((self.chat.id.clone(), body.width, max_scroll, total));
             self.scroll = self.scroll.min(max_scroll);
             let start = max_scroll - self.scroll;
-            self.tool_hits = hits.into_iter().filter(|(n, _)| *n >= start && *n < start + h).map(|(n, id)| (body.y + (n - start) as u16, id)).collect();
-            let visible: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
+            let mut visible: Vec<Line> = Vec::with_capacity(h);
+            let mut at = 0;
+            for b in &blocks {
+                let n = b.lines.len();
+                if at + n > start && at < start + h {
+                    let (from, to) = (start.saturating_sub(at), (start + h - at).min(n));
+                    visible.extend(b.lines[from..to].iter().cloned());
+                    for (k, hit) in b.hits.iter().filter(|(k, _)| (from..to).contains(k)) {
+                        self.click_hits.push((body.y + (at + k - start) as u16, hit.clone()));
+                    }
+                }
+                at += n;
+                if at >= start + h {
+                    break;
+                }
+            }
             f.render_widget(Paragraph::new(visible), body);
             if max_scroll > 0 {
                 // a thin scrollbar on the right edge
@@ -1965,16 +2695,24 @@ impl Pane for Chat {
             let inner = ui::frame(f, mr, &title, Some(&format!("{}/{}", self.menu_sel.min(items.len() - 1) + 1, items.len())), false, t);
             self.menu_sel = self.menu_sel.min(items.len() - 1);
             let start = self.menu_sel.saturating_sub(rows as usize - 1);
+            // the left column fits the longest entry (up to half the width); two spaces always come before the
+            // description, and a command's arguments show muted after its name
+            let need = items.iter().map(|it| it.left.width() + if it.args.is_empty() { 0 } else { it.args.width() + 1 }).max().unwrap_or(0) + 2;
+            let lw = need.min(inner.width as usize / 2).max(10);
             for (row, it) in items.iter().skip(start).take(rows as usize).enumerate() {
-                let d = it.desc.as_str();
                 let on = start + row == self.menu_sel;
                 let cs = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default().add_modifier(Modifier::BOLD) };
-                let left = it.left.clone();
-                let lw = (inner.width as usize / 2).min(36);
+                let name = ui::fit(&it.left, lw - 2);
+                let room = (lw - 2).saturating_sub(name.width());
+                let args = if it.args.is_empty() || room < 4 { String::new() } else { format!(" {}", ui::fit(&it.args, room - 1)) };
+                let pad = lw.saturating_sub(name.width() + args.width());
+                let dw = (inner.width as usize).saturating_sub(lw + 1);
                 let line = Line::from(vec![
                     Span::styled(if on { "▌" } else { " " }, ui::accent(t)),
-                    Span::styled(format!("{:<lw$}", ui::fit(&left, lw)), cs),
-                    Span::styled(d.to_string(), if on { Style::default().add_modifier(Modifier::BOLD) } else { ui::muted(t) }),
+                    Span::styled(name, cs),
+                    Span::styled(args, ui::muted(t)),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(ui::fit(&it.desc, dw), if on { Style::default().add_modifier(Modifier::BOLD) } else { ui::muted(t) }),
                 ]);
                 f.render_widget(Paragraph::new(line), Rect { y: inner.y + row as u16, height: 1, ..inner });
             }
@@ -2003,8 +2741,11 @@ impl Pane for Chat {
                 }
             }
         }
-        if matches!(self.provider_of().as_str(), "claude" | "codex") && comp.width > 70 && !self.effort.is_empty() {
-            // the effort, bottom-left
+        let agent = matches!(self.provider_of().as_str(), "claude" | "codex");
+        // the bottom edge: effort on the left, spend and plan usage after it, the permission mode on the right
+        let mut left_end = comp.x + 1;
+        let mut right_start = comp.right().saturating_sub(1);
+        if agent && comp.width > 70 && !self.effort.is_empty() {
             let color = match self.effort.as_str() {
                 "ultracode" => t.shine,
                 "max" | "xhigh" => t.accent,
@@ -2013,9 +2754,10 @@ impl Pane for Chat {
             let label = Line::from(vec![Span::raw(" "), Span::styled(format!("◆ {} effort", self.effort), Style::default().fg(color).add_modifier(Modifier::BOLD)), Span::styled(" /effort ", Style::default().fg(t.muted))]);
             let lw = label.width() as u16;
             f.render_widget(Paragraph::new(label), Rect { x: comp.x + 2, y: comp.bottom() - 1, width: lw, height: 1 });
+            left_end = comp.x + 2 + lw;
         }
-        if matches!(self.provider_of().as_str(), "claude" | "codex") && comp.width > 40 {
-            // the permission mode, on the box's bottom edge (a running Codex only takes a new one with your next message)
+        if agent && comp.width > 40 {
+            // the permission mode (a running Codex only takes a new one with your next message)
             let (glyph, words, color) = perm_badge(&self.perms, t);
             let later = self.stream.as_ref().is_some_and(|s| s.perms != self.perms);
             let label = Line::from(vec![
@@ -2025,46 +2767,96 @@ impl Pane for Chat {
             ]);
             let lw = label.width() as u16;
             if lw + 4 < comp.width {
-                f.render_widget(Paragraph::new(label), Rect { x: comp.right() - lw - 2, y: comp.bottom() - 1, width: lw, height: 1 });
+                right_start = comp.right() - lw - 2;
+                f.render_widget(Paragraph::new(label), Rect { x: right_start, y: comp.bottom() - 1, width: lw, height: 1 });
             }
         }
-        let room = inner.width.saturating_sub(3) as usize;
-        let shown: String = self.input.replace('\n', "⏎");
-        let before: String = shown.chars().take(self.cursor).collect();
-        let bw = before.width();
-        let skip = bw.saturating_sub(room.saturating_sub(1));
-        let (text, style) = if self.input.is_empty() {
-            let name = providers::label(&self.provider_of()).to_lowercase();
-            if !self.questions.is_empty() {
-                (format!("{name} is asking you something above: choose, or just type your own answer"), ui::muted(t))
-            } else if self.stream.is_some() && self.stream.as_ref().is_some_and(|s| s.steer.is_some()) {
-                (format!("type to queue a message: {name} reads it after its current step"), ui::muted(t))
-            } else if self.stream.is_some() {
-                ("type to queue a message: it sends when this reply ends".to_string(), ui::muted(t))
-            } else {
-                (format!("message {name}…   (/ for commands · /model to switch)"), ui::muted(t))
+        // "$0.84 this chat · 5h 72%": what the chat has cost, and how full the AI's plan window is
+        let spend = self.spend();
+        let usage = if agent { self.usage_text() } else { None };
+        if spend > 0.0 || usage.is_some() {
+            let mut sp = vec![Span::raw(" ")];
+            if spend > 0.0 {
+                sp.push(Span::styled(format!("${spend:.2} this chat"), ui::muted(t)));
             }
-        } else {
-            let mut s = String::new();
-            let mut w = 0;
-            for c in shown.chars() {
-                let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-                if w + cw > skip {
-                    s.push(c);
+            if let Some((u, hot)) = usage {
+                if spend > 0.0 {
+                    sp.push(Span::styled(" · ", ui::muted(t)));
                 }
-                w += cw;
+                sp.push(Span::styled(u, if hot { Style::default().fg(t.danger).add_modifier(Modifier::BOLD) } else { ui::muted(t) }));
             }
-            (ui::fit(&s, room), Style::default())
-        };
-        f.render_widget(Paragraph::new(Line::from(vec![Span::styled("› ", ui::bold_accent(t)), Span::styled(text, style)])), inner);
+            sp.push(Span::raw(" "));
+            let label = Line::from(sp);
+            let lw = label.width() as u16;
+            let x = left_end + if left_end > comp.x + 1 { 1 } else { 1 };
+            if x + lw < right_start {
+                f.render_widget(Paragraph::new(label), Rect { x, y: comp.bottom() - 1, width: lw, height: 1 });
+            }
+        }
+        // the top edge: where a recalled prompt came from, and how long the text is
+        let mut top_right = comp.right().saturating_sub(1);
+        if rows > 1 && comp.width > 30 {
+            let n = self.input.split('\n').count();
+            let size = if n > 1 { format!("{n} lines") } else { format!("{rows} rows") };
+            let label = if comp.width > 60 { format!(" {size} · ctrl+j new line ") } else { format!(" {size} ") };
+            let lw = label.width() as u16;
+            top_right = comp.right() - lw - 2;
+            f.render_widget(Paragraph::new(Span::styled(label, ui::muted(t))), Rect { x: top_right, y: comp.y, width: lw, height: 1 });
+        }
+        if let Some(from) = &self.history_from {
+            let room = top_right.saturating_sub(comp.x + 4) as usize;
+            let label = ui::fit(&format!(" from: {from} "), room);
+            let lw = label.width() as u16;
+            if lw > 8 {
+                f.render_widget(Paragraph::new(Span::styled(label, ui::muted(t))), Rect { x: comp.x + 2, y: comp.y, width: lw, height: 1 });
+            }
+        }
+        // ---- the text
+        if self.input.is_empty() {
+            let name = providers::label(&self.provider_of()).to_lowercase();
+            let hint = if !self.questions.is_empty() {
+                format!("{name} is asking you something above: choose, or just type your own answer")
+            } else if self.stream.as_ref().is_some_and(|s| s.steer.is_some()) {
+                format!("type to queue a message: {name} reads it after its current step")
+            } else if self.stream.is_some() {
+                "type to queue a message: it sends when this reply ends".to_string()
+            } else {
+                format!("message {name}…   (/ for commands · ctrl+j new line)")
+            };
+            let room = inner.width.saturating_sub(3) as usize;
+            f.render_widget(Paragraph::new(Line::from(vec![Span::styled("› ", ui::bold_accent(t)), Span::styled(ui::fit(&hint, room), ui::muted(t))])), inner);
+            if cx.focused && !self.confirm_delete {
+                f.set_cursor_position(Position { x: inner.x + 2, y: inner.y });
+            }
+            return;
+        }
+        self.ed.clamp_scroll(&segs, shown);
+        self.ed.follow(&segs, shown);
+        let top = self.ed.scroll;
+        let lines: Vec<Line> = segs
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(shown)
+            .map(|(v, s)| {
+                let text: String = self.ed.lines[s.row].chars().skip(s.start).take(s.end - s.start).map(|c| if c == '\t' { ' ' } else { c }).collect();
+                let lead = if v == 0 { Span::styled("› ", ui::bold_accent(t)) } else { Span::raw("  ") };
+                Line::from(vec![lead, Span::raw(text)])
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
         if cx.focused && !self.confirm_delete {
-            let x = inner.x + 2 + (bw - skip) as u16;
-            f.set_cursor_position(Position { x: x.min(inner.right().saturating_sub(1)), y: inner.y });
+            let (v, x) = self.ed.cursor_visual(&segs);
+            if v >= top && v < top + shown {
+                let x = inner.x + 2 + x as u16;
+                f.set_cursor_position(Position { x: x.min(inner.right().saturating_sub(1)), y: inner.y + (v - top) as u16 });
+            }
         }
     }
 
     fn key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         if k.modifiers.contains(KeyModifiers::ALT) {
             return false;
         }
@@ -2075,8 +2867,8 @@ impl Pane for Chat {
             }
             return true;
         }
-        // scrolling and ctrl+o work whatever is waiting on you
-        let view_key = matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) || (ctrl && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End | KeyCode::Char('o')));
+        // scrolling, ctrl+o and copying work whatever is waiting on you
+        let view_key = matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) || (ctrl && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End | KeyCode::Char('o') | KeyCode::Char('y')));
         if !view_key && (!self.questions.is_empty() || !self.asks.is_empty()) && self.input.is_empty() {
             // a prompt that just popped up doesn't take the keys you were typing: letters go to the box (and then
             // wait there: with text in the box, typing is typing), and a stray enter or esc does nothing
@@ -2128,8 +2920,7 @@ impl Pane for Chat {
                 self.send_now(cx);
             } else {
                 let text = self.input.trim().to_string();
-                self.input.clear();
-                self.cursor = 0;
+                self.set_input(String::new());
                 if !text.is_empty() {
                     self.send(text, cx);
                 }
@@ -2150,14 +2941,32 @@ impl Pane for Chat {
             }
             KeyCode::Up if self.input.is_empty() && self.queue.iter().any(|q| !q.sent) => {
                 let i = self.queue.iter().rposition(|q| !q.sent).unwrap_or(0);
-                self.input = self.queue.remove(i).text;
-                self.cursor = self.input.chars().count();
+                let text = self.queue.remove(i).text;
+                self.set_input(text);
             }
             KeyCode::Char('o') if ctrl => {
                 self.expanded = !self.expanded;
                 self.open.clear();
                 self.cache.clear();
                 self.relayout = true;
+            }
+            KeyCode::Char('y') if ctrl => self.copy_quick(cx),
+            // undo / redo in the box
+            KeyCode::Char(z @ ('z' | 'Z')) if ctrl && (shift || z == 'Z') => {
+                self.edit(|e| e.redo());
+            }
+            KeyCode::Char('z') if ctrl => {
+                self.edit(|e| e.undo());
+            }
+            // a new line: ctrl+j works on every terminal (shift+enter only where the terminal tells them apart)
+            KeyCode::Char('j') if ctrl => {
+                self.edit(|e| e.newline());
+                self.menu_sel = 0;
+            }
+            // delete the word before the cursor (ctrl+backspace arrives as ctrl+h on many terminals)
+            KeyCode::Char('w' | 'h') if ctrl => {
+                self.edit(|e| e.delete_word_left());
+                self.menu_sel = 0;
             }
             KeyCode::Char('n') if ctrl => self.new_chat(),
             KeyCode::Char('r') if ctrl => self.retry(cx),
@@ -2166,22 +2975,21 @@ impl Pane for Chat {
                     self.confirm_delete = true;
                 }
             }
-            KeyCode::Char('u') if ctrl => {
-                self.input.clear();
-                self.cursor = 0;
-            }
-            KeyCode::Char('a') if ctrl => self.cursor = 0,
-            KeyCode::Char('e') if ctrl => self.cursor = self.input.chars().count(),
+            KeyCode::Char('u') if ctrl => self.set_input(String::new()),
+            // the start / end of the line you're on
+            KeyCode::Char('a') if ctrl => self.edit(|e| e.col = 0),
+            KeyCode::Char('e') if ctrl => self.edit(|e| e.col = e.lines[e.row].chars().count()),
             KeyCode::Char(c) if !ctrl => {
                 self.insert(&c.to_string());
                 self.history_pos = None;
+                self.history_from = None;
             }
             KeyCode::Esc => {
                 if !self.input.is_empty() {
                     // clears the box (and the / menu) first: stopping a reply takes an esc on an empty box
-                    self.input.clear();
-                    self.cursor = 0;
+                    self.set_input(String::new());
                     self.history_pos = None;
+                    self.history_from = None;
                 } else if self.stream.is_some() {
                     self.stop();
                 } else {
@@ -2189,18 +2997,21 @@ impl Pane for Chat {
                 }
             }
             KeyCode::Enter => {
-                // shift/alt+enter: newline
-                if k.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.insert("\n");
+                // shift+enter: a new line
+                if shift {
+                    self.edit(|e| e.newline());
                     return true;
                 }
                 let mut text = self.input.trim().to_string();
                 if let Some(it) = items.get(self.menu_sel.min(items.len().saturating_sub(1))) {
+                    if let Some(p) = &it.put {
+                        // an earlier prompt: into the box, to edit or send
+                        self.set_input(p.clone());
+                        return true;
+                    }
                     if !it.run {
                         // a command that needs its argument: complete it, the menu then lists the choices
-                        self.input = it.fill.clone();
-                        self.cursor = self.input.chars().count();
-                        self.menu_sel = 0;
+                        self.set_input(it.fill.clone());
                         return true;
                     }
                     text = it.fill.clone();
@@ -2208,9 +3019,9 @@ impl Pane for Chat {
                 if text.is_empty() {
                     return true;
                 }
-                self.input.clear();
-                self.cursor = 0;
+                self.set_input(String::new());
                 self.history_pos = None;
+                self.history_from = None;
                 if text.starts_with('/') {
                     self.run_command(&text, cx);
                 } else {
@@ -2219,70 +3030,65 @@ impl Pane for Chat {
             }
             KeyCode::Tab if !items.is_empty() => {
                 let it = &items[self.menu_sel.min(items.len() - 1)];
-                // tab on a command that takes an argument goes straight to its choices
-                self.input = if it.run && !it.fill.contains(' ') && self.arg_options(&it.fill).is_empty() { it.fill.clone() } else if it.fill.ends_with(' ') || it.fill.contains(' ') { it.fill.clone() } else { format!("{} ", it.fill) };
-                self.cursor = self.input.chars().count();
-                self.menu_sel = 0;
+                // tab on a command that takes an argument goes straight to its choices; on a folder it goes in
+                let next = if let Some(p) = &it.put {
+                    p.clone()
+                } else if it.run && !it.fill.contains(' ') && self.arg_options(&it.fill).is_empty() {
+                    it.fill.clone()
+                } else if it.fill.ends_with(' ') || it.fill.contains(' ') {
+                    it.fill.clone()
+                } else {
+                    format!("{} ", it.fill)
+                };
+                self.set_input(next);
             }
             KeyCode::Up if !items.is_empty() => self.menu_sel = self.menu_sel.saturating_sub(1),
             KeyCode::Down if !items.is_empty() => self.menu_sel = (self.menu_sel + 1).min(items.len() - 1),
             KeyCode::Up if ctrl => self.scroll += 1,
             KeyCode::Down if ctrl => self.scroll = self.scroll.saturating_sub(1),
+            // ↑↓ move between the lines of what you're writing; from the first line, ↑ goes back through your
+            // earlier prompts (this chat's, then every other chat's), like a shell
             KeyCode::Up => {
-                // recall earlier messages you sent
-                let mine: Vec<&str> = self.chat.messages.iter().filter(|m| m.role == "user").map(|m| m.content.as_str()).collect();
-                if !mine.is_empty() && (self.input.is_empty() || self.history_pos.is_some()) {
-                    let pos = self.history_pos.map(|p| p.saturating_sub(1)).unwrap_or(mine.len() - 1);
-                    self.history_pos = Some(pos);
-                    self.input = mine[pos].to_string();
-                    self.cursor = self.input.chars().count();
-                } else {
+                if !self.row_move(-1) && !((self.input.is_empty() || self.history_pos.is_some()) && self.recall(true)) {
                     self.scroll += 1;
                 }
             }
             KeyCode::Down => {
-                if let Some(p) = self.history_pos {
-                    let mine: Vec<&str> = self.chat.messages.iter().filter(|m| m.role == "user").map(|m| m.content.as_str()).collect();
-                    if p + 1 < mine.len() {
-                        self.history_pos = Some(p + 1);
-                        self.input = mine[p + 1].to_string();
-                    } else {
-                        self.history_pos = None;
-                        self.input.clear();
-                    }
-                    self.cursor = self.input.chars().count();
-                } else {
+                if !self.row_move(1) && !self.recall(false) {
                     self.scroll = self.scroll.saturating_sub(1);
                 }
             }
+            // ctrl+pgup / ctrl+pgdn: the previous / next chat in the list
+            KeyCode::PageUp if ctrl => self.step_chat(false),
+            KeyCode::PageDown if ctrl => self.step_chat(true),
             KeyCode::PageUp => self.scroll += 10,
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.chars().count()),
+            KeyCode::Left if ctrl => self.edit(|e| e.word_left()),
+            KeyCode::Right if ctrl => self.edit(|e| e.word_right()),
+            KeyCode::Left => self.edit(|e| e.left()),
+            KeyCode::Right => self.edit(|e| e.right()),
             // ctrl+end (or end with nothing typed): back to the live end; ctrl+home: the top (render caps it)
             KeyCode::End if ctrl || self.input.is_empty() => {
                 self.scroll = 0;
                 self.unseen = 0;
             }
             KeyCode::Home if ctrl => self.scroll = usize::MAX / 2,
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.chars().count(),
+            KeyCode::Home | KeyCode::End => {
+                let (w, home) = (self.comp_w, k.code == KeyCode::Home);
+                self.edit(|e| {
+                    let segs = e.layout(w);
+                    if home { e.home(&segs) } else { e.end(&segs) }
+                });
+            }
+            KeyCode::Backspace if ctrl => {
+                self.edit(|e| e.delete_word_left());
+                self.menu_sel = 0;
+            }
             KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    let mut chars: Vec<char> = self.input.chars().collect();
-                    chars.remove(self.cursor - 1);
-                    self.input = chars.into_iter().collect();
-                    self.cursor -= 1;
-                    self.menu_sel = 0;
-                }
+                self.edit(|e| e.backspace());
+                self.menu_sel = 0;
             }
-            KeyCode::Delete => {
-                let mut chars: Vec<char> = self.input.chars().collect();
-                if self.cursor < chars.len() {
-                    chars.remove(self.cursor);
-                    self.input = chars.into_iter().collect();
-                }
-            }
+            KeyCode::Delete => self.edit(|e| e.delete()),
             _ => return false,
         }
         true
@@ -2306,18 +3112,28 @@ impl Pane for Chat {
             MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
             MouseEventKind::Down(MouseButton::Left) => {
                 let pos = Position { x: ev.column, y: ev.row };
-                // a tool line: open / close just that call
-                if let Some((_, id)) = self.tool_hits.iter().find(|(y, _)| *y == ev.row).cloned() {
-                    if !self.open.remove(&id) {
-                        self.open.insert(id);
+                // a tool line opens / closes just that call; a code block's header copies the block
+                if let Some((_, hit)) = self.click_hits.iter().find(|(y, _)| *y == ev.row).cloned() {
+                    match hit {
+                        Hit::Tool(id) => {
+                            if !self.open.remove(&id) {
+                                self.open.insert(id);
+                            }
+                            self.cache.clear();
+                            self.relayout = true;
+                        }
+                        Hit::Code(c) => {
+                            crate::clip::copy(&c.text);
+                            cx.notify(copied_code(&c));
+                        }
                     }
-                    self.cache.clear();
-                    self.relayout = true;
                     return;
                 }
                 if self.chat.messages.is_empty() {
-                    if let Some((_, s)) = self.hero_hits.iter().find(|(r, _)| r.contains(pos)).cloned() {
-                        self.send(s, cx);
+                    match self.hero_hits.iter().find(|(r, _)| r.contains(pos)).map(|h| h.1.clone()) {
+                        Some(HeroHit::Say(s)) => self.send(s, cx),
+                        Some(HeroHit::Folder(d)) => self.run_command(&format!("/cwd {d}"), cx),
+                        None => {}
                     }
                 }
             }
@@ -2345,6 +3161,17 @@ impl Pane for Chat {
         }
         let list = Rect { y: area.y + 2, height: area.height.saturating_sub(2), ..area };
         let h = list.height as usize;
+        // a chat just opened (a click, /open, ctrl+pgdn) scrolls into view; the wheel is free the rest of the time
+        if self.side_follow != self.chat.id && h > 0 {
+            if let Some(at) = rows.iter().position(|(g, i)| g.is_none() && self.chats[*i].id == self.chat.id) {
+                if at < self.side_scroll {
+                    self.side_scroll = at.saturating_sub(1); // its date heading too, if it's just above
+                } else if at >= self.side_scroll + h {
+                    self.side_scroll = at + 1 - h;
+                }
+                self.side_follow = self.chat.id.clone();
+            }
+        }
         self.side_scroll = self.side_scroll.min(rows.len().saturating_sub(h));
         for (n, (group, i)) in rows.iter().skip(self.side_scroll).take(h).enumerate() {
             let r = Rect { y: list.y + n as u16, height: 1, ..list };
@@ -2901,6 +3728,78 @@ mod tests {
         k.render_html(&mut c, 150, 44, "docs/screenshot-agent.html");
     }
 
+    /// The Claude fixture replayed `n` times into one live reply (fresh call ids each time): a long agent run.
+    fn long_live_chat(k: &mut Kit, n: usize) -> Chat {
+        let mut c = agent_chat(k, "claude", PROMPT);
+        for rep in 0..n {
+            let mut p = agent::Claude::new(std::path::Path::new("C:\\work\\demo"));
+            for evs in parse_fixture(CLAUDE_FIXTURE, |v, t, s| p.feed(v, t, s)) {
+                let evs: Vec<Ev> = evs
+                    .into_iter()
+                    .map(|e| match e {
+                        Ev::Tool(mut t) => {
+                            t.id = format!("{rep}-{}", t.id);
+                            t.parent = t.parent.map(|p| format!("{rep}-{p}"));
+                            Ev::Tool(t)
+                        }
+                        e => e,
+                    })
+                    .collect();
+                deliver(k, &mut c, evs);
+            }
+        }
+        c
+    }
+
+    /// Frame time of a long live reply at 140x44. `cargo test chat_render_perf -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn chat_render_perf() {
+        let mut k = Kit::new();
+        let mut c = long_live_chat(&mut k, 20);
+        let _forget = Forget(c.chat.id.clone());
+        for expanded in [false, true] {
+            c.expanded = expanded;
+            c.cache.clear();
+            k.render(&mut c, 140, 44);
+            let t0 = Instant::now();
+            for _ in 0..30 {
+                k.render(&mut c, 140, 44);
+            }
+            println!("live, expanded={expanded}: {:.2} ms/frame", t0.elapsed().as_secs_f64() * 1000.0 / 30.0);
+        }
+        // with a command running at the end (its spinner redraws that block every frame)
+        deliver(&mut k, &mut c, [Ev::Tool(store::Tool { id: "perf-run".into(), name: "Bash".into(), label: "Bash".into(), target: "cargo build".into(), status: "running".into(), ..Default::default() })]);
+        c.expanded = false;
+        let t0 = Instant::now();
+        for i in 0..30 {
+            k.time = 1.0 + i as f64 * 0.1;
+            k.render(&mut c, 140, 44);
+        }
+        println!("live, a call running: {:.2} ms/frame", t0.elapsed().as_secs_f64() * 1000.0 / 30.0);
+        // finished: the same reply 30 times over, every message cached
+        c.stream = None;
+        c.expanded = true;
+        let m = c.chat.messages.clone();
+        for _ in 0..30 {
+            c.chat.messages.extend(m.iter().cloned());
+        }
+        c.cache.clear();
+        k.render(&mut c, 140, 44);
+        let t0 = Instant::now();
+        for _ in 0..30 {
+            k.render(&mut c, 140, 44);
+        }
+        println!("finished, 62 messages: {:.2} ms/frame", t0.elapsed().as_secs_f64() * 1000.0 / 30.0);
+        let mut e = Chat::new(&k.config);
+        e.info.push("x".into());
+        let t0 = Instant::now();
+        for _ in 0..30 {
+            k.render(&mut e, 140, 44);
+        }
+        println!("empty (the test harness itself): {:.2} ms/frame", t0.elapsed().as_secs_f64() * 1000.0 / 30.0);
+    }
+
     #[test]
     fn chat_agent_claude_fixture() {
         let mut k = Kit::new();
@@ -3001,7 +3900,7 @@ mod tests {
         assert!(s.contains("Fetch(https://docs.rs/serde)"));
         assert!(s.contains("0/2 done · now: Running the tests"));
         // clicking the Bash line opens it (all output), clicking again closes it
-        let (row, _) = c.tool_hits.iter().find(|(_, id)| id == "t2").cloned().unwrap();
+        let (row, _) = c.click_hits.iter().find(|(_, h)| *h == Hit::Tool("t2".into())).cloned().unwrap();
         let click = |row| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 10, row, modifiers: KeyModifiers::NONE };
         k.mouse(&mut c, click(row), Rect::new(0, 0, 120, 36));
         assert!(c.open.contains("t2"));
@@ -3082,6 +3981,406 @@ mod tests {
         k.key(&mut c, KeyCode::Enter);
         assert!(!c.always.contains_key(&c.chat.id));
         c.stop();
+    }
+
+    fn user(text: &str) -> store::Msg {
+        store::Msg { role: "user".into(), content: text.into(), ..Default::default() }
+    }
+
+    fn reply(text: &str) -> store::Msg {
+        store::Msg { role: "assistant".into(), content: text.into(), model: Some("ollama".into()), ..Default::default() }
+    }
+
+    /// A plain (non-agent) chat with one exchange.
+    fn plain_chat(k: &Kit, you: &str, ai: &str) -> Chat {
+        let mut c = Chat::new(&k.config);
+        c.provider = "ollama".into();
+        c.chat.provider = Some("ollama".into());
+        c.chat.title = store::title_from(you);
+        c.chat.messages.push(user(you));
+        c.chat.messages.push(reply(ai));
+        c
+    }
+
+    fn click(row: u16) -> MouseEvent {
+        MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 10, row, modifiers: KeyModifiers::NONE }
+    }
+
+    fn enter(k: &mut Kit, c: &mut Chat, line: &str) {
+        k.typ(c, line);
+        k.key(c, KeyCode::Enter);
+    }
+
+    /// ctrl+y copies the last reply's last code block (or all of a reply without one), /copy the reply's markdown,
+    /// /copy code 2 the block before, /copy all the chat; a click on a block's ┌─ header copies that block.
+    #[test]
+    fn chat_copy_reply_and_code() {
+        use crate::clip::last_copied;
+        let mut k = Kit::new();
+        let rust = "fn main() {\n    println!(\"hi\");\n}";
+        let mut c = plain_chat(&k, "two snippets please", &format!("Here:\n\n```sh\nls -la\n```\n\nand\n\n```rust\n{rust}\n```\nDone."));
+        k.key_mod(&mut c, KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert_eq!(last_copied().as_deref(), Some(rust));
+        assert!(k.notices().iter().any(|n| n == "copied 3 lines of rust"), "{:?}", k.notices());
+        enter(&mut k, &mut c, "/copy code 2");
+        assert_eq!(last_copied().as_deref(), Some("ls -la"));
+        enter(&mut k, &mut c, "/copy");
+        assert!(last_copied().is_some_and(|t| t.starts_with("Here:") && t.ends_with("Done.") && t.contains("```rust")), "the reply's own markdown");
+        enter(&mut k, &mut c, "/copy all");
+        assert!(last_copied().is_some_and(|t| t.starts_with("# two snippets please") && t.contains("**you:**") && t.contains("```sh")));
+        enter(&mut k, &mut c, "/copy code 3");
+        assert!(c.info.iter().any(|l| l.contains("has 2 code blocks")), "{:?}", c.info);
+        // the menu after /copy lists the blocks, newest first
+        c.input = "/copy ".into();
+        c.cursor = 6;
+        let s = k.render_html(&mut c, 130, 40, "target/snap/chat-copy-menu.html");
+        assert!(s.contains("its last code block: rust · fn main() {") && s.contains("code 2") && s.contains("sh · ls -la"), "{s}");
+        c.input.clear();
+        c.cursor = 0;
+        // a click on a block's header copies it
+        let s = k.render_html(&mut c, 130, 40, "target/snap/chat-code-headers.html");
+        assert!(s.contains("┌─ sh  click to copy"), "{s}");
+        let (row, _) = c.click_hits.iter().find(|(_, h)| matches!(h, Hit::Code(b) if b.lang == "sh")).cloned().unwrap();
+        k.mouse(&mut c, click(row), Rect::new(0, 0, 130, 40));
+        assert_eq!(last_copied().as_deref(), Some("ls -la"));
+        // no code in the reply: ctrl+y takes all of it
+        let mut c = plain_chat(&k, "hi", "Just words,\nno code.");
+        k.key_mod(&mut c, KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert_eq!(last_copied().as_deref(), Some("Just words,\nno code."));
+        assert!(k.notices().iter().any(|n| n == "copied the last reply (2 lines)"), "{:?}", k.notices());
+    }
+
+    /// /save and /copy all keep an agent's tool calls, as a folded list where they happened; /save never writes
+    /// over an earlier export.
+    #[test]
+    fn chat_export_folds_tools_and_never_overwrites() {
+        let k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "fix it");
+        c.stream = None;
+        let tool = |label: &str, target: &str, summary: &str, status: &str| store::Part::Tool(store::Tool { id: label.into(), name: label.into(), label: label.into(), target: target.into(), summary: summary.into(), status: status.into(), ..Default::default() });
+        let m = c.chat.messages.last_mut().unwrap();
+        m.parts = vec![store::Part::Text { text: "Looking.".into() }, tool("Update", "a.rs", "+1 -1", "done"), tool("Bash", "cargo test", "exit 1", "error"), store::Part::Text { text: "Fixed.".into() }];
+        m.content = "Looking.\n\nFixed.".into();
+        let md = c.export_md();
+        println!("{md}");
+        assert!(md.contains("<details><summary>2 tool calls: Update, Bash</summary>"), "{md}");
+        assert!(md.contains("- Update `a.rs` · +1 -1\n- Bash `cargo test` · exit 1 (error)"), "{md}");
+        let at = |s: &str| md.find(s).unwrap();
+        assert!(at("Looking.") < at("<details>") && at("</details>") < at("Fixed."), "in the order they happened");
+        let dir = std::path::absolute("target/test-scratch/chat/save").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = free_path(&dir, "fix: it");
+        assert_eq!(first.file_name().unwrap(), "fix_ it.md");
+        std::fs::write(&first, "x").unwrap();
+        assert_eq!(free_path(&dir, "fix: it").file_name().unwrap(), "fix_ it 2.md", "an earlier export is kept");
+    }
+
+    /// The chat list from the keyboard: /open searches titles as you type and opens by id, ctrl+pgup / ctrl+pgdn
+    /// step through the list (the sidebar keeps the open chat in view), /rename renames and saves.
+    #[test]
+    fn chat_list_keyboard_search_and_rename() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.chats = (0..30)
+            .map(|i| {
+                let mut ch = store::Chat::new("claude");
+                ch.id = format!("kb{i}");
+                ch.title = if i == 17 { "the regex one".into() } else { format!("chat {i}") };
+                ch.updated = 1000.0 - i as f64;
+                ch.messages.push(user(&format!("hi {i}")));
+                ch
+            })
+            .collect();
+        let _forget = Forget("kb16".into());
+        k.typ(&mut c, "/open ");
+        let items = c.menu();
+        assert_eq!((items.len(), items[0].left.as_str()), (30, "chat 0"), "every chat, newest first");
+        k.typ(&mut c, "regex");
+        assert_eq!(c.menu().len(), 1, "narrowed as you type");
+        let s = k.render_html(&mut c, 120, 30, "target/snap/chat-open-menu.html");
+        assert!(s.contains("the regex one") && s.contains("older · claude code · 1 message"), "{s}");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.chat.id, "kb17");
+        let side = k.render_side(&mut c, 32, 12);
+        assert!(side.contains("the regex one"), "the list scrolled to the open chat: {side}");
+        k.key_mod(&mut c, KeyCode::PageDown, KeyModifiers::CONTROL);
+        assert_eq!(c.chat.id, "kb18");
+        k.key_mod(&mut c, KeyCode::PageUp, KeyModifiers::CONTROL);
+        k.key_mod(&mut c, KeyCode::PageUp, KeyModifiers::CONTROL);
+        assert_eq!(c.chat.id, "kb16");
+        enter(&mut k, &mut c, "/rename regex notes");
+        assert_eq!(c.chat.title, "regex notes");
+        assert!(store::load_all().iter().any(|x| x.id == "kb16" && x.title == "regex notes"), "saved");
+        // /open with typed words (no pick) opens the first title that has them
+        enter(&mut k, &mut c, "/open chat 3");
+        assert_eq!(c.chat.id, "kb3");
+        // above the first chat is a new one
+        let top = c.chats[0].id.clone();
+        c.open_chat(&top);
+        k.key_mod(&mut c, KeyCode::PageUp, KeyModifiers::CONTROL);
+        assert!(c.chat.messages.is_empty());
+    }
+
+    /// The composer grows with what you write (up to 8 rows, then scrolls), ctrl+j / shift+enter add lines, ↑↓ move
+    /// between them before they reach history, and the word keys and undo work like the notes editor.
+    #[test]
+    fn chat_composer_grows_and_edits_by_line() {
+        let mut k = Kit::new();
+        let mut c = plain_chat(&k, "earlier prompt", "ok");
+        k.typ(&mut c, "first line");
+        k.key_mod(&mut c, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        k.typ(&mut c, "second line");
+        k.key_mod(&mut c, KeyCode::Enter, KeyModifiers::SHIFT);
+        k.typ(&mut c, "third");
+        assert_eq!(c.input, "first line\nsecond line\nthird");
+        let s = k.render_html(&mut c, 100, 30, "target/snap/chat-composer-lines.html");
+        assert!(s.contains("› first line") && s.contains("│  second line") && s.contains("3 lines · ctrl+j new line"), "{s}");
+        // ↑ goes up a line keeping the column; on the first line it leaves your text alone
+        k.key(&mut c, KeyCode::Up);
+        assert_eq!(c.cursor, "first line\nsecon".chars().count());
+        k.key(&mut c, KeyCode::Up);
+        k.key(&mut c, KeyCode::Up);
+        assert_eq!((c.input.as_str(), c.cursor), ("first line\nsecond line\nthird", 5), "no history over what you typed");
+        k.key(&mut c, KeyCode::Down);
+        k.key(&mut c, KeyCode::Down);
+        assert_eq!(c.cursor, "first line\nsecond line\nthird".chars().count());
+        // words: ctrl+left, ctrl+w, ctrl+z
+        k.key_mod(&mut c, KeyCode::Left, KeyModifiers::CONTROL);
+        assert_eq!(c.cursor, "first line\nsecond line\n".chars().count());
+        k.key_mod(&mut c, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        k.key_mod(&mut c, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(c.input, "first line\nsecond line\n");
+        k.key_mod(&mut c, KeyCode::Backspace, KeyModifiers::CONTROL);
+        assert_eq!(c.input, "first line\nsecond line", "ctrl+backspace at a line's start joins it up");
+        k.key_mod(&mut c, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        k.key_mod(&mut c, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(c.input, "first line\nsecond line\nthird", "undone");
+        // a long paste: 8 rows show, the rest scrolls, and the box says how long it is
+        c.input.clear();
+        c.cursor = 0;
+        let mut acts = vec![];
+        c.paste(&(1..=20).map(|i| format!("row{i:02}")).collect::<Vec<_>>().join("\r\n"), &mut cx_of(&k, &mut acts, true));
+        let s = k.render_html(&mut c, 100, 30, "target/snap/chat-composer-paste.html");
+        let rows = s.lines().filter(|l| l.contains("row")).count();
+        assert!(rows == 8 && s.contains("row20") && !s.contains("row12") && s.contains("20 lines"), "{rows} rows: {s}");
+        // enter sends all of it; ctrl+z brings it back
+        k.key(&mut c, KeyCode::Enter);
+        assert!(c.input.is_empty() && c.chat.messages.iter().any(|m| m.content.starts_with("row01\nrow02")));
+        c.stop();
+        k.key_mod(&mut c, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert!(c.input.starts_with("row01"), "{:?}", c.input);
+    }
+
+    /// ↑ past this chat's first message carries on into your prompts from other chats (each once, newest chat first)
+    /// with "from: <chat>" on the box; /prompts searches them and puts one in the box without sending it.
+    #[test]
+    fn chat_history_reaches_other_chats() {
+        let mut k = Kit::new();
+        let mut c = plain_chat(&k, "hello here", "hi");
+        let old = |id: &str, title: &str, prompts: &[&str]| {
+            let mut ch = store::Chat::new("ollama");
+            ch.id = id.into();
+            ch.title = title.into();
+            for p in prompts {
+                ch.messages.push(user(p));
+                ch.messages.push(reply("done"));
+            }
+            ch
+        };
+        let races = "review this diff for races, list file:line";
+        c.chats = vec![old("h1", "races review", &[races]), old("h2", "names", &["name my app", races])];
+        let up = |k: &mut Kit, c: &mut Chat| k.key(c, KeyCode::Up);
+        up(&mut k, &mut c);
+        assert_eq!((c.input.as_str(), c.history_from.as_deref()), ("hello here", None));
+        up(&mut k, &mut c);
+        assert_eq!((c.input.as_str(), c.history_from.as_deref()), (races, Some("races review")));
+        let s = k.render_html(&mut c, 110, 30, "target/snap/chat-history-from.html");
+        assert!(s.contains("from: races review"), "{s}");
+        up(&mut k, &mut c);
+        assert_eq!(c.input, "name my app", "the same prompt in another chat comes once");
+        up(&mut k, &mut c);
+        assert_eq!(c.input, "name my app", "the oldest stays");
+        k.key(&mut c, KeyCode::Down);
+        k.key(&mut c, KeyCode::Down);
+        assert_eq!(c.input, "hello here");
+        k.key(&mut c, KeyCode::Down);
+        assert!(c.input.is_empty() && c.history_from.is_none());
+        // /prompts: search as you type, enter puts it in the box unsent
+        k.typ(&mut c, "/prompts diff for");
+        let items = c.menu();
+        assert!(items.len() == 1 && items[0].put.as_deref() == Some(races) && items[0].desc == "from races review", "{:?}", items.iter().map(|i| &i.left).collect::<Vec<_>>());
+        let sent = c.chat.messages.len();
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!((c.input.as_str(), c.chat.messages.len()), (races, sent));
+    }
+
+    /// The live reply's cached blocks draw exactly what a fresh draw does: every line and every click target, folded
+    /// and expanded; a running call still animates.
+    #[test]
+    fn chat_live_blocks_match_a_full_draw() {
+        let mut k = Kit::new();
+        let mut c = long_live_chat(&mut k, 3);
+        let _forget = Forget(c.chat.id.clone());
+        let draw = |c: &mut Chat, k: &Kit| {
+            let mut acts = vec![];
+            let cx = cx_of(k, &mut acts, true);
+            let b = c.transcript(138, &cx);
+            (b.iter().flat_map(|b| b.lines.iter().map(|l| l.to_string()).collect::<Vec<_>>()).collect::<Vec<_>>(), b.iter().map(|b| b.hits.len()).sum::<usize>())
+        };
+        for expanded in [false, true] {
+            c.expanded = expanded;
+            let first = draw(&mut c, &k);
+            let cached = draw(&mut c, &k);
+            assert!(c.live.2.len() > 10, "blocks kept: {}", c.live.2.len());
+            c.live.2.clear();
+            let fresh = draw(&mut c, &k);
+            assert_eq!(first, fresh);
+            assert_eq!(cached, fresh);
+            assert!(fresh.1 > 10, "click targets: {}", fresh.1);
+        }
+        // the same reply once it's done (drawn in one go) reads the same too
+        let live = draw(&mut c, &k).0;
+        let stream = c.stream.take();
+        let done = draw(&mut c, &k).0;
+        assert_eq!(live, done);
+        c.stream = stream;
+        // a running call animates: its spinner moves from one frame to the next
+        deliver(&mut k, &mut c, [Ev::Tool(store::Tool { id: "run1".into(), name: "Bash".into(), label: "Bash".into(), target: "sleep 5".into(), status: "running".into(), ..Default::default() })]);
+        let spin = |k: &mut Kit, c: &mut Chat| k.render(c, 140, 44).lines().find(|l| l.contains("Bash(sleep 5)")).map(|l| l.trim().chars().next()).flatten();
+        k.time = 1.0;
+        let a = spin(&mut k, &mut c);
+        k.time = 1.25;
+        let b = spin(&mut k, &mut c);
+        assert!(a.is_some() && a != b, "{a:?} {b:?}");
+        c.stop();
+    }
+
+    /// /lead and /tasks hand the goal (or the last reply) to the agents app's lead form / planner, /task makes a
+    /// card; the text also goes on the clipboard.
+    #[test]
+    fn chat_hands_plans_to_agents() {
+        let k = Kit::new();
+        let plan = "## Plan\n1. split the parser\n2. add tests";
+        let mut c = plain_chat(&k, "plan the refactor", plan);
+        let run = |c: &mut Chat, line: &str| {
+            let mut acts = vec![];
+            c.run_command(line, &mut cx_of(&k, &mut acts, true));
+            acts.into_iter()
+                .filter_map(|a| match a {
+                    Action::AppKey(app, key) => Some(format!("key {app} {key}")),
+                    Action::AppPaste(app, text) => Some(format!("paste {app} {text}")),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(&mut c, "/lead"), [format!("key agents L"), format!("paste agents {plan}")]);
+        assert_eq!(crate::clip::last_copied().as_deref(), Some(plan));
+        assert_eq!(run(&mut c, "/lead ship the parser"), ["key agents L", "paste agents ship the parser"]);
+        assert_eq!(run(&mut c, "/tasks"), [format!("key agents P"), format!("paste agents {plan}")]);
+        assert_eq!(run(&mut c, "/task write the docs"), ["key agents n", "paste agents write the docs"]);
+        assert!(run(&mut c, "/task").is_empty() && c.info.iter().any(|l| l.contains("/task <what the agent should do>")));
+        let mut empty = Chat::new(&k.config);
+        assert!(run(&mut empty, "/lead").is_empty() && empty.info.iter().any(|l| l.contains("takes the last reply")));
+    }
+
+    /// A new Claude Code / Codex chat that would start in your home folder (or a drive root, or the system) shows a
+    /// folder picker instead of suggestions and only runs there once you say so; /cwd completes paths with tab.
+    #[test]
+    fn chat_new_agent_chat_asks_for_a_folder() {
+        let mut k = Kit::new();
+        let home = dirs::home_dir().unwrap();
+        assert!(risky_dir(&home) && !risky_dir(&home.join("proj")));
+        assert!(risky_dir(Path::new(if cfg!(windows) { "C:\\" } else { "/" })));
+        if cfg!(windows) {
+            assert!(risky_dir(Path::new("C:\\Windows\\System32")) && !risky_dir(Path::new("C:\\Code\\thing")));
+        } else {
+            assert!(risky_dir(Path::new("/usr/bin")) && !risky_dir(Path::new("/srv/thing")));
+        }
+        let base = std::path::absolute("target/test-scratch/chat/cwd-pick").unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["alpha/inner", "alpine", "beta"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let mut c = Chat::new(&k.config);
+        c.provider = "claude".into();
+        c.chat.provider = Some("claude".into());
+        c.launch_dir = home.clone();
+        let mut used = store::Chat::new("claude");
+        used.cwd = Some(base.join("beta").to_string_lossy().to_string());
+        c.chats = vec![used];
+        let s = k.render_html(&mut c, 130, 40, "target/snap/chat-folder-pick.html");
+        assert!(s.contains("where should Claude Code work?") && s.contains("used before") && s.contains("use it anyway") && !s.contains("rainbows"), "{s}");
+        // enter once is held (with a warning), enter again sends it from there
+        k.typ(&mut c, "hi");
+        k.key(&mut c, KeyCode::Enter);
+        assert!(c.chat.messages.is_empty() && c.input == "hi" && c.risky_armed);
+        assert!(k.render(&mut c, 130, 40).contains("enter again sends it from"));
+        k.key(&mut c, KeyCode::Enter);
+        let _forget = Forget(c.chat.id.clone());
+        assert!(c.chat.messages.len() == 2 && c.chat.cwd.as_deref() == Some(home.to_string_lossy().as_ref()));
+        c.stop();
+        // a click on a folder picks it
+        c.new_chat();
+        k.render(&mut c, 130, 40);
+        let r = c.hero_hits.iter().find(|(_, h)| matches!(h, HeroHit::Folder(d) if d.ends_with("beta"))).map(|h| h.0).unwrap();
+        k.mouse(&mut c, MouseEvent { column: r.x + 2, ..click(r.y) }, Rect::new(0, 0, 130, 40));
+        assert!(c.chat.cwd.as_deref().is_some_and(|d| d.ends_with("beta")) && !c.needs_folder());
+        // /cwd completes a path a folder at a time
+        let sep = std::path::MAIN_SEPARATOR;
+        c.input = format!("/cwd {}{sep}al", base.display());
+        c.cursor = c.input.chars().count();
+        let items = c.menu();
+        assert_eq!(items.iter().take(2).map(|i| i.left.rsplit(sep).nth(1).unwrap_or("")).collect::<Vec<_>>(), ["alpha", "alpine"], "{:?}", items.iter().map(|i| &i.left).collect::<Vec<_>>());
+        k.key(&mut c, KeyCode::Tab);
+        assert_eq!(c.input, format!("/cwd {}{sep}alpha{sep}", base.display()));
+        let items = c.menu();
+        assert!(items[0].desc == "this folder" && items.iter().any(|i| i.left.ends_with(&format!("inner{sep}"))));
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.chat.cwd.as_deref(), Some(base.join("alpha").to_string_lossy().as_ref()));
+    }
+
+    /// The box's bottom edge shows what the chat has cost and how full the AI's plan window is (red past 85%); sending
+    /// at effort max that close to the limit says so.
+    #[test]
+    fn chat_spend_and_plan_usage_on_the_box() {
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "go");
+        let _forget = Forget(c.chat.id.clone());
+        deliver(&mut k, &mut c, [Ev::Token("Done.".into()), Ev::Cost(0.5), Ev::Done { note: Some("3s · 1k tokens · $0.500 · claude code".into()) }]);
+        assert_eq!(c.chat.messages.last().unwrap().cost_usd, Some(0.5));
+        // an older reply only has it in its note
+        c.chat.messages.insert(0, store::Msg { role: "assistant".into(), content: "old".into(), note: Some("9s · 2k tokens · $0.340 · 3 turns".into()), ..Default::default() });
+        assert!((c.spend() - 0.84).abs() < 1e-9);
+        *c.usage.lock().unwrap() = vec![("claude".into(), "5-hour".into(), 72.0), ("claude".into(), "weekly".into(), 20.0), ("codex".into(), "5-hour".into(), 99.0)];
+        let s = k.render_html(&mut c, 130, 30, "target/snap/chat-spend.html");
+        assert!(s.contains("$0.84 this chat · 5h 72%"), "{s}");
+        c.usage.lock().unwrap()[0].2 = 91.0;
+        c.effort = "max".into();
+        enter(&mut k, &mut c, "and more");
+        assert!(c.info.iter().any(|l| l.starts_with("⚠ claude code 5-hour window at 91%")), "{:?}", c.info);
+        c.stop();
+        // a plain AI shows no plan window
+        let mut p = plain_chat(&k, "hi", "yo");
+        *p.usage.lock().unwrap() = vec![("claude".into(), "5-hour".into(), 50.0)];
+        assert!(p.usage_text().is_none());
+    }
+
+    /// In the / menu a long command is cut with room to spare: two spaces always come before its description.
+    #[test]
+    fn chat_menu_names_never_run_into_descriptions() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.input = "/".into();
+        c.cursor = 1;
+        for w in [60u16, 80, 130] {
+            let s = k.render_html(&mut c, w, 40, &format!("target/snap/chat-slash-{w}.html"));
+            let row = s.lines().find(|l| l.contains("/effort")).unwrap_or_else(|| panic!("{s}"));
+            let after = &row[row.find("/effort").unwrap()..];
+            assert!(after.contains("  how hard"), "w={w}: {row}");
+            let perms = s.lines().find(|l| l.contains("/perms")).unwrap();
+            assert!(perms[perms.find("/perms").unwrap()..].contains("  what coding agents"), "w={w}: {perms}");
+        }
     }
 
     #[test]

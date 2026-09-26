@@ -25,6 +25,19 @@ pub struct Msg {
     /// On a reply: the chat's CLI sessions as they were before it started, so regenerating it can go back to them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_before: Option<serde_json::Map<String, Value>>,
+    /// What the reply cost in dollars, when the AI says (Claude Code does): the chat adds them up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+impl Msg {
+    /// The reply's cost: its own number, else the "$0.136" an older version wrote into the note.
+    pub fn cost(&self) -> f64 {
+        self.cost_usd.unwrap_or_else(|| {
+            let note = self.note.as_deref().unwrap_or("");
+            note.split(" · ").find_map(|x| x.strip_prefix('$').and_then(|n| n.trim().parse::<f64>().ok())).unwrap_or(0.0)
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

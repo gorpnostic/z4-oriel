@@ -62,6 +62,12 @@ impl Limits {
     pub fn worst(&self, agent: &str) -> Option<f64> {
         self.of(agent).iter().map(|w| w.pct).fold(None, |a, p| Some(a.map_or(p, |a: f64| a.max(p))))
     }
+    /// An agent's fullest window, "5h 72% · resets 1h 10m", with its %: for where you pick agents and budgets.
+    pub fn fullest(&self, agent: &str) -> Option<(String, f64)> {
+        let w = self.of(agent).iter().max_by(|a, b| a.pct.partial_cmp(&b.pct).unwrap_or(std::cmp::Ordering::Equal))?;
+        let reset = w.resets_at.map(|r| format!(" · resets {}", super::until(r))).unwrap_or_default();
+        Some((format!("{} {:.0}%{reset}", short(&w.label), w.pct), w.pct))
+    }
     /// "5h 34% · wk 12%"
     pub fn text(&self, agent: &str) -> String {
         let w = self.of(agent);

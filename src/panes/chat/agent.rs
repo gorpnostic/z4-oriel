@@ -874,6 +874,11 @@ impl Claude {
         Ok(())
     }
 
+    /// What the run cost, in dollars (0 until Claude Code says).
+    pub fn cost(&self) -> f64 {
+        self.cost
+    }
+
     /// The line under the finished reply: duration · tokens · cost · turns.
     pub fn note(&self, elapsed: Duration) -> String {
         let mut p = vec![human_ms(elapsed.as_millis() as u64), format!("{} tokens", human_tokens(self.result_tokens.max(self.sent_tokens)))];

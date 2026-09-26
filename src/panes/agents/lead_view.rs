@@ -309,6 +309,16 @@ impl Agents {
         true
     }
 
+    /// "claude 5h 72% · resets 1h 10m" (or "claude paused (rate limit)") for an agent, and whether it's near its
+    /// limit (over 85%, or paused). None when its plan usage isn't known.
+    pub(super) fn limit_note(&self, agent: &str) -> Option<(String, bool)> {
+        if self.paused.get(agent).is_some_and(|u| *u > super::store::now()) {
+            return Some((format!("{agent} paused (rate limit)"), true));
+        }
+        let (s, pct) = self.limits.fullest(agent)?;
+        Some((format!("{agent} {s}"), pct > 85.0))
+    }
+
     pub(super) fn draw_lead_form(&self, f: &mut Frame, area: Rect, cx: &Cx) {
         let t = cx.theme;
         let Mode::LeadForm(form) = &self.mode else { return };
@@ -368,22 +378,30 @@ impl Agents {
         let ri = ui::frame(f, c, "run budget $ (all agents)", None, form.field == 4, t);
         super::view::draw_input(f, ri, &form.budget, "8.00", form.field == 4, t);
         y += 4;
-        // the roster, briefly
+        // the roster, briefly, with how full each one's plan is: "claude-haiku cheap (claude 5h 72% · resets 1h 10m)"
         if y + 1 < bottom {
             let roster = self.roster();
             let mut spans = vec![Span::styled("workers  ", bold(t.muted))];
+            let mut told: Vec<&str> = vec![];
             for (i, w) in roster.iter().filter(|w| w.enabled).enumerate() {
                 if i > 0 {
                     spans.push(Span::styled(" · ", ui::muted(t)));
                 }
                 spans.push(Span::styled(w.name.clone(), Style::default().fg(t.fg)));
                 spans.push(Span::styled(format!(" {}", w.tier), ui::muted(t)));
+                if let Some((note, hot)) = self.limit_note(&w.agent) {
+                    // the same plan again for its next worker: just the %
+                    let note = if told.contains(&w.agent.as_str()) { note.split(" · resets").next().unwrap_or("").to_string() } else { note };
+                    told.push(&w.agent);
+                    spans.push(Span::styled(format!(" ({note})"), if hot { Style::default().fg(t.danger).add_modifier(Modifier::BOLD) } else { ui::muted(t) }));
+                }
             }
             if roster.iter().all(|w| !w.enabled) {
                 spans.push(Span::styled("none — press R on the board to set up the roster", Style::default().fg(t.danger)));
             }
             spans.push(Span::styled("   (R edits)", Style::default().fg(t.frame)));
-            f.render_widget(Paragraph::new(Line::from(spans)), Rect { y, height: 1, ..inner });
+            // two rows, so the plan notes wrap rather than run off
+            f.render_widget(Paragraph::new(Line::from(spans)).wrap(ratatui::widgets::Wrap { trim: true }), Rect { y, height: 2.min(bottom.saturating_sub(y)), ..inner });
             y += 2;
         }
         if y < bottom {
@@ -967,5 +985,46 @@ impl Agents {
             let r = Rect { x: body.x + 2, y: body.bottom().saturating_sub(1), width: 24.min(body.width), height: 1 };
             f.render_widget(Paragraph::new(Span::styled(format!(" ↓ {scroll} newer lines "), ui::accent(t))), r);
         }
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::super::{Agents, Mode, Paths, roster, store::Task};
+    use crate::config::RosterEntry;
+    use crate::testkit::Kit;
+
+    fn worker(name: &str, agent: &str, tier: &str) -> RosterEntry {
+        RosterEntry { name: name.into(), agent: agent.into(), model: String::new(), tier: tier.into(), good_at: String::new(), max_turns: 20, budget_usd: 1.0, enabled: true }
+    }
+
+    /// Where you pick agents and budgets, each agent's plan usage shows: the lead form's roster line (red past
+    /// 85%, "paused" while rate-limited) and each task in the batch popup, with the tasks' own caps added up.
+    #[test]
+    fn agents_limits_where_you_choose() {
+        let dir = super::super::tests::scratch("limits");
+        let mut a = Agents::with_paths(Paths { agents: dir.join("agents"), wt: dir.join("wt") });
+        a.start_dir = Some(dir.clone());
+        a.roster = vec![worker("claude-haiku", "claude", "cheap"), worker("claude-worker", "claude", "premium"), worker("codex", "codex", "mid")];
+        let now = crate::panes::files::clock::now_secs();
+        a.limits = roster::Limits { claude: vec![roster::Window { label: "5-hour".into(), pct: 91.0, resets_at: Some(now + 4230) }], codex: vec![roster::Window { label: "5-hour".into(), pct: 12.0, resets_at: None }] };
+        a.mode = Mode::LeadForm(a.new_lead_form());
+        let mut k = Kit::new();
+        let s = k.render_html(&mut a, 150, 44, "target/snap/agents-lead-limits.html");
+        assert!(s.contains("claude-haiku cheap (claude 5h 91% · resets 1h 10m)"), "{s}");
+        assert!(s.contains("claude-worker premium") && s.contains("(claude 5h 91%)") && s.contains("codex mid (codex 5h 12%)"), "the notes wrap onto a second row: {s}");
+        let note = a.limit_note("claude").unwrap();
+        assert!(note.1, "over 85% is flagged");
+        a.paused.insert("codex".into(), super::super::store::now() + 600);
+        assert_eq!(a.limit_note("codex"), Some(("codex paused (rate limit)".into(), true)));
+        // the batch popup
+        for (id, agent, cap) in [("t1", "claude", 1.5), ("t2", "codex", 0.0)] {
+            a.store.tasks.push(Task { id: id.into(), title: format!("task {id}"), agent: agent.into(), budget_usd: cap, ..Default::default() });
+            a.marked.push(id.into());
+        }
+        a.mode = Mode::Batch;
+        let s = k.render_html(&mut a, 150, 44, "target/snap/agents-batch-limits.html");
+        assert!(s.contains("claude · default · 5h 91%") && s.contains("codex · default · paused (rate limit)"), "{s}");
+        assert!(s.contains("(their own caps: $1.50)"), "{s}");
     }
 }

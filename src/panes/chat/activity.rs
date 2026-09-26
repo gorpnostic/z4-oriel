@@ -9,7 +9,8 @@ use crate::theme::Theme;
 use crate::ui;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use unicode_width::UnicodeWidthStr;
 
 pub const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -582,112 +583,207 @@ pub fn todo_row(it: &Todo, prefix: &str, width: usize, t: &Theme) -> Line<'stati
     ])
 }
 
-/// Draw a reply's parts. `hits` gets (line index, call id) for every call's header line (click to expand).
-pub fn render(parts: &[Part], width: usize, t: &Theme, v: &View, out: &mut Vec<Line<'static>>, hits: &mut Vec<(usize, String)>) {
-    let muted = Style::default().fg(t.muted);
-    // a blank line between blocks, like Claude Code
-    let mut prev: Option<&'static str> = None;
-    let gap = |out: &mut Vec<Line<'static>>, prev: Option<&str>, _kind: &str| {
-        if prev.is_some() {
-            out.push(Line::raw(""));
-        }
-    };
-    let hidden_thinking = |i: usize| matches!(parts[i], Part::Thinking { .. }) && !v.expanded && !(v.live && i + 1 == parts.len());
-    let mut skip_to = 0;
-    for (i, p) in parts.iter().enumerate() {
-        if i < skip_to {
+/// What a click on a transcript line does: open or close a call, or copy a code block.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Hit {
+    Tool(String),
+    Code(md::Code),
+}
+
+/// A stretch of transcript drawn together (a text part, a call, a run of look-ups...) with its clickable lines,
+/// counted from its own first line. Shared, so a cached block costs nothing to hand out again.
+#[derive(Clone, Default)]
+pub struct Block {
+    pub lines: Rc<Vec<Line<'static>>>,
+    pub hits: Rc<Vec<(usize, Hit)>>,
+}
+
+/// A live reply's blocks that can't change any more, by their first part: (fingerprint, block).
+pub type BlockCache = HashMap<usize, (u64, Block)>;
+
+/// Draw a reply's parts. `hits` gets (line index, what a click does) for every call's header line and every code
+/// block's header.
+pub fn render(parts: &[Part], width: usize, t: &Theme, v: &View, out: &mut Vec<Line<'static>>, hits: &mut Vec<(usize, Hit)>) {
+    for b in render_blocks(parts, width, t, v, None) {
+        let off = out.len();
+        hits.extend(b.hits.iter().map(|(n, h)| (n + off, h.clone())));
+        out.extend(b.lines.iter().cloned());
+    }
+}
+
+/// The parts as blocks. With a cache, a block whose parts haven't changed since the last frame (anything but a
+/// running call or live thinking, which animate) is handed back as it was instead of being drawn again: a long
+/// live run costs what changed, not the whole transcript.
+pub fn render_blocks(parts: &[Part], width: usize, t: &Theme, v: &View, mut cache: Option<&mut BlockCache>) -> Vec<Block> {
+    let mut blocks: Vec<Block> = vec![];
+    let mut i = 0;
+    while i < parts.len() {
+        let (end, shows, live) = extent(parts, i, v);
+        if !shows {
+            i = end;
             continue;
         }
-        match p {
-            Part::Text { text } => {
-                if text.trim().is_empty() {
-                    continue;
-                }
-                gap(out, prev, "text");
-                let mut lines = md::render(text.trim(), width.saturating_sub(1), "  ", t);
-                bullet(&mut lines, Style::default().fg(t.fg));
-                out.extend(lines);
-                prev = Some("text");
+        let first = blocks.is_empty();
+        let key = (cache.is_some() && !live).then(|| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (i, end, first, width, t.name.as_str(), v.expanded).hash(&mut h);
+            for p in &parts[i..end] {
+                fingerprint(p, v, &mut h);
             }
-            // a run of reads and searches: one line, until ctrl+o or a click opens it
-            Part::Tool(tool) if is_lookup(tool) && !v.expanded && !v.open.contains(&tool.id) => {
-                let mut run: Vec<&Tool> = vec![];
-                let mut j = i;
-                while j < parts.len() {
-                    match &parts[j] {
-                        Part::Tool(x) if is_lookup(x) => run.push(x),
-                        _ if hidden_thinking(j) => {}
-                        _ => break,
-                    }
-                    j += 1;
-                }
-                skip_to = j;
-                gap(out, prev, "tool");
-                hits.push((out.len(), tool.id.clone()));
-                out.push(lookup_line(&run, t, v));
-                prev = Some("tool");
-            }
-            Part::Thinking { text, tokens } => {
-                let live_last = v.live && i + 1 == parts.len();
-                if !v.expanded && !live_last {
-                    continue;
-                }
-                gap(out, prev, "thinking");
-                let toks = if *tokens > 0 { format!(" · ~{} tokens", agent::human_tokens(*tokens)) } else { String::new() };
-                let (word, style) = if live_last { ("Thinking…", Style::default().fg(t.shine).add_modifier(Modifier::ITALIC)) } else { ("Thought", muted.add_modifier(Modifier::ITALIC)) };
-                out.push(Line::from(vec![Span::styled("  ◇ ", Style::default().fg(t.shine)), Span::styled(word, style), Span::styled(toks, muted)]));
-                if v.expanded && !text.trim().is_empty() {
-                    out.extend(md::wrap(vec![Span::styled(text.trim().to_string(), muted.add_modifier(Modifier::ITALIC))], width.saturating_sub(1), "    ", "    "));
-                } else if live_last && !text.trim().is_empty() {
-                    // what it's thinking right now: the last few lines, like watching it think
-                    let lines = md::wrap(vec![Span::styled(text.trim().to_string(), muted.add_modifier(Modifier::ITALIC))], width.saturating_sub(1), "    ", "    ");
-                    let skip = lines.len().saturating_sub(3);
-                    out.extend(lines.into_iter().skip(skip));
-                }
-                prev = Some("thinking");
-            }
-            Part::Tool(tool) => {
-                gap(out, prev, "tool");
-                tool_lines(tool, 0, width, t, v, out, hits);
-                prev = Some("tool");
-            }
-            Part::Todos { items } => {
-                if items.is_empty() {
-                    continue;
-                }
-                gap(out, prev, "todos");
-                todo_lines(items, width, t, v.time, out);
-                prev = Some("todos");
-            }
-            Part::User { text } => {
-                // "❯ you  also fix the tests": what you sent while it worked, where it read it
-                gap(out, prev, "user");
-                let head = vec![Span::styled("  ❯ ", Style::default().fg(t.user).add_modifier(Modifier::BOLD)), Span::styled("you  ", muted)];
-                let mut lines = md::wrap(vec![Span::styled(text.trim().to_string(), Style::default().fg(t.fg))], width.saturating_sub(10), "", "");
-                if let Some(first) = lines.first_mut() {
-                    let mut spans = head;
-                    spans.append(&mut first.spans);
-                    *first = Line::from(spans);
-                }
-                for (n, l) in lines.into_iter().enumerate() {
-                    if n == 0 {
-                        out.push(l);
-                    } else {
-                        let mut spans = vec![Span::raw("       ")];
-                        spans.extend(l.spans);
-                        out.push(Line::from(spans));
-                    }
-                }
-                prev = Some("user");
-            }
-            Part::Mark { text } => {
-                gap(out, prev, "mark");
-                let side = "─".repeat(3);
-                out.push(Line::from(Span::styled(format!("  {side} {text} {side}"), muted)));
-                prev = Some("mark");
+            h.finish()
+        });
+        if let (Some(c), Some(k)) = (cache.as_deref(), key) {
+            if let Some((_, b)) = c.get(&i).filter(|(was, _)| *was == k) {
+                blocks.push(b.clone());
+                i = end;
+                continue;
             }
         }
+        let b = draw_block(parts, i, end, first, width, t, v);
+        if let (Some(c), Some(k)) = (cache.as_deref_mut(), key) {
+            c.insert(i, (k, b.clone()));
+        }
+        blocks.push(b);
+        i = end;
     }
+    blocks
+}
+
+fn running(t: &Tool) -> bool {
+    t.status == "running" || t.children.iter().any(running)
+}
+
+/// Thinking that isn't shown (collapsed, and not what it's doing right now).
+fn hidden_thinking(parts: &[Part], i: usize, v: &View) -> bool {
+    matches!(parts[i], Part::Thinking { .. }) && !v.expanded && !(v.live && i + 1 == parts.len())
+}
+
+/// A run of look-ups starts here (drawn as one line until ctrl+o or a click opens it).
+fn lookup_run(tool: &Tool, v: &View) -> bool {
+    is_lookup(tool) && !v.expanded && !v.open.contains(&tool.id)
+}
+
+/// The block starting at part `i`: where it ends, whether it draws anything, and whether it animates.
+fn extent(parts: &[Part], i: usize, v: &View) -> (usize, bool, bool) {
+    match &parts[i] {
+        Part::Text { text } => (i + 1, !text.trim().is_empty(), false),
+        Part::Tool(tool) if lookup_run(tool, v) => {
+            let (mut j, mut live) = (i, false);
+            while j < parts.len() {
+                match &parts[j] {
+                    Part::Tool(x) if is_lookup(x) => live |= running(x),
+                    _ if hidden_thinking(parts, j, v) => {}
+                    _ => break,
+                }
+                j += 1;
+            }
+            (j, true, live)
+        }
+        Part::Thinking { .. } => {
+            let live_last = v.live && i + 1 == parts.len();
+            (i + 1, v.expanded || live_last, live_last)
+        }
+        Part::Tool(tool) => (i + 1, true, v.live && running(tool)),
+        Part::Todos { items } => (i + 1, !items.is_empty(), false),
+        Part::User { .. } | Part::Mark { .. } => (i + 1, true, false),
+    }
+}
+
+/// Everything that changes how a part draws (cheap: a call's output is counted, not read).
+fn fingerprint(p: &Part, v: &View, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    fn tool(t: &Tool, v: &View, h: &mut impl std::hash::Hasher) {
+        (&t.id, &t.name, &t.label, &t.target, &t.status, t.ms, &t.summary, &t.parent, v.open.contains(&t.id)).hash(h);
+        (t.body.len(), t.body.first(), t.body.last(), t.children.len()).hash(h);
+        for c in &t.children {
+            tool(c, v, h);
+        }
+    }
+    match p {
+        Part::Text { text } => (0u8, text).hash(h),
+        Part::Thinking { text, tokens } => (1u8, text.len(), tokens).hash(h),
+        Part::Tool(t) => {
+            2u8.hash(h);
+            tool(t, v, h);
+        }
+        Part::Todos { items } => {
+            3u8.hash(h);
+            for it in items {
+                (&it.text, &it.active, &it.status).hash(h);
+            }
+        }
+        Part::User { text } => (4u8, text).hash(h),
+        Part::Mark { text } => (5u8, text).hash(h),
+    }
+}
+
+/// Draw parts [i, end) as one block, with a blank line first unless it's the reply's first (like Claude Code).
+fn draw_block(parts: &[Part], i: usize, end: usize, first: bool, width: usize, t: &Theme, v: &View) -> Block {
+    let muted = Style::default().fg(t.muted);
+    let mut out: Vec<Line<'static>> = vec![];
+    let mut hits: Vec<(usize, Hit)> = vec![];
+    if !first {
+        out.push(Line::raw(""));
+    }
+    match &parts[i] {
+        Part::Text { text } => {
+            let (mut lines, codes) = md::render_full(text.trim(), width.saturating_sub(1), "  ", t);
+            bullet(&mut lines, Style::default().fg(t.fg));
+            let off = out.len();
+            hits.extend(codes.into_iter().map(|(n, c)| (n + off, Hit::Code(c))));
+            out.extend(lines);
+        }
+        Part::Tool(tool) if lookup_run(tool, v) => {
+            let run: Vec<&Tool> = parts[i..end].iter().filter_map(|p| if let Part::Tool(x) = p { Some(x) } else { None }).collect();
+            hits.push((out.len(), Hit::Tool(tool.id.clone())));
+            out.push(lookup_line(&run, t, v));
+        }
+        Part::Thinking { text, tokens } => {
+            let live_last = v.live && i + 1 == parts.len();
+            let toks = if *tokens > 0 { format!(" · ~{} tokens", agent::human_tokens(*tokens)) } else { String::new() };
+            let (word, style) = if live_last { ("Thinking…", Style::default().fg(t.shine).add_modifier(Modifier::ITALIC)) } else { ("Thought", muted.add_modifier(Modifier::ITALIC)) };
+            out.push(Line::from(vec![Span::styled("  ◇ ", Style::default().fg(t.shine)), Span::styled(word, style), Span::styled(toks, muted)]));
+            if v.expanded && !text.trim().is_empty() {
+                out.extend(md::wrap(vec![Span::styled(text.trim().to_string(), muted.add_modifier(Modifier::ITALIC))], width.saturating_sub(1), "    ", "    "));
+            } else if live_last && !text.trim().is_empty() {
+                // what it's thinking right now: the last few lines, like watching it think
+                let lines = md::wrap(vec![Span::styled(text.trim().to_string(), muted.add_modifier(Modifier::ITALIC))], width.saturating_sub(1), "    ", "    ");
+                let skip = lines.len().saturating_sub(3);
+                out.extend(lines.into_iter().skip(skip));
+            }
+        }
+        Part::Tool(tool) => {
+            let mut th = vec![];
+            tool_lines(tool, 0, width, t, v, &mut out, &mut th);
+            hits.extend(th.into_iter().map(|(n, id)| (n, Hit::Tool(id))));
+        }
+        Part::Todos { items } => todo_lines(items, width, t, v.time, &mut out),
+        Part::User { text } => {
+            // "❯ you  also fix the tests": what you sent while it worked, where it read it
+            let head = vec![Span::styled("  ❯ ", Style::default().fg(t.user).add_modifier(Modifier::BOLD)), Span::styled("you  ", muted)];
+            let mut lines = md::wrap(vec![Span::styled(text.trim().to_string(), Style::default().fg(t.fg))], width.saturating_sub(10), "", "");
+            if let Some(first) = lines.first_mut() {
+                let mut spans = head;
+                spans.append(&mut first.spans);
+                *first = Line::from(spans);
+            }
+            for (n, l) in lines.into_iter().enumerate() {
+                if n == 0 {
+                    out.push(l);
+                } else {
+                    let mut spans = vec![Span::raw("       ")];
+                    spans.extend(l.spans);
+                    out.push(Line::from(spans));
+                }
+            }
+        }
+        Part::Mark { text } => {
+            let side = "─".repeat(3);
+            out.push(Line::from(Span::styled(format!("  {side} {text} {side}"), muted)));
+        }
+    }
+    Block { lines: Rc::new(out), hits: Rc::new(hits) }
 }
 
 #[cfg(test)]
