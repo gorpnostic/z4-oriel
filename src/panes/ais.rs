@@ -16,6 +16,8 @@ mod catalog;
 mod draw;
 mod limits;
 mod ollama;
+#[cfg(test)]
+pub(crate) mod qa_keys;
 mod saver;
 #[cfg(test)]
 mod tests;

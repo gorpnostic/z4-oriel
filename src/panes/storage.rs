@@ -10,6 +10,8 @@
 
 mod catalog;
 mod draw;
+#[cfg(test)]
+mod qa_keys;
 mod scan;
 mod sys;
 #[cfg(test)]

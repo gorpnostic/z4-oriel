@@ -5,6 +5,8 @@
 mod cover;
 mod engine;
 mod library;
+#[cfg(test)]
+pub(crate) mod qa_keys;
 
 use crate::pane::{Cx, Pane, Waker};
 use crate::theme::Theme;

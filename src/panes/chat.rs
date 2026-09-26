@@ -7,6 +7,8 @@ mod agent;
 pub mod approve;
 mod md;
 pub mod providers;
+#[cfg(test)]
+mod qa_keys;
 mod store;
 
 /// A diff line's background for a theme (line tint, changed-word tint): the themes app previews with it.

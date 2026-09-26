@@ -1692,6 +1692,9 @@ fn watch_omarchy(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
 }
 
 #[cfg(test)]
+mod qa_keys;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
