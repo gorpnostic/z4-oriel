@@ -358,6 +358,59 @@ fn settings_theme_previews_live() {
     key(&mut k, &mut p, KeyCode::Up);
     key(&mut k, &mut p, KeyCode::Enter);
     assert!(k.actions.iter().any(|a| matches!(a, Action::Palette(q) if q == "theme ")));
+    // a preview the app ended (you went to another app) leaves nothing to keep or go back to
+    k.actions.clear();
+    key(&mut k, &mut p, KeyCode::Right);
+    k.theme = crate::theme::get(&k.config.theme);
+    let s = show(&mut k, &mut p);
+    assert!(!s.contains("(preview)") && p.preview.is_none(), "{s}");
+}
+
+/// config.toml with a typo: a banner says where; a change still applies, but says it isn't saved (the app writes
+/// nothing over the file until it reads again).
+#[test]
+fn settings_says_when_config_toml_is_broken() {
+    let mut k = kit();
+    let mut p = Settings::new(&k.config);
+    crate::config::set_broken(Some("config.toml line 2: invalid string".into()));
+    let s = at(&mut k, &mut p, "update_check");
+    k.render_html(&mut p, 160, 30, "target/snap/settings-broken.html");
+    assert!(s.contains("⚠ config.toml line 2: invalid string") && s.contains("o opens the file"), "{s}");
+    key(&mut k, &mut p, KeyCode::Char(' '));
+    assert_eq!(k.apply_config(&mut p), 1, "it holds for now");
+    let s = show(&mut k, &mut p);
+    assert!(s.contains("not saved") && !s.contains("check for updates saved"), "{s}");
+    crate::config::set_broken(None);
+    assert!(!show(&mut k, &mut p).contains("o opens the file"), "fixed: the banner goes");
+}
+
+/// Any size draws (a thin split, a short window), in every section, mid-edit and mid-search.
+#[test]
+fn settings_small_sizes() {
+    let mut k = kit();
+    k.config.music.folders = vec!["/no/such/music".into()];
+    let mut p = Settings::new(&k.config);
+    let sizes = [(1, 1), (6, 2), (20, 4), (40, 8), (70, 12), (111, 9), (112, 5), (200, 3)];
+    for i in 0..CATS.len() {
+        p.set_cat(i, &mut Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut vec![], focused: true, time: 1.0 });
+        for (w, h) in sizes {
+            k.render(&mut p, w, h);
+            k.render_side(&mut p, w, h);
+        }
+    }
+    for state in ["ai.anthropic_key", "prefix", "music.folders"] {
+        jump(state);
+        show(&mut k, &mut p);
+        key(&mut k, &mut p, KeyCode::Enter);
+        for (w, h) in sizes {
+            k.render(&mut p, w, h);
+        }
+        key(&mut k, &mut p, KeyCode::Esc);
+    }
+    jump("zzz nothing");
+    for (w, h) in sizes {
+        k.render(&mut p, w, h);
+    }
 }
 
 #[test]

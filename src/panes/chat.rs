@@ -51,7 +51,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/next", "", "music: next song"),
     ("/prev", "", "music: previous song"),
     ("/music", "", "go to the music app"),
-    ("/sidebar", "", "hide / show the sidebar"),
+    ("/sidebar", "", "hide / show the sidebar — remembered"),
     ("/icons", "", "nerd font icons on / off — remembered"),
     ("/settings", "[setting]", "every setting in one place (alt ,) · /settings perms opens that one"),
     ("/info", "", "what's running: AI, model, folder"),
@@ -694,17 +694,22 @@ impl Chat {
                 }
             }
             // /perms default <mode>: where every new chat starts (saved); /perms <mode>: just this chat
-            "/perms" if arg.to_lowercase().starts_with("default ") => match norm_perms(&arg[8..]) {
-                Some(p) => {
-                    self.default_perms = p.to_string();
-                    if self.chat.messages.is_empty() {
-                        self.perms = p.to_string();
+            // (a bare "/perms default" says where they start: it isn't "ask", the way Claude Code names that mode)
+            "/perms" if arg.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("default")) => {
+                let mode = arg.get(7..).unwrap_or("").trim();
+                match norm_perms(mode) {
+                    Some(p) => {
+                        self.default_perms = p.to_string();
+                        if self.chat.messages.is_empty() {
+                            self.perms = p.to_string();
+                        }
+                        cx.edit_config(move |c| c.ai.perms = p.to_string());
+                        cx.notify(format!("new chats start in {p} · saved (settings › AI chat has it too)"));
                     }
-                    cx.edit_config(move |c| c.ai.perms = p.to_string());
-                    cx.notify(format!("new chats start in {p} · saved (settings › AI chat has it too)"));
+                    None if mode.is_empty() => self.info.push(format!("new chats start in {} · /perms default <ask|edits|auto|plan|bypass> changes it", self.default_perms)),
+                    None => self.info.push(format!("no mode called {mode} — ask · edits · auto · plan · bypass")),
                 }
-                None => self.info.push(format!("no mode called {} — ask · edits · auto · plan · bypass", arg[8..].trim())),
-            },
+            }
             "/perms" => match norm_perms(&arg) {
                 Some(p) => {
                     self.perms = p.to_string();
@@ -2108,6 +2113,11 @@ mod tests {
         assert_eq!(c.perms, "bypass", "a new chat starts from the default");
         assert_eq!(run_cmd(&mut k, &mut c, "/perms default ask"), 1);
         assert_eq!(k.config.ai.perms, "ask");
+        // a bare /perms default says where new chats start, and changes nothing
+        run_cmd(&mut k, &mut c, "/perms plan");
+        assert_eq!(run_cmd(&mut k, &mut c, "/perms Default"), 0);
+        assert!(c.info.iter().any(|l| l.contains("new chats start in ask")), "{:?}", c.info);
+        assert_eq!(c.perms, "plan", "not taken as ask");
         // a chat that was open all along follows (its empty chat switches AI too) ...
         let mut before = Chat::new(&crate::config::Config::default());
         before.avail = vec!["claude", "codex"];

@@ -313,12 +313,14 @@ impl Onboard {
     pub fn new(theme_now: &str, cfg: &crate::config::Config) -> Onboard {
         use crate::panes::chat::providers;
         let themes = theme::names();
-        let avail = providers::available(&cfg.ai);
+        // tests never probe this machine for AIs (TCP) or read its audio-player library
+        let avail = if cfg!(test) { vec![] } else { providers::available(&cfg.ai) };
         let ais = providers::PROVIDERS.iter().map(|p| (p.1, avail.contains(&p.0))).collect();
         let music_default = cfg.music.folders.first().cloned().unwrap_or_else(|| dirs::audio_dir().map(|d| d.to_string_lossy().to_string()).unwrap_or_default());
         let notes_default = if cfg.notes_folder.is_empty() { crate::config::data_dir().join("notes").to_string_lossy().to_string() } else { cfg.notes_folder.clone() };
         // the audio-player app (Windows): its library is picked up automatically
         let audio_player = std::env::var_os("APPDATA")
+            .filter(|_| !cfg!(test))
             .map(|a| std::path::PathBuf::from(a).join("audio-player").join("library.json"))
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())

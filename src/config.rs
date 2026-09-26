@@ -342,6 +342,20 @@ pub fn update_at(path: &Path, current: &Config, f: impl FnOnce(&mut Config)) -> 
     }
 }
 
+thread_local! {
+    /// Why config.toml isn't being saved (it doesn't parse: the message says which line), while that lasts. The
+    /// app sets it; the settings app shows it as a banner. The UI is one thread; thread-local keeps tests apart.
+    static BROKEN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn broken() -> Option<String> {
+    BROKEN.with(|b| b.borrow().clone())
+}
+
+pub fn set_broken(e: Option<String>) {
+    BROKEN.with(|b| *b.borrow_mut() = e);
+}
+
 /// Where notes live: `notes_folder` (~ = your home folder), else oriel's data folder. The notes app and chat's
 /// /note both use this.
 pub fn notes_dir(c: &Config) -> PathBuf {

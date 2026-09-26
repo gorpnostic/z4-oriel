@@ -82,7 +82,7 @@ impl Pane for Home {
         }
         y += rows * 2 + 1;
         // bindings
-        let pre = cx.config.prefix.replace("ctrl+", "ctrl-");
+        let pre = crate::config::prefix(cx.config).replace("ctrl+", "ctrl-"); // the one in effect
         let lines = vec![
             Line::from([ui::key_hint("alt ←↑↓→", "move", t), ui::key_hint("alt n", "new terminal", t), ui::key_hint("alt p", "palette", t)].concat()),
             Line::from([ui::key_hint("alt 1-9", "tabs", t), ui::key_hint("alt t", "new tab", t), ui::key_hint("alt z", "zoom", t), ui::key_hint("alt w", "close", t)].concat()),

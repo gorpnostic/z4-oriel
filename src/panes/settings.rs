@@ -495,7 +495,18 @@ impl Settings {
         let label = r.label.clone();
         let when = r.when;
         cx.edit_config(move |c| set(c, &v));
-        self.msg = Some((format!("{label} saved · applies {}", when.applies()), false));
+        self.msg = Some(match crate::config::broken() {
+            // config.toml has a typo: the app applies it for now and writes nothing (the banner says where)
+            Some(_) => (format!("{label}: changed until oriel closes, not saved (config.toml doesn't read)"), true),
+            None => (format!("{label} saved · applies {}", when.applies()), false),
+        });
+    }
+
+    /// A closer word on what a commit did, unless it couldn't be saved (then commit's message stays).
+    fn after_commit(&mut self, s: String) {
+        if crate::config::broken().is_none() {
+            self.msg = Some((s, false));
+        }
     }
 
     /// A typed value, checked for what the row needs. Err = what's wrong (the box stays open).
@@ -558,7 +569,7 @@ impl Settings {
                         self.edit = None;
                         if let Some(r) = rows.iter().find(|r| r.id == "prefix") {
                             self.commit(r, spec.clone(), cx);
-                            self.msg = Some((format!("prefix key: {spec} · works now"), false));
+                            self.after_commit(format!("prefix key: {spec} · works now"));
                         }
                     }
                     Err(e) => *err = Some(format!("{e}: pick another")),
@@ -605,7 +616,7 @@ impl Settings {
                                 let secret = matches!(r.ctl, Ctl::Secret { .. });
                                 self.commit(r, v, cx);
                                 if secret {
-                                    self.msg = Some((format!("{} saved · it's in config.toml as plain text", r.label), false));
+                                    self.after_commit(format!("{} saved · it's in config.toml as plain text", r.label));
                                 }
                             }
                             Err(e) => *err = Some(e),
@@ -699,7 +710,6 @@ impl Settings {
             _ => String::new(),
         }
     }
-
 }
 
 /// Does a row match what you're looking for (its name, key, id, description or section)?
@@ -898,7 +908,7 @@ impl Settings {
                     let gone = list.remove(n);
                     let text = list.join("\n");
                     self.commit(r, text, cx);
-                    self.msg = Some((format!("removed {gone}"), false));
+                    self.after_commit(format!("removed {gone}"));
                 }
                 return true;
             }
@@ -930,7 +940,7 @@ impl Settings {
             if r.is_setting() && val != def {
                 self.end_preview(cx);
                 self.commit(r, def, cx);
-                self.msg = Some((format!("{} is back to its default", r.label), false));
+                self.after_commit(format!("{} is back to its default", r.label));
             }
             return r.is_setting();
         }
@@ -970,7 +980,7 @@ impl Settings {
                 Some(_) => {
                     let v = self.theme_now.clone();
                     self.commit(r, v.clone(), cx);
-                    self.msg = Some((format!("theme: {v} · saved"), false));
+                    self.after_commit(format!("theme: {v} · saved"));
                 }
                 // the palette's theme picker (live preview, search by name)
                 None => cx.act(Action::Palette("theme ".into())),
@@ -990,7 +1000,7 @@ impl Settings {
             Ctl::Secret { .. } if matches!(code, KeyCode::Char('x') | KeyCode::Delete) => {
                 if !val.is_empty() {
                     self.commit(r, String::new(), cx);
-                    self.msg = Some((format!("{} cleared", r.label), false));
+                    self.after_commit(format!("{} cleared", r.label));
                 }
             }
             Ctl::List if matches!(code, KeyCode::Enter | KeyCode::Char('a')) => {

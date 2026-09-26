@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
     let mut start = None;
     match args.first().map(String::as_str) {
         Some("-h" | "--help") => {
-            println!("{}", help(&cfg.prefix));
+            println!("{}", help(&config::prefix(&cfg)));
             return Ok(());
         }
         Some("-V" | "--version") => {
@@ -95,7 +95,7 @@ fn main() -> anyhow::Result<()> {
         Some(app) if panes::known(app) => start = Some(app.to_string()),
         Some(other) => {
             let what = if other.starts_with('-') { format!("unknown option {other}") } else { format!("no app called '{other}'") };
-            eprintln!("oriel: {what}\n\n{}", help(&cfg.prefix));
+            eprintln!("oriel: {what}\n\n{}", help(&config::prefix(&cfg)));
             std::process::exit(2);
         }
         None => {}

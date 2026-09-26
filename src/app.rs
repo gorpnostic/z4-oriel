@@ -144,6 +144,8 @@ pub struct App {
     notice: Option<(String, Instant)>,
     prefix_armed: bool,
     palette: Option<Palette>,
+    /// The pane showing a theme it hasn't saved (settings' live preview): only while it has the keyboard.
+    theme_preview: Option<PaneId>,
     quit: bool,
     start: Instant,
     last_tick: HashMap<PaneId, Instant>,
@@ -181,8 +183,6 @@ pub struct App {
     _config_watcher: Option<notify::RecommendedWatcher>,
     /// Where the config is read and written (see edit_config); None = memory only (tests).
     cfg_path: Option<std::path::PathBuf>,
-    /// config.toml doesn't parse (the message says which line): nothing is written until it does.
-    config_broken: Option<String>,
     /// config.toml changed on disk: re-read it at this point (editors write in two steps).
     config_reload_at: Option<Instant>,
     /// A newer version is out: shown at the bottom of the sidebar.
@@ -217,6 +217,7 @@ impl App {
             notice: None,
             prefix_armed: false,
             palette: None,
+            theme_preview: None,
             quit: false,
             start: Instant::now(),
             last_tick: HashMap::new(),
@@ -235,7 +236,6 @@ impl App {
             _theme_watcher: None,
             _config_watcher: None,
             cfg_path: if cfg!(test) { None } else { Some(config::path()) },
-            config_broken: None,
             config_reload_at: None,
             update_ready: None,
             term_focused: true,
@@ -295,7 +295,7 @@ impl App {
     /// is written over the file until it's fixed (it's re-read as soon as it is).
     pub fn config_error(&mut self, e: String) {
         self.notify(format!("⚠ {e} · running on defaults, and not saving over it"));
-        self.config_broken = Some(e);
+        config::set_broken(Some(e)); // nothing is written until it parses; settings shows why
     }
 
     fn add(&mut self, p: Box<dyn Pane>) -> PaneId {
@@ -492,6 +492,18 @@ impl App {
         }
     }
 
+    /// A theme settings is previewing lasts while settings has the keyboard: go to another app (or close it) and
+    /// the saved theme is back, the way closing the palette puts it back. Unsaved looks never linger.
+    fn end_left_preview(&mut self) {
+        let Some(id) = self.theme_preview else { return };
+        if self.theme.name == self.config.theme {
+            self.theme_preview = None; // kept (saved), or already back
+        } else if self.focused() != id {
+            self.theme_preview = None;
+            self.theme = theme::get(&self.config.theme);
+        }
+    }
+
     /// Nerd Font glyphs on or off, now and from the next start (palette, /icons, setup).
     fn set_icons(&mut self, nerd: bool) {
         ui::NERD.store(nerd, std::sync::atomic::Ordering::Relaxed);
@@ -513,10 +525,10 @@ impl App {
             }
         };
         match saved {
-            Ok(()) => self.config_broken = None,
+            Ok(()) => config::set_broken(None),
             Err(e) => {
                 self.notify(format!("⚠ not saved: {e}"));
-                self.config_broken = Some(e);
+                config::set_broken(Some(e));
             }
         }
         self.set_config(c);
@@ -547,7 +559,8 @@ impl App {
         let Some(p) = &self.cfg_path else { return };
         match config::load_from(p) {
             Ok(c) => {
-                if self.config_broken.take().is_some() {
+                if config::broken().is_some() {
+                    config::set_broken(None);
                     self.notify("✓ config.toml reads fine again: settings loaded");
                 }
                 if c == self.config {
@@ -556,10 +569,10 @@ impl App {
                 self.set_config(c);
             }
             Err(e) => {
-                if self.config_broken.as_ref() != Some(&e) {
+                if config::broken().as_ref() != Some(&e) {
                     self.notify(format!("⚠ {e} · keeping the settings you had, and not saving over it"));
                 }
-                self.config_broken = Some(e);
+                config::set_broken(Some(e));
             }
         }
     }
@@ -782,7 +795,10 @@ impl App {
                         self.notify(format!("⚠ {p}"));
                     }
                 }
-                Action::PreviewTheme(t) => self.set_theme(&t, false),
+                Action::PreviewTheme(t) => {
+                    self.set_theme(&t, false);
+                    self.theme_preview = Some(from);
+                }
                 Action::Config(f) => self.edit_config(f),
                 Action::Palette(q) => {
                     self.open_palette();
@@ -1452,6 +1468,7 @@ impl App {
 
     // ------------------------------------------------------------------ draw
     fn draw(&mut self, f: &mut Frame) {
+        self.end_left_preview();
         let area = f.area();
         let t = self.theme.clone();
         if !matches!(t.bg, ratatui::style::Color::Reset) {
@@ -2164,7 +2181,7 @@ mod tests {
         let broken = "theme = \"dracula\"\nprefix = ctrl+b\n[ai]\nperms = \"plan\"\n";
         std::fs::write(&p, broken).unwrap();
         app.reload_config();
-        assert!(app.config_broken.as_deref().is_some_and(|e| e.contains("line 2")));
+        assert!(config::broken().as_deref().is_some_and(|e| e.contains("line 2")));
         assert!(app.notice.as_ref().unwrap().0.contains("line 2"));
         app.run_cmd(Cmd::Theme("ocean".into()));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), broken, "never written over");
@@ -2173,7 +2190,7 @@ mod tests {
         // fixed: picked up, and saving works again
         std::fs::write(&p, "theme = \"dracula\"\nprefix = \"ctrl+b\"\n").unwrap();
         app.reload_config();
-        assert!(app.config_broken.is_none() && app.config.prefix == "ctrl+b");
+        assert!(config::broken().is_none() && app.config.prefix == "ctrl+b");
         assert!(app.notice.as_ref().unwrap().0.contains("reads fine again"));
     }
 
@@ -2216,6 +2233,12 @@ mod tests {
         app.apply(settings, vec![Action::PreviewTheme("ocean".into())]);
         assert_eq!(app.theme.name, "ocean");
         assert_eq!(config::load_from(&p).unwrap().theme, "oriel");
+        term.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.theme.name, "ocean", "still previewing while settings has the keyboard");
+        // ... and going to another app mid-preview puts the saved one back (nothing unsaved lingers)
+        app.goto_app("files");
+        term.draw(|f| app.draw(f)).unwrap();
+        assert_eq!((app.theme.name.as_str(), app.theme_preview), ("oriel", None));
         // a bare-key prefix from a hand edit can't eat every b typed: ctrl+space then
         app.config.prefix = "b".into();
         assert!(!app.is_prefix(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)));

@@ -10,6 +10,9 @@ impl Settings {
         self.start(cx);
         self.pump();
         self.theme_now = cx.theme.name.clone();
+        if self.preview.as_deref() == Some(self.theme_now.as_str()) {
+            self.preview = None; // the app put the saved theme back (you went elsewhere mid-preview)
+        }
         let t = cx.theme;
         let cfg = cx.config;
         self.count_songs(cfg);
@@ -34,6 +37,11 @@ impl Settings {
         let mut head = head;
         head.push(Span::styled(if changed > 0 { format!("   ● {changed} changed from the default · saved as you go") } else { "   saved as you go".into() }, ui::muted(t)));
         f.render_widget(Paragraph::new(Line::from(head)), Rect { y: body.y, height: 1, ..body });
+        // ---- config.toml doesn't parse: say where, and that nothing is saved until it does
+        if let (Some(e), true) = (crate::config::broken(), body.height > 1) {
+            let banner = format!("⚠ {e} · changes hold until oriel closes, nothing is saved · o opens the file");
+            f.render_widget(Paragraph::new(Span::styled(ui::fit(&banner, body.width as usize), Style::default().fg(t.danger).add_modifier(Modifier::BOLD))), Rect { y: body.y + 1, height: 1, ..body });
+        }
         // ---- the list, and the panel beside (or under) it
         let wide = body.width >= 112;
         let list_w = if wide { body.width - (body.width / 3).clamp(44, 60) - 2 } else { body.width };
@@ -204,7 +212,7 @@ impl Settings {
                     extra.push(note("using defaults from what's installed: any edit makes it your own".into()));
                 }
                 for w in &cfg.roster {
-                    extra.push(note(format!("{} {} · {} · {}{}", if w.enabled { "●" } else { "○" }, w.name, w.agent, if w.model.is_empty() { "default" } else { &w.model }, format!(" · {}", w.tier))));
+                    extra.push(note(format!("{} {} · {} · {} · {}", if w.enabled { "●" } else { "○" }, w.name, w.agent, if w.model.is_empty() { "default" } else { &w.model }, w.tier)));
                 }
             }
             "tools.config" => extra.push(note("c copies the path".into())),
