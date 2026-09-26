@@ -485,6 +485,7 @@ impl Chat {
     fn new_chat(&mut self) {
         self.stop();
         self.persist_if_changed();
+        self.draft = false; // a session carried on but never answered is let go
         let p = self.provider_of();
         self.chat = store::Chat::new(&p);
         self.chat.model = self.models.get(&p).cloned().filter(|m| !m.is_empty());
@@ -502,6 +503,7 @@ impl Chat {
         self.stop();
         self.persist_if_changed();
         let Some(c) = self.chats.iter().find(|c| c.id == id).cloned() else { return };
+        self.draft = false;
         self.chat = c;
         self.cache.clear();
         self.scroll = 0;
@@ -675,7 +677,6 @@ impl Chat {
             self.enqueue(text);
             return;
         }
-        self.draft = false;
         if self.chat.messages.is_empty() {
             self.chat.title = store::title_from(&text);
             if self.chat.cwd.is_none() {
@@ -688,6 +689,7 @@ impl Chat {
 
     /// Ask the provider for a reply to the conversation as it stands (last message = the user's).
     fn start_reply(&mut self, cx: &mut Cx) {
+        self.draft = false; // you've said something (or regenerated): it's a chat of yours now
         let provider = self.provider_of();
         let messages: Vec<(String, String)> = self.chat.messages.iter().map(|m| (m.role.clone(), m.content.clone())).collect();
         self.chat.messages.push(store::Msg { role: "assistant".into(), model: Some(provider.clone()), ..Default::default() });
@@ -2260,6 +2262,30 @@ mod tests {
         assert!(side.contains("app only") && side.contains("login work") && side.contains("older login") && !side.contains("docs"), "{side}");
         k.key_mod(&mut c, KeyCode::Char('f'), KeyModifiers::CONTROL);
         assert!(k.render_side(&mut c, 34, 20).contains("docs"));
+    }
+
+    /// A session carried on from the search app stays a draft only until you leave it: the chat you open next
+    /// saves as usual again.
+    #[test]
+    fn chat_resumed_draft_is_let_go() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        let mut other = store::Chat::new("claude");
+        other.id = "other".into();
+        other.messages.push(store::Msg { role: "user".into(), content: "hello".into(), ..Default::default() });
+        c.chats = vec![other];
+        let mut s = store::Chat::new("claude");
+        s.messages.push(store::Msg { role: "user".into(), content: "from elsewhere".into(), ..Default::default() });
+        request_open(Open::Resume(s, "carrying on".into()));
+        k.render(&mut c, 100, 24);
+        assert!(c.draft && c.info == ["carrying on"]);
+        c.open_chat(0);
+        assert!(!c.draft && c.chat.id == "other", "the draft went; this chat is yours");
+        request_open(Open::Resume(store::Chat::new("claude"), "again".into()));
+        k.render(&mut c, 100, 24);
+        assert!(c.draft);
+        c.new_chat();
+        assert!(!c.draft);
     }
 
     /// The search app's reader: the chat's renderer with no composer, keys only scroll.

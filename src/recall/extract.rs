@@ -321,9 +321,11 @@ pub fn claude(path: &Path) -> Option<Doc> {
                         "tool_use" => {
                             let name = b["name"].as_str().unwrap_or("");
                             if let Some((label, target)) = crate::panes::chat::tool_brief(name, &b["input"], Path::new(&d.cwd)) {
+                                let n = d.turns.len();
                                 d.push(Kind::Tool, t, &format!("{label}\t{target}"));
-                                if let Some(id) = b["id"].as_str() {
-                                    calls.insert(id.to_string(), d.turns.len() - 1);
+                                // (a call that cleans to nothing isn't kept, so there's no turn to point at)
+                                if let Some(id) = b["id"].as_str().filter(|_| d.turns.len() > n) {
+                                    calls.insert(id.to_string(), n);
                                 }
                             }
                         }

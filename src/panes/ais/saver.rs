@@ -346,14 +346,22 @@ pub fn plan_claude(paths: &Paths, p: &Preset) -> Result<Plan, String> {
 /// How long `h` asks Claude Code to keep session transcripts (its own default is 30 days).
 pub const KEEP_DAYS: i64 = 365;
 
+/// cleanupPeriodDays as a number of days (written as 400 or 400.0).
+fn days(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+}
+
 /// Keep Claude Code's session transcripts for a year instead of a month (`cleanupPeriodDays`). A higher setting
 /// already in place is left alone (the plan then changes nothing).
 pub fn plan_history(paths: &Paths) -> Result<Plan, String> {
     let target = paths.claude_settings();
     let original = std::fs::read_to_string(&target).ok();
-    let cur = original.as_deref().and_then(|t| serde_json::from_str::<Value>(t).ok()).and_then(|v| v.get("cleanupPeriodDays").and_then(|d| d.as_i64()));
+    let had = original.as_deref().and_then(|t| serde_json::from_str::<Value>(t).ok()).and_then(|v| v.get("cleanupPeriodDays").cloned());
+    let cur = had.as_ref().and_then(days);
     let want = cur.filter(|d| *d >= KEEP_DAYS).unwrap_or(KEEP_DAYS);
-    let (new_text, diff) = edit_settings(original.as_deref(), &[("cleanupPeriodDays", Some(json!(want)))], &[])?;
+    // a longer setting is written back as it was (400.0 stays 400.0), so the plan changes nothing
+    let set = had.filter(|_| cur.is_some_and(|d| d >= KEEP_DAYS)).unwrap_or(json!(KEEP_DAYS));
+    let (new_text, diff) = edit_settings(original.as_deref(), &[("cleanupPeriodDays", Some(set))], &[])?;
     Ok(Plan {
         title: "keep Claude Code's history for a year?".into(),
         target,
@@ -563,7 +571,7 @@ pub fn readouts(paths: &Paths) -> Readouts {
             }
         }
         r.status_line = s.get("statusLine").map(|sl| sl.get("command").and_then(|c| c.as_str()).map(String::from).unwrap_or_else(|| sl.to_string()));
-        r.history_days = s.get("cleanupPeriodDays").and_then(|d| d.as_i64());
+        r.history_days = s.get("cleanupPeriodDays").and_then(days);
         r.matches = PRESETS.iter().find(|p| preset_matches(p, &obj, &env)).map(|p| p.name);
     }
     names.sort();
@@ -643,6 +651,9 @@ mod tests {
         assert!(plan_history(&paths).unwrap().diff.iter().all(|d| d.0 == ' '), "already set: nothing to change");
         std::fs::write(paths.claude_settings(), "{ \"cleanupPeriodDays\": 1000 }").unwrap();
         assert!(plan_history(&paths).unwrap().diff.iter().all(|d| d.0 == ' '), "longer than a year: left alone");
+        std::fs::write(paths.claude_settings(), "{ \"cleanupPeriodDays\": 1000.0 }").unwrap();
+        assert!(plan_history(&paths).unwrap().diff.iter().all(|d| d.0 == ' '), "written as a float, still longer");
+        assert_eq!(readouts(&paths).history_days, Some(1000));
     }
 
     #[test]

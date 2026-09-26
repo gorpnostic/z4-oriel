@@ -549,8 +549,7 @@ mod tests {
         let mut h = Help::new();
         assert_eq!(h.title(), "help · chat");
         let s = k.render_html(&mut h, 120, 30, "target/snap/help-search.html");
-        assert!(s.contains("search every AI session (alt r)") && !s.contains("talking to an AI"), "scrolled down to it
-{s}");
+        assert!(s.contains("search every AI session (alt r)") && !s.contains("talking to an AI"), "scrolled down to it\n{s}");
         assert!(s.contains("p:<project>") && s.contains("attach the part that matched"), "{s}");
         // later draws scroll freely again
         for _ in 0..10 {

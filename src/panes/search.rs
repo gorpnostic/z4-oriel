@@ -262,9 +262,12 @@ impl Search {
 
     /// Add a filter to the query, or take it out again (a sidebar click).
     fn toggle(&mut self, prefix: &str, value: &str) {
-        let want = format!("{prefix}{value}").to_lowercase();
-        let had = self.query.split_whitespace().any(|w| w.to_lowercase() == want);
-        let mut words: Vec<String> = self.query.split_whitespace().filter(|w| !w.to_lowercase().starts_with(prefix)).map(String::from).collect();
+        // a project folder can have a space in its name: p:"my project"
+        let value = value.to_ascii_lowercase();
+        let want = if value.contains(char::is_whitespace) { format!("{prefix}\"{value}\"") } else { format!("{prefix}{value}") };
+        let old = recall::words(&self.query);
+        let had = old.iter().any(|w| w.to_ascii_lowercase() == want);
+        let mut words: Vec<String> = old.iter().filter(|w| !w.to_ascii_lowercase().starts_with(prefix)).map(|w| w.to_string()).collect();
         if !had {
             words.push(want);
         }
@@ -686,7 +689,7 @@ impl Pane for Search {
         } else {
             "…".into()
         };
-        let rw = right.chars().count() as u16;
+        let rw = (right.chars().count() as u16).min(area.width / 2); // a narrow split keeps the box
         let typing = !self.in_list;
         let mut line = vec![Span::styled("› ", ui::bold_accent(t))];
         if self.query.is_empty() && typing {
@@ -868,7 +871,7 @@ impl Pane for Search {
             y += 1;
             head(f, &mut y, "projects");
             for (p, n) in &s.projects {
-                let on = q.project.as_deref() == Some(p.to_lowercase().as_str());
+                let on = q.project.as_deref() == Some(p.to_ascii_lowercase().as_str());
                 row(f, &mut y, p.clone(), n.to_string(), on, Some(SideHit::Project(p.clone())));
             }
         }

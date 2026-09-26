@@ -197,3 +197,40 @@ fn search_answers_before_the_index_pass() {
     drop(req_tx);
     assert_eq!(order, vec!["known 4", "results 1: 1", "indexed 4", "results 1: 1"], "the sidebar and the answer first");
 }
+
+/// Every size draws without a panic: the results, the reader and the sidebar, down to a sliver of a split.
+#[test]
+fn search_draws_at_any_size() {
+    let mut k = Kit::new();
+    let (mut s, _env) = app(&mut k, "sizes");
+    typ(&mut k, &mut s, "retry");
+    for (w, h) in [(1, 1), (2, 3), (8, 4), (12, 5), (20, 6), (30, 8), (200, 60)] {
+        k.render(&mut s, w, h);
+        k.render_side(&mut s, w, h);
+    }
+    let narrow = k.render(&mut s, 20, 12);
+    assert!(narrow.contains("› retry"), "the box keeps room for what you typed\n{narrow}");
+    k.key(&mut s, KeyCode::Enter);
+    assert!(s.viewer.is_some());
+    for (w, h) in [(1, 1), (3, 2), (10, 6), (40, 10)] {
+        k.render(&mut s, w, h);
+    }
+}
+
+/// A sidebar click on a project whose folder name has a space filters by the whole name, and a second click
+/// takes it off again.
+#[test]
+fn search_project_with_a_space() {
+    let mut k = Kit::new();
+    let (mut s, _env) = app(&mut k, "space");
+    s.query = "flaky".into();
+    s.toggle("p:", "My App");
+    assert_eq!(s.query, "flaky p:\"my app\"");
+    let q = Query::parse(&s.query);
+    assert_eq!((q.project.as_deref(), q.terms), (Some("my app"), vec!["flaky".to_string()]));
+    s.toggle("p:", "My App");
+    assert_eq!(s.query, "flaky");
+    s.toggle("p:", "demo");
+    s.toggle("p:", "My App");
+    assert_eq!(s.query, "flaky p:\"my app\"", "another project replaces the first");
+}

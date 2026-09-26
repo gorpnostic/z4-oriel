@@ -231,7 +231,12 @@ fn discover(env: &Env) -> Vec<(Src, PathBuf, String)> {
         match known.get(&norm(path)) {
             Some(&i) => out[i].2 = title.to_string(),
             None if Path::new(path).is_file() => {
-                let src = if path.contains("rollout-") { Src::Codex } else { Src::Claude };
+                let src = match t["agent"].as_str() {
+                    Some("codex") => Src::Codex,
+                    Some("kimi") => Src::Kimi,
+                    _ if path.contains("rollout-") => Src::Codex,
+                    _ => Src::Claude,
+                };
                 out.push((src, PathBuf::from(path), title.to_string()));
             }
             None => {}
@@ -387,37 +392,45 @@ pub struct Query {
     pub bad: Vec<String>,
 }
 
+/// A query's words: a "quoted phrase", or a filter with a quoted value (p:"my project"), counts as one.
+pub fn words(s: &str) -> Vec<&str> {
+    let mut out = vec![];
+    let mut rest = s.trim_start();
+    while !rest.is_empty() {
+        let quoted = if rest.starts_with('"') { Some(1) } else { rest.find(":\"").filter(|&c| !rest[..c].contains(char::is_whitespace)).map(|c| c + 2) };
+        let end = match quoted {
+            Some(q) => rest[q..].find('"').map(|e| q + e + 1).unwrap_or(rest.len()),
+            None => rest.find(char::is_whitespace).unwrap_or(rest.len()),
+        };
+        out.push(&rest[..end]);
+        rest = rest[end..].trim_start();
+    }
+    out
+}
+
 impl Query {
     pub fn parse(s: &str) -> Query {
         let mut q = Query::default();
-        let mut rest = s;
-        while !rest.trim().is_empty() {
-            rest = rest.trim_start();
-            let word = if let Some(r) = rest.strip_prefix('"') {
-                let end = r.find('"').unwrap_or(r.len());
-                let w = &r[..end];
-                rest = r.get(end + 1..).unwrap_or("");
-                if !w.trim().is_empty() {
-                    q.terms.push(w.trim().to_ascii_lowercase());
+        for word in words(s) {
+            if let Some(w) = word.strip_prefix('"') {
+                let w = w.strip_suffix('"').unwrap_or(w).trim();
+                if !w.is_empty() {
+                    q.terms.push(w.to_ascii_lowercase());
                 }
                 continue;
-            } else {
-                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-                let w = &rest[..end];
-                rest = &rest[end..];
-                w
-            };
+            }
             let low = word.to_ascii_lowercase();
+            let value = |v: &str| v.trim_matches('"').trim().to_string();
             if let Some(v) = low.strip_prefix("p:").or(low.strip_prefix("project:")) {
-                q.project = Some(v.to_string()).filter(|v| !v.is_empty());
-            } else if let Some(v) = low.strip_prefix("ai:") {
-                match ai_alias(v) {
+                q.project = Some(value(v)).filter(|v| !v.is_empty());
+            } else if let Some(v) = low.strip_prefix("ai:").map(value) {
+                match ai_alias(&v) {
                     Some(a) => q.ai = Some(a.to_string()),
                     None if v.is_empty() => {}
                     None => q.bad.push(word.to_string()),
                 }
-            } else if let Some(v) = low.strip_prefix("since:") {
-                match since(v) {
+            } else if let Some(v) = low.strip_prefix("since:").map(value) {
+                match since(&v) {
                     Some(s) => q.since = Some(s),
                     None if v.is_empty() => {}
                     None => q.bad.push(word.to_string()),
@@ -470,7 +483,7 @@ fn since(v: &str) -> Option<i64> {
         "y" => 365 * 86400,
         _ => return None,
     };
-    Some(n * per)
+    n.checked_mul(per) // since:99999999999999y is nonsense, not a crash
 }
 
 #[derive(Clone, Debug)]

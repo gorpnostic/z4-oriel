@@ -211,6 +211,24 @@ fn recall_search_filters_and_snippets() {
     assert_eq!(p.terms, vec!["retry", "fake clock"]);
     assert_eq!((p.project.as_deref(), p.ai.as_deref(), p.since), (Some("demo"), Some("claude"), Some(14 * 86400)));
     assert_eq!(p.bad, vec!["ai:nope", "since:soon"]);
+    // a folder with a space in its name, quoted like a phrase; a huge since: is a bad filter, not an overflow
+    assert_eq!(words("p:\"my app\" retry \"a b\" x"), vec!["p:\"my app\"", "retry", "\"a b\"", "x"]);
+    let p = Query::parse("p:\"My App\" retry since:99999999999999y");
+    assert_eq!((p.project.as_deref(), p.terms.clone(), p.bad.clone()), (Some("my app"), vec!["retry".to_string()], vec!["since:99999999999999y".to_string()]));
+    assert_eq!(Query::parse("p:\"unclosed words").project.as_deref(), Some("unclosed words"));
+}
+
+/// An agent task whose transcript lives outside the CLIs' usual folders is read with its own AI's reader.
+#[test]
+fn recall_agent_transcript_elsewhere() {
+    let (env, ..) = fixtures("elsewhere");
+    let wire = env.paths.data.join("runs").join("wire.jsonl");
+    std::fs::create_dir_all(wire.parent().unwrap()).unwrap();
+    std::fs::write(&wire, "{\"message\": {\"role\": \"user\", \"content\": \"tidy the changelog\"}}\n").unwrap();
+    std::fs::write(&env.tasks, serde_json::json!({"tasks": [{"id": "k3", "title": "changelog", "agent": "kimi", "transcript_path": wire.to_string_lossy()}]}).to_string()).unwrap();
+    let (m, _) = update(&env, 2, &|_, _| {});
+    let e = m.sessions.iter().find(|e| e.task == "changelog").expect("indexed");
+    assert_eq!((e.src, e.turns), (Src::Kimi, 1));
 }
 
 #[test]
