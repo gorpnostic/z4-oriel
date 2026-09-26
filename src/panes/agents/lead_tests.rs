@@ -794,3 +794,44 @@ fn agents_lead_live_claude_haiku() {
     assert_eq!(r.protocol, "mcp");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Roster edits and the lead choice are saved through the app (its one config writer), each touching only its own
+/// fields; and an open agents app follows a roster or [lead] changed elsewhere (a hand edit, another window).
+#[test]
+fn agents_config_goes_through_the_app() {
+    let dir = scratch("lead-config");
+    let mut k = Kit::new();
+    k.config.lead.gate = "cargo check".into(); // set by hand: not the lead form's to touch
+    let mut p = Agents::with_paths(Paths { agents: dir.join("agents"), wt: dir.join("wt") });
+    p.roster = roster();
+    k.key(&mut p, KeyCode::Char('R'));
+    k.key(&mut p, KeyCode::Char(' ')); // w1 off
+    assert_eq!(k.apply_config(&mut p), 1, "saved right away, through the app");
+    assert_eq!((k.config.roster.len(), k.config.roster[0].enabled), (3, false));
+    // the lead choice: agent, model, parallel and budget, nothing else
+    p.lead_cfg.agent = "codex".into();
+    p.lead_cfg.max_parallel = 2;
+    p.lead_cfg.gate = String::new();
+    let mut acts = vec![];
+    {
+        let mut cx = crate::pane::Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut acts, focused: true, time: 1.0 };
+        p.save_config(&mut cx);
+    }
+    k.actions.extend(acts);
+    assert_eq!(k.apply_config(&mut p), 1);
+    assert_eq!((k.config.lead.agent.as_str(), k.config.lead.max_parallel, k.config.lead.gate.as_str()), ("codex", 2, "cargo check"));
+    assert_eq!(p.lead_cfg.gate, "cargo check", "the pane took the saved [lead] back");
+    // removing every worker saves an empty roster (= the defaults from what's installed), not nothing
+    for _ in 0..3 {
+        k.key(&mut p, KeyCode::Char('x'));
+    }
+    assert_eq!(k.apply_config(&mut p), 3);
+    assert!(k.config.roster.is_empty() && p.roster.is_empty());
+    // a roster edited somewhere else reaches the open pane
+    let mut cfg = k.config.clone();
+    cfg.roster = roster();
+    cfg.lead.stagger_s = 0;
+    p.config_changed(&cfg);
+    assert_eq!((p.roster().len(), p.stagger), (3, Duration::ZERO));
+    let _ = std::fs::remove_dir_all(&dir);
+}

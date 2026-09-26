@@ -118,6 +118,23 @@ impl Kit {
         woke
     }
 
+    /// Do what the app does with the pane's `cx.edit_config` calls: apply them to `self.config` (never to disk),
+    /// then tell the pane. Returns how many there were.
+    pub fn apply_config(&mut self, p: &mut dyn Pane) -> usize {
+        let (edits, rest): (Vec<Action>, Vec<Action>) = std::mem::take(&mut self.actions).into_iter().partition(|a| matches!(a, Action::Config(_)));
+        self.actions = rest;
+        let n = edits.len();
+        for a in edits {
+            if let Action::Config(f) = a {
+                f(&mut self.config);
+            }
+        }
+        if n > 0 {
+            p.config_changed(&self.config);
+        }
+        n
+    }
+
     pub fn notices(&self) -> Vec<String> {
         // alerts are toasts too (and also go to the event center)
         self.actions.iter().filter_map(|a| match a { Action::Notify(s) | Action::Alert(_, s) => Some(s.clone()), _ => None }).collect()

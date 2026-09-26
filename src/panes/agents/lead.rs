@@ -439,7 +439,7 @@ impl Agents {
         self.lead_cfg.model = model.trim().to_string();
         self.lead_cfg.max_parallel = max_parallel.clamp(1, 5);
         self.lead_cfg.run_budget_usd = budget;
-        self.save_config();
+        self.save_config(cx);
         self.lead_focus = true;
         self.save();
         let (root, id2) = (repo.root.clone(), id.clone());
@@ -1931,16 +1931,15 @@ impl Agents {
         }
     }
 
-    /// Save the lead choice + roster to the config file (never under `cargo test`).
-    pub(super) fn save_config(&self) {
-        if cfg!(test) {
-            return; // tests never read or write the real config
-        }
-        let mut c = crate::config::load();
-        c.lead = self.lead_cfg.clone();
-        if !self.roster.is_empty() {
-            c.roster = self.roster.clone();
-        }
-        crate::config::save(&c);
+    /// Remember the lead choice (agent, model, parallel, run budget) in the config. Only those fields, and
+    /// through the app, so the rest of [lead] and whatever was saved elsewhere since oriel started stay as they are.
+    pub(super) fn save_config(&self, cx: &mut Cx) {
+        let l = self.lead_cfg.clone();
+        cx.edit_config(move |c| {
+            c.lead.agent = l.agent;
+            c.lead.model = l.model;
+            c.lead.max_parallel = l.max_parallel;
+            c.lead.run_budget_usd = l.run_budget_usd;
+        });
     }
 }

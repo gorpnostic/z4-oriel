@@ -16,6 +16,8 @@ pub enum Event {
     /// A pane's background work produced something: redraw (and call `Pane::poll`).
     Wake(PaneId),
     ThemeFilesChanged,
+    /// config.toml changed on disk (a hand edit, another oriel window, or our own save).
+    ConfigFileChanged,
     Tick,
     /// The clipboard image grab (alt+v / ctrl+v) finished: paste these paths into the pane, or, if the clipboard
     /// had no image, hand it the key it was pressed with.
@@ -38,6 +40,9 @@ pub enum Action {
     SetTheme(String),
     /// Switch to this theme quietly (the themes app, as you edit): saved, no toast.
     ApplyTheme(String),
+    /// Change the config (use `cx.edit_config`). The app is its only writer: it re-reads config.toml, applies
+    /// this, saves, and calls `config_changed` on every pane.
+    Config(Box<dyn FnOnce(&mut Config) + Send>),
     /// Open the palette with this text already typed (e.g. "theme " = the theme picker with live preview).
     Palette(String),
     /// Switch to an app's tab.
@@ -90,6 +95,11 @@ impl Cx<'_> {
     pub fn alert(&mut self, kind: crate::alerts::Kind, s: impl Into<String>) {
         self.actions.push(Action::Alert(kind, s.into()));
     }
+    /// Remember a setting: `f` changes only what it's about, the app saves it and every pane hears.
+    /// Never write config.toml yourself (a stale copy would undo what others saved).
+    pub fn edit_config(&mut self, f: impl FnOnce(&mut Config) + Send + 'static) {
+        self.actions.push(Action::Config(Box::new(f)));
+    }
     /// A Sender + id a background thread can use to wake the UI: `waker.wake()`.
     pub fn waker(&self) -> Waker {
         Waker { id: self.id, tx: self.tx.clone() }
@@ -132,6 +142,9 @@ pub trait Pane {
     fn tick_every(&self) -> Option<Duration> {
         None
     }
+    /// The config changed (a setting saved from any pane, or config.toml edited by hand): pick up what applies
+    /// to an open pane.
+    fn config_changed(&mut self, _cfg: &Config) {}
     /// When the pane's program has ended: what to tell the event center, if anything ("Firefox installed").
     fn exit_note(&mut self) -> Option<(crate::alerts::Kind, String)> {
         None

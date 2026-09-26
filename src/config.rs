@@ -1,9 +1,13 @@
 //! ~/.config/oriel/config.toml (Linux) or %APPDATA%\oriel\config.toml (Windows). Every field is optional.
+//!
+//! One writer: the app (App::edit_config, reached from panes by `cx.edit_config(|c| ...)`). It re-reads the file,
+//! changes only what was asked and writes it back atomically, so a hand edit or a second window isn't overwritten
+//! by a stale copy. A file that doesn't parse is never written over.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Config {
     /// Theme name; empty = "omarchy" on Omarchy, else "ultra".
@@ -28,7 +32,7 @@ pub struct Config {
     pub roster: Vec<RosterEntry>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct LeadConfig {
     /// Who orchestrates: "claude", "codex", "kimi"… Empty = the last one used, else the first installed.
@@ -71,7 +75,7 @@ pub struct RosterEntry {
     pub enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct AiConfig {
     /// AI for new chats: "claude", "codex", "ollama", "openai", "anthropic". Empty = the first one this
@@ -98,7 +102,7 @@ pub struct AiConfig {
     pub anthropic_key: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct MusicConfig {
     /// Folders to scan for audio; empty = the OS music folder.
@@ -178,8 +182,34 @@ pub fn path() -> PathBuf {
     dir().join("config.toml")
 }
 
+/// The config to run with: config.toml, or the defaults if it's missing or doesn't parse (`load_checked` says why).
 pub fn load() -> Config {
-    let mut c: Config = std::fs::read_to_string(path()).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default();
+    load_checked().unwrap_or_else(|_| with_theme(Config::default()))
+}
+
+/// config.toml; no file = the defaults. Err = it's there but doesn't parse (the message says which line).
+pub fn load_checked() -> Result<Config, String> {
+    load_from(&path())
+}
+
+pub fn load_from(path: &Path) -> Result<Config, String> {
+    let c = match std::fs::read_to_string(path) {
+        Ok(s) => parse(&s)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(e) => return Err(format!("can't read {}: {e}", path.display())),
+    };
+    Ok(with_theme(c))
+}
+
+/// config.toml's text as a Config. The error is one line: where, and what's wrong ("line 3: invalid string").
+fn parse(s: &str) -> Result<Config, String> {
+    toml::from_str(s).map_err(|e| {
+        let at = e.span().map(|r| format!("line {}: ", s.get(..r.start).unwrap_or(s).matches('\n').count() + 1)).unwrap_or_default();
+        format!("config.toml {at}{}", e.message().split_whitespace().collect::<Vec<_>>().join(" "))
+    })
+}
+
+fn with_theme(mut c: Config) -> Config {
     if c.theme.is_empty() {
         // the animated ultra theme by default; on Omarchy follow the desktop theme instead
         c.theme = if crate::theme::omarchy_dir().is_some() { "omarchy".into() } else { "ultra".into() };
@@ -187,13 +217,49 @@ pub fn load() -> Config {
     c
 }
 
-pub fn save(c: &Config) {
-    if cfg!(test) {
-        return; // tests never touch the real config
+/// Write `c` atomically (a temp file renamed over the old one), unless the file there doesn't parse: then nothing
+/// is written, so one typo never costs you the rest of the file.
+pub fn save_to(path: &Path, c: &Config) -> Result<(), String> {
+    if let Ok(s) = std::fs::read_to_string(path) {
+        parse(&s).map_err(|e| format!("{e} (fix it and oriel picks it up)"))?;
     }
-    let _ = std::fs::create_dir_all(dir());
-    if let Ok(s) = toml::to_string_pretty(c) {
-        let _ = std::fs::write(path(), s);
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let text = toml::to_string_pretty(c).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("couldn't save {}: {e}", path.display())
+    })
+}
+
+/// The one way config.toml changes: re-read it (so edits made elsewhere survive), apply `f`, write it back, and
+/// return what's now in effect. If the file doesn't parse, nothing is written: `f` is applied to `current` instead
+/// (it holds for this session) and the error comes back with it.
+pub fn update_at(path: &Path, current: &Config, f: impl FnOnce(&mut Config)) -> (Config, Result<(), String>) {
+    match load_from(path) {
+        Ok(mut c) => {
+            f(&mut c);
+            let saved = save_to(path, &c);
+            (c, saved)
+        }
+        Err(e) => {
+            let mut c = current.clone();
+            f(&mut c);
+            (c, Err(format!("{e} (fix it and oriel picks it up)")))
+        }
+    }
+}
+
+/// Where notes live: `notes_folder` (~ = your home folder), else oriel's data folder. The notes app and chat's
+/// /note both use this.
+pub fn notes_dir(c: &Config) -> PathBuf {
+    let custom = c.notes_folder.trim();
+    match custom.strip_prefix('~') {
+        _ if custom.is_empty() => data_dir().join("notes"),
+        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest.trim_start_matches(['/', '\\'])),
+        None => PathBuf::from(custom),
     }
 }
 
@@ -228,4 +294,65 @@ pub fn which(prog: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::path::absolute(format!("target/test-scratch/config/{name}")).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("config.toml")
+    }
+
+    #[test]
+    fn config_update_keeps_what_others_saved() {
+        let p = scratch("update");
+        // what a chat saved after the app loaded its copy
+        std::fs::write(&p, "[ai]\nperms = \"bypass\"\nanthropic_key = \"sk-test\"\n\n[[roster]]\nname = \"kimi\"\nagent = \"kimi\"\n").unwrap();
+        let stale = Config::default();
+        let (c, saved) = update_at(&p, &stale, |c| c.theme = "ocean".into());
+        assert!(saved.is_ok());
+        let disk = load_from(&p).unwrap();
+        assert_eq!((disk.theme.as_str(), disk.ai.perms.as_str(), disk.ai.anthropic_key.as_str()), ("ocean", "bypass", "sk-test"));
+        assert_eq!(disk.roster.len(), 1);
+        assert_eq!(c, disk, "what's in effect is what's on disk");
+        assert!(!p.with_extension("toml.tmp").exists(), "written through a temp file that's gone");
+    }
+
+    #[test]
+    fn config_typo_is_reported_and_never_overwritten() {
+        let p = scratch("broken");
+        let text = "theme = \"ocean\"\nprefix = ctrl+b\n\n[ai]\nanthropic_key = \"sk-keep\"\n";
+        std::fs::write(&p, text).unwrap();
+        let e = load_from(&p).unwrap_err();
+        assert!(e.contains("line 2"), "{e}");
+        // a change still applies for this session, but the file is left alone
+        let mut current = Config::default();
+        current.theme = "dracula".into();
+        let (c, saved) = update_at(&p, &current, |c| c.ai.perms = "plan".into());
+        assert!(saved.unwrap_err().contains("line 2"));
+        assert_eq!((c.theme.as_str(), c.ai.perms.as_str()), ("dracula", "plan"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+        assert!(save_to(&p, &Config::default()).is_err(), "save_to refuses too");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+        // a wrong type is caught the same way
+        std::fs::write(&p, "[lead]\nmax_parallel = \"3\"\n").unwrap();
+        assert!(load_from(&p).unwrap_err().contains("line 2"));
+        // no file at all is just the defaults
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(load_from(&p).unwrap().prefix, "ctrl+space");
+    }
+
+    #[test]
+    fn config_notes_dir() {
+        let mut c = Config::default();
+        assert_eq!(notes_dir(&c), data_dir().join("notes"));
+        c.notes_folder = "~/vault".into();
+        assert_eq!(notes_dir(&c), dirs::home_dir().unwrap_or_default().join("vault"));
+        c.notes_folder = " /x/notes ".into();
+        assert_eq!(notes_dir(&c), PathBuf::from("/x/notes"));
+    }
 }

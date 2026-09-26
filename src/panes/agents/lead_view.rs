@@ -428,19 +428,20 @@ impl Agents {
         }
     }
 
-    /// Roster edits are saved to the config right away (the lead reads them on its next roster call).
-    fn set_roster(&mut self, r: Vec<RosterEntry>) {
-        self.roster = r;
-        self.save_config();
+    /// Roster edits are saved to the config right away (the lead reads them on its next roster call). Only the
+    /// roster: an empty one (every worker removed) is saved too, and means the defaults from what's installed.
+    fn set_roster(&mut self, r: Vec<RosterEntry>, cx: &mut Cx) {
+        self.roster = r.clone();
+        cx.edit_config(move |c| c.roster = r);
     }
 
-    pub(super) fn roster_key(&mut self, k: KeyEvent) -> bool {
+    pub(super) fn roster_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
         let Mode::Roster(mut v) = std::mem::replace(&mut self.mode, Mode::Board) else { return false };
         let mut roster = self.roster();
         if let Some(mut e) = v.edit.take() {
             e.err.clear();
             let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-            let save = |s: &mut Self, e: &mut RosterEdit, roster: &mut Vec<RosterEntry>| -> bool {
+            let save = |s: &mut Self, e: &mut RosterEdit, roster: &mut Vec<RosterEntry>, cx: &mut Cx| -> bool {
                 let name = e.name.text.trim().to_string();
                 if name.is_empty() {
                     e.err = "give it a name".into();
@@ -465,7 +466,7 @@ impl Agents {
                     Some(i) if i < roster.len() => roster[i] = w,
                     _ => roster.push(w),
                 }
-                s.set_roster(roster.clone());
+                s.set_roster(roster.clone(), cx);
                 true
             };
             match k.code {
@@ -474,7 +475,7 @@ impl Agents {
                     return true;
                 }
                 KeyCode::Char('s') if ctrl => {
-                    if save(self, &mut e, &mut roster) {
+                    if save(self, &mut e, &mut roster, cx) {
                         v.sel = e.idx.unwrap_or(roster.len() - 1);
                         self.mode = Mode::Roster(v);
                         return true;
@@ -494,7 +495,7 @@ impl Agents {
                     if !used {
                         match k.code {
                             KeyCode::Enter if e.field == 7 => {
-                                if save(self, &mut e, &mut roster) {
+                                if save(self, &mut e, &mut roster, cx) {
                                     v.sel = e.idx.unwrap_or(roster.len() - 1);
                                     self.mode = Mode::Roster(v);
                                     return true;
@@ -524,24 +525,24 @@ impl Agents {
             KeyCode::Down | KeyCode::Char('j') => v.sel = (v.sel + 1).min(n.saturating_sub(1)),
             KeyCode::Char(' ') if n > 0 => {
                 roster[v.sel].enabled = !roster[v.sel].enabled;
-                self.set_roster(roster);
+                self.set_roster(roster, cx);
             }
             KeyCode::Enter | KeyCode::Char('e') if n > 0 => v.edit = Some(self.roster_edit(Some(v.sel))),
             KeyCode::Char('a') | KeyCode::Char('n') => v.edit = Some(self.roster_edit(None)),
             KeyCode::Char('x') | KeyCode::Delete if n > 0 => {
                 roster.remove(v.sel);
                 v.sel = v.sel.min(roster.len().saturating_sub(1));
-                self.set_roster(roster);
+                self.set_roster(roster, cx);
             }
             KeyCode::Char('J') if v.sel + 1 < n => {
                 roster.swap(v.sel, v.sel + 1);
                 v.sel += 1;
-                self.set_roster(roster);
+                self.set_roster(roster, cx);
             }
             KeyCode::Char('K') if v.sel > 0 => {
                 roster.swap(v.sel, v.sel - 1);
                 v.sel -= 1;
-                self.set_roster(roster);
+                self.set_roster(roster, cx);
             }
             _ => {}
         }

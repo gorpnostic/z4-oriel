@@ -20,16 +20,25 @@ use crossterm::{
 };
 use std::sync::mpsc;
 
+fn help(prefix: &str) -> String {
+    format!(
+        "oriel {} — a terminal workspace\n\n  oriel              open (starts in the ai app)\n  oriel <app>        open straight into an app, this time only: ai agents ais terminal claude codex music system files notes calendar storage themes help\n  oriel --config     print the config file path\n  oriel update       update to the latest release (keeps this one for rollback)\n  oriel rollback     go back to the version before the last update\n  oriel changelog    what's new in recent releases\n  oriel --tour       replay the tour\n  oriel --version\n\nInside: F1-F9 apps, F10 help (every key and how-to), alt p palette, alt n terminal split, {prefix} = tmux-style prefix.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut cfg = config::load();
+    // a config.toml that doesn't parse: run on the defaults, say so, and never write over it
+    let (cfg, broken) = match config::load_checked() {
+        Ok(c) => (c, None),
+        Err(e) => (config::load(), Some(e)),
+    };
+    // `oriel <app>` opens that app this once; it's never saved as the startup app
+    let mut start = None;
     match args.first().map(String::as_str) {
         Some("-h" | "--help") => {
-            println!(
-                "oriel {} — a terminal workspace\n\n  oriel              open (starts in the ai app)\n  oriel <app>        open straight into an app: ai agents ais terminal claude codex music system files notes calendar storage themes help\n  oriel --config     print the config file path\n  oriel update       update to the latest release (keeps this one for rollback)\n  oriel rollback     go back to the version before the last update\n  oriel changelog    what's new in recent releases\n  oriel --tour       replay the first-run setup and tour\n  oriel --version\n\nInside: F1-F9 apps, F10 help (every key and how-to), alt p palette, alt n terminal split, {} = tmux-style prefix.",
-                env!("CARGO_PKG_VERSION"),
-                cfg.prefix
-            );
+            println!("{}", help(&cfg.prefix));
             return Ok(());
         }
         Some("-V" | "--version") => {
@@ -83,7 +92,12 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("--tour") => {}
-        Some(app) => cfg.startup = app.to_string(),
+        Some(app) if panes::known(app) => start = Some(app.to_string()),
+        Some(other) => {
+            let what = if other.starts_with('-') { format!("unknown option {other}") } else { format!("no app called '{other}'") };
+            eprintln!("oriel: {what}\n\n{}", help(&cfg.prefix));
+            std::process::exit(2);
+        }
         None => {}
     }
 
@@ -104,7 +118,10 @@ fn main() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, crossterm::event::EnableFocusChange)?;
     let tour = args.first().map(String::as_str) == Some("--tour");
-    let mut app = app::App::new(cfg, tx);
+    let mut app = app::App::with_start(cfg, tx, start);
+    if let Some(e) = broken {
+        app.config_error(e);
+    }
     if tour {
         app.start_tour();
     }

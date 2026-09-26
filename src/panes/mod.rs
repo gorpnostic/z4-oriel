@@ -43,6 +43,14 @@ pub fn available(name: &str) -> bool {
     }
 }
 
+/// Every name `open` takes (`oriel <app>` checks against it). A CLI agent counts even when it isn't installed:
+/// the app says so then.
+const NAMES: &[&str] = &["terminal", "shell", "ai", "chat", "music", "system", "files", "notes", "calendar", "storage", "agents", "ais", "home", "help", "themes", "alerts", "updates"];
+
+pub fn known(name: &str) -> bool {
+    NAMES.contains(&name) || AGENTS.iter().any(|a| a.0 == name)
+}
+
 pub fn open(name: &str, cfg: &Config) -> Option<Box<dyn Pane>> {
     Some(match name {
         "terminal" | "shell" => Box::new(term::Term::shell(cfg, None)),
@@ -50,7 +58,7 @@ pub fn open(name: &str, cfg: &Config) -> Option<Box<dyn Pane>> {
         "music" => Box::new(music::Music::new(cfg)),
         "system" => Box::new(system::System::new()),
         "files" => Box::new(files::Files::new(None)),
-        "notes" => Box::new(notes::Notes::new()),
+        "notes" => Box::new(notes::Notes::new(cfg)),
         "calendar" => Box::new(calendar::Calendar::new()),
         "storage" => Box::new(storage::Storage::new()),
         "agents" => Box::new(agents::Agents::new(cfg)),

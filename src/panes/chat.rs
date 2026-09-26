@@ -52,7 +52,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/prev", "", "music: previous song"),
     ("/music", "", "go to the music app"),
     ("/sidebar", "", "hide / show the sidebar"),
-    ("/icons", "", "nerd font icons on / off"),
+    ("/icons", "", "nerd font icons on / off — remembered"),
     ("/info", "", "what's running: AI, model, folder"),
     ("/delete", "", "delete this chat"),
     ("/help", "", "keys and commands (F10: the full guide)"),
@@ -88,6 +88,19 @@ fn norm_perms(s: &str) -> Option<&'static str> {
         "bypass" | "full" | "yolo" | "bypasspermissions" => Some("bypass"),
         _ => None,
     }
+}
+
+/// `<dir>/<title>.md` for /note and /save, or `<title> 2.md`, `<title> 3.md`… so nothing is overwritten.
+fn free_md_path(dir: &std::path::Path, title: &str) -> PathBuf {
+    let name: String = title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
+    let name = name.trim();
+    let mut path = dir.join(format!("{name}.md"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{name} {n}.md"));
+        n += 1;
+    }
+    path
 }
 
 /// /effort levels, like Claude Code's. ultracode = max plus its multi-agent mode.
@@ -563,9 +576,10 @@ impl Chat {
                 self.chat.model = model.clone();
                 self.chat.state.remove(&p); // a CLI session is tied to its model
                 self.models.insert(p.clone(), model.clone().unwrap_or_default());
-                let mut c = crate::config::load();
-                c.ai.models.insert(p.clone(), model.clone().unwrap_or_default());
-                crate::config::save(&c);
+                let (id, m) = (p.clone(), model.clone().unwrap_or_default());
+                cx.edit_config(move |c| {
+                    c.ai.models.insert(id, m);
+                });
                 cx.notify(format!("{}{} · {} · remembered", ui::lead("ai"), providers::label(&p), model.unwrap_or_else(|| "default model".into())));
             }
             "/model" if arg.is_empty() => {
@@ -600,13 +614,16 @@ impl Chat {
                         self.chat.provider = Some(id.clone());
                         self.chat.model = model.clone();
                         self.provider = id.clone();
-                        let mut c = crate::config::load();
-                        c.ai.provider = id.clone();
                         if let Some(m) = &model {
-                            c.ai.models.insert(id.clone(), m.clone());
                             self.models.insert(id.clone(), m.clone());
                         }
-                        crate::config::save(&c);
+                        let (pid, m) = (id.clone(), model.clone());
+                        cx.edit_config(move |c| {
+                            if let Some(m) = m {
+                                c.ai.models.insert(pid.clone(), m);
+                            }
+                            c.ai.provider = pid;
+                        });
                         cx.notify(format!("{}{} · {} · remembered", ui::lead("ai"), providers::label(&id), model.unwrap_or_else(|| "default model".into())));
                     } else {
                         self.info.push(format!("no AI called {id} — try /provider"));
@@ -627,9 +644,8 @@ impl Chat {
                 let want = arg.trim().to_lowercase();
                 if let Some((level, what)) = EFFORTS.iter().find(|(l, _)| *l == want) {
                     self.effort = if *level == "default" { String::new() } else { level.to_string() };
-                    let mut c = crate::config::load();
-                    c.ai.effort = self.effort.clone();
-                    crate::config::save(&c);
+                    let e = self.effort.clone();
+                    cx.edit_config(move |c| c.ai.effort = e);
                     cx.notify(format!("effort: {level} · {what}"));
                 } else {
                     self.info.push(format!("effort now: {}. Choose one:", if self.effort.is_empty() { "default" } else { &self.effort }));
@@ -642,9 +658,7 @@ impl Chat {
                 Some(p) => {
                     self.perms = p.to_string();
                     // remembered: every new chat (and the next time oriel starts) uses it
-                    let mut c = crate::config::load();
-                    c.ai.perms = p.to_string();
-                    crate::config::save(&c);
+                    cx.edit_config(move |c| c.ai.perms = p.to_string());
                     cx.notify(format!("agent permissions: {p} · saved for every chat"));
                 }
                 None => {
@@ -677,13 +691,14 @@ impl Chat {
                 let mut a = arg.split_whitespace();
                 match (a.next(), a.next()) {
                     (Some(p @ ("openai" | "anthropic")), Some(key)) => {
-                        let mut c = crate::config::load();
-                        if p == "openai" {
-                            c.ai.openai_key = key.to_string();
-                        } else {
-                            c.ai.anthropic_key = key.to_string();
-                        }
-                        crate::config::save(&c);
+                        let (openai, k) = (p == "openai", key.to_string());
+                        cx.edit_config(move |c| {
+                            if openai {
+                                c.ai.openai_key = k;
+                            } else {
+                                c.ai.anthropic_key = k;
+                            }
+                        });
                         self.keys.insert(p.to_string(), key.to_string());
                         let id: &'static str = if p == "openai" { "openai" } else { "anthropic" };
                         if !self.avail.contains(&id) {
@@ -700,15 +715,10 @@ impl Chat {
             }
             "/note" => match self.chat.messages.iter().rev().find(|m| m.role == "assistant" && !m.content.is_empty()) {
                 Some(m) => {
-                    let dir = crate::config::data_dir().join("notes");
+                    // the folder the notes app shows (notes_folder, else oriel's own)
+                    let dir = crate::config::notes_dir(cx.config);
                     let _ = std::fs::create_dir_all(&dir);
-                    let name: String = self.chat.title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
-                    let mut path = dir.join(format!("{}.md", name.trim()));
-                    let mut n = 2;
-                    while path.exists() {
-                        path = dir.join(format!("{} {n}.md", name.trim()));
-                        n += 1;
-                    }
+                    let path = free_md_path(&dir, &self.chat.title);
                     match std::fs::write(&path, format!("# {}\n\n{}\n", self.chat.title, m.content)) {
                         Ok(_) => cx.notify(format!("saved to notes: {}", path.file_name().unwrap_or_default().to_string_lossy())),
                         Err(e) => self.info.push(format!("couldn't save: {e}")),
@@ -722,8 +732,8 @@ impl Chat {
                 } else {
                     let dir = dirs::document_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default()).join("oriel chats");
                     let _ = std::fs::create_dir_all(&dir);
-                    let name: String = self.chat.title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect();
-                    let path = dir.join(format!("{}.md", name.trim()));
+                    // two chats with the same title each get their own file
+                    let path = free_md_path(&dir, &self.chat.title);
                     let mut md = format!("# {}\n\n", self.chat.title);
                     for m in &self.chat.messages {
                         let who = if m.role == "user" { "you".to_string() } else { providers::label(m.model.as_deref().unwrap_or("ai")).to_lowercase() };
@@ -1295,6 +1305,30 @@ impl Pane for Chat {
         self.stream.as_ref().map(|_| Duration::from_millis(100))
     }
 
+    /// Something was remembered elsewhere (another chat's /perms or /model, setup, a hand edit): new chats here use
+    /// it, and so does this one while it's still empty.
+    fn config_changed(&mut self, cfg: &crate::config::Config) {
+        self.models = cfg.ai.models.clone();
+        self.effort = cfg.ai.effort.clone();
+        if let Some(p) = norm_perms(&cfg.ai.perms) {
+            self.perms = p.to_string();
+        }
+        // a key saved with /key makes that AI usable here too
+        for (id, key) in [("openai", &cfg.ai.openai_key), ("anthropic", &cfg.ai.anthropic_key)] {
+            if !key.is_empty() && !self.avail.contains(&id) {
+                self.avail.push(id);
+            }
+        }
+        if let Some(p) = self.avail.iter().find(|p| **p == cfg.ai.provider) {
+            self.provider = p.to_string();
+        }
+        if self.chat.messages.is_empty() && self.stream.is_none() {
+            let p = self.provider.clone();
+            self.chat.model = self.models.get(&p).cloned().filter(|m| !m.is_empty());
+            self.chat.provider = Some(p);
+        }
+    }
+
     fn poll(&mut self, cx: &mut Cx) {
         let who = providers::label(&self.provider_of()).to_lowercase();
         let Some(s) = &mut self.stream else { return };
@@ -1655,9 +1689,8 @@ impl Pane for Chat {
             KeyCode::BackTab => {
                 let i = PERM_CYCLE.iter().position(|p| *p == self.perms).map(|i| (i + 1) % PERM_CYCLE.len()).unwrap_or(0);
                 self.perms = PERM_CYCLE[i].to_string();
-                let mut c = crate::config::load();
-                c.ai.perms = self.perms.clone();
-                crate::config::save(&c);
+                let p = self.perms.clone();
+                cx.edit_config(move |c| c.ai.perms = p);
             }
             KeyCode::Up if self.input.is_empty() && self.queue.iter().any(|q| !q.sent) => {
                 let i = self.queue.iter().rposition(|q| !q.sent).unwrap_or(0);
@@ -2002,6 +2035,76 @@ mod tests {
         k.typ(&mut c, "/model codex gpt-5.6-luna");
         k.key(&mut c, KeyCode::Enter);
         assert_eq!((c.provider_of().as_str(), c.chat.model.as_deref()), ("codex", Some("gpt-5.6-luna")));
+    }
+
+    /// Run a slash command, then do what the app does with the config changes it asked for.
+    fn run_cmd(k: &mut Kit, c: &mut Chat, line: &str) -> usize {
+        let mut acts = vec![];
+        {
+            let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut acts, focused: true, time: 1.0 };
+            c.run_command(line, &mut cx);
+        }
+        k.actions.extend(acts);
+        k.apply_config(c)
+    }
+
+    /// /perms, /effort, /model, /provider, /key and shift+tab never write config.toml themselves: they ask the
+    /// app (its one writer), so a later theme change can't undo them, and chats that are already open follow.
+    #[test]
+    fn chat_settings_go_through_the_app() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.avail = vec!["claude", "codex"];
+        c.provider = "claude".into();
+        c.chat.provider = Some("claude".into());
+        for cmd in ["/perms bypass", "/effort high", "/model opus", "/key anthropic sk-test", "/provider codex"] {
+            assert_eq!(run_cmd(&mut k, &mut c, cmd), 1, "{cmd} asks the app to save it");
+        }
+        let a = &k.config.ai;
+        assert_eq!((a.perms.as_str(), a.effort.as_str(), a.anthropic_key.as_str(), a.provider.as_str()), ("bypass", "high", "sk-test", "codex"));
+        assert_eq!(a.models.get("claude").map(String::as_str), Some("opus"));
+        // shift+tab: the next mode, remembered the same way
+        k.key_mod(&mut c, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(k.apply_config(&mut c), 1);
+        assert_eq!(k.config.ai.perms, "ask");
+        // a chat that was open all along follows (its empty chat switches AI too) ...
+        let mut before = Chat::new(&crate::config::Config::default());
+        before.avail = vec!["claude", "codex"];
+        before.config_changed(&k.config);
+        assert_eq!((before.perms.as_str(), before.effort.as_str(), before.provider.as_str()), ("ask", "high", "codex"));
+        assert_eq!(before.chat.provider.as_deref(), Some("codex"));
+        assert!(before.avail.contains(&"anthropic"), "the saved key makes the Anthropic API usable here too");
+        assert_eq!(before.models.get("claude").map(String::as_str), Some("opus"));
+        // ... but one with a conversation in it keeps its AI
+        let mut busy = Chat::new(&crate::config::Config::default());
+        busy.avail = vec!["claude", "codex"];
+        busy.chat.provider = Some("claude".into());
+        busy.chat.messages.push(store::Msg { role: "user".into(), content: "hi".into(), ..Default::default() });
+        busy.config_changed(&k.config);
+        assert_eq!(busy.chat.provider.as_deref(), Some("claude"));
+        // and a chat opened now starts from it
+        assert_eq!(Chat::new(&k.config).perms, "ask");
+    }
+
+    /// /note saves where the notes app looks (notes_folder), and neither /note nor /save overwrites a file.
+    #[test]
+    fn chat_note_goes_to_the_notes_folder() {
+        let dir = std::path::absolute("target/test-scratch/config/chat-notes").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut k = Kit::new();
+        k.config.notes_folder = dir.to_string_lossy().to_string();
+        let mut c = Chat::new(&k.config);
+        c.chat.title = "fix the tests".into();
+        c.chat.messages.push(store::Msg { role: "user".into(), content: "why do they fail".into(), ..Default::default() });
+        c.chat.messages.push(store::Msg { role: "assistant".into(), content: "a stale fixture".into(), ..Default::default() });
+        run_cmd(&mut k, &mut c, "/note");
+        run_cmd(&mut k, &mut c, "/note");
+        assert!(std::fs::read_to_string(dir.join("fix the tests.md")).unwrap().contains("a stale fixture"));
+        assert!(dir.join("fix the tests 2.md").exists(), "the second one gets its own file");
+        assert!(k.notices().iter().any(|n| n.contains("fix the tests 2.md")), "{:?}", k.notices());
+        // /save names its export the same way
+        assert_eq!(free_md_path(&dir, "fix the tests"), dir.join("fix the tests 3.md"));
+        assert_eq!(free_md_path(&dir, "a/b: c?"), dir.join("a_b_ c_.md"));
     }
 
     /// enter while a reply runs queues the message; Claude Code gets it mid-reply and it lands inline, others get

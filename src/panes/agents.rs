@@ -1850,6 +1850,13 @@ impl Pane for Agents {
     fn poll(&mut self, cx: &mut Cx) {
         self.sync(cx);
     }
+    /// The roster or [lead] changed elsewhere (a hand edit, another window, this app's own save coming back): the
+    /// next roster call, worker start and lead run use it.
+    fn config_changed(&mut self, cfg: &crate::config::Config) {
+        self.lead_cfg = cfg.lead.clone();
+        self.roster = cfg.roster.clone();
+        self.stagger = Duration::from_secs(cfg.lead.stagger_s as u64);
+    }
     fn tagged_panes(&mut self, live: &[(String, Option<Activity>)]) {
         let mine: Vec<(String, Option<Activity>)> = live.iter().filter(|(t, _)| t.starts_with("agent-task:")).cloned().collect();
         if self.tagged.as_ref() != Some(&mine) {
@@ -1875,7 +1882,7 @@ impl Pane for Agents {
             Mode::Form(_) => self.form_key(k, cx),
             Mode::Repo(_) => self.picker_key(k, cx),
             Mode::LeadForm(_) => self.lead_form_key(k, cx),
-            Mode::Roster(_) => self.roster_key(k),
+            Mode::Roster(_) => self.roster_key(k, cx),
             Mode::Watch(_) => self.watch_key(k, cx),
             Mode::Log(_) => self.log_key(k, cx),
             Mode::Batch => {
