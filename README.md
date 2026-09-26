@@ -62,7 +62,7 @@ Every app lives in the sidebar. Click one, or press its F-key.
 |---|---|---|
 | | **ai** | |
 | F1 | **chat** | Chat with Claude Code, Codex, Ollama, any OpenAI-compatible server, or the Anthropic API. With coding agents you see everything as it happens: what they say and think, every file read, edit (as a diff) and command with its output and running time, and their todo list ticking off. Type while they work to queue a message. Chats are saved in the sidebar. |
-| F2 | **agents** | Run a team of coding agents on one goal (**lead mode**), or single tasks on a board. Each agent works in its own copy of the repo, and finished work is merged safely one piece at a time. |
+| F2 | **agents** | Run a team of coding agents on one goal (**lead mode**), or your own tasks: mark several and run them together, all at once or one after another, with priorities, dependencies and budgets. Each agent works in its own copy of the repo, and finished work is merged safely one piece at a time. |
 | F3 | **your AIs** | Installs and signs in to 12 coding CLIs with one key: Claude Code, Codex, Kimi, OpenCode, Aider, Copilot, Cursor, Qwen, Amp, Droid, Crush and Goose. It also shows your real plan limits with reset countdowns, tokens and cost per day, and has token-saver presets. |
 | | **tools** | |
 | F4 | **music** | Plays your music folder: cover art, a live spectrum, synced lyrics, playlists, shuffle and repeat. `F12` plays/pauses from any app. |
@@ -72,6 +72,7 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | | **calendar** | A month at a glance and the day's plans. `a` adds one ("2pm dentist"); plans with a time pop up as a reminder from any app. |
 | F8 | **storage** | Frees up space. It finds what's safe to clean (caches, temp files, trash), shows the biggest folders, and uninstalls apps. It also has a catalog of 60+ popular apps (OBS, Steam, Minecraft launchers, VPNs, AI apps, dev tools, browsers…) that install with one key, using whichever package manager your system has: winget, pacman/AUR, apt, flatpak or npm. Nothing is deleted or installed without asking. |
 | F9 | **terminal** | A real shell. Split it next to anything. |
+| | **alerts** | The event center: agents finishing or needing you, approvals, failed builds, calendar reminders, finished installs, memory and AI-usage warnings, new versions. The bell at the bottom of the sidebar counts the new ones, and you get a desktop notification when oriel isn't the window you're in. |
 | | **themes** | Make your own theme: every colour with a live preview. (Bottom of the sidebar, with help.) |
 | F10 | **help** | Every key, command and how-to, by topic. |
 
@@ -99,6 +100,9 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | make the AI ask before every change | `/perms ask`. Then `y` allows, `n` denies, `a` always allows that tool |
 | use the real Claude Code or Codex screen | run `claude` or `codex` in a terminal pane. Its tab gets status dots (below) |
 | work in another folder | start oriel there, or `/cwd <folder>` for one chat, or `o` in agents to pick a repo |
+| run several coding tasks at once and merge them | in agents (`F2`), add tasks with `n`, mark them with `space`, press `enter`, then `p` (all at once) or `s` (one after another). Their work lands in one new branch; `d` reviews it, `m` merges it. `+`/`-` sets a task's priority, and the task form takes "after" (what it waits for) and a budget |
+| see what happened while I was away | the bell (**alerts**) at the bottom of the sidebar |
+| update oriel, or undo an update | `oriel update` (or the **update to …** row at the bottom of the sidebar, or `alt p` → updates) shows what's new and updates in place. `oriel rollback` goes back to the version before |
 | install another AI tool | `F3` → `2` → `enter` on it |
 | save tokens | `F3` → `4` (token saver) → pick a preset → `enter` |
 | change the theme | `alt p` → type `theme`, or `/theme` in chat. Make your own in **themes** (`/theme edit`) |
@@ -148,6 +152,10 @@ supported agent. It splits the goal into small tasks and hands them to **workers
 3. `w` watches the lead and every worker live, side by side. `enter` on a card opens that agent's full
    transcript, and `t` takes a worker over in a real terminal.
 4. When it's done, `d` shows the combined diff and `m` merges it into your branch. oriel never pushes.
+
+Tasks can have a priority (low, normal, high, urgent) and wait for other tasks; when several are ready, the
+highest starts first. You can also skip the lead: mark your own tasks with `space` and press `enter` to run them
+through the same machinery.
 
 How it keeps workers from breaking each other:
 
@@ -257,7 +265,9 @@ good_at = "frontend, UI"
 budget_usd = 1.0
 ```
 
-Other commands: `oriel update`, `oriel --tour` (replay the setup and tour), `oriel --version`.
+Other commands: `oriel update` (keeps the current version so `oriel rollback` can bring it back),
+`oriel changelog` (what's new), `oriel --tour` (replay the setup and tour), `oriel --version`.
+`desktop_notifications = false` turns off the desktop notifications for alerts.
 
 ## Build from source
 
