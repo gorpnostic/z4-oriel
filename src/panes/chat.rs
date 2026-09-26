@@ -30,7 +30,8 @@ use unicode_width::UnicodeWidthStr;
 const COMMANDS: &[(&str, &str, &str)] = &[
     ("/new", "", "start a new chat"),
     ("/retry", "", "regenerate the last reply"),
-    ("/model", "<ai> [model]", "switch AI: claude, codex, ollama, openai, anthropic"),
+    ("/provider", "<ai>", "switch AI: claude, codex, ollama, openai, anthropic — remembered"),
+    ("/model", "<model>", "switch model for the current AI — remembered per AI"),
     ("/cwd", "<folder>", "folder Claude Code / Codex work in for this chat"),
     ("/perms", "<ask|edits|plan|bypass>", "what coding agents may do — remembered for every chat"),
     ("/key", "<openai|anthropic> <key>", "save an API key"),
@@ -121,6 +122,10 @@ pub struct Chat {
     always: HashSet<String>,
     info: Vec<String>,
     avail: Vec<&'static str>,
+    /// the model picked per AI (/model), remembered in the config
+    models: std::collections::BTreeMap<String, String>,
+    /// models installed in Ollama, fetched in the background for the /model menu
+    ollama_models: Arc<Mutex<Vec<String>>>,
     confirm_delete: bool,
     side_hits: Vec<(Rect, SideItem)>,
     side_scroll: usize,
@@ -140,9 +145,26 @@ impl Chat {
         } else {
             avail.first().map(|s| s.to_string()).unwrap_or_else(|| "none".into())
         };
+        let ollama_models: Arc<Mutex<Vec<String>>> = Arc::default();
+        if avail.contains(&"ollama") && !cfg!(test) {
+            let (url, into) = (cfg.ai.ollama_url.clone(), ollama_models.clone());
+            std::thread::spawn(move || {
+                let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(3))).build().into();
+                if let Ok(r) = agent.get(&format!("{}/api/tags", url.trim_end_matches('/'))).call() {
+                    if let Some(v) = r.into_body().read_to_string().ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
+                        let names: Vec<String> = v["models"].as_array().map(|a| a.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect()).unwrap_or_default();
+                        *into.lock().unwrap() = names;
+                    }
+                }
+            });
+        }
+        let mut first = store::Chat::new(&provider);
+        first.model = cfg.ai.models.get(&provider).cloned().filter(|m| !m.is_empty());
         Chat {
             chats,
-            chat: store::Chat::new(&provider),
+            chat: first,
+            models: cfg.ai.models.clone(),
+            ollama_models,
             input: String::new(),
             cursor: 0,
             scroll: 0,
@@ -204,7 +226,9 @@ impl Chat {
     fn new_chat(&mut self) {
         self.stop();
         self.persist_if_changed();
-        self.chat = store::Chat::new(&self.provider_of());
+        let p = self.provider_of();
+        self.chat = store::Chat::new(&p);
+        self.chat.model = self.models.get(&p).cloned().filter(|m| !m.is_empty());
         self.cache.clear();
         self.scroll = 0;
         self.info.clear();
@@ -330,13 +354,34 @@ impl Chat {
         match cmd {
             "/new" => self.new_chat(),
             "/retry" => self.retry(cx),
-            "/model" => {
-                if arg.is_empty() {
-                    self.info.push("pick an AI with /model <name> [model]:".into());
-                    for (id, label, what) in providers::PROVIDERS {
-                        self.info.push(format!("  {id:<10} {label} — {what}"));
-                    }
-                } else {
+            // /model <name>: a model for the current AI; the old "/model <ai> [model]" still works
+            "/model" if !arg.is_empty() && !providers::PROVIDERS.iter().any(|p| p.0 == arg.split_whitespace().next().unwrap_or("").to_lowercase()) => {
+                let p = self.provider_of();
+                let model = if arg.eq_ignore_ascii_case("default") { None } else { Some(arg.clone()) };
+                self.chat.model = model.clone();
+                self.chat.state.remove(&p); // a CLI session is tied to its model
+                self.models.insert(p.clone(), model.clone().unwrap_or_default());
+                let mut c = crate::config::load();
+                c.ai.models.insert(p.clone(), model.clone().unwrap_or_default());
+                crate::config::save(&c);
+                cx.notify(format!("{}{} · {} · remembered", ui::lead("ai"), providers::label(&p), model.unwrap_or_else(|| "default model".into())));
+            }
+            "/model" if arg.is_empty() => {
+                let p = self.provider_of();
+                self.info.push(format!("{} is using {}. Pick one with /model <name>:", providers::label(&p), self.chat.model.clone().unwrap_or_else(|| "its default model".into())));
+                for (m, what) in self.models_for(&p) {
+                    self.info.push(format!("  {m:<22} {what}"));
+                }
+            }
+            "/provider" if arg.is_empty() => {
+                self.info.push("pick an AI with /provider <name> (then /model for its model):".into());
+                for (id, label, what) in providers::PROVIDERS {
+                    let here = if self.avail.contains(id) { "" } else { "  (not set up here)" };
+                    self.info.push(format!("  {id:<10} {label} — {what}{here}"));
+                }
+            }
+            "/provider" | "/model" => {
+                {
                     let mut a = arg.split_whitespace();
                     let id = a.next().unwrap_or("claude").to_lowercase();
                     if providers::PROVIDERS.iter().any(|p| p.0 == id) && !self.avail.contains(&id.as_str()) {
@@ -348,13 +393,21 @@ impl Chat {
                             _ => format!("  add a key: /key {id} <key>"),
                         });
                     } else if providers::PROVIDERS.iter().any(|p| p.0 == id) {
-                        let model = a.next().map(String::from);
+                        // an explicit model, else the one remembered for this AI
+                        let model = a.next().map(String::from).or_else(|| self.models.get(&id).cloned()).filter(|m| !m.is_empty());
                         self.chat.provider = Some(id.clone());
                         self.chat.model = model.clone();
                         self.provider = id.clone();
-                        cx.notify(format!("{}{}{}", ui::lead("ai"), providers::label(&id), model.map(|m| format!(" · {m}")).unwrap_or_default()));
+                        let mut c = crate::config::load();
+                        c.ai.provider = id.clone();
+                        if let Some(m) = &model {
+                            c.ai.models.insert(id.clone(), m.clone());
+                            self.models.insert(id.clone(), m.clone());
+                        }
+                        crate::config::save(&c);
+                        cx.notify(format!("{}{} · {} · remembered", ui::lead("ai"), providers::label(&id), model.unwrap_or_else(|| "default model".into())));
                     } else {
-                        self.info.push(format!("no AI called {id} — try /model"));
+                        self.info.push(format!("no AI called {id} — try /provider"));
                     }
                 }
             }
@@ -481,14 +534,64 @@ impl Chat {
         }
     }
 
+    /// The models the /model menu offers for an AI (the current one first, marked).
+    fn models_for(&self, p: &str) -> Vec<(String, String)> {
+        let s = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+        let mut v = match p {
+            "claude" => s(&[
+                ("default", "Claude Code's default"),
+                ("opus", "most capable (always the newest Opus)"),
+                ("sonnet", "balanced speed and smarts"),
+                ("haiku", "fastest and cheapest"),
+                ("claude-opus-5-5", "Opus 5.5"),
+                ("claude-sonnet-5", "Sonnet 5"),
+                ("claude-haiku-4-5", "Haiku 4.5"),
+                ("claude-fable-5-1", "Fable 5.1"),
+            ]),
+            "codex" => s(&[
+                ("default", "Codex's default"),
+                ("gpt-5.6-sol", "most capable"),
+                ("gpt-5.6-terra", "balanced"),
+                ("gpt-5.6-luna", "fast and cheap"),
+                ("gpt-5.3-codex", "older coding model"),
+            ]),
+            "anthropic" => s(&[
+                ("claude-sonnet-5", "Sonnet 5 — balanced"),
+                ("claude-opus-5-5", "Opus 5.5 — most capable"),
+                ("claude-haiku-4-5", "Haiku 4.5 — fastest"),
+                ("claude-fable-5-1", "Fable 5.1"),
+            ]),
+            "openai" => s(&[("gpt-5.6-terra", "balanced"), ("gpt-5.6-sol", "most capable"), ("gpt-5.6-luna", "fast and cheap")]),
+            "ollama" => {
+                let got = self.ollama_models.lock().unwrap().clone();
+                if got.is_empty() {
+                    s(&[("llama3.2", "pull models with `ollama pull <name>`")])
+                } else {
+                    got.into_iter().map(|m| (m, "installed in Ollama".to_string())).collect()
+                }
+            }
+            _ => vec![],
+        };
+        if let Some(cur) = &self.chat.model {
+            if let Some(i) = v.iter().position(|(m, _)| m == cur) {
+                let (m, w) = v.remove(i);
+                v.insert(0, (m, format!("{w} · current")));
+            } else {
+                v.insert(0, (cur.clone(), "current".into()));
+            }
+        }
+        v
+    }
+
     /// Choices for a command's argument (what gets listed after `/model `, `/theme `...).
     fn arg_options(&self, cmd: &str) -> Vec<(String, String)> {
         let pairs = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
         match cmd {
-            "/model" => providers::PROVIDERS
+            "/provider" => providers::PROVIDERS
                 .iter()
                 .map(|(id, label, what)| (id.to_string(), if self.avail.contains(id) { format!("{label} — {what}") } else { format!("{label} — not set up here") }))
                 .collect(),
+            "/model" => self.models_for(&self.provider_of()),
             "/perms" => PERMS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
             "/key" => pairs(&[("openai", "OpenAI-compatible key"), ("anthropic", "Anthropic API key")]),
             "/theme" => crate::theme::names().into_iter().map(|n| (n.clone(), if n == "omarchy" { "follows your Omarchy theme".into() } else if n == "terminal" { "your terminal's own colours".into() } else { String::new() })).collect(),
@@ -1384,6 +1487,45 @@ mod tests {
         k.poll(&mut c);
         assert!(c.info.iter().any(|l| l.contains("4 actions were blocked") && l.contains("/perms bypass")), "{:?}", c.info);
         store::delete(&c.chat.id);
+    }
+
+    #[test]
+    fn chat_provider_and_model_commands() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.avail = vec!["claude", "codex"];
+        c.provider = "claude".into();
+        c.chat.provider = Some("claude".into());
+        // /model lists the current AI's models
+        c.input = "/model ".into();
+        c.cursor = 7;
+        let s = k.render(&mut c, 130, 40);
+        assert!(s.contains("opus") && s.contains("sonnet") && s.contains("haiku"), "{s}");
+        c.input.clear();
+        c.cursor = 0;
+        k.typ(&mut c, "/model opus");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.chat.model.as_deref(), Some("opus"));
+        assert_eq!(c.models.get("claude").map(String::as_str), Some("opus"));
+        // /provider switches the AI; its own remembered model comes back with it
+        k.typ(&mut c, "/provider codex");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.provider_of(), "codex");
+        assert_eq!(c.chat.model, None);
+        c.input = "/model ".into();
+        c.cursor = 7;
+        assert!(k.render(&mut c, 130, 40).contains("gpt-5.6-terra"));
+        c.input.clear();
+        c.cursor = 0;
+        k.typ(&mut c, "/provider claude");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.chat.model.as_deref(), Some("opus"), "claude's model remembered");
+        c.new_chat();
+        assert_eq!(c.chat.model.as_deref(), Some("opus"), "new chats use it too");
+        // the old one-shot form still works
+        k.typ(&mut c, "/model codex gpt-5.6-luna");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!((c.provider_of().as_str(), c.chat.model.as_deref()), ("codex", Some("gpt-5.6-luna")));
     }
 
     #[test]

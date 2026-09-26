@@ -105,7 +105,7 @@ oriel uses whatever you already have and picks the first one it finds:
 - **API keys**: `/key openai <key>` or `/key anthropic <key>` in the chat. The OpenAI option works with any
   compatible server: OpenRouter, LM Studio, llama.cpp…
 
-Switch any time with `/model`. Type `/` to see every command.
+Switch the AI with `/provider`, and its model with `/model`. The menu lists that AI's models, including the models installed in Ollama. Both are remembered, each AI keeps its own model. Type `/` to see every command.
 
 **Permissions for coding agents:** `/perms` sets what Claude Code and Codex may do in chat, and it's remembered for every chat:
 

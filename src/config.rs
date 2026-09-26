@@ -31,6 +31,9 @@ pub struct AiConfig {
     /// What coding agents may do in chat: "ask", "edits" (default), "plan" (read-only) or "bypass" (anything).
     /// Set with /perms; applies to every new chat.
     pub perms: String,
+    /// The model picked for each AI with /model (e.g. claude = "opus"); new chats use it.
+    #[serde(default)]
+    pub models: std::collections::BTreeMap<String, String>,
     pub ollama_url: String,
     pub ollama_model: String,
     /// Any OpenAI-compatible endpoint (OpenAI, OpenRouter, LM Studio, llama.cpp server...).
@@ -69,6 +72,7 @@ impl Default for AiConfig {
         AiConfig {
             provider: String::new(),
             perms: "edits".into(),
+            models: Default::default(),
             ollama_url: "http://127.0.0.1:11434".into(),
             ollama_model: "llama3.2".into(),
             openai_url: "https://api.openai.com/v1".into(),
