@@ -900,7 +900,8 @@ impl Chat {
         }
         // ---- the status line
         let e = s.started.elapsed();
-        const STAR: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
+        // not ✳: Windows draws that one as a colour emoji two cells wide
+        const STAR: &[&str] = &["·", "✢", "✶", "✻", "✽", "✻", "✶", "✢"];
         let spin = STAR[(e.as_millis() / 120) as usize % STAR.len()];
         let action = if !self.asks.is_empty() {
             "waiting for you".to_string()
