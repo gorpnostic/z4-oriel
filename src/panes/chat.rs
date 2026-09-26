@@ -1903,7 +1903,7 @@ impl Chat {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             (m.content.len(), m.note.as_deref().unwrap_or(""), m.steps.len(), m.parts.len(), width, cx.theme.name.as_str()).hash(&mut h);
             // the check badge: /verify's result, and the check it looks for
-            (m.verified.as_deref(), self.chat.extra.get("check").map(|v| v.to_string())).hash(&mut h);
+            (m.verified.as_deref(), self.chat.extra.get("check").and_then(|v| v["cmd"].as_str())).hash(&mut h);
             h.finish()
         };
         if let Some((k, b)) = self.cache.get(&i) {
@@ -2599,6 +2599,8 @@ impl Chat {
         }
         let cur = check_of(&self.chat);
         let on = cur.as_ref().is_some_and(|k| k.status == "on");
+        // "/check on" is the bare /check, not a command called "on"
+        let arg = if arg.eq_ignore_ascii_case("on") { "" } else { arg };
         match arg {
             "off" | "stop" => {
                 if let Some(mut k) = cur.filter(|_| on) {
@@ -2640,6 +2642,10 @@ impl Chat {
             self.info.push("/verify <command> — e.g. /verify cargo test (next time it remembers it for this folder)".into());
             return;
         };
+        if self.stream.is_some() {
+            self.info.push("the reply is still running: /verify when it's done (or esc it first)".into());
+            return;
+        }
         let Some(idx) = self.chat.messages.iter().rposition(|m| m.role == "assistant") else {
             self.info.push("no reply to verify yet".into());
             return;
@@ -4179,6 +4185,22 @@ impl Pane for Chat {
     }
 
     fn mouse(&mut self, ev: MouseEvent, _area: Rect, cx: &mut Cx) {
+        // the diff view: a click picks a file, the wheel scrolls its hunks
+        if let Some(v) = self.review.as_mut().filter(|v| v.chat == self.chat.id) {
+            let pos = Position { x: ev.column, y: ev.row };
+            match ev.kind {
+                MouseEventKind::ScrollUp => v.scroll = v.scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => v.scroll += 3,
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(&(_, i)) = v.hits.iter().find(|(r, _)| r.contains(pos)) {
+                        v.file = i;
+                        v.scroll = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match ev.kind {
             MouseEventKind::ScrollUp => self.scroll += 3,
             MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
@@ -5890,6 +5912,10 @@ mod tests {
         assert!(s.contains("everything this chat changed") && s.contains("new.txt") && s.contains("b.txt") && s.contains("3 files"), "{s}");
         k.key(&mut c, KeyCode::Down);
         assert_eq!(c.review.as_ref().unwrap().file, 1);
+        // a click on a file row picks it
+        let row = c.review.as_ref().unwrap().hits[2].0;
+        k.mouse(&mut c, MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: row.x + 2, row: row.y, modifiers: KeyModifiers::NONE }, Rect::new(0, 0, 120, 30));
+        assert_eq!(c.review.as_ref().unwrap().file, 2);
         k.key(&mut c, KeyCode::Esc);
         assert!(c.review.is_none());
         // /undo: back to before turn 2 (b.txt comes back), nothing happens until y
@@ -5998,6 +6024,31 @@ mod tests {
         let mut p = plain_chat(&k, "hi", "yo");
         enter(&mut k, &mut p, "/check cargo test");
         assert!(p.info.iter().any(|l| l.contains("coding agent")) && check_of(&p.chat).is_none(), "{:?}", p.info);
+    }
+
+    /// /verify runs the check now and the last reply's badge says what it found (the command is remembered for the
+    /// folder, so a bare /verify runs it again); not while a reply is running.
+    #[test]
+    fn chat_verify_badges_the_last_reply() {
+        let mut k = Kit::new();
+        let d = ckpt_folder("verify", &[("ok.txt", "x
+")]);
+        let mut c = coding_chat(&k, &d);
+        let _forget = Forget(c.chat.id.clone());
+        c.chat.messages.push(user("tidy it"));
+        let edit = store::Part::Tool(store::Tool { label: "Update".into(), target: "ok.txt".into(), status: "done".into(), ..Default::default() });
+        c.chat.messages.push(store::Msg { role: "assistant".into(), model: Some("claude".into()), content: "Done, all tests pass.".into(), parts: vec![edit, store::Part::Text { text: "Done, all tests pass.".into() }], ..Default::default() });
+        let s = k.render(&mut c, 120, 24);
+        assert!(s.contains("○ not run: nothing checked this work"), "{s}");
+        enter(&mut k, &mut c, "/verify git --version");
+        wait_until(&mut k, &mut c, "the check", |c| c.chat.messages[1].verified.is_some());
+        assert!(c.chat.messages[1].verified.as_deref().unwrap().starts_with("✓ checked") && c.info.iter().any(|l| l == "✓ git --version passes"), "{:?}", c.info);
+        let s = k.render(&mut c, 120, 24);
+        assert!(s.contains("✓ checked") && s.contains("git --version") && !s.contains("not run"), "{s}");
+        assert_eq!(remembered_check(&d).as_deref(), Some("git --version"));
+        c.stream = Some(test_stream(None));
+        enter(&mut k, &mut c, "/verify");
+        assert!(c.info.iter().any(|l| l.contains("still running")), "{:?}", c.info);
     }
 
     /// The badge under a finished coding agent's reply: ✓ when a check ran after its last edit, ✗ when that check

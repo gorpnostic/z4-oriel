@@ -29,6 +29,30 @@ const KEEP_DAYS: i64 = 14;
 /// Who checkpoint commits are by (a repo without user.name set can still make them).
 const IDENT: [(&str, &str); 4] = [("GIT_AUTHOR_NAME", "oriel"), ("GIT_AUTHOR_EMAIL", "oriel@localhost"), ("GIT_COMMITTER_NAME", "oriel"), ("GIT_COMMITTER_EMAIL", "oriel@localhost")];
 
+/// One git job at a time per folder: two at once (a turn's snapshot, /diff, the note's numbers) would fight over
+/// the shadow's index (index.lock) or snapshot a folder half way through a restore.
+static BUSY: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+static FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Holds a folder until dropped.
+struct Busy(PathBuf);
+
+fn busy(root: &Path) -> Busy {
+    let mut b = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+    while b.iter().any(|r| r == root) {
+        b = FREED.wait(b).unwrap_or_else(|e| e.into_inner());
+    }
+    b.push(root.to_path_buf());
+    Busy(root.to_path_buf())
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| *r != self.0);
+        FREED.notify_all();
+    }
+}
+
 /// Where a folder's checkpoints live.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Place {
@@ -65,6 +89,7 @@ impl Place {
         }
         let shadow = shadow_root().join(format!("{:016x}", fnv(&dir.to_string_lossy())));
         let p = Place { root: dir, shadow: Some(shadow.clone()) };
+        let _busy = busy(&p.root);
         if !shadow.join("HEAD").is_file() {
             std::fs::create_dir_all(&shadow).map_err(|e| format!("couldn't make {}: {e}", shadow.display()))?;
             p.ok(&["init", "-q"])?;
@@ -155,6 +180,11 @@ fn size_check(p: &Place, caps: &Caps) -> Result<(), String> {
 /// The folder as it is now, as a git tree. Nothing you use changes; a folder too big to do quickly is skipped
 /// with the reason.
 pub fn tree(p: &Place, caps: &Caps) -> Result<String, String> {
+    let _busy = busy(&p.root);
+    tree_in(p, caps)
+}
+
+fn tree_in(p: &Place, caps: &Caps) -> Result<String, String> {
     size_check(p, caps)?;
     match &p.shadow {
         None => {
@@ -173,17 +203,24 @@ pub fn tree(p: &Place, caps: &Caps) -> Result<String, String> {
 
 /// Snapshot the folder as checkpoint `turn` of `chat`: the commit's sha. Old checkpoints are pruned on the way.
 pub fn snapshot(p: &Place, chat: &str, turn: usize, caps: &Caps) -> Result<String, String> {
-    let tree = tree(p, caps)?;
+    let _busy = busy(&p.root);
+    let tree = tree_in(p, caps)?;
     let msg = format!("oriel checkpoint · chat {chat} · turn {turn}");
     let args = ["commit-tree", tree.as_str(), "-m", msg.as_str()];
     let c = ok_of(p.git_env(&args, &IDENT), &args)?;
     p.ok(&["update-ref", &format!("refs/oriel/ckpt/{chat}/{turn}"), &c])?;
-    prune(p, chat, crate::panes::files::clock::now_secs());
+    prune_in(p, chat, crate::panes::files::clock::now_secs());
     Ok(c)
 }
 
 /// Keep a chat's newest KEEP checkpoints, and nobody's older than KEEP_DAYS (a deleted chat's go that way too).
+#[cfg(test)]
 pub fn prune(p: &Place, chat: &str, now: i64) {
+    let _busy = busy(&p.root);
+    prune_in(p, chat, now)
+}
+
+fn prune_in(p: &Place, chat: &str, now: i64) {
     let Ok(list) = p.ok(&["for-each-ref", "--format=%(refname) %(creatordate:unix)", "refs/oriel/ckpt/"]) else { return };
     let mut mine: Vec<(usize, String)> = vec![];
     let mut drop: Vec<String> = vec![];
@@ -250,6 +287,7 @@ pub fn plan(p: &Place, ckpt: &str, now: &str) -> Result<Plan, String> {
 /// Put the folder back the way it was at `ckpt`: the files in `plan.write` come back from it, the ones in
 /// `plan.delete` (made since) go. Only those paths are touched; the real index, HEAD and branches never are.
 pub fn restore(p: &Place, ckpt: &str, plan: &Plan) -> Result<(), String> {
+    let _busy = busy(&p.root);
     let safe = |f: &String| !Path::new(f).is_absolute() && Path::new(f).components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
     if let Some(bad) = plan.write.iter().chain(&plan.delete).find(|f| !safe(f)) {
         return Err(format!("refusing a path outside the folder: {bad}"));
@@ -400,6 +438,27 @@ mod tests {
         assert_eq!(read(&d, "notes.md").as_deref(), Some("untracked\n"));
         assert!(!d.join("extra.rs").exists() && d.join("secret/key").exists(), "ignored files are never snapshotted or deleted");
         assert_eq!((g(&["rev-parse", "HEAD"]), g(&["status", "--porcelain"]), g(&["stash", "list"])), before, "back to exactly the state at the checkpoint");
+    }
+
+    /// Snapshots, trees and restores of one folder never run at once (they'd fight over the shadow's index.lock):
+    /// several threads going at the same folder all succeed.
+    #[test]
+    fn chat_ckpt_one_job_per_folder() {
+        let d = scratch("busy");
+        for i in 0..20 {
+            write(&d, &format!("f{i}.txt"), &"x".repeat(i * 100));
+        }
+        let p = Place::of(&d).unwrap();
+        let jobs: Vec<_> = (0..6)
+            .map(|n| {
+                let p = p.clone();
+                std::thread::spawn(move || if n % 2 == 0 { snapshot(&p, "busy", n, &CAPS).map(|_| ()) } else { tree(&p, &CAPS).map(|_| ()) })
+            })
+            .collect();
+        for j in jobs {
+            j.join().unwrap().unwrap();
+        }
+        assert_eq!(list(&p, "busy").len(), 3);
     }
 
     /// A chat keeps its newest 50 checkpoints; anything older than two weeks goes whoever it belongs to; a folder
