@@ -149,7 +149,8 @@ enum Msg {
     Progress(String, String),
     Merged(String, Result<String, String>),
     Removed(String, Result<(), String>, Then),
-    Plan(Result<(Vec<(String, String)>, f64), String>),
+    /// The planner's cards, for the repo it read (the board may have moved to another one meanwhile).
+    Plan(String, Result<(Vec<(String, String)>, f64), String>),
     // ---- lead mode
     /// A headless worker's live event, and its end.
     Worker(String, stream::Ev),
@@ -375,6 +376,8 @@ pub struct Agents {
     mode: Mode,
     col: usize,
     row: [usize; 4],
+    /// The task each column has selected: cards arriving or leaving above it move `row`, not the selection.
+    sel_id: [Option<String>; 4],
     scroll: [usize; 4],
     hits: Vec<(Rect, Hit)>,
     side_hits: Vec<(Rect, Hit)>,
@@ -467,6 +470,7 @@ impl Agents {
             mode: Mode::Board,
             col: 0,
             row: [0; 4],
+            sel_id: Default::default(),
             scroll: [0; 4],
             hits: vec![],
             side_hits: vec![],
@@ -612,6 +616,28 @@ impl Agents {
             if let Some(r) = self.column(c).iter().position(|&i| self.store.tasks[i].id == id) {
                 self.col = c;
                 self.row[c] = r;
+                self.sel_id[c] = Some(id.to_string());
+            }
+        }
+    }
+
+    /// Remember which task each column has selected (after the user moved), so the cursor stays on it.
+    fn pin_selection(&mut self) {
+        for c in 0..4 {
+            let col = self.column(c);
+            self.sel_id[c] = col.get(self.row[c].min(col.len().saturating_sub(1))).map(|&i| self.store.tasks[i].id.clone());
+        }
+    }
+
+    /// Keep each column's cursor on the task it had selected while cards arrive and leave around it (REVIEW and
+    /// DONE are newest first, so every finished worker shifts them). A task that left the column hands the
+    /// cursor to whatever now sits in its row.
+    fn follow_selection(&mut self) {
+        for c in 0..4 {
+            let col = self.column(c);
+            match self.sel_id[c].as_ref().and_then(|id| col.iter().position(|&i| self.store.tasks[i].id == *id)) {
+                Some(r) => self.row[c] = r,
+                None => self.sel_id[c] = col.get(self.row[c].min(col.len().saturating_sub(1))).map(|&i| self.store.tasks[i].id.clone()),
             }
         }
     }
@@ -627,8 +653,21 @@ impl Agents {
         self.store.repos.truncate(12);
         self.repo = Some(r);
         self.row = [0; 4];
+        self.sel_id = Default::default();
         self.scroll = [0; 4];
+        self.prune_marks();
         self.save();
+    }
+
+    /// Marks only hold this repo's TODO tasks that still exist and aren't in a run: a switch of repo or a deleted
+    /// task mustn't send stale cards into the next run.
+    fn prune_marks(&mut self) {
+        if self.marked.is_empty() {
+            return;
+        }
+        let key = self.repo_key();
+        let keep: Vec<String> = self.marked.iter().filter(|id| self.task(id).is_some_and(|t| t.repo == key && t.status == Status::Todo && t.run.is_empty())).cloned().collect();
+        self.marked = keep;
     }
 
     fn open_repo(&mut self, path: PathBuf, cx: &Cx) {
@@ -645,8 +684,8 @@ impl Agents {
             let d = crate::panes::files::clock::local(t);
             (d.year, d.month, d.day) == (now.year, now.month, now.day)
         };
-        // workers, plus the leads that orchestrated them
-        self.store.tasks.iter().filter(|t| same(t.started.max(t.created))).fold(0.0, |a, t| a + t.cost_usd) + self.store.runs.iter().filter(|r| same(r.created)).fold(0.0, |a, r| a + r.cost_usd)
+        // workers (with what they spent before a retry), plus the leads that orchestrated them
+        self.store.tasks.iter().filter(|t| same(t.started.max(t.created))).fold(0.0, |a, t| a + t.cost_usd + t.spent_before) + self.store.runs.iter().filter(|r| same(r.created)).fold(0.0, |a, r| a + r.cost_usd)
     }
 
     // ------------------------------------------------------------------ the state machine
@@ -671,11 +710,18 @@ impl Agents {
             self.watchdog();
             self.check_waiters();
             self.watch_budgets(cx);
+            // runs without a lead at the wheel go to review once nothing's left, whichever way their tasks settled
+            let settle: Vec<String> = self.store.runs.iter().filter(|r| r.state == store::RunState::Running && (r.manual || r.finishing)).map(|r| r.id.clone()).collect();
+            for r in settle {
+                self.batch_check(&r, cx);
+            }
             if before != (self.store.tasks.iter().filter(|t| t.status == Status::Running).count(), self.merge_queue.len(), self.merging.clone()) {
                 dirty = true;
             }
         }
         self.refresh_limits(cx, runs);
+        self.prune_marks();
+        self.follow_selection();
         if dirty {
             self.save();
         }
@@ -724,7 +770,7 @@ impl Agents {
             Msg::Status(id, st) => self.on_status(&id, st, cx),
             Msg::Started(id, r) => self.on_started(&id, r, cx),
             Msg::Refreshed(id, stats, c) => {
-                self.live(&id).busy = false;
+                // (a refresh isn't a git job: it leaves `busy` to whatever is running for the task)
                 if let Some(t) = self.task_mut(&id) {
                     if let Some(s) = stats {
                         (t.added, t.removed, t.files) = (s.added, s.removed, s.files);
@@ -735,6 +781,17 @@ impl Agents {
                         }
                     }
                 }
+                // a budget on a task in a tab: claude's own cap only works headless, so close the tab once the
+                // transcript says it's spent (the card goes to REVIEW with what it did)
+                let over = self.task(&id).filter(|t| !t.headless() && t.run.is_empty() && t.status.active() && t.budget_usd > 0.0 && t.cost_usd >= t.budget_usd && !t.error.starts_with("stopped at its budget")).cloned();
+                if let Some(t) = over {
+                    let why = format!("stopped at its budget (${:.2} of ${:.2})", t.cost_usd, t.budget_usd);
+                    if let Some(tm) = self.task_mut(&id) {
+                        tm.error = why.clone();
+                    }
+                    cx.act(Action::CloseTag(t.tag()));
+                    cx.alert(crate::alerts::Kind::Usage, format!("{} {why} — its tab was closed", t.title));
+                }
             }
             Msg::Gone(id, changes) => {
                 self.live(&id).busy = false;
@@ -744,14 +801,19 @@ impl Agents {
                 }
                 if changes {
                     self.to_review(&id, "agent tab closed · ready for review", cx);
-                } else if let Some(t) = self.task_mut(&id) {
-                    t.status = Status::Todo;
-                    t.last = "agent tab closed with no changes".into();
-                    t.question.clear();
-                    t.branch.clear();
-                    t.worktree.clear();
-                    t.base_sha.clear();
-                    self.select(&id);
+                } else {
+                    let following = self.selected().as_deref() == Some(id.as_str());
+                    if let Some(t) = self.task_mut(&id) {
+                        t.status = Status::Todo;
+                        t.last = "agent tab closed with no changes".into();
+                        t.question.clear();
+                        t.branch.clear();
+                        t.worktree.clear();
+                        t.base_sha.clear();
+                    }
+                    if following {
+                        self.select(&id);
+                    }
                 }
             }
             Msg::Diff(id, r) => {
@@ -776,7 +838,8 @@ impl Agents {
             Msg::Merged(id, r) => {
                 self.live(&id).busy = false;
                 let sp = self.paths.status(&id);
-                let Some(t) = self.task_mut(&id) else { return };
+                let following = self.selected().as_deref() == Some(id.as_str());
+                let Some(t) = self.task_mut(&id).filter(|t| t.status != Status::Done) else { return };
                 match r {
                     Ok(summary) => {
                         t.status = Status::Done;
@@ -787,7 +850,9 @@ impl Agents {
                         let title = t.title.clone();
                         let _ = std::fs::remove_file(&sp);
                         cx.notify(format!("✓ {title} · {summary}"));
-                        self.select(&id);
+                        if following {
+                            self.select(&id);
+                        }
                     }
                     Err(e) => {
                         t.last.clear();
@@ -810,7 +875,9 @@ impl Agents {
                     }
                 }
                 let sp = self.paths.status(&id);
-                let Some(t) = self.task_mut(&id) else { return };
+                let following = self.selected().as_deref() == Some(id.as_str());
+                // a merge that landed first wins: it isn't relabelled "discarded" by a late removal
+                let Some(t) = self.task_mut(&id).filter(|t| !(t.status == Status::Done && t.outcome == "merged")) else { return };
                 match r {
                     Err(e) => {
                         t.error = e.clone();
@@ -825,6 +892,8 @@ impl Agents {
                         if then == Then::Retry {
                             let t = self.task_mut(&id).unwrap();
                             t.status = Status::Todo;
+                            // what it spent so far still counts today
+                            t.spent_before += t.cost_usd;
                             (t.added, t.removed, t.files, t.cost_usd, t.tokens) = (0, 0, 0, 0.0, 0);
                             self.start(&id, cx);
                         } else {
@@ -832,22 +901,27 @@ impl Agents {
                             t.outcome = "discarded".into();
                             t.finished = store::now();
                             t.last = "discarded".into();
-                            self.select(&id);
+                            t.queued = false;
+                            t.want_merge = false;
+                            if following {
+                                self.select(&id);
+                            }
                         }
                     }
                 }
             }
-            Msg::Plan(r) => {
+            Msg::Plan(repo, r) => {
                 self.planning = false;
                 match r {
                     Ok((items, usd)) if !items.is_empty() => {
                         let n = items.len();
                         let agent = self.default_agent();
                         for (title, prompt) in items {
-                            self.add_task(&title, &prompt, agent, "");
+                            self.add_task_in(&repo, &title, &prompt, agent, "");
                         }
-                        self.col = 0;
-                        cx.notify(format!("planned {n} tasks{}", if usd > 0.0 { format!(" · ${usd:.2}") } else { String::new() }));
+                        let name = Path::new(&repo).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                        let place = if repo == self.repo_key() { String::new() } else { format!(" in {name}") };
+                        cx.notify(format!("planned {n} tasks{place}{}", if usd > 0.0 { format!(" · ${usd:.2}") } else { String::new() }));
                     }
                     Ok(_) => cx.notify("the planner came back with no tasks"),
                     Err(e) => cx.notify(format!("plan failed: {e}")),
@@ -1057,11 +1131,16 @@ impl Agents {
     }
 
     fn add_task(&mut self, title: &str, prompt: &str, agent: usize, model: &str) -> String {
+        let repo = self.repo_key();
+        self.add_task_in(&repo, title, prompt, agent, model)
+    }
+
+    fn add_task_in(&mut self, repo: &str, title: &str, prompt: &str, agent: usize, model: &str) -> String {
         let id = store::new_id(&self.store.tasks);
         let title = if title.trim().is_empty() { prompt.lines().next().unwrap_or("task").chars().take(60).collect() } else { title.trim().to_string() };
         self.store.tasks.push(Task {
             id: id.clone(),
-            repo: self.repo_key(),
+            repo: repo.to_string(),
             title,
             prompt: prompt.trim().to_string(),
             agent: KINDS[agent.min(KINDS.len() - 1)].0.to_string(),
@@ -1086,6 +1165,14 @@ impl Agents {
         }
         if self.live(id).busy {
             return;
+        }
+        if t.run.is_empty() {
+            // your own "after" links: it can't start until those are merged (a run of them orders it for you)
+            let waits: Vec<String> = t.depends_on.iter().filter_map(|d| self.task(d)).filter(|d| !(d.status == Status::Done && d.outcome == "merged")).map(|d| format!("\"{}\"", d.title)).collect();
+            if !waits.is_empty() {
+                cx.notify(format!("\"{}\" waits for {} to be merged — or mark them all (space) and press enter to run them in order", t.title, waits.join(", ")));
+                return;
+            }
         }
         // lead-run tasks branch off the run's integration branch, in the run's repo
         let base = if t.run.is_empty() { None } else { self.run_ref(&t.run).map(|r| r.branch.clone()) };
@@ -1140,12 +1227,20 @@ impl Agents {
                 }
             }
             Ok(s) => {
+                let accepting = self.task(id).is_some_and(|t| t.run.is_empty() || self.run_accepting(&t.run));
                 let Some(t) = self.task_mut(id) else { return };
                 t.branch = s.branch;
                 t.base_branch = s.base_branch;
                 t.base_sha = s.base_sha;
                 t.worktree = s.worktree.display().to_string();
                 t.last = format!("starting {}…", if t.worker.is_empty() { &t.agent } else { &t.worker });
+                if !accepting {
+                    // its run was stopped while the worktree was made: back in the queue (start makes it afresh)
+                    t.status = Status::Todo;
+                    t.queued = true;
+                    t.last = "queued".into();
+                    return;
+                }
                 let t = t.clone();
                 if t.headless() {
                     self.start_worker(id, cx);
@@ -1198,9 +1293,27 @@ impl Agents {
         self.spawn(cx, move |send| send(Msg::Diff(id, git::diff_against(Path::new(&t.repo), Path::new(&t.worktree), &t.base_sha, target.as_deref()))));
     }
 
+    /// Can you act on this task right now (merge, discard, retry, comment, take over)? Not while a git step runs
+    /// for it (starting, checking, merging, resolving, removing): a second one at the same time would fight it.
+    fn can_act(&self, id: &str) -> Result<(), &'static str> {
+        if self.merging.as_deref() == Some(id) {
+            return Err("it's being merged right now — try again in a moment");
+        }
+        match self.live.get(id) {
+            Some(l) if l.busy || l.checking => Err("it's in the middle of a git step — try again in a moment"),
+            _ => Ok(()),
+        }
+    }
+
     fn merge(&mut self, id: &str, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
+        if let Err(why) = self.can_act(id) {
+            cx.notify(why);
+            return;
+        }
         if !t.run.is_empty() {
+            // a finished run takes it in again (and goes back to review once it's merged)
+            self.revive(&t.run);
             // a lead-run task lands on the run's integration branch, through the gated merge queue
             if !t.headless() {
                 cx.act(Action::CloseTag(t.tag()));
@@ -1260,11 +1373,21 @@ impl Agents {
             cx.notify("that task has no worktree any more");
             return;
         }
+        if let Err(why) = self.can_act(id) {
+            cx.notify(why);
+            return;
+        }
         if t.headless() {
             if self.live.get(id).is_some_and(|l| l.stop.is_some()) {
                 cx.notify("it's still working — comment when it's done, or t to take it over");
                 return;
             }
+            if self.run_ref(&t.run).is_some_and(|r| r.state == store::RunState::Stopped) {
+                cx.notify("the run is stopped — resume it first (r on the lead panel)");
+                return;
+            }
+            // your answer unblocks it (worker_again), and a finished run takes the new round in
+            self.revive(&t.run);
             self.worker_again(id, text, cx);
             self.save();
             return;
@@ -1287,7 +1410,8 @@ impl Agents {
             return;
         }
         self.planning = true;
-        self.spawn(cx, move |send| send(Msg::Plan(run_planner(&bin, &repo.root, &goal))));
+        let key = repo.root.display().to_string();
+        self.spawn(cx, move |send| send(Msg::Plan(key, run_planner(&bin, &repo.root, &goal))));
     }
 
     /// enter on a card: start it, jump to its agent, or review it. Headless workers show their live transcript.
@@ -1316,6 +1440,13 @@ impl Agents {
 
     fn do_confirm(&mut self, c: Confirm, cx: &mut Cx) {
         self.mode = Mode::Board;
+        // a git step may have started for the task while the question was up
+        if matches!(c.what, Pending::Merge | Pending::Discard | Pending::Retry) {
+            if let Err(why) = self.can_act(&c.id) {
+                cx.notify(why);
+                return;
+            }
+        }
         match c.what {
             Pending::Merge => self.merge(&c.id, cx),
             Pending::Discard if self.task(&c.id).is_some_and(|t| !t.run.is_empty()) => self.discard_task(&c.id, None, cx),
@@ -1364,18 +1495,52 @@ impl Agents {
         }
     }
 
-    /// "a1b2, fix the parser" -> task ids: exact ids, or the TODO task whose title starts with it.
+    /// "a1b2, fix the parser" -> task ids: exact ids, or the open task whose title starts with it. An exact id may
+    /// name a finished task (the field comes back prefilled when you edit): merged ones are simply met and drop
+    /// out, discarded ones never will be. No loops: a task can't wait for one that already waits for it.
     fn resolve_after(&self, text: &str, me: Option<&str>) -> Result<Vec<String>, String> {
         let mut out = vec![];
         for part in text.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()) {
             let low = part.to_lowercase();
+            if let Some(t) = self.store.tasks.iter().find(|t| t.id == part && Some(t.id.as_str()) != me && t.status == Status::Done) {
+                if t.outcome == "merged" {
+                    continue;
+                }
+                return Err(format!("'{}' was discarded — take it out of after", t.title));
+            }
             let hit = self.store.tasks.iter().filter(|t| Some(t.id.as_str()) != me && t.status != Status::Done).find(|t| t.id == part || t.title.to_lowercase().starts_with(&low));
             match hit {
-                Some(t) => out.push(t.id.clone()),
+                Some(t) => {
+                    if let Some(me) = me.filter(|me| self.waits_on(&t.id, me)) {
+                        let mine = self.task(me).map(|x| x.title.clone()).unwrap_or_default();
+                        return Err(format!("'{}' already waits for '{mine}'", t.title));
+                    }
+                    if !out.contains(&t.id) {
+                        out.push(t.id.clone());
+                    }
+                }
                 None => return Err(format!("no open task called '{part}'")),
             }
         }
         Ok(out)
+    }
+
+    /// Does task `a` wait for task `b`, directly or through what it waits for?
+    fn waits_on(&self, a: &str, b: &str) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![a.to_string()];
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x.clone()) {
+                continue;
+            }
+            for d in self.task(&x).map(|t| t.depends_on.clone()).unwrap_or_default() {
+                if d == b {
+                    return true;
+                }
+                stack.push(d);
+            }
+        }
+        false
     }
 
     fn submit_form(&mut self, mut form: Form, start: bool, cx: &mut Cx) {
@@ -1431,6 +1596,13 @@ impl Agents {
             t.depends_on = after;
             t.budget_usd = budget;
         }
+        // a waiting task of a finished run you just fixed up (another agent, say): the run takes it in again
+        if let Some(run) = self.task(&id).filter(|t| t.status == Status::Todo && !t.run.is_empty()).map(|t| t.run.clone()) {
+            if let Some(t) = self.task_mut(&id) {
+                t.queued = true;
+            }
+            self.revive(&run);
+        }
         self.save();
         self.mode = Mode::Board;
         self.select(&id);
@@ -1450,7 +1622,8 @@ impl Agents {
         match k.code {
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.lead_focus = false,
             KeyCode::Up | KeyCode::Char('k') => {}
-            KeyCode::Esc | KeyCode::Char('s') if run.state.active() => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::StopRun }),
+            // esc leaves the panel like everywhere else; stopping the run is s (and y)
+            KeyCode::Char('s') if run.state.active() => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::StopRun }),
             KeyCode::Esc => self.lead_focus = false,
             KeyCode::Char('w') => self.mode = Mode::Watch(WatchView { run: run.id, sel: 0 }),
             KeyCode::Enter => self.mode = Mode::Log(LogView { target: LogTarget::Lead(run.id), scroll: 0, back: None }),
@@ -1556,19 +1729,22 @@ impl Agents {
             _ => {
                 let Some(id) = self.selected() else { return matches!(k.code, KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't')) };
                 let t = self.task(&id).unwrap().clone();
-                let busy = self.live(&id).busy;
                 let has_wt = !t.worktree.is_empty();
                 let running_headless = t.headless() && self.live(&id).stop.is_some();
                 let in_run = !t.run.is_empty();
+                if let (KeyCode::Char('c' | 'm' | 'x' | 'r' | 't'), Err(why), false) = (k.code, self.can_act(&id), t.status == Status::Done) {
+                    cx.notify(why);
+                    return true;
+                }
                 match k.code {
                     KeyCode::Char('d') if has_wt => self.open_diff(&id, cx),
-                    KeyCode::Char('c') if has_wt && t.status != Status::Done && !busy && !running_headless => self.mode = Mode::Comment(id, Input::new("", true)),
-                    KeyCode::Char('m') if in_run && has_wt && !busy && t.status == Status::Review => self.confirm(Pending::Merge),
-                    KeyCode::Char('m') if !in_run && has_wt && !busy && matches!(t.status, Status::Review | Status::Running | Status::Blocked) => self.confirm(Pending::Merge),
-                    KeyCode::Char('x') if !busy && t.status == Status::Todo && !in_run => self.confirm(Pending::Delete),
-                    KeyCode::Char('x') if !busy && t.status != Status::Done => self.confirm(Pending::Discard),
-                    KeyCode::Char('r') if !in_run && !busy && t.status != Status::Todo && !(t.status == Status::Done && t.outcome == "merged") => self.confirm(Pending::Retry),
-                    KeyCode::Char('t') if t.headless() && has_wt && !busy => self.take_over(&id, cx),
+                    KeyCode::Char('c') if has_wt && t.status != Status::Done && !running_headless => self.mode = Mode::Comment(id, Input::new("", true)),
+                    KeyCode::Char('m') if in_run && has_wt && t.status == Status::Review => self.confirm(Pending::Merge),
+                    KeyCode::Char('m') if !in_run && has_wt && matches!(t.status, Status::Review | Status::Running | Status::Blocked) => self.confirm(Pending::Merge),
+                    KeyCode::Char('x') if t.status == Status::Todo && !in_run => self.confirm(Pending::Delete),
+                    KeyCode::Char('x') if t.status != Status::Done => self.confirm(Pending::Discard),
+                    KeyCode::Char('r') if !in_run && t.status != Status::Todo && !(t.status == Status::Done && t.outcome == "merged") => self.confirm(Pending::Retry),
+                    KeyCode::Char('t') if t.headless() && has_wt => self.take_over(&id, cx),
                     KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't') => {}
                     _ => return false,
                 }
@@ -1578,6 +1754,15 @@ impl Agents {
     }
 
     fn diff_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
+        let Mode::Diff(v) = &self.mode else { return false };
+        // the same guard as on the board: no second git step for a task while one is running
+        let id = v.id.clone();
+        if matches!(k.code, KeyCode::Char('m' | 'x' | 'c')) && self.task(&id).is_some() {
+            if let Err(why) = self.can_act(&id) {
+                cx.notify(why);
+                return true;
+            }
+        }
         let Mode::Diff(v) = &mut self.mode else { return false };
         let nfiles = v.data.as_ref().and_then(|d| d.as_ref().ok()).map(|d| d.files.len()).unwrap_or(0);
         match k.code {
@@ -1869,7 +2054,7 @@ impl Pane for Agents {
 
     fn key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
         self.sync(cx);
-        match &self.mode {
+        let used = match &self.mode {
             Mode::Board => self.board_key(k, cx),
             Mode::Diff(_) => self.diff_key(k, cx),
             Mode::Form(_) => self.form_key(k, cx),
@@ -1903,8 +2088,11 @@ impl Pane for Agents {
             }
             Mode::Confirm(_) => {
                 let Mode::Confirm(c) = std::mem::replace(&mut self.mode, Mode::Board) else { return true };
+                // throwing something away (or stopping a run) takes a real y; enter only confirms merges
+                let destructive = matches!(c.what, Pending::StopRun | Pending::DiscardRun | Pending::Discard | Pending::Retry | Pending::Delete);
                 match k.code {
-                    KeyCode::Char('y') | KeyCode::Enter => self.do_confirm(c, cx),
+                    KeyCode::Char('y') => self.do_confirm(c, cx),
+                    KeyCode::Enter if !destructive => self.do_confirm(c, cx),
                     KeyCode::Char('n') | KeyCode::Esc => {}
                     _ => self.mode = Mode::Confirm(c),
                 }
@@ -1932,7 +2120,10 @@ impl Pane for Agents {
                 }
                 true
             }
-        }
+        };
+        // the cursor stays on the card you moved it to, whatever arrives or leaves around it later
+        self.pin_selection();
+        used
     }
 
     fn paste(&mut self, text: &str, _cx: &mut Cx) {
@@ -2039,6 +2230,7 @@ impl Pane for Agents {
             }
             _ => {}
         }
+        self.pin_selection();
     }
 
     fn side(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {

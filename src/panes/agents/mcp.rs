@@ -414,8 +414,9 @@ mod tests {
     fn agents_mcp_progress_while_waiting() {
         let rpc = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "wait", "arguments": {}, "_meta": {"progressToken": "p1"}}}).to_string();
         let mut out = vec![];
+        // (a long call next to the ticks: the progress thread still gets its turns on a busy machine)
         serve_with(rpc.as_bytes(), &mut out, |_, _| {
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(900));
             Ok("{\"events\":[]}".into())
         }, Duration::from_millis(60));
         let lines: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();

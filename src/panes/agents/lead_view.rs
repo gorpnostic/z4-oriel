@@ -66,6 +66,7 @@ fn spread<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, w: usize) -> Line<'a> {
 fn state_label(r: &Run) -> &'static str {
     match r.state {
         RunState::Starting => "starting",
+        RunState::Running if r.finishing => "finishing",
         RunState::Running => "running",
         RunState::Review => "ready for review",
         RunState::Merged => "merged",
@@ -202,7 +203,8 @@ impl Agents {
             add(format!("{review} to review"), Style::default().fg(t.shine));
         }
         if merging > 0 {
-            add(format!("{merging} merging"), Style::default().fg(t.shine));
+            // a stopped run holds its merges until it's resumed
+            add(if run.state == RunState::Running { format!("{merging} merging") } else { format!("{merging} waiting to merge") }, Style::default().fg(t.shine));
         }
         add(format!("{merged} merged"), if merged > 0 { Style::default().fg(t.good) } else { ui::muted(t) });
         let lead_cost = vec![Span::styled(format!("lead {}", money(run.cost_usd)), ui::muted(t))];
@@ -893,8 +895,10 @@ impl Agents {
             KeyCode::Char('c') => {
                 if let LogTarget::Task(id) = v.target.clone() {
                     let ok = self.task(&id).is_some_and(|t| !t.worktree.is_empty() && t.status == Status::Review);
-                    if ok {
-                        self.mode = Mode::Comment(id, Input::new("", true));
+                    match self.can_act(&id) {
+                        Err(why) => cx.notify(why),
+                        Ok(()) if ok => self.mode = Mode::Comment(id, Input::new("", true)),
+                        Ok(()) => {}
                     }
                 }
             }
@@ -910,7 +914,9 @@ impl Agents {
         let (title, sub, log, color) = self.target_info(&target, cx);
         let task = if let LogTarget::Task(id) = &target { self.task(id).cloned() } else { None };
         let hints: Vec<(&str, &str)> = match &task {
-            Some(tk) if tk.headless() && !tk.worktree.is_empty() => vec![("↑↓", "scroll"), ("t", "take over in a tab"), ("d", "diff"), ("c", "follow-up"), ("esc", "back")],
+            // a follow-up only when it can start: finished, and no git step (a merge, a check) running for it
+            Some(tk) if tk.headless() && !tk.worktree.is_empty() && tk.status == Status::Review && self.can_act(&tk.id).is_ok() => vec![("↑↓", "scroll"), ("t", "take over in a tab"), ("d", "diff"), ("c", "follow-up"), ("esc", "back")],
+            Some(tk) if tk.headless() && !tk.worktree.is_empty() => vec![("↑↓", "scroll"), ("t", "take over in a tab"), ("d", "diff"), ("esc", "back")],
             Some(_) => vec![("↑↓", "scroll"), ("d", "diff"), ("esc", "back")],
             None => vec![("↑↓", "scroll"), ("d", "integration diff"), ("esc", "back")],
         };

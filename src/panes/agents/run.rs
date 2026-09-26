@@ -200,8 +200,8 @@ fn run_process(spec: &Spec, stop: &Arc<AtomicBool>, o: &mut Outcome, on: &mut dy
     let thread_id = Arc::new(Mutex::new(String::new()));
     let over: Arc<Mutex<Option<String>>> = Arc::default();
     if spec.agent == "codex" && spec.budget_usd > 0.0 {
-        let (tid, over, finished, stop, budget, model) = (thread_id.clone(), over.clone(), finished.clone(), stop.clone(), spec.budget_usd, spec.model.clone());
-        std::thread::spawn(move || codex_budget_watch(&tid, &over, &finished, &stop, budget, &model));
+        let (tid, over, finished, stop, budget, model, resumed) = (thread_id.clone(), over.clone(), finished.clone(), stop.clone(), spec.budget_usd, spec.model.clone(), !spec.resume.is_empty());
+        std::thread::spawn(move || codex_budget_watch(&tid, &over, &finished, &stop, budget, &model, resumed));
     }
     let mut parser = Parser::new(Kind::of(&spec.agent), &spec.cwd, &spec.model);
     let mut got = false;
@@ -259,10 +259,12 @@ fn kill_tree(child: &mut std::process::Child) {
 }
 
 /// Poll the codex rollout for this thread (`~/.codex/sessions/**/rollout-*-<thread>.jsonl`) and stop the run
-/// when its token count prices past the budget.
-fn codex_budget_watch(tid: &Mutex<String>, over: &Mutex<Option<String>>, finished: &AtomicBool, stop: &AtomicBool, budget: f64, model: &str) {
+/// when its token count prices past the budget. A resumed thread's count includes its earlier rounds, which the
+/// budget (what's left of the task's) doesn't cover: those are what the file said when first read.
+fn codex_budget_watch(tid: &Mutex<String>, over: &Mutex<Option<String>>, finished: &AtomicBool, stop: &AtomicBool, budget: f64, model: &str, resumed: bool) {
     let Some(root) = std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| dirs::home_dir().map(|h| h.join(".codex"))) else { return };
     let mut file: Option<PathBuf> = None;
+    let mut before: Option<f64> = if resumed { None } else { Some(0.0) };
     while !finished.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(3));
         let id = tid.lock().unwrap().clone();
@@ -280,7 +282,8 @@ fn codex_budget_watch(tid: &Mutex<String>, over: &Mutex<Option<String>>, finishe
         let n = |k: &str| u[k].as_u64().unwrap_or(0) as f64;
         let (pi, pc, po) = super::cost::codex_price(model);
         let cached = n("cached_input_tokens");
-        let cost = ((n("input_tokens") - cached).max(0.0) * pi + cached * pc + n("output_tokens") * po) / 1e6;
+        let total = ((n("input_tokens") - cached).max(0.0) * pi + cached * pc + n("output_tokens") * po) / 1e6;
+        let cost = total - *before.get_or_insert(total);
         if cost > budget {
             *over.lock().unwrap() = Some(format!("stopped at its budget (${cost:.2} of ${budget:.2})"));
             stop.store(true, Ordering::SeqCst);
@@ -377,12 +380,14 @@ pub fn worker_spec(agent: &str, bin: &Path, model: &str, prompt: &str, resume: &
                 a.extend(["resume".into(), resume.into(), "-c".into(), "sandbox_mode=workspace-write".into()]);
             } else {
                 a.extend(["-C".into(), wt.to_string_lossy().to_string(), "--sandbox".into(), "workspace-write".into()]);
-                let _ = std::fs::create_dir_all(tmp);
-                let schema = tmp.join(format!("oriel-report-{}.json", uuid()));
-                if std::fs::write(&schema, REPORT_SCHEMA).is_ok() {
-                    a.extend(["--output-schema".into(), schema.to_string_lossy().to_string()]);
-                    cleanup.push(schema);
-                }
+            }
+            // follow-ups report too (`exec resume` takes the schema as well), or a blocked worker's answer or a fix
+            // round would come back without one
+            let _ = std::fs::create_dir_all(tmp);
+            let schema = tmp.join(format!("oriel-report-{}.json", uuid()));
+            if std::fs::write(&schema, REPORT_SCHEMA).is_ok() {
+                a.extend(["--output-schema".into(), schema.to_string_lossy().to_string()]);
+                cleanup.push(schema);
             }
             // minimal profile: no user config (MCP servers, profiles), no nested agents
             a.extend(["--json".into(), "--skip-git-repo-check".into(), "--ignore-user-config".into(), "-c".into(), "agents.enabled=false".into()]);
@@ -400,7 +405,8 @@ pub fn worker_spec(agent: &str, bin: &Path, model: &str, prompt: &str, resume: &
             if !model.is_empty() {
                 a.extend(["-m".into(), model.into()]);
             }
-            let p = if resume.is_empty() { format!("{prompt}\n\nEnd with your report as a ```json block: {REPORT_SCHEMA}") } else { prompt.to_string() };
+            // every round ends with the report, follow-ups too: it's how oriel hears "done" or "blocked"
+            let p = format!("{prompt}\n\nEnd with your report as a ```json block: {REPORT_SCHEMA}");
             a.extend(["-p".into(), p, "--output-format".into(), "stream-json".into()]);
             env.push(("KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY".to_string(), "2".to_string()));
         }
@@ -639,8 +645,12 @@ mod tests {
         cleanup(&c);
         let c = worker_spec("codex", Path::new("codex"), "", "go", "T1", 0, 0.0, wt, &tmp);
         assert_eq!(&c.args[..3], &["exec", "resume", "T1"].map(String::from));
+        assert!(c.args.iter().any(|a| a == "--output-schema"), "a follow-up reports too: {:?}", c.args);
+        cleanup(&c);
         let k = worker_spec("kimi", Path::new("kimi"), "", "go", "K1", 0, 0.0, wt, &tmp);
-        assert_eq!(k.args, ["-S", "K1", "-p", "go", "--output-format", "stream-json"].map(String::from));
+        assert_eq!(k.args[..3], ["-S", "K1", "-p"].map(String::from));
+        assert!(k.args[3].starts_with("go\n\n") && k.args[3].contains("```json") && k.args[3].contains("\"blocked\""), "a follow-up asks for the report too: {}", k.args[3]);
+        assert_eq!(k.args[4..], ["--output-format", "stream-json"].map(String::from));
         assert!(k.env.iter().any(|(e, v)| e == "KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY" && v == "2"));
 
         let mcp = Proto::Mcp(PathBuf::from("/bin/oriel"), 4242, "tok".into());

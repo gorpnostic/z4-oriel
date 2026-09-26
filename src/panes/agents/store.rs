@@ -56,6 +56,8 @@ pub struct Task {
     pub session_id: String,
     pub transcript_path: String,
     pub cost_usd: f64,
+    /// What earlier attempts cost before a retry started it over (today's total still counts it).
+    pub spent_before: f64,
     pub tokens: u64,
     pub added: u64,
     pub removed: u64,
@@ -79,6 +81,8 @@ pub struct Task {
     pub tier: String,
     /// Waiting in TODO for a free worker slot (lead runs start these by themselves).
     pub queued: bool,
+    /// Paused by a rate limit mid-task: once its vendor unpauses it carries on in the same worktree and session.
+    pub resume_after_limit: bool,
     /// Caps from the roster: claude --max-turns / --max-budget-usd (others are stopped past the budget).
     pub max_turns: u32,
     pub budget_usd: f64,
@@ -224,6 +228,9 @@ pub struct Run {
     pub manual: bool,
     pub serial: bool,
     pub batch: Vec<String>,
+    /// The lead is done but some of its work isn't: the run carries on without it (like a run of yours) and goes
+    /// to review once nothing is left.
+    pub finishing: bool,
 }
 
 impl Run {

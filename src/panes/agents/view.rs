@@ -156,7 +156,7 @@ impl Agents {
         lines.push(Line::raw(""));
         let par = self.lead_cfg.max_parallel.clamp(1, 5);
         lines.push(Line::from(vec![Span::styled(" p ", Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD)), Span::styled(format!("  all at once: up to {par} at a time, highest priority first"), Style::default().fg(t.fg))]));
-        lines.push(Line::from(vec![Span::styled(" s ", Style::default().fg(Color::Black).bg(t.shine).add_modifier(Modifier::BOLD)), Span::styled("  one after another, in the order you marked them", Style::default().fg(t.fg))]));
+        lines.push(Line::from(vec![Span::styled(" s ", Style::default().fg(Color::Black).bg(t.shine).add_modifier(Modifier::BOLD)), Span::styled("  one after another, in the order you marked them (after-links first)", Style::default().fg(t.fg))]));
         lines.push(Line::raw(""));
         let budget = self.lead_cfg.run_budget_usd;
         for l in [
@@ -396,6 +396,7 @@ impl Agents {
             Status::Todo => Span::styled(format!("added {}", dur(now - task.created)), ui::muted(t)),
             Status::Running => Span::styled(dur(now - task.started), ui::accent(t)),
             Status::Blocked => Span::styled("BLOCKED", bold(t.danger)),
+            Status::Review if task.want_merge && !self.run_accepting(&task.run) => Span::styled("merge on hold", ui::muted(t)),
             Status::Review if task.want_merge => Span::styled("merging", bold(t.shine)),
             Status::Review => Span::styled(format!("took {}", dur(task.finished - task.started)), ui::muted(t)),
             Status::Done => Span::styled(format!("{} {}", task.outcome, crate::panes::files::clock::stamp(task.finished).get(0..6).unwrap_or("")), ui::muted(t)),
@@ -442,7 +443,11 @@ impl Agents {
                 Status::Todo if task.queued && !task.depends_on.is_empty() => {
                     let (a, _) = two_lines(&task.prompt.replace('\n', " "), w);
                     lines.push(Line::styled(a, ui::muted(t)));
-                    lines.push(Line::styled(ui::fit(&format!("after {}", task.depends_on.join(", ")), w), Style::default().fg(t.frame)));
+                    // waiting on something that won't merge by itself: say so, rather than wait forever
+                    match self.waiting_for(task).iter().find_map(|d| self.dead_dep(&task.run, d)) {
+                        Some((title, why)) => lines.push(Line::styled(ui::fit(&format!("waits for {title}, which {why} — x drops this one"), w), Style::default().fg(t.danger))),
+                        None => lines.push(Line::styled(ui::fit(&format!("after {}", task.depends_on.join(", ")), w), Style::default().fg(t.frame))),
+                    }
                 }
                 Status::Todo => {
                     let (a, b) = two_lines(&task.prompt.replace('\n', " "), w);
@@ -674,11 +679,11 @@ impl Agents {
         }
         f.render_widget(Paragraph::new(Line::from(spans)), r);
         // after
-        let r = field(f, "after (waits for these to be merged)", 3, 5, &mut y);
+        let r = field(f, "after (starts once these are merged)", 3, 5, &mut y);
         draw_input(f, r, &form.after, "task ids or the start of their titles, comma separated · empty = no wait", form.field == 5, t);
         // budget
         let r = field(f, "budget $ (stops it past this)", 3, 6, &mut y);
-        draw_input(f, r, &form.budget, "empty = the roster's cap for this agent", form.field == 6, t);
+        draw_input(f, r, &form.budget, "empty = none (run together: the roster's cap) · codex/kimi tabs aren't capped", form.field == 6, t);
         // buttons
         y += 1;
         if y < bottom {
@@ -718,9 +723,26 @@ impl Agents {
         if let Some(run) = self.run_ref(&c.id) {
             let goal: String = run.goal.lines().next().unwrap_or("").chars().take(50).collect();
             let workers = self.run_tasks(&run.id).iter().filter(|x| matches!(x.status, Status::Running | Status::Blocked)).count();
+            let left = self.run_tasks(&run.id).iter().filter(|x| x.status != Status::Done).count();
             let (title, body, yes, danger): (&str, Vec<String>, &str, bool) = match c.what {
-                Pending::StopRun => ("stop the lead run", vec![format!("Stop \"{goal}\"?"), format!("The lead and {workers} running worker(s) stop now. What's merged stays on"), format!("{} for you to review or merge.", run.branch)], "stop", true),
-                Pending::MergeRun => ("merge the lead run", vec![format!("Squash-merge {} into {}?", run.branch, run.base_branch), format!("Everything the run merged ({} task(s)) becomes one commit on {}.", run.merged, run.base_branch), "Then the integration branch and the lead's checkout are removed.".into()], "merge", false),
+                Pending::StopRun => (
+                    "stop the lead run",
+                    vec![
+                        format!("Stop \"{goal}\"?"),
+                        format!("The lead and {workers} running worker(s) stop now, and nothing new merges."),
+                        format!("What's merged stays on {} for you to review or merge;", run.branch),
+                        "r resumes the run where it stopped.".into(),
+                    ],
+                    "stop",
+                    true,
+                ),
+                Pending::MergeRun => {
+                    let mut body = vec![format!("Squash-merge {} into {}?", run.branch, run.base_branch), format!("Everything the run merged ({} task(s)) becomes one commit on {}.", run.merged, run.base_branch), "Then the integration branch and the lead's checkout are removed.".into()];
+                    if left > 0 {
+                        body.push(format!("{left} task(s) that didn't make it in go too (worktrees and all)."));
+                    }
+                    ("merge the lead run", body, "merge", false)
+                }
                 _ => ("discard the lead run", vec![format!("Throw away \"{goal}\"?"), format!("Stops everything and deletes {} and every worker's worktree.", run.branch), "Nothing reaches your branch.".into()], "discard", true),
             };
             let h = body.len() as u16 + 6;

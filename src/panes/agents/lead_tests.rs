@@ -2,8 +2,10 @@
 //! throwaway repos under target/test-scratch. No real agent runs (the one live test is #[ignore]).
 //!
 //! Fake workers follow a tiny script in their task's goal: `write FILE: CONTENT` (\n for newlines),
-//! `cost 0.10`, `spin` (repeat one call until the watchdog steps in). Follow-ups about conflict markers,
-//! a failed gate or the watchdog are handled the way a real worker would.
+//! `cost 0.10`, `spin` (repeat one call until the watchdog steps in), `hold` (work until stopped),
+//! `fail MESSAGE` (end with that error), `limit` (hit a usage limit on the first run), `ask` (report "blocked"
+//! with a question). Follow-ups about conflict markers, a failed gate or the watchdog are handled the way a real
+//! worker would; a follow-up starting "answer:" comes back with no structured report (as codex/kimi often do).
 
 use super::stream::{Entry, Ev};
 use super::tests::{noop_agent, scratch, sh, temp_repo, until};
@@ -81,7 +83,13 @@ fn fake_worker(seen: Arc<Mutex<Vec<String>>>) -> run::Fake {
             summary = "fixed what the gate complained about".into();
         } else if p.contains("watchdog") {
             summary = "took a different approach and finished".into();
+        } else if p.starts_with("answer:") {
+            // a follow-up that just does it and says so, no report block
+            on(Ev::Cost(0.01));
+            return run::Outcome { session, cost: 0.01, text: "went with the default and finished".into(), ..Default::default() };
         } else {
+            let fresh = spec.resume.is_empty();
+            let (mut fail, mut ask): (Option<String>, bool) = (None, false);
             for line in p.lines() {
                 if let Some(rest) = line.strip_prefix("write ") {
                     let (file, content) = rest.split_once(": ").unwrap_or((rest, ""));
@@ -99,7 +107,30 @@ fn fake_worker(seen: Arc<Mutex<Vec<String>>>) -> run::Fake {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     return run::Outcome { session, cost: 0.01, stopped: true, ..Default::default() };
+                } else if line.trim() == "hold" {
+                    on(Ev::Entry(Entry { kind: 't', id: "hold".into(), label: "Bash".into(), target: "npm run build".into(), status: "running".into(), ..Default::default() }));
+                    let t0 = Instant::now();
+                    while !stop.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(20) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    return run::Outcome { session, cost: 0.01, stopped: true, ..Default::default() };
+                } else if let Some(m) = line.strip_prefix("fail ") {
+                    fail = Some(m.trim().to_string());
+                } else if line.trim() == "limit" && fresh {
+                    fail = Some("usage limit reached for your plan, try again later".into());
+                } else if line.trim() == "ask" {
+                    ask = true;
                 }
+            }
+            if let Some(e) = fail {
+                on(Ev::Cost(0.02));
+                on(Ev::Error(e.clone()));
+                return run::Outcome { session, cost: 0.02, error: Some(e), ..Default::default() };
+            }
+            if ask {
+                let report = json!({"status": "blocked", "summary": "need a decision", "questions": ["which default should it use?"]});
+                on(Ev::Report(report.clone()));
+                return run::Outcome { session, cost, text: "need a decision".into(), report: Some(report), ..Default::default() };
             }
             summary = format!("did {}", first.trim_start_matches("TASK "));
         }
@@ -108,6 +139,21 @@ fn fake_worker(seen: Arc<Mutex<Vec<String>>>) -> run::Fake {
         on(Ev::Report(report.clone()));
         run::Outcome { session, cost, text: summary, report: Some(report), ..Default::default() }
     })
+}
+
+/// Direct calls into the pane need a Cx.
+fn with_cx<R>(k: &mut Kit, f: impl FnOnce(&mut crate::pane::Cx) -> R) -> R {
+    let mut cx = crate::pane::Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut k.actions, focused: true, time: 1.0 };
+    f(&mut cx)
+}
+
+/// Mark these TODO tasks and run them together: `serial` = s (one after another), else p.
+fn run_batch(k: &mut Kit, p: &mut Agents, ids: &[String], serial: bool) {
+    p.marked = ids.to_vec();
+    k.key(p, KeyCode::Enter);
+    assert!(matches!(p.mode, Mode::Batch));
+    k.key(p, KeyCode::Char(if serial { 's' } else { 'p' }));
+    assert!(p.marked.is_empty(), "the run started: {:?}", k.notices());
 }
 
 /// A scripted text-protocol lead: `first` is its first reply's actions; afterwards it merges every task that
@@ -241,8 +287,10 @@ fn agents_batch_runs_without_a_lead() {
     assert!(r.manual && r.merged == 3, "{r:?}
 {:#?}", p.store.tasks);
     assert!(r.branch.contains("batch-"), "{}", r.branch);
-    let first = seen.lock().unwrap().first().cloned().unwrap_or_default();
-    assert!(first.contains(&c), "the urgent one started first: {first}");
+    // c (urgent) and a took the two slots; b waited. (Which of the two first reaches its worker depends on whose
+    // worktree git makes first, so only the pair is checked.)
+    let firsts: Vec<String> = seen.lock().unwrap().iter().take(2).cloned().collect();
+    assert!(firsts.iter().any(|s| s.contains(&c)) && !firsts.iter().any(|s| s.contains(&b)), "the urgent one went ahead of b: {firsts:?}");
     assert_eq!(p.task(&b).unwrap().attempts, 1, "b failed the gate once and went back to its worker");
     for (f, want) in [("a.txt", "aaa"), ("b.txt", "fixed"), ("c.txt", "sea")] {
         assert_eq!(sh(&repo, &["show", &format!("{}:{f}", r.branch)]), want);
@@ -576,6 +624,376 @@ fn agents_lead_gate_shell_and_trouble() {
     assert!(git::run_gate(&dir, &accept_cmd("nope.txt"), Duration::from_secs(20), &[]).is_err());
     std::fs::write(dir.join("yes.txt"), "y").unwrap();
     git::run_gate(&dir, &accept_cmd("yes.txt"), Duration::from_secs(20), &[]).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------------ stopping, resuming, settling
+
+/// Stop really stops (B4): the cut-off worker's half-done work is never merged and the queued task doesn't start.
+/// Then oriel restarts, and r resumes (B5): the cut worker carries on in its session, merges, and the task that
+/// waited for it starts and merges too. Enter alone never confirms the stop (B71).
+#[test]
+fn agents_batch_stop_holds_everything_then_resume_finishes() {
+    let dir = scratch("batch-stop");
+    let repo = temp_repo(&dir);
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(seen.clone()), fake_text_lead(json!([]), 0, Arc::default()));
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    let a = p.add_task("Add a", "write a.txt: half\nhold", 0, "");
+    let b = p.add_task("Add b", "write b.txt: bee", 0, "");
+    run_batch(&mut k, &mut p, &[a.clone(), b.clone()], true);
+    until(&mut k, &mut p, 20_000, "a is working", |p| p.task(&a).is_some_and(|t| t.status == Status::Running && !t.touched.is_empty()));
+    let r = run0(&p);
+    // s on the lead panel, then enter: not a yes for something this big
+    p.lead_focus = true;
+    k.key(&mut p, KeyCode::Char('s'));
+    assert!(matches!(&p.mode, Mode::Confirm(c) if c.what == Pending::StopRun));
+    k.key(&mut p, KeyCode::Enter);
+    assert!(matches!(p.mode, Mode::Confirm(_)), "enter doesn't confirm a stop");
+    k.key(&mut p, KeyCode::Char('y'));
+    until(&mut k, &mut p, 10_000, "a stopped", |p| p.task(&a).is_some_and(|t| t.status == Status::Review && p.live.get(&t.id).is_none_or(|l| l.stop.is_none())));
+    for _ in 0..20 {
+        k.poll(&mut p);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (ta, tb) = (p.task(&a).unwrap().clone(), p.task(&b).unwrap().clone());
+    assert_eq!(ta.last, "stopped", "{ta:?}");
+    assert!(ta.want_merge && p.merge_queue.is_empty() && p.merging.is_none(), "nothing queued for merging: {ta:?}");
+    assert_eq!((tb.status, tb.queued), (Status::Todo, true), "b is still queued: {tb:?}");
+    assert_eq!(run0(&p).state, store::RunState::Stopped);
+    assert_eq!(sh(&repo, &["rev-list", "--count", &format!("{}..{}", r.base_sha, r.branch)]), "0", "nothing reached the run's branch");
+    assert!(p.queue_merge(&a).is_err(), "a stopped run takes no merges");
+
+    // oriel closes and comes back; r picks the run up
+    drop(p);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut p = lead_pane(&dir, &repo, fake_worker(seen.clone()), fake_text_lead(json!([]), 0, Arc::default()));
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    assert_eq!(p.task(&b).map(|t| (t.status, t.queued)), Some((Status::Todo, true)));
+    k.key(&mut p, KeyCode::Up);
+    assert!(p.lead_focus);
+    k.key(&mut p, KeyCode::Char('r'));
+    until(&mut k, &mut p, 30_000, "the run finished", |p| p.store.runs[0].state == store::RunState::Review);
+    let r = run0(&p);
+    assert_eq!(r.merged, 2, "{:#?}", p.store.tasks);
+    assert_eq!(sh(&repo, &["show", &format!("{}:a.txt", r.branch)]), "half", "a carried on from where it was cut");
+    assert_eq!(sh(&repo, &["show", &format!("{}:b.txt", r.branch)]), "bee");
+    assert!(seen.lock().unwrap().iter().any(|s| s.contains("You were interrupted")), "{:?}", seen.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A run of yours settles even when a task doesn't make it (B18, B30): b fails, gets one fresh try with the same
+/// agent and model (B41), is blocked — and the run goes to review naming it. x (and y) then throws it away.
+#[test]
+fn agents_batch_settles_with_a_blocked_task_and_keeps_its_model() {
+    let dir = scratch("batch-settle");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(Arc::default()), fake_text_lead(json!([]), 0, Arc::default()));
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    let a = p.add_task("Add a", "write a.txt: aaa", 0, "");
+    let b = p.add_task("Add b", "write b.txt: bee\nfail the build is broken", 1, "luna");
+    run_batch(&mut k, &mut p, &[a.clone(), b.clone()], false);
+    until(&mut k, &mut p, 30_000, "the run settled", |p| p.store.runs[0].state == store::RunState::Review);
+    let (r, tb) = (run0(&p), p.task(&b).unwrap().clone());
+    assert!(r.summary.contains("1 of 2 merged") && r.summary.contains("1 blocked"), "{}", r.summary);
+    assert!(tb.blocked && tb.error.starts_with("gave up") && tb.redispatches == 1, "{tb:?}");
+    assert_eq!((tb.agent.as_str(), tb.model.as_str()), ("codex", "luna"), "the fresh try kept your agent and model");
+    assert!(k.notices().iter().any(|n| n.contains("your run is ready") && n.contains("1 blocked")), "{:?}", k.notices());
+    // throw b away: x, enter does nothing, y does
+    p.lead_focus = false;
+    p.select(&b);
+    k.key(&mut p, KeyCode::Char('x'));
+    assert!(matches!(&p.mode, Mode::Confirm(c) if c.what == Pending::Discard));
+    k.key(&mut p, KeyCode::Enter);
+    assert!(matches!(p.mode, Mode::Confirm(_)));
+    k.key(&mut p, KeyCode::Char('y'));
+    until(&mut k, &mut p, 10_000, "b discarded", |p| p.task(&b).is_some_and(|t| t.status == Status::Done));
+    assert_eq!(p.task(&b).unwrap().outcome, "discarded");
+    assert_eq!(run0(&p).state, store::RunState::Review);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The run's budget runs out after the first task: the second is set aside, and the run still reaches review.
+#[test]
+fn agents_batch_settles_when_the_budget_runs_out() {
+    let dir = scratch("batch-budget");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(Arc::default()), fake_text_lead(json!([]), 0, Arc::default()));
+    p.lead_cfg.run_budget_usd = 0.05;
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    let a = p.add_task("Add a", "write a.txt: aaa\ncost 0.10", 0, "");
+    let b = p.add_task("Add b", "write b.txt: bee", 0, "");
+    run_batch(&mut k, &mut p, &[a.clone(), b.clone()], true);
+    until(&mut k, &mut p, 30_000, "the run settled", |p| p.store.runs[0].state == store::RunState::Review);
+    let r = run0(&p);
+    assert!(r.summary.contains("1 of 2 merged") && r.summary.contains("1 not started (budget reached)"), "{}", r.summary);
+    assert_eq!(p.task(&b).unwrap().status, Status::Todo);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The lead calls done with work still queued (B20): the run keeps going ("finishing") until nothing's left, then
+/// goes to review. Its tasks the lead never merged go away with the run when you merge it.
+#[test]
+fn agents_lead_done_early_finishes_the_work_then_merge_cleans_up() {
+    let dir = scratch("lead-finishing");
+    let repo = temp_repo(&dir);
+    // three independent tasks (two would be run one after the other, and the second would wait for a merge the
+    // lead never asked for)
+    let plan = json!([
+        {"tool": "plan", "args": {"tasks": [
+            {"id": "a", "title": "Add a", "goal": "write a.txt: aaa", "worker": "w1", "owns": ["a.txt"], "size": "S"},
+            {"id": "b", "title": "Add b", "goal": "write b.txt: bee", "worker": "w1", "owns": ["b.txt"], "size": "S"},
+            {"id": "c", "title": "Add c", "goal": "write c.txt: sea", "worker": "w1", "owns": ["c.txt"], "size": "S"}
+        ]}},
+        {"tool": "done", "args": {"summary": "handed out"}}
+    ]);
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(Arc::default()), fake_text_lead(plan, 99, Arc::default()));
+    p.lead_cfg.max_parallel = 1;
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    start(&mut k, &mut p, "Two files");
+    until(&mut k, &mut p, 30_000, "the lead is done", |p| p.store.runs[0].finishing);
+    until(&mut k, &mut p, 30_000, "the run settled", |p| p.store.runs[0].state == store::RunState::Review);
+    let r = run0(&p);
+    assert!(r.log.iter().any(|l| l.starts_with("the lead is done")), "{:?}", r.log);
+    assert!(r.log.iter().any(|l| l.starts_with("lead finished") && l.contains("3 not merged")), "{:?}", r.log);
+    let tasks: Vec<Task> = ["a", "b", "c"].iter().map(|k| by_key(&p, k).clone()).collect();
+    assert!(tasks.iter().all(|t| t.status == Status::Review), "all three ran after the lead left: {tasks:#?}");
+    let wts: Vec<String> = tasks.iter().map(|t| t.worktree.clone()).collect();
+    assert!(wts.iter().all(|w| Path::new(w).is_dir()));
+    // merge the run: the confirm says what goes with it
+    k.key(&mut p, KeyCode::Up);
+    assert!(p.lead_focus);
+    k.key(&mut p, KeyCode::Char('m'));
+    assert!(k.render(&mut p, 150, 44).contains("3 task(s) that didn't make it in go too"));
+    k.key(&mut p, KeyCode::Char('y'));
+    until(&mut k, &mut p, 15_000, "merged", |p| p.store.runs[0].state == store::RunState::Merged || !p.store.runs[0].error.is_empty());
+    assert_eq!(run0(&p).state, store::RunState::Merged, "{}", run0(&p).error);
+    for key in ["a", "b", "c"] {
+        let t = by_key(&p, key);
+        assert_eq!((t.status, t.outcome.as_str()), (Status::Done, "discarded"), "{t:?}");
+    }
+    assert!(wts.iter().all(|w| !Path::new(w).exists()), "their worktrees went with the run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A worker that hits a usage limit keeps its worktree and session (B21): once the vendor's pause is over it
+/// carries on where it stopped instead of starting over.
+#[test]
+fn agents_rate_limited_worker_carries_on_where_it_stopped() {
+    let dir = scratch("rate-limit");
+    let repo = temp_repo(&dir);
+    let resumes: Arc<Mutex<Vec<String>>> = Arc::default();
+    let base = fake_worker(Arc::default());
+    let r2 = resumes.clone();
+    let worker: run::Fake = Arc::new(move |spec: &run::Spec, stop: &AtomicBool, on: &mut dyn FnMut(Ev)| {
+        r2.lock().unwrap().push(spec.resume.clone());
+        base(spec, stop, on)
+    });
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, worker, fake_text_lead(json!([]), 0, Arc::default()));
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    let a = p.add_task("Add r", "write r.txt: one\nlimit", 0, "");
+    run_batch(&mut k, &mut p, &[a.clone()], false);
+    until(&mut k, &mut p, 20_000, "paused", |p| p.task(&a).is_some_and(|t| t.resume_after_limit));
+    let t = p.task(&a).unwrap().clone();
+    assert_eq!((t.status, t.queued), (Status::Todo, true));
+    assert_eq!(std::fs::read_to_string(Path::new(&t.worktree).join("r.txt")).unwrap().trim(), "one", "its edits are still there");
+    assert!(p.paused.contains_key("claude"));
+    // the plan resets
+    p.paused.clear();
+    until(&mut k, &mut p, 20_000, "the run finished", |p| p.store.runs[0].state == store::RunState::Review);
+    let first = resumes.lock().unwrap().clone();
+    assert_eq!(first.len(), 2, "{first:?}");
+    assert_eq!((first[0].as_str(), first[1].as_str()), ("", t.session_id.as_str()), "the second run resumed the first one's session");
+    assert_eq!(sh(&repo, &["show", &format!("{}:r.txt", run0(&p).branch)]), "one");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Answering a blocked worker with c unblocks it even when its follow-up comes back without a report (B42): it
+/// merges instead of being blocked again, and the finished run takes the round in.
+#[test]
+fn agents_answering_a_blocked_worker_lets_it_merge() {
+    let dir = scratch("answer");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(Arc::default()), fake_text_lead(json!([]), 0, Arc::default()));
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    let a = p.add_task("Pick a default", "write q.txt: q\nask", 0, "");
+    run_batch(&mut k, &mut p, &[a.clone()], false);
+    until(&mut k, &mut p, 20_000, "blocked", |p| p.task(&a).is_some_and(|t| t.blocked));
+    until(&mut k, &mut p, 5000, "the run settled", |p| p.store.runs[0].state == store::RunState::Review);
+    p.lead_focus = false;
+    p.select(&a);
+    k.key(&mut p, KeyCode::Char('c'));
+    assert!(matches!(p.mode, Mode::Comment(..)));
+    k.typ(&mut p, "answer: use the default");
+    k.key(&mut p, KeyCode::Enter);
+    assert!(p.task(&a).is_some_and(|t| !t.blocked && t.questions.is_empty()), "answered");
+    until(&mut k, &mut p, 20_000, "merged", |p| p.task(&a).is_some_and(|t| t.status == Status::Done));
+    assert_eq!(p.task(&a).unwrap().outcome, "merged", "{:?}", p.task(&a));
+    until(&mut k, &mut p, 5000, "the run settled again", |p| p.store.runs[0].state == store::RunState::Review);
+    assert!(run0(&p).summary.contains("1 of 1 merged"), "{}", run0(&p).summary);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A task that ran out of its budget isn't started over at the same cap (B43): it's blocked for you. And a task
+/// whose budget is spent can't start another round.
+#[test]
+fn agents_task_budget_covers_every_round() {
+    let dir = scratch("task-budget");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(Arc::default()), fake_text_lead(json!([]), 0, Arc::default()));
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    let a = p.add_task("Big job", "write x.txt: x\nfail hit its budget", 0, "");
+    run_batch(&mut k, &mut p, &[a.clone()], false);
+    until(&mut k, &mut p, 20_000, "blocked", |p| p.task(&a).is_some_and(|t| t.blocked));
+    let t = p.task(&a).unwrap().clone();
+    assert_eq!(t.redispatches, 0, "not started over at the same cap: {t:?}");
+    assert!(t.questions[0].contains("hit its budget") && t.questions[0].contains("t continues it"), "{:?}", t.questions);
+    // a budget that's used up: the next round doesn't start
+    if let Some(tm) = p.task_mut(&a) {
+        (tm.budget_usd, tm.cost_usd) = (0.10, 0.12);
+    }
+    with_cx(&mut k, |cx| p.worker_again(&a, "one more thing", cx));
+    let t = p.task(&a).unwrap().clone();
+    assert!(t.status == Status::Review && t.blocked && t.questions[0].contains("spent its budget ($0.12 of $0.10)"), "{t:?}");
+    assert!(p.live.get(&a).is_none_or(|l| l.stop.is_none()), "no worker started");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------------ the scheduler and the watchdog, by hand
+
+/// A pane with a running run of its own (no git: nothing it starts gets far) for scheduler tests.
+fn bare_run(dir: &Path) -> (Agents, String) {
+    let mut p = Agents::with_paths(Paths { agents: dir.join("agents"), wt: dir.join("wt") });
+    p.booted = true; // no repo detection: these tests drive the pane by hand
+    p.fake_worker = Some(fake_worker(Arc::default()));
+    let run = "r1".to_string();
+    p.store.runs.push(store::Run { id: run.clone(), repo: dir.join("nope").display().to_string(), state: store::RunState::Running, branch: "oriel/batch-x".into(), max_parallel: 2, manual: true, created: store::now(), ..Default::default() });
+    (p, run)
+}
+
+fn queued(p: &mut Agents, run: &str, id: &str, agent: &str, model: &str, priority: i8) {
+    p.store.tasks.push(Task { id: id.into(), title: id.into(), repo: p.store.runs[0].repo.clone(), agent: agent.into(), model: model.into(), priority, mode: "headless".into(), run: run.into(), queued: true, created: store::now(), ..Default::default() });
+}
+
+/// A staggered urgent task keeps its slot (B63): a low-priority task on another model doesn't jump in while the
+/// urgent one waits out the stagger.
+#[test]
+fn agents_stagger_never_lets_a_lower_priority_task_jump_ahead() {
+    let dir = scratch("stagger");
+    let mut k = Kit::new();
+    let (mut p, run) = bare_run(&dir);
+    queued(&mut p, &run, "u", "claude", "sonnet", 2);
+    queued(&mut p, &run, "n", "claude", "sonnet", 0);
+    queued(&mut p, &run, "l", "codex", "", -1);
+    p.stagger = Duration::from_secs(5);
+    p.last_start.insert(("claude".into(), "sonnet".into()), Instant::now());
+    with_cx(&mut k, |cx| p.schedule(cx));
+    for id in ["u", "n", "l"] {
+        assert_eq!(p.task(id).unwrap().status, Status::Todo, "{id} waits: the urgent one is staggered");
+    }
+    p.stagger = Duration::ZERO;
+    with_cx(&mut k, |cx| p.schedule(cx));
+    let st = |p: &Agents, id: &str| p.task(id).unwrap().status;
+    assert_eq!((st(&p, "u"), st(&p, "n"), st(&p, "l")), (Status::Running, Status::Running, Status::Todo), "the two slots went by priority");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A build prints nothing while it runs: the watchdog gives it as long as the gate gets before calling it hung
+/// (B47), while anything else is hung after hung_after.
+#[test]
+fn agents_watchdog_gives_builds_longer() {
+    let dir = scratch("watch-build");
+    let (mut p, run) = bare_run(&dir);
+    queued(&mut p, &run, "w", "claude", "", 0);
+    p.task_mut("w").unwrap().status = Status::Running;
+    p.hung_after = Duration::from_secs(1);
+    p.lead_cfg.gate_timeout_s = 3600;
+    let arm = |p: &mut Agents, target: &str| {
+        let l = p.live("w");
+        l.stop = Some(Arc::new(AtomicBool::new(false)));
+        l.nudge = None;
+        l.last_event = Instant::now().checked_sub(Duration::from_secs(3));
+        l.log = vec![Entry { kind: 't', id: "b1".into(), label: "Bash".into(), target: target.into(), status: "running".into(), ..Default::default() }];
+    };
+    arm(&mut p, "cargo build --release");
+    p.watchdog();
+    assert!(p.live["w"].nudge.is_none(), "a quiet build isn't hung yet");
+    arm(&mut p, "cat notes.txt");
+    p.watchdog();
+    assert!(p.live["w"].nudge.as_ref().is_some_and(|(r, _)| r.starts_with("hung")), "{:?}", p.live["w"].nudge);
+    assert!(p.live["w"].stop.as_ref().unwrap().load(Ordering::SeqCst));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Esc on the lead panel just leaves it (B71); s asks, and only y stops the run.
+#[test]
+fn agents_lead_panel_esc_leaves_and_only_y_stops() {
+    let dir = scratch("lead-esc");
+    let mut k = Kit::new();
+    let mut p = demo_run(&dir);
+    k.render(&mut p, 150, 44);
+    p.lead_focus = true;
+    k.key(&mut p, KeyCode::Esc);
+    assert!(!p.lead_focus && matches!(p.mode, Mode::Board));
+    p.col = 3;
+    k.key(&mut p, KeyCode::Enter); // on a card now (a finished one here), never a stop
+    assert_eq!(run0(&p).state, store::RunState::Running);
+    p.mode = Mode::Board;
+    p.lead_focus = true;
+    k.key(&mut p, KeyCode::Char('s'));
+    assert!(matches!(&p.mode, Mode::Confirm(c) if c.what == Pending::StopRun));
+    k.key(&mut p, KeyCode::Enter);
+    assert!(matches!(p.mode, Mode::Confirm(_)));
+    k.key(&mut p, KeyCode::Esc);
+    assert!(matches!(p.mode, Mode::Board));
+    assert_eq!(run0(&p).state, store::RunState::Running);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stopped run holds everything that comes back to it (B4): a merge that bounces after the stop starts no
+/// fix round, a worker that finishes after it isn't queued for merging, and nothing is merged by hand either.
+#[test]
+fn agents_stopped_run_starts_nothing_new() {
+    let dir = scratch("stopped-holds");
+    let mut k = Kit::new();
+    let (mut p, run) = bare_run(&dir);
+    queued(&mut p, &run, "a", "claude", "", 0);
+    // (no worktree: its round is "checked" at once, with no git involved)
+    if let Some(t) = p.task_mut("a") {
+        (t.status, t.queued, t.want_merge, t.session_id) = (Status::Review, false, true, "s-a".into());
+    }
+    queued(&mut p, &run, "b", "claude", "", 0);
+    with_cx(&mut k, |cx| p.stop_run(&run, cx));
+    assert_eq!(run0(&p).state, store::RunState::Stopped);
+    assert!(p.task("b").unwrap().queued && p.task("a").unwrap().want_merge, "stop keeps the queue and the wanted merges");
+    // a merge that was in flight bounces on the gate
+    p.merging = Some("a".into());
+    with_cx(&mut k, |cx| p.on_run_merged("a", Err(git::MergeErr::Gate("`cargo check` failed (exit 101)".into())), cx));
+    let t = p.task("a").unwrap().clone();
+    assert!(t.status == Status::Review && t.attempts == 0 && p.live.get("a").is_none_or(|l| l.stop.is_none()), "no fix round: {t:?}");
+    assert!(t.last.contains("the run is stopped"), "{}", t.last);
+    // a worker that comes back after the stop: checked, but not queued for merging
+    with_cx(&mut k, |cx| p.on_worker_done("a", run::Outcome { session: "s-a".into(), text: "done".into(), ..Default::default() }, cx));
+    let t = p.task("a").unwrap().clone();
+    assert!(t.status == Status::Review && t.last.contains("the run is stopped") && p.merge_queue.is_empty() && p.merging.is_none(), "{t:?}");
+    assert!(p.queue_merge("a").is_err());
+    with_cx(&mut k, |cx| p.schedule(cx));
+    assert_eq!(p.task("b").unwrap().status, Status::Todo, "a stopped run starts nothing");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
