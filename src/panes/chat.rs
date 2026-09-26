@@ -1319,6 +1319,22 @@ impl Pane for Chat {
     fn icon(&self) -> &'static str {
         "ai"
     }
+    fn cwd(&self) -> Option<PathBuf> {
+        // where its agents work (without workdir()'s fallback, which makes a folder)
+        Some(self.chat.cwd.clone().map(PathBuf::from).unwrap_or_else(|| self.launch_dir.clone())).filter(|d| d.is_dir())
+    }
+    fn reopen(&self) -> Option<&'static str> {
+        Some("ai")
+    }
+    fn resume_id(&self) -> Option<String> {
+        // a chat that's been saved (an empty new one has nothing to come back to)
+        self.chats.iter().any(|c| c.id == self.chat.id).then(|| self.chat.id.clone())
+    }
+    fn resume(&mut self, id: &str) {
+        if let Some(i) = self.chats.iter().position(|c| c.id == id) {
+            self.open_chat(i);
+        }
+    }
     fn subtitle(&self) -> Option<String> {
         let p = self.provider_of();
         let mut s = providers::label(&p).to_lowercase();
@@ -1953,6 +1969,31 @@ mod tests {
         c.input.clear();
         c.cursor = 0;
         println!("{}", k.render_side(&mut c, 32, 24));
+    }
+
+    #[test]
+    fn chat_reopens_the_chat_you_left() {
+        let k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        assert_eq!(c.resume_id(), None, "a blank new chat has nothing to come back to");
+        c.chats = (0..3)
+            .map(|i| {
+                let mut ch = store::Chat::new("claude");
+                ch.id = format!("r{i}");
+                ch.messages.push(store::Msg { role: "user".into(), content: format!("hi {i}"), ..Default::default() });
+                ch
+            })
+            .collect();
+        c.resume("r2");
+        assert_eq!((c.chat.id.as_str(), c.resume_id().as_deref()), ("r2", Some("r2")));
+        c.resume("gone"); // deleted since: stays put
+        assert_eq!(c.chat.id, "r2");
+        assert_eq!(c.reopen(), Some("ai"));
+        // alt n from here opens the terminal in the chat's folder
+        let d = std::path::absolute("target/test-scratch/shell").unwrap();
+        std::fs::create_dir_all(&d).unwrap();
+        c.chat.cwd = Some(d.display().to_string());
+        assert_eq!(c.cwd(), Some(d));
     }
 
     #[test]

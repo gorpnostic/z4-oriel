@@ -12,7 +12,8 @@ pub struct Config {
     pub shell: String,
     /// Prefix key for tmux-style bindings, e.g. "ctrl+space", "ctrl+b", "ctrl+a".
     pub prefix: String,
-    /// What oriel opens on: an app ("ai", "music", "terminal"...) or "home".
+    /// What oriel opens on: "last" (your tabs, splits and the app and chat you were in, as you left them), an app
+    /// ("ai", "music", "terminal"...) or "home".
     pub startup: String,
     /// true = plain-text icons (for terminals without a Nerd Font)
     pub plain_icons: bool,
@@ -111,7 +112,7 @@ impl Default for Config {
             theme: String::new(),
             shell: String::new(),
             prefix: "ctrl+space".into(),
-            startup: "ai".into(),
+            startup: "last".into(),
             plain_icons: false,
             desktop_notifications: true,
             notes_folder: String::new(),

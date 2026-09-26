@@ -1818,6 +1818,11 @@ impl Pane for Agents {
     fn icon(&self) -> &'static str {
         "robot"
     }
+    fn cwd(&self) -> Option<PathBuf> {
+        // the selected task's worktree, else the repo
+        let wt = self.selected().and_then(|id| self.store.tasks.iter().find(|t| t.id == id).map(|t| PathBuf::from(&t.worktree)));
+        wt.filter(|w| !w.as_os_str().is_empty() && w.is_dir()).or_else(|| self.repo.as_ref().map(|r| r.root.clone()))
+    }
     fn subtitle(&self) -> Option<String> {
         let repo = self.repo.as_ref()?;
         let today = self.today();

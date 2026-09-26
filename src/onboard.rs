@@ -144,7 +144,7 @@ pub enum Stage {
     Tour { step: usize, start: Probe },
 }
 
-const STARTS: &[(&str, &str)] = &[("ai", "chat"), ("agents", "agents"), ("home", "home screen"), ("terminal", "terminal"), ("music", "music")];
+const STARTS: &[(&str, &str)] = &[("last", "where you left off"), ("ai", "chat"), ("agents", "agents"), ("home", "home screen"), ("terminal", "terminal"), ("music", "music")];
 const STEPS_SETUP: usize = 6; // theme, icons, music, notes, defaults, AIs
 
 /// What the app should do after a key/click.
@@ -174,6 +174,8 @@ pub struct Onboard {
     hits: Vec<(Rect, Btn)>,
     /// the tour card, drawn over the app: clicks on it are its own, not the pane's underneath
     card: Rect,
+    /// the prefix key as configured, for the tour's text
+    prefix: String,
 }
 
 /// Quick count of audio files under a folder (bounded, so typing a huge path stays instant).
@@ -290,7 +292,7 @@ impl Onboard {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .map(|v| v.get("tracks").and_then(|t| t.as_array()).map(|a| a.len()).or_else(|| v.as_array().map(|a| a.len())).unwrap_or(0));
-        Onboard { stage: Stage::Welcome, themes, theme_before: theme_now.to_string(), ais, ai_ids: avail, music_default, notes_default, audio_player, hits: vec![], card: Rect::default() }
+        Onboard { stage: Stage::Welcome, themes, theme_before: theme_now.to_string(), ais, ai_ids: avail, music_default, notes_default, audio_player, hits: vec![], card: Rect::default(), prefix: cfg.prefix.clone() }
     }
 
     fn to_music(&mut self) {
@@ -375,7 +377,7 @@ impl Onboard {
             Stage::Notes { input } => match k.code {
                 KeyCode::Enter => {
                     let path = input.trim().to_string();
-                    let start = STARTS.iter().position(|s| s.0 == "ai").unwrap_or(0);
+                    let start = STARTS.iter().position(|s| s.0 == "last").unwrap_or(0);
                     self.stage = Stage::Defaults { row: 0, start, ai: 0 };
                     if !path.is_empty() && path != self.notes_default {
                         return (true, Out::NotesFolder(path));
@@ -672,15 +674,16 @@ impl Onboard {
 
     fn draw_tour(&mut self, f: &mut Frame, area: Rect, t: &Theme, step: usize) {
         let s = &STEPS[step];
+        let body = s.body.replace("ctrl+space", &self.prefix);
         let w = 58.min(area.width.saturating_sub(4));
-        let body_lines = (s.body.chars().count() as u16).div_ceil(w.saturating_sub(4).max(1)) + 1;
+        let body_lines = (body.chars().count() as u16).div_ceil(w.saturating_sub(4).max(1)) + 1;
         let h = 4 + body_lines + if s.keys.is_empty() { 0 } else { 2 };
         let r = Rect { x: area.right().saturating_sub(w + 2), y: area.bottom().saturating_sub(h + 1), width: w, height: h.min(area.height) };
         self.card = r;
         f.render_widget(Clear, r);
         let title = format!("tour · {}/{} · {}", step + 1, STEPS.len(), s.title);
         let inner = ui::frame(f, r, &title, None, true, t);
-        let mut lines = vec![Line::raw(s.body)];
+        let mut lines = vec![Line::raw(body)];
         if !s.keys.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![Span::styled("try  ", ui::muted(t)), Span::styled(s.keys, Style::default().fg(t.accent).add_modifier(Modifier::BOLD))]));

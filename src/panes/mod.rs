@@ -23,7 +23,7 @@ use crate::pane::Pane;
 /// (name, key on the home screen, icon, label). The order is the home screen's order.
 pub const APPS: &[(&str, char, &str, &str)] = &[
     ("terminal", 't', "term", "terminal"),
-    ("ai", 'a', "ai", "ai chat"),
+    ("ai", 'a', "ai", "chat"),
     ("claude", 'c', "claude", "claude code"),
     ("codex", 'x', "robot", "codex"),
     ("music", 'm', "music", "music"),
@@ -96,34 +96,42 @@ mod tests {
 }
 
 pub fn open(name: &str, cfg: &Config) -> Option<Box<dyn Pane>> {
+    open_in(name, cfg, None)
+}
+
+/// `open`, starting in `cwd` where that means something: a terminal, Claude Code or Codex runs there, files shows
+/// it (alt n from a pane opens the terminal in that pane's folder; a restored session reopens each pane in its own).
+pub fn open_in(name: &str, cfg: &Config, cwd: Option<std::path::PathBuf>) -> Option<Box<dyn Pane>> {
+    let cwd = cwd.filter(|d| d.is_dir());
     Some(match name {
-        "terminal" | "shell" => Box::new(term::Term::shell(cfg, None)),
+        "terminal" | "shell" => Box::new(term::Term::shell(cfg, cwd)),
         "ai" | "chat" => Box::new(chat::Chat::new(cfg)),
         "music" => Box::new(music::Music::new(cfg)),
         "system" => Box::new(system::System::new()),
-        "files" => Box::new(files::Files::new(None)),
+        "files" => Box::new(files::Files::new(cwd)),
         "notes" => Box::new(notes::Notes::new()),
         "calendar" => Box::new(calendar::Calendar::new()),
         "storage" => Box::new(storage::Storage::new()),
         "agents" => Box::new(agents::Agents::new(cfg)),
         "ais" => Box::new(ais::Ais::new(cfg)),
         "home" => Box::new(home::Home::new()),
-        "help" => Box::new(help::Help::new()),
+        "help" => Box::new(help::Help::new().prefix(&cfg.prefix)),
         "themes" => Box::new(themes::Themes::new()),
         "alerts" => Box::new(alerts::Alerts::new()),
         "updates" => Box::new(updates::Updates::new()),
         _ => {
-            let (_, prog, title) = AGENTS.iter().find(|a| a.0 == name)?;
+            let &(app, prog, title) = AGENTS.iter().find(|a| a.0 == name)?;
             let path = which(prog)?;
             let icon = APPS.iter().find(|a| a.0 == name).map(|a| a.2).unwrap_or("term");
             let icon: &'static str = crate::ui::ICON_NAMES.iter().find(|n| **n == icon).copied().unwrap_or("term");
             // .cmd shims (npm installs on Windows) need cmd.exe to run them
             let p = path.to_string_lossy().to_string();
-            if cfg!(windows) && (p.ends_with(".cmd") || p.ends_with(".bat")) {
-                Box::new(term::Term::new(title, icon, "cmd.exe", vec!["/c".into(), p], None))
+            let t = if cfg!(windows) && (p.ends_with(".cmd") || p.ends_with(".bat")) {
+                term::Term::new(title, icon, "cmd.exe", vec!["/c".into(), p], cwd)
             } else {
-                Box::new(term::Term::new(title, icon, &p, vec![], None))
-            }
+                term::Term::new(title, icon, &p, vec![], cwd)
+            };
+            Box::new(t.reopen_as(app))
         }
     })
 }

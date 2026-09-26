@@ -44,6 +44,8 @@ pub enum Action {
     GotoApp(&'static str),
     /// Send a key to an app's pane without switching to it (/play → the music app), opening it if needed.
     AppKey(&'static str, char),
+    /// Paste text into an app's pane (opening it if needed), and switch to it.
+    AppPaste(&'static str, String),
     ToggleSidebar,
     ToggleIcons,
     /// Open a pane in a new tab of its own, named `name` and remembered by `tag` (e.g. an orchestrator task id),
@@ -190,6 +192,26 @@ pub trait Pane {
     /// True when the program inside wants mouse events itself (so right-click goes to it, not our menu).
     fn wants_mouse(&self) -> bool {
         false
+    }
+    /// The folder this pane works in (files' folder, a chat's /cwd, a task's worktree, a shell's folder): a
+    /// terminal opened from here (alt n) starts there, and it's saved with the session.
+    fn cwd(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+    /// The panes::open name that makes this pane again when oriel restarts ("terminal", "claude", "files"...).
+    /// None = it isn't brought back.
+    fn reopen(&self) -> Option<&'static str> {
+        None
+    }
+    /// What to reopen inside it next time (the open chat's or note's id)...
+    fn resume_id(&self) -> Option<String> {
+        None
+    }
+    /// ...and reopening it, at start.
+    fn resume(&mut self, _id: &str) {}
+    /// Something the palette can send to chat from here: (what it is, the text), e.g. ("this note", its text).
+    fn for_chat(&self) -> Option<(String, String)> {
+        None
     }
 }
 

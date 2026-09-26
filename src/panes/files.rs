@@ -509,6 +509,12 @@ impl Pane for Files {
     fn icon(&self) -> &'static str {
         "files"
     }
+    fn cwd(&self) -> Option<PathBuf> {
+        Some(self.dir.clone())
+    }
+    fn reopen(&self) -> Option<&'static str> {
+        Some("files")
+    }
 
     fn poll(&mut self, cx: &mut Cx) {
         self.start(cx);
@@ -555,7 +561,7 @@ impl Pane for Files {
         let hints: Vec<(&str, &str)> = if self.focus_preview {
             vec![("j/k", "scroll"), ("esc", "back to the list"), ("o", &os), ("p", "copy path"), ("t", "terminal here")]
         } else {
-            vec![("enter", "open"), ("o", &os), ("p", "copy path"), ("t", "terminal here"), ("backspace", "up"), (".", "hidden")]
+            vec![("enter", "open"), ("o", &os), ("p", "copy path"), ("t", "terminal here"), ("a", "ask chat"), ("backspace", "up"), (".", "hidden")]
         };
         let body = ui::hint_line(f, area, &hints, t);
         let body = Rect { height: body.height.saturating_sub(1), ..body }; // a gap above the hints, like nest
@@ -711,6 +717,11 @@ impl Files {
             KeyCode::Char('t') => {
                 let term = crate::panes::term::Term::shell(cx.config, Some(self.dir.clone()));
                 cx.act(Action::Open(Box::new(term), Place::Split));
+            }
+            // ask chat about it: the path goes into chat's box (Claude Code and Codex read the file themselves)
+            KeyCode::Char('a') => {
+                let p = self.sel_path().to_string_lossy().to_string();
+                cx.act(Action::AppPaste("ai", format!("{} ", crate::clip::paste_form(&[p]))));
             }
             KeyCode::Char('.') => {
                 self.hidden = !self.hidden;
@@ -887,6 +898,20 @@ pub(crate) mod tests {
         // r refreshes; F5 (and shift+F5) are left to the app: F5 is the system app from everywhere
         assert!(k.key(&mut p, KeyCode::Char('r')));
         assert!(!k.key(&mut p, KeyCode::F(5)) && !k.key_mod(&mut p, KeyCode::F(5), KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn files_ask_chat_and_folder() {
+        let d = fixture("files-ask");
+        let mut k = Kit::new();
+        let mut p = Files::new(Some(d.clone()));
+        settle(&mut k, &mut p);
+        assert_eq!((p.cwd(), p.reopen()), (Some(d.clone()), Some("files")), "a terminal from here starts in this folder");
+        let idx = p.shown.iter().position(|&i| p.all[i].name == "main.rs").unwrap() + 1;
+        p.select(idx);
+        assert!(k.key(&mut p, KeyCode::Char('a')));
+        let want = format!("{} ", crate::clip::paste_form(&[d.join("main.rs").to_string_lossy().to_string()]));
+        assert!(k.actions.iter().any(|a| matches!(a, Action::AppPaste("ai", t) if *t == want)), "the path goes to chat");
     }
 
     #[test]

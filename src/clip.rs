@@ -150,6 +150,38 @@ foreach ($f in $files) {{ 'FILE ' + $f }}"#
     }
 }
 
+/// The clipboard's text (the right-click menu's paste; the terminal's own paste is ctrl+v). Blocking: call it
+/// from a background thread.
+pub fn grab_text() -> Option<String> {
+    #[cfg(windows)]
+    {
+        // Windows PowerShell 5.1 (STA, its own module path, as in grab_image), told to answer in UTF-8
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let ps = format!(r"{sysroot}\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let script = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; [Console]::Out.Write([System.Windows.Forms.Clipboard]::GetText())";
+        let out = cmd(&ps)
+            .env("PSModulePath", format!(r"{sysroot}\System32\WindowsPowerShell\v1.0\Modules"))
+            .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", script])
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        for (prog, args) in [("pbpaste", vec![]), ("wl-paste", vec!["--no-newline"]), ("xclip", vec!["-selection", "clipboard", "-o"]), ("xsel", vec!["--clipboard", "--output"])] {
+            if crate::config::which(prog).is_none() {
+                continue;
+            }
+            if let Ok(o) = cmd(prog).args(&args).stderr(Stdio::null()).output() {
+                if o.status.success() {
+                    return Some(String::from_utf8_lossy(&o.stdout).to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
 /// How a path should be pasted: quoted when it has spaces (like dragging a file into a terminal does).
 pub fn paste_form(paths: &[String]) -> String {
     paths.iter().map(|p| if p.contains(' ') { format!("\"{p}\"") } else { p.clone() }).collect::<Vec<_>>().join(" ")

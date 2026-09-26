@@ -44,7 +44,8 @@ impl Alerts {
     }
 }
 
-fn color(k: Kind, t: &crate::theme::Theme) -> Color {
+/// Each kind's colour (the list here, and the toasts).
+pub(crate) fn color(k: Kind, t: &crate::theme::Theme) -> Color {
     match k {
         Kind::AgentDone | Kind::Download | Kind::Update => t.good,
         Kind::NeedsYou | Kind::BuildFailed | Kind::Memory => t.danger,

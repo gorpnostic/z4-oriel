@@ -46,21 +46,30 @@ impl Node {
         }
     }
 
-    /// Remove leaf `target`; its sibling takes the parent's place. Returns false if target is the root leaf.
-    pub fn remove(&mut self, target: PaneId) -> bool {
+    /// Remove leaf `target`; its sibling takes the parent's place. Returns the first pane of that sibling (where
+    /// focus goes next), or None if target is the root leaf or isn't here.
+    pub fn remove(&mut self, target: PaneId) -> Option<PaneId> {
         match self {
-            Node::Leaf(_) => false,
+            Node::Leaf(_) => None,
             Node::Split { a, b, .. } => {
-                if matches!(**a, Node::Leaf(id) if id == target) {
-                    *self = (**b).clone();
-                    return true;
-                }
-                if matches!(**b, Node::Leaf(id) if id == target) {
-                    *self = (**a).clone();
-                    return true;
-                }
-                a.remove(target) || b.remove(target)
+                let took = if matches!(**a, Node::Leaf(id) if id == target) {
+                    (**b).clone()
+                } else if matches!(**b, Node::Leaf(id) if id == target) {
+                    (**a).clone()
+                } else {
+                    return a.remove(target).or_else(|| b.remove(target));
+                };
+                *self = took;
+                self.first()
             }
+        }
+    }
+
+    /// The first pane in reading order.
+    pub fn first(&self) -> Option<PaneId> {
+        match self {
+            Node::Leaf(id) => Some(*id),
+            Node::Split { a, .. } => a.first(),
         }
     }
 
@@ -213,5 +222,19 @@ mod tests {
         // normal sizes are unchanged
         let (a, b) = split_rect(Rect::new(0, 0, 10, 20), Dir::Down, 0.5);
         assert_eq!((a.height, b.height, b.y), (10, 10, 10));
+    }
+
+    #[test]
+    fn layout_remove_says_what_took_its_place() {
+        // 1 | (2 / (3 | 4)): closing 2 hands focus to the split below it, starting at 3 (not the tree's first, 1)
+        let mut n = Node::Leaf(1);
+        n.split(1, 2, Dir::Right);
+        n.split(2, 3, Dir::Down);
+        n.split(3, 4, Dir::Right);
+        assert_eq!(n.remove(2), Some(3));
+        assert_eq!(n.remove(4), Some(3));
+        assert_eq!(n.remove(9), None, "not in the tree");
+        assert_eq!(n.remove(1), Some(3));
+        assert_eq!(n.remove(3), None, "the last pane stays");
     }
 }

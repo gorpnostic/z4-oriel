@@ -34,6 +34,13 @@ pub struct Term {
     last_scan: Instant,
     /// Tell the event center how this ended ("installing Firefox" -> "Firefox installed" / "failed").
     exit_alert: Option<String>,
+    /// The folder it started in, and the one the shell last said it's in (OSC 7 / Windows Terminal's OSC 9;9,
+    /// sent by prompts like starship and oh-my-posh), set by the reader thread.
+    dir: Option<std::path::PathBuf>,
+    osc_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
+    /// What it comes back as when oriel restarts: "terminal" for a shell, "claude" / "codex"; None for the rest
+    /// (installs, an orchestrator's workers).
+    reopen: Option<&'static str>,
 }
 
 /// Programs that are coding agents (by executable name), so their panes get status dots from the start.
@@ -87,7 +94,16 @@ impl Term {
             },
             last_scan: Instant::now(),
             exit_alert: None,
+            dir,
+            osc_dir: Arc::default(),
+            reopen: None,
         }
+    }
+
+    /// Brought back as `name` (a panes::open name) when oriel restarts where you left off.
+    pub fn reopen_as(mut self, name: &'static str) -> Term {
+        self.reopen = Some(name);
+        self
     }
 
     /// When the command ends, say so in the event center: `what` is e.g. "Firefox".
@@ -99,7 +115,7 @@ impl Term {
     pub fn shell(cfg: &crate::config::Config, cwd: Option<std::path::PathBuf>) -> Term {
         let (prog, args) = crate::config::default_shell(cfg);
         let name = std::path::Path::new(&prog).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(prog.clone());
-        Term::new(&name, "term", &prog, args, cwd)
+        Term::new(&name, "term", &prog, args, cwd).reopen_as("terminal")
     }
 
     fn start_reader(&mut self, waker: Waker) {
@@ -108,6 +124,7 @@ impl Term {
         let writer = self.writer.clone();
         let exited = self.exited.clone();
         let (last_output, born) = (self.last_output.clone(), self.born);
+        let osc_dir = self.osc_dir.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16384];
             loop {
@@ -124,6 +141,9 @@ impl Term {
                             let _ = writer.lock().unwrap().write_all(format!("\x1b[{};{}R", r + 1, c + 1).as_bytes());
                         }
                         drop(p);
+                        if let Some(d) = osc_cwd(data) {
+                            *osc_dir.lock().unwrap() = Some(d);
+                        }
                         last_output.store(born.elapsed().as_millis() as u64, Ordering::Relaxed);
                         waker.wake();
                     }
@@ -200,6 +220,51 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// The last folder a shell reported in this output: OSC 7 (`ESC ] 7 ; file://host/path BEL`, percent-encoded)
+/// or Windows Terminal's OSC 9;9 (`ESC ] 9 ; 9 ; "C:\path" BEL`), ended by BEL or ESC \. Only folders that exist.
+fn osc_cwd(data: &[u8]) -> Option<std::path::PathBuf> {
+    let mut found = None;
+    let mut i = 0;
+    while let Some(at) = data[i..].windows(2).position(|w| w == b"\x1b]").map(|p| p + i) {
+        let body = &data[at + 2..];
+        let end = body.iter().position(|&b| b == 0x07 || b == 0x1b).unwrap_or(body.len());
+        let s = String::from_utf8_lossy(&body[..end]);
+        let path = if let Some(url) = s.strip_prefix("7;") {
+            // file://host/path: drop the host; /C:/x on Windows is C:/x
+            let rest = url.strip_prefix("file://").unwrap_or(url);
+            let p = &rest[rest.find('/').unwrap_or(rest.len())..];
+            let p = percent_decode(p);
+            let bytes = p.as_bytes();
+            if cfg!(windows) && bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' { Some(p[1..].to_string()) } else { Some(p) }
+        } else {
+            s.strip_prefix("9;9;").map(|p| p.trim_matches('"').to_string())
+        };
+        if let Some(p) = path.filter(|p| !p.is_empty()).map(std::path::PathBuf::from).filter(|p| p.is_dir()) {
+            found = Some(p);
+        }
+        i = at + 2 + end;
+    }
+    found
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(v) = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 fn color(c: vt100::Color) -> Color {
     match c {
         vt100::Color::Default => Color::Reset,
@@ -223,6 +288,12 @@ impl Pane for Term {
     }
     fn is_terminal(&self) -> bool {
         true
+    }
+    fn cwd(&self) -> Option<std::path::PathBuf> {
+        self.osc_dir.lock().ok().and_then(|d| d.clone()).or_else(|| self.dir.clone())
+    }
+    fn reopen(&self) -> Option<&'static str> {
+        self.reopen
     }
     fn exit_note(&mut self) -> Option<(crate::alerts::Kind, String)> {
         let what = self.exit_alert.take()?;
@@ -462,5 +533,26 @@ mod tests {
         assert!(t.wants_fkeys());
         t.agent = true; // a coding agent that's full-screen (opencode) still leaves F-keys to switch apps
         assert!(!t.wants_fkeys());
+    }
+
+    #[test]
+    fn term_knows_its_folder() {
+        let d = std::path::absolute("target/test-scratch/shell/term dir").unwrap();
+        let sub = d.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (prog, args): (&str, Vec<String>) = if cfg!(windows) { ("cmd.exe", vec!["/c".into(), "exit".into()]) } else { ("sh", vec!["-c".into(), "true".into()]) };
+        let t = Term::new("sh", "term", prog, args, Some(d.clone()));
+        assert_eq!(t.cwd(), Some(d.clone()), "where it started");
+        assert_eq!(t.reopen(), None, "a plain command isn't reopened");
+        assert_eq!(t.reopen_as("terminal").reopen(), Some("terminal"));
+        // the shell reports where it cd'd to: OSC 7 (percent-encoded, with a host) and Windows Terminal's 9;9
+        let url = format!("file://host{}{}", if cfg!(windows) { "/" } else { "" }, sub.display().to_string().replace('\\', "/").replace(' ', "%20"));
+        assert_eq!(osc_cwd(format!("prompt\x1b]7;{url}\x07$ ").as_bytes()), Some(sub.clone()), "{url}");
+        assert_eq!(osc_cwd(format!("\x1b]9;9;\"{}\"\x1b\\", d.display()).as_bytes()), Some(d.clone()));
+        // the last one wins; a folder that doesn't exist and other OSCs (titles) are ignored
+        let two = format!("\x1b]9;9;{}\x07\x1b]0;title\x07\x1b]9;9;{}\x07", d.display(), sub.display());
+        assert_eq!(osc_cwd(two.as_bytes()), Some(sub.clone()));
+        assert_eq!(osc_cwd(b"\x1b]9;9;/no/such/folder\x07"), None);
+        assert_eq!(osc_cwd(b"\x1b]0;just a title\x07"), None);
     }
 }

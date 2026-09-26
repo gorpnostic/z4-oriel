@@ -134,6 +134,20 @@ pub fn mark_all_read() {
     });
 }
 
+/// Mark the ones `f` picks as read (alt j went to them).
+pub fn mark_read_if(f: impl Fn(&Alert) -> bool) {
+    CENTER.with_borrow_mut(|c| {
+        let mut any = false;
+        for a in c.list.iter_mut().filter(|a| !a.read && f(a)) {
+            a.read = true;
+            any = true;
+        }
+        if any {
+            save(c);
+        }
+    });
+}
+
 pub fn dismiss(k: &Key) {
     CENTER.with_borrow_mut(|c| {
         c.list.retain(|a| key(a) != *k);
