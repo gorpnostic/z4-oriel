@@ -42,8 +42,12 @@ pub const SIDEBAR: &[(&str, &str, &str, &str)] = &[
     ("notes", "notes", "notes", "F7"),
     ("storage", "storage", "storage", "F8"),
     ("terminal", "term", "terminal", "F9"),
+    // ── pinned to the bottom of the sidebar
+    ("themes", "theme", "themes", ""),
     ("help", "search", "help", "F10"),
 ];
+/// SIDEBAR entries from here on sit at the bottom of the sidebar, not in a section.
+const FOOTER: usize = 9;
 /// Where each sidebar section starts: (index into SIDEBAR, heading).
 const SECTIONS: &[(usize, &str)] = &[(0, "ai"), (3, "tools")];
 
@@ -168,6 +172,7 @@ pub struct App {
     tags: HashMap<String, PaneId>,
     done: std::collections::HashSet<PaneId>,
     _watcher: Option<notify::RecommendedWatcher>,
+    _theme_watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl App {
@@ -200,6 +205,7 @@ impl App {
             pane_close: vec![],
             hover: Position { x: u16::MAX, y: u16::MAX },
             _watcher: None,
+            _theme_watcher: None,
             renaming: None,
             ctx: None,
             onboard: None,
@@ -210,7 +216,8 @@ impl App {
             tags: HashMap::new(),
             done: Default::default(),
         };
-        app._watcher = watch_omarchy(tx);
+        app._watcher = watch_omarchy(tx.clone());
+        app._theme_watcher = watch_themes(tx);
         if !cfg!(test) && !crate::onboard::done_before() {
             app.onboard = Some(crate::onboard::Onboard::new(&app.theme.name, &app.config));
         }
@@ -601,6 +608,12 @@ impl App {
                         self.notify(format!("no theme called {t} — /theme lists them"));
                     }
                 }
+                Action::ApplyTheme(t) => {
+                    self.set_theme(&t, true);
+                    if let Some(p) = theme::problems(&t).into_iter().next() {
+                        self.notify(format!("⚠ {p}"));
+                    }
+                }
                 Action::Palette(q) => {
                     self.open_palette();
                     if let Some(p) = &mut self.palette {
@@ -681,6 +694,14 @@ impl App {
                     std::thread::sleep(Duration::from_millis(150)); // let omarchy finish swapping files
                     self.set_theme("omarchy", false);
                     self.notify(format!("{}omarchy theme updated", ui::lead("theme")));
+                } else if theme::is_custom(&self.theme.name) {
+                    // your theme file changed (the themes app, or you, in an editor): recolour
+                    std::thread::sleep(Duration::from_millis(60)); // editors write in two steps
+                    let name = self.theme.name.clone();
+                    self.set_theme(&name, false);
+                    if let Some(p) = theme::problems(&name).into_iter().next() {
+                        self.notify(format!("⚠ {p}"));
+                    }
                 }
             }
             Event::Tick => {
@@ -805,8 +826,8 @@ impl App {
             return;
         }
         if let KeyCode::F(n) = k.code {
-            if (1..=SIDEBAR.len() as u8).contains(&n) && k.modifiers.is_empty() {
-                self.goto_app(SIDEBAR[n as usize - 1].0);
+            if let Some(a) = SIDEBAR.iter().find(|a| a.3 == format!("F{n}")).filter(|_| k.modifiers.is_empty()) {
+                self.goto_app(a.0);
                 return;
             }
             if n == 12 {
@@ -979,8 +1000,10 @@ impl App {
         items.push((format!("{}new tab", ui::lead("tab")), Cmd::NewTab));
         items.push((format!("{}rename this tab", ui::lead("tab")), Cmd::Rename));
         items.push((format!("{}close this tab", ui::lead("close")), Cmd::CloseTab(self.cur)));
+        items.push((format!("{}theme editor: make your own", ui::lead("theme")), Cmd::App("themes")));
         for t in theme::names() {
-            items.push((format!("{}theme {t}", ui::lead("theme")), Cmd::Theme(t)));
+            let yours = if theme::is_custom(&t) { "  · yours" } else { "" };
+            items.push((format!("{}theme {t}{yours}", ui::lead("theme")), Cmd::Theme(t)));
         }
         items.push(("toggle nerd font icons".into(), Cmd::Icons));
         items.push((format!("{}help: every key, command and how-to  F10", ui::lead("search")), Cmd::Help));
@@ -1355,8 +1378,22 @@ impl App {
             f.render_widget(Paragraph::new(Span::styled(clock, ui::muted(t))), Rect { x: area.right() - cw - 2, y: area.y, width: cw, height: 1 });
         }
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), y: inner.y + 1, height: inner.height.saturating_sub(1) };
+        // ---- the footer: themes and help, pinned to the bottom
+        let foot_n = (SIDEBAR.len() - FOOTER) as u16;
+        let inner = if inner.height > foot_n + 12 {
+            let fy = inner.bottom() - foot_n;
+            ui::rule(f, Rect { y: fy - 1, height: 1, ..inner }, t);
+            for (k, &(name, icon, label, key)) in SIDEBAR[FOOTER..].iter().enumerate() {
+                let r = Rect { y: fy + k as u16, height: 1, ..inner };
+                ui::side_row(f, r, icon, label, key, cur_app == Some(name), t);
+                self.side_hits.push((r, SideHit::App(name)));
+            }
+            Rect { height: inner.height - foot_n - 1, ..inner }
+        } else {
+            inner
+        };
         let mut y = inner.y;
-        for (idx, &(name, icon, label, key)) in SIDEBAR.iter().enumerate() {
+        for (idx, &(name, icon, label, key)) in SIDEBAR[..FOOTER].iter().enumerate() {
             if y >= inner.bottom() {
                 break;
             }
@@ -1531,6 +1568,24 @@ pub(crate) fn local_offset_secs() -> i64 {
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
+/// Your theme files: saving one recolours oriel.
+fn watch_themes(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
+    use notify::{RecursiveMode, Watcher};
+    if cfg!(test) {
+        return None;
+    }
+    let dir = theme::themes_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.is_ok_and(|e| e.kind.is_modify() || e.kind.is_create()) {
+            let _ = tx.send(Event::ThemeFilesChanged);
+        }
+    })
+    .ok()?;
+    w.watch(&dir, RecursiveMode::NonRecursive).ok()?;
+    Some(w)
+}
 
 fn watch_omarchy(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
     use notify::{RecursiveMode, Watcher};

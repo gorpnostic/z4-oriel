@@ -286,7 +286,7 @@ fn tok_style(tk: crate::panes::files::preview::Tok, t: &Theme) -> Style {
 
 /// A diff line's background: the whole line tinted with the theme's added / removed colour, and the words that
 /// actually changed a stronger tint of it. None on themes without RGB colours (the terminal's own ANSI).
-fn band(t: &Theme, add: bool) -> Option<(ratatui::style::Color, ratatui::style::Color)> {
+pub(crate) fn band(t: &Theme, add: bool) -> Option<(ratatui::style::Color, ratatui::style::Color)> {
     use ratatui::style::Color;
     let base = match t.bg {
         Color::Rgb(..) => t.bg,

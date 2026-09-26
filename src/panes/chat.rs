@@ -9,6 +9,9 @@ mod md;
 pub mod providers;
 mod store;
 
+/// A diff line's background for a theme (line tint, changed-word tint): the themes app previews with it.
+pub(crate) use activity::band as diff_band;
+
 use crate::pane::{Action, Cx, Pane};
 use crate::ui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -37,7 +40,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/key", "<openai|anthropic> <key>", "save an API key"),
     ("/note", "", "save the last reply to notes"),
     ("/save", "", "export this chat as a markdown file"),
-    ("/theme", "<name>", "switch colour theme (live preview with just /theme)"),
+    ("/theme", "<name|edit|new>", "switch theme · edit opens the theme editor · new <name> makes your own"),
     ("/play", "", "music: play / pause"),
     ("/next", "", "music: next song"),
     ("/prev", "", "music: previous song"),
@@ -498,6 +501,23 @@ impl Chat {
                     }
                 }
             },
+            "/theme" if arg == "edit" || arg == "editor" => cx.act(Action::GotoApp("themes")),
+            "/theme" if arg == "new" || arg.starts_with("new ") => {
+                // your own theme, starting from the one you're in, then the editor to colour it
+                let name = crate::theme::free_name(arg.strip_prefix("new").unwrap_or("").trim().trim_matches('"'));
+                let name = if name == "mine" && !arg.contains(' ') { crate::theme::free_name("my-theme") } else { name };
+                let mut th = cx.theme.clone();
+                let base = if crate::theme::is_custom(&th.name) { crate::theme::base_of(&th.name) } else { th.name.clone() };
+                th.name = name.clone();
+                match crate::theme::save_custom(&name, &base, &th) {
+                    Ok(path) => {
+                        self.info.push(format!("made your theme {name} ({}): colour it in the themes app", path.display()));
+                        cx.act(Action::ApplyTheme(name));
+                        cx.act(Action::GotoApp("themes"));
+                    }
+                    Err(e) => self.info.push(format!("couldn't make the theme: {e}")),
+                }
+            }
             "/theme" if !arg.is_empty() => cx.act(Action::SetTheme(arg)),
             "/theme" => cx.act(Action::Palette("theme ".into())),
             "/key" => {
@@ -656,7 +676,22 @@ impl Chat {
             "/model" => self.models_for(&self.provider_of()),
             "/perms" => PERMS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
             "/key" => pairs(&[("openai", "OpenAI-compatible key"), ("anthropic", "Anthropic API key")]),
-            "/theme" => crate::theme::names().into_iter().map(|n| (n.clone(), if n == "omarchy" { "follows your Omarchy theme".into() } else if n == "terminal" { "your terminal's own colours".into() } else { String::new() })).collect(),
+            "/theme" => {
+                let mut v: Vec<(String, String)> = vec![("edit".into(), "open the theme editor".into()), ("new ".into(), "make your own theme from this one".into())];
+                v.extend(crate::theme::names().into_iter().map(|n| {
+                    let what = if n == "omarchy" {
+                        "follows your Omarchy theme".into()
+                    } else if n == "terminal" {
+                        "your terminal's own colours".into()
+                    } else if crate::theme::is_custom(&n) {
+                        "yours".into()
+                    } else {
+                        String::new()
+                    };
+                    (n, what)
+                }));
+                v
+            }
             "/cwd" => {
                 // folders chats have used, newest first
                 let mut seen = vec![];

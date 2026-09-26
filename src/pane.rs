@@ -30,6 +30,8 @@ pub enum Action {
     Close,
     Notify(String),
     SetTheme(String),
+    /// Switch to this theme quietly (the themes app, as you edit): saved, no toast.
+    ApplyTheme(String),
     /// Open the palette with this text already typed (e.g. "theme " = the theme picker with live preview).
     Palette(String),
     /// Switch to an app's tab.

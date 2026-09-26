@@ -71,6 +71,7 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | F7 | **notes** | Markdown notes that save as you type, with a live preview. |
 | F8 | **storage** | Frees up space. It finds what's safe to clean (caches, temp files, trash), shows the biggest folders, and uninstalls apps. It also has a catalog of 60+ popular apps (OBS, Steam, Minecraft launchers, VPNs, AI apps, dev tools, browsers…) that install with one key, using whichever package manager your system has: winget, pacman/AUR, apt, flatpak or npm. Nothing is deleted or installed without asking. |
 | F9 | **terminal** | A real shell. Split it next to anything. |
+| | **themes** | Make your own theme: every colour with a live preview. (Bottom of the sidebar, with help.) |
 | F10 | **help** | Every key, command and how-to, by topic. |
 
 ![a Claude Code run: todos, edits as diffs, command output (dracula theme)](docs/screenshot-agent.png)
@@ -98,14 +99,14 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | work in another folder | start oriel there, or `/cwd <folder>` for one chat, or `o` in agents to pick a repo |
 | install another AI tool | `F3` → `2` → `enter` on it |
 | save tokens | `F3` → `4` (token saver) → pick a preset → `enter` |
-| change the theme | `alt p` → type `theme`, or `/theme` in chat |
+| change the theme | `alt p` → type `theme`, or `/theme` in chat. Make your own in **themes** (`/theme edit`) |
 | find anything else | `alt p` searches every app, action and theme, and `F10` explains them |
 
 ## Keys
 
 | Key | Does |
 |---|---|
-| `F1`–`F10` | switch apps (`F12` plays/pauses music from anywhere) |
+| `F1`–`F10` | switch apps (`F10` is help; `F12` plays/pauses music from anywhere) |
 | `alt p` | the palette: every app, action and theme, searchable |
 | `alt n` | a terminal beside the current pane |
 | `alt t` · `alt 1-9` | new tab · go to one of your tabs |
@@ -192,6 +193,25 @@ There are also:
 - **terminal**, which uses your terminal's own colours;
 - **omarchy** (the default on [Omarchy](https://omarchy.org)), which follows your Omarchy theme and recolours
   instantly when you switch.
+
+**Make your own:** open **themes** (bottom of the sidebar, or `/theme edit`). Pick a colour with `↑↓`, then turn
+its hue with `←→`, make it darker or lighter with `[` `]`, change how colourful it is with `-` `=`, or press `enter`
+and type a hex code. Every change saves and recolours oriel at once, with a live preview of diffs, code and borders.
+Editing a built-in theme makes your own copy on the first change, so the originals stay.
+
+A theme is one small file in the `themes` folder next to `config.toml`. It can start from any other theme and
+list only what it changes:
+
+```toml
+# themes/midnight.toml
+base = "ocean"        # start from any theme
+accent = "#ff79c6"    # frames, titles, keywords in code
+good = "#50fa7b"      # added lines, success
+danger = "#ff5555"    # removed lines, errors
+```
+
+Colours are `#rrggbb`, an ANSI name like `bright-blue`, or `terminal` for your terminal's own. Editing the file by
+hand works too: save it and oriel recolours. To share a theme, send the file.
 
 ## Configuration
 
