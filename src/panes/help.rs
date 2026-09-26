@@ -162,6 +162,7 @@ fn topics() -> Vec<Topic> {
             K("enter", "start a task / open its agent"),
             K("d  ·  c", "diff · send feedback"),
             K("m  ·  x", "squash-merge into your branch · discard"),
+            P("A task with a budget has its claude or codex tab closed once the budget is spent (c carries on without the cap). A task waits for what it's after to be merged before it starts."),
             K("P", "let an AI plan tasks for a goal"),
             K("o", "pick the repo"),
             P("Status dots: ◐ working · red ● needs you · green ● finished while you were away."),

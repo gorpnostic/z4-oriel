@@ -55,7 +55,7 @@ fn fake_worker(seen: Arc<Mutex<Vec<String>>>) -> run::Fake {
             std::fs::write(&path, content).unwrap();
             on(Ev::Touched(file.to_string()));
         };
-        let mut summary = String::new();
+        let summary: String;
         if p.contains("conflict markers") {
             let mut fs = vec![];
             files_under(&cwd, &mut fs);
@@ -994,6 +994,32 @@ fn agents_stopped_run_starts_nothing_new() {
     assert!(p.queue_merge("a").is_err());
     with_cx(&mut k, |cx| p.schedule(cx));
     assert_eq!(p.task("b").unwrap().status, Status::Todo, "a stopped run starts nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Resuming a lead's run checks the rounds that ended while it was stopped (B5), so the lead hears they finished
+/// instead of waiting on them forever.
+#[test]
+fn agents_resume_checks_rounds_that_ended_while_stopped() {
+    let dir = scratch("resume-check");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let (mut p, run) = bare_run(&dir);
+    if let Some(r) = p.run_mut(&run) {
+        (r.manual, r.finishing, r.state, r.worktree, r.repo) = (false, true, store::RunState::Stopped, repo.display().to_string(), repo.display().to_string());
+    }
+    queued(&mut p, &run, "f", "claude", "", 0);
+    if let Some(t) = p.task_mut("f") {
+        (t.status, t.queued, t.worktree, t.repo, t.summary) = (Status::Review, false, repo.display().to_string(), repo.display().to_string(), "did it".into());
+        t.last = "finished · the run is stopped (r resumes it)".into();
+        t.file_stats = vec![("a.txt".into(), 1, 0)];
+    }
+    with_cx(&mut k, |cx| p.resume_run(&run, cx));
+    assert_eq!(run0(&p).state, store::RunState::Running);
+    assert!(p.live.get("f").is_some_and(|l| l.checking), "its round is being checked");
+    until(&mut k, &mut p, 10_000, "checked", |p| p.live.get("f").is_some_and(|l| !l.checking));
+    let told = p.runs_live.get(&run).is_some_and(|l| l.events.iter().any(|e| e.task == "f" && e.card["event"] == "finished"));
+    assert!(told, "the lead hears it finished");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

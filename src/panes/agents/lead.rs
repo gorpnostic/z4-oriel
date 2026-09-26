@@ -710,6 +710,9 @@ impl Agents {
                 // finished and wanting to merge: conflicts go back to its worker, the rest through the check
                 Status::Review if t.want_merge && !t.blocked && wt && !t.conflicts.is_empty() => self.start_resolve(&t.id, None, cx),
                 Status::Review if t.want_merge && !t.blocked => self.check_task(&t.id, cx),
+                // a lead's task whose round ended while the run was stopped (or as oriel closed, before its
+                // check): checked now, so the lead hears it finished
+                Status::Review if !r.manual && !t.blocked && t.error.is_empty() && wt && (t.last.starts_with("finished · the run is stopped") || t.file_stats.is_empty()) => self.check_task(&t.id, cx),
                 _ => {}
             }
         }
@@ -1536,7 +1539,12 @@ impl Agents {
         self.spawn(cx, move |send| {
             let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
             let wt = Path::new(&t.worktree);
-            let resolved = if resolving { Some(git::finish_resolve(wt).map(|_| ())) } else { None };
+            // a conflict merge still open in the worktree is oriel's (workers don't run git), even when oriel
+            // restarted since and forgot it was resolving: commit it now
+            let resolved = match git::finish_resolve(wt) {
+                Ok(false) if !resolving => None,
+                r => Some(r.map(|_| ())),
+            };
             let stats = git::file_stats(wt, &t.base_sha).ok();
             let conflicts = git::conflicts_with(Path::new(&t.repo), wt, &t.base_sha, &integ);
             send(Msg::Checked(id2, stats, conflicts, resolved));
@@ -1905,11 +1913,13 @@ impl Agents {
     }
 
     pub(super) fn on_redispatched(&mut self, id: &str, r: Result<(), String>, w: crate::config::RosterEntry, cx: &mut Cx) {
+        // (the fresh worker's watchdog count starts over with it: start() resets the task's live state)
         self.live(id).busy = false;
         let Some(t) = self.task_mut(id) else { return };
         if let Err(e) = r {
+            // its old worktree wouldn't go: it waits in REVIEW with the error (a run of yours settles without it)
             t.error = e;
-            return;
+            return self.event(id, "failed");
         }
         t.redispatches += 1;
         t.attempts = 0;

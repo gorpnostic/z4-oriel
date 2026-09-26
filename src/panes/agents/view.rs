@@ -445,7 +445,7 @@ impl Agents {
                     lines.push(Line::styled(a, ui::muted(t)));
                     // waiting on something that won't merge by itself: say so, rather than wait forever
                     match self.waiting_for(task).iter().find_map(|d| self.dead_dep(&task.run, d)) {
-                        Some((title, why)) => lines.push(Line::styled(ui::fit(&format!("waits for {title}, which {why} — x drops this one"), w), Style::default().fg(t.danger))),
+                        Some((title, why)) => lines.push(Line::styled(ui::fit(&format!("stuck: {title} {why} · x drops it"), w), Style::default().fg(t.danger))),
                         None => lines.push(Line::styled(ui::fit(&format!("after {}", task.depends_on.join(", ")), w), Style::default().fg(t.frame))),
                     }
                 }
@@ -683,7 +683,7 @@ impl Agents {
         draw_input(f, r, &form.after, "task ids or the start of their titles, comma separated · empty = no wait", form.field == 5, t);
         // budget
         let r = field(f, "budget $ (stops it past this)", 3, 6, &mut y);
-        draw_input(f, r, &form.budget, "empty = none (run together: the roster's cap) · codex/kimi tabs aren't capped", form.field == 6, t);
+        draw_input(f, r, &form.budget, "empty = none (run together: the roster's cap) · kimi tabs can't be capped", form.field == 6, t);
         // buttons
         y += 1;
         if y < bottom {

@@ -480,7 +480,7 @@ fn agents_card_names_a_dead_dependency() {
     p.store.tasks.push(Task { outcome: "discarded".into(), ..task("d1", "Old parser", Status::Done) });
     p.store.tasks.push(Task { queued: true, depends_on: vec!["d1".into()], prompt: "use the new parser".into(), ..task("d2", "Use the parser", Status::Todo) });
     let board = k.render(&mut p, 300, 44);
-    assert!(board.contains("waits for Old parser, which was discarded"), "{board}");
+    assert!(board.contains("stuck: Old parser was discarded · x drops it"), "{board}");
     assert!(p.card(p.task("d2").unwrap())["stuck"].as_str().is_some_and(|s| s.contains("discarded")));
     // and the run doesn't wait for it: nothing else is going, so it's ready for review
     assert!(p.working("r9").is_empty());
@@ -505,6 +505,13 @@ fn agents_hand_task_after_budget_and_retry_spend() {
     k.key(&mut p, KeyCode::Enter);
     assert_eq!(p.task(&second).unwrap().status, Status::Todo, "it waits");
     assert!(k.notices().iter().any(|n| n.contains("waits for \"First part\" to be merged")), "{:?}", k.notices());
+    // what it waits for was thrown away: it never will be merged, so say how to get out
+    if let Some(t) = p.task_mut(&first) {
+        (t.status, t.outcome) = (Status::Done, "discarded".into());
+    }
+    k.key(&mut p, KeyCode::Enter);
+    assert_eq!(p.task(&second).unwrap().status, Status::Todo);
+    assert!(k.notices().last().is_some_and(|n| n.contains("which was discarded — edit it (e)")), "{:?}", k.notices());
     // over budget in its tab
     let run = id_of(&p, "Fix pty resize on split");
     p.task_mut(&run).unwrap().budget_usd = 0.20;
@@ -512,6 +519,13 @@ fn agents_hand_task_after_budget_and_retry_spend() {
     let t = p.task(&run).unwrap().clone();
     assert!(t.error.contains("stopped at its budget ($0.25 of $0.20)"), "{t:?}");
     assert!(k.actions.iter().any(|a| matches!(a, Action::CloseTag(tag) if *tag == t.tag())), "its tab is closed");
+    // telling it to carry on anyway lifts the budget (or the new tab would close at once)
+    p.task_mut(&run).unwrap().worktree = dir.display().to_string();
+    p.fake_agent = Some(noop_agent()); // the tab it opens runs a no-op, never a real agent
+    with_cx(&mut k, |cx| p.comment(&run, "finish the last bit", cx));
+    assert_eq!(p.task(&run).unwrap().budget_usd, 0.0);
+    assert!(k.notices().iter().any(|n| n.contains("lifted for this follow-up")), "{:?}", k.notices());
+    k.actions.clear(); // drops the tab the comment opened
     // retry: what it spent still counts today
     let rev = id_of(&p, "Usage sink status line");
     let before = p.today();
@@ -614,6 +628,50 @@ fn agents_selection_stays_on_its_card() {
     with_cx(&mut k, |cx| p.on_msg(Msg::Removed(blocked, Ok(()), Then::Discarded), cx));
     k.poll(&mut p);
     assert_eq!((p.col, p.selected()), (2, Some(old.clone())), "the cursor didn't jump to DONE");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Another app's /lead or /task opens this one and pastes right away (L or n, then the text): it lands in the lead's
+/// goal or the task's prompt, even on a fresh pane that doesn't know its repo yet. The form's after and budget
+/// fields and the comment box take a paste too.
+#[test]
+fn agents_paste_reaches_the_form_opened_for_it() {
+    let dir = scratch("paste");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let mut p = pane(&dir, &repo);
+    // L arrives before the repo is detected, the goal right after it
+    k.key(&mut p, KeyCode::Char('L'));
+    assert!(p.repo.is_none() && matches!(p.mode, Mode::Board), "still detecting the repo");
+    with_cx(&mut k, |cx| p.paste("Add dark mode\nto every pane", cx));
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    match &p.mode {
+        Mode::LeadForm(f) => assert_eq!(f.goal.text, "Add dark mode\nto every pane"),
+        _ => panic!("the lead form should be open"),
+    }
+    k.key(&mut p, KeyCode::Esc);
+    // n, then a task description: the prompt, not the one-line title
+    k.key(&mut p, KeyCode::Char('n'));
+    let long = "Fix the login button on narrow windows: it stops responding once the sidebar is open";
+    with_cx(&mut k, |cx| p.paste(long, cx));
+    let Mode::Form(f) = &mut p.mode else { panic!("the task form should be open") };
+    assert_eq!((f.title.text.as_str(), f.prompt.text.as_str(), f.field), ("", long, 1));
+    // a short line on the title is a title; after and budget take theirs
+    f.field = 0;
+    f.prompt = Input::new("", true);
+    with_cx(&mut k, |cx| p.paste("Fix login", cx));
+    for (field, text) in [(5, "k3f9"), (6, " 1.5 ")] {
+        if let Mode::Form(f) = &mut p.mode {
+            f.field = field;
+        }
+        with_cx(&mut k, |cx| p.paste(text, cx));
+    }
+    let Mode::Form(f) = &p.mode else { panic!() };
+    assert_eq!((f.title.text.as_str(), f.prompt.text.as_str(), f.after.text.as_str(), f.budget.text.as_str()), ("Fix login", "", "k3f9", "1.5"));
+    // the comment box
+    p.mode = Mode::Comment("x".into(), Input::new("", true));
+    with_cx(&mut k, |cx| p.paste("use the default", cx));
+    assert!(matches!(&p.mode, Mode::Comment(_, i) if i.text == "use the default"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

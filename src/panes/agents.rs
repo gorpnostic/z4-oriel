@@ -382,6 +382,9 @@ pub struct Agents {
     hits: Vec<(Rect, Hit)>,
     side_hits: Vec<(Rect, Hit)>,
     planning: bool,
+    /// n or L pressed before the repo is known (another app's /task or /lead opens this one and types into it at
+    /// once): that form, with whatever was pasted meanwhile, opens as soon as there's a repo.
+    pending_form: Option<(char, String)>,
     /// The oriel binary the hooks call.
     hook_exe: Option<PathBuf>,
     /// Tests: run this instead of the real agent.
@@ -475,6 +478,7 @@ impl Agents {
             hits: vec![],
             side_hits: vec![],
             planning: false,
+            pending_form: None,
             hook_exe: std::env::current_exe().ok(),
             fake_agent: None,
             start_dir: None,
@@ -753,6 +757,7 @@ impl Agents {
                         if matches!(self.mode, Mode::Repo(_)) {
                             self.mode = Mode::Board;
                         }
+                        self.open_pending_form(cx);
                     }
                     Err(e) => {
                         if picked {
@@ -1168,7 +1173,12 @@ impl Agents {
         }
         if t.run.is_empty() {
             // your own "after" links: it can't start until those are merged (a run of them orders it for you)
-            let waits: Vec<String> = t.depends_on.iter().filter_map(|d| self.task(d)).filter(|d| !(d.status == Status::Done && d.outcome == "merged")).map(|d| format!("\"{}\"", d.title)).collect();
+            let deps: Vec<&Task> = t.depends_on.iter().filter_map(|d| self.task(d)).filter(|d| !(d.status == Status::Done && d.outcome == "merged")).collect();
+            if let Some(d) = deps.iter().find(|d| d.status == Status::Done) {
+                cx.notify(format!("\"{}\" waits for \"{}\", which was discarded — edit it (e) to drop the link", t.title, d.title));
+                return;
+            }
+            let waits: Vec<String> = deps.iter().map(|d| format!("\"{}\"", d.title)).collect();
             if !waits.is_empty() {
                 cx.notify(format!("\"{}\" waits for {} to be merged — or mark them all (space) and press enter to run them in order", t.title, waits.join(", ")));
                 return;
@@ -1392,8 +1402,14 @@ impl Agents {
             self.save();
             return;
         }
+        let over = t.budget_usd > 0.0 && t.cost_usd >= t.budget_usd;
         self.open_agent(&t, text, true, cx);
         let tm = self.task_mut(id).unwrap();
+        if over {
+            // you asked it to carry on past its budget: that's the budget lifted, or its tab would close at once
+            tm.budget_usd = 0.0;
+            cx.notify(format!("{} had spent its budget (${:.2} of ${:.2}) — lifted for this follow-up", t.title, t.cost_usd, t.budget_usd));
+        }
         tm.status = Status::Running;
         tm.followups += 1;
         tm.question.clear();
@@ -1462,6 +1478,18 @@ impl Agents {
             }
         }
         self.save();
+    }
+
+    /// The repo is known now: open the form someone asked for before it was (see `pending_form`).
+    fn open_pending_form(&mut self, cx: &mut Cx) {
+        if !matches!(self.mode, Mode::Board) {
+            return;
+        }
+        let Some((key, text)) = self.pending_form.take() else { return };
+        self.mode = if key == 'L' { Mode::LeadForm(self.new_lead_form()) } else { Mode::Form(self.new_form(None)) };
+        if !text.is_empty() {
+            self.paste(&text, cx);
+        }
     }
 
     fn new_form(&self, editing: Option<&Task>) -> Form {
@@ -1668,6 +1696,8 @@ impl Agents {
             KeyCode::Char('L') => {
                 if self.repo.is_some() {
                     self.mode = Mode::LeadForm(self.new_lead_form());
+                } else {
+                    self.pending_form = Some(('L', String::new()));
                 }
             }
             KeyCode::Char('R') => self.mode = Mode::Roster(RosterView { sel: 0, edit: None }),
@@ -1682,6 +1712,8 @@ impl Agents {
             KeyCode::Char('n') => {
                 if self.repo.is_some() {
                     self.mode = Mode::Form(self.new_form(None));
+                } else {
+                    self.pending_form = Some(('n', String::new()));
                 }
             }
             KeyCode::Char('e') => {
@@ -2128,9 +2160,19 @@ impl Pane for Agents {
 
     fn paste(&mut self, text: &str, _cx: &mut Cx) {
         match &mut self.mode {
+            // a form asked for before the repo was known takes what's pasted meanwhile (/task, /lead)
+            Mode::Board if self.pending_form.is_some() => {
+                if let Some((_, t)) = &mut self.pending_form {
+                    t.push_str(text);
+                }
+            }
             Mode::Form(f) => match f.field {
-                0 => f.title.insert(text),
+                // a task description (several lines, or more than a title's worth) belongs in the prompt, even
+                // when it lands on a new form's empty title (/task sends one right after opening the form)
+                0 if !(f.title.text.is_empty() && (text.trim().contains('\n') || text.trim().chars().count() > 60)) => f.title.insert(text),
                 3 => f.model.insert(text),
+                5 => f.after.insert(text),
+                6 => f.budget.insert(text.trim()),
                 _ => {
                     f.field = 1;
                     f.prompt.insert(text)
