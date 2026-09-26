@@ -2,6 +2,10 @@
 //! highlighted on the right: folders get a summary + their README, text/code its contents with light syntax
 //! colouring, images a half-block pixel picture. Places (home, desktop, ..., drives) live in the sidebar.
 //!
+//! `/` filters the folder as you type; n / R / d make, rename and bin files (asking first); c / x / e / t open
+//! Claude Code, Codex, your editor or a shell here, beside it. The folder is watched, so files something else
+//! writes (an agent, a download) show up by themselves.
+//!
 //! Directory reads and previews run on background threads that hand results back through `Shared` and wake
 //! the pane; render only draws what is already in memory.
 
@@ -17,12 +21,13 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Default)]
@@ -30,7 +35,27 @@ struct Shared {
     listing: Option<(u64, Result<Vec<Entry>, String>)>,
     preview: Option<(u64, Preview)>,
     places: Option<Vec<PlaceItem>>,
+    /// A background file operation (the recycle bin) finished: what to say.
+    op: Option<Result<String, String>>,
 }
+
+/// A name being typed in the little dialog.
+enum Ask {
+    /// a new file, or a folder when it ends in /
+    New(String),
+    /// (the old name, the new one so far)
+    Rename(String, String),
+}
+
+/// What the files app opens beside itself, in the folder it shows.
+pub(crate) enum Launch {
+    Shell,
+    Agent(&'static str),
+    Edit(PathBuf),
+}
+
+/// The folder is read again at most this often while it keeps changing (a build writing hundreds of files).
+const REFRESH_GAP: Duration = Duration::from_millis(500);
 
 struct Req {
     ticket: u64,
@@ -67,6 +92,23 @@ pub struct Files {
     pv_rect: Rect,
     side_hits: Vec<(Rect, usize)>,
     last_click: Option<(usize, Instant)>,
+    /// The `/` filter: Some while one is set (even empty), `filtering` while you type into it.
+    filter: Option<String>,
+    filtering: bool,
+    ask: Option<Ask>,
+    /// "move <path> to the recycle bin?", waiting for y.
+    confirm: Option<PathBuf>,
+    /// Makes the panes it opens (tests swap in one that starts nothing).
+    launcher: fn(&Launch, &Path, &crate::config::Config) -> Result<Box<dyn Pane>, String>,
+    /// Moves a file to the recycle bin (tests swap in one that just deletes it in the scratch folder).
+    trasher: fn(&Path) -> Result<(), String>,
+    /// Set by the folder watcher when something changed; the next poll reads the folder again.
+    changed: Arc<AtomicBool>,
+    watch: Option<(PathBuf, notify::RecommendedWatcher)>,
+    last_load: Instant,
+    /// To notice the pane coming back into view (it reads the folder again then).
+    was_focused: bool,
+    last_render: Instant,
 }
 
 // Glyphs the shared icon table doesn't have (Nerd Font Material Design), with plain fallbacks.
@@ -145,6 +187,17 @@ impl Files {
             pv_rect: Rect::default(),
             side_hits: vec![],
             last_click: None,
+            filter: None,
+            filtering: false,
+            ask: None,
+            confirm: None,
+            launcher: launch,
+            trasher: preview::to_trash,
+            changed: Arc::default(),
+            watch: None,
+            last_load: Instant::now(),
+            was_focused: true,
+            last_render: Instant::now(),
         }
     }
 
@@ -184,7 +237,9 @@ impl Files {
     fn load(&mut self) {
         self.list_gen += 1;
         self.loading = true;
+        self.last_load = Instant::now();
         let Some(waker) = self.waker.clone() else { return };
+        self.watch_dir(&waker);
         let (ticket, dir, shared) = (self.list_gen, self.dir.clone(), self.shared.clone());
         std::thread::spawn(move || {
             let r = preview::list_dir(&dir);
@@ -193,8 +248,43 @@ impl Files {
         });
     }
 
+    /// Watch the folder on screen (not its subfolders): a change wakes the pane, which reads it again.
+    fn watch_dir(&mut self, waker: &Waker) {
+        use notify::event::{EventKind, MetadataKind, ModifyKind};
+        use notify::{RecursiveMode, Watcher};
+        if self.watch.as_ref().is_some_and(|(d, _)| *d == self.dir) {
+            return;
+        }
+        self.watch = None;
+        let (changed, w) = (self.changed.clone(), waker.clone());
+        let made = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            // reads (our own previews) aren't changes; a burst of writes wakes us once, the poll clears the flag
+            let change = res.is_ok_and(|e| !e.kind.is_access() && !matches!(e.kind, EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))));
+            if change && !changed.swap(true, Ordering::SeqCst) {
+                w.wake();
+            }
+        });
+        if let Ok(mut watcher) = made {
+            if watcher.watch(&self.dir, RecursiveMode::NonRecursive).is_ok() {
+                self.watch = Some((self.dir.clone(), watcher));
+            }
+        }
+    }
+
+    /// Read the folder again, keeping the selection: something changed on disk, or the pane is back in view.
+    fn refresh(&mut self) {
+        if self.waker.is_none() {
+            return;
+        }
+        self.changed.store(false, Ordering::SeqCst);
+        self.want_sel = self.sel_entry().map(|e| e.name.clone());
+        self.load();
+    }
+
     fn navigate(&mut self, dir: PathBuf, want_sel: Option<String>) {
         self.dir = dir;
+        self.filter = None;
+        self.filtering = false;
         self.all.clear();
         self.shown.clear();
         self.error = None;
@@ -215,9 +305,64 @@ impl Files {
 
     fn refilter(&mut self) {
         let keep = self.sel_entry().map(|e| e.name.clone());
-        self.shown = (0..self.all.len()).filter(|&i| self.hidden || !self.all[i].hidden).collect();
+        let q = self.filter.as_deref().unwrap_or("").to_lowercase();
+        self.shown = (0..self.all.len()).filter(|&i| (self.hidden || !self.all[i].hidden) && (q.is_empty() || self.all[i].name.to_lowercase().contains(&q))).collect();
         self.sel = keep.and_then(|n| self.shown.iter().position(|&i| self.all[i].name == n).map(|p| p + 1)).unwrap_or(0);
         self.follow = true;
+    }
+
+    /// The filter text changed: the list narrows and the cursor goes to the top match (enter opens it).
+    fn filter_changed(&mut self) {
+        self.refilter();
+        self.sel = if self.shown.is_empty() { 0 } else { 1 };
+        self.scroll = 0;
+        self.request_preview(false);
+    }
+
+    fn start_filter(&mut self) {
+        self.focus_preview = false;
+        self.filtering = true;
+        self.filter.get_or_insert_with(String::new);
+    }
+
+    /// Keys while typing into the filter. Arrows move, enter opens, esc drops the filter.
+    fn filter_key(&mut self, key: KeyEvent, typed: Option<char>) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.filter = None;
+                self.filtering = false;
+                self.refilter();
+                self.request_preview(false);
+            }
+            KeyCode::Enter => {
+                self.filtering = false;
+                if self.sel > 0 {
+                    self.open_sel();
+                }
+            }
+            KeyCode::Backspace => {
+                match self.filter.as_mut().map(|f| f.pop()) {
+                    Some(Some(_)) => self.filter_changed(),
+                    _ => {
+                        // backspace on an empty filter: done filtering
+                        self.filter = None;
+                        self.filtering = false;
+                        self.refilter();
+                    }
+                }
+            }
+            KeyCode::Down => self.select(self.sel + 1),
+            KeyCode::Up => self.select(self.sel.saturating_sub(1)),
+            KeyCode::PageDown | KeyCode::PageUp | KeyCode::Home | KeyCode::End => return false,
+            _ => match typed {
+                Some(c) => {
+                    self.filter.get_or_insert_with(String::new).push(c);
+                    self.filter_changed();
+                }
+                None => return false,
+            },
+        }
+        true
     }
 
     fn rows(&self) -> usize {
@@ -344,6 +489,8 @@ impl Files {
                     Span::styled("    loading…", ui::muted(t))
                 } else if let Some(e) = &self.error {
                     Span::styled(format!("    {e}"), Style::default().fg(t.danger))
+                } else if self.filter.as_deref().is_some_and(|q| !q.is_empty()) {
+                    Span::styled("    nothing matches · esc clears the filter", ui::muted(t))
                 } else {
                     Span::styled("    (empty)", ui::muted(t))
                 };
@@ -499,6 +646,10 @@ impl Pane for Files {
         if self.loading && self.all.is_empty() {
             return Some("reading…".into());
         }
+        if let Some(q) = self.filter.as_deref().filter(|q| !q.is_empty()) {
+            let total = self.all.iter().filter(|e| self.hidden || !e.hidden).count();
+            return Some(format!("{} of {total} match “{q}”", self.shown.len()));
+        }
         let (d, fcount) = self.counts();
         let mut s = format!("{d} {} · {fcount} {}", if d == 1 { "folder" } else { "folders" }, if fcount == 1 { "file" } else { "files" });
         if self.hidden {
@@ -512,13 +663,15 @@ impl Pane for Files {
 
     fn poll(&mut self, cx: &mut Cx) {
         self.start(cx);
-        let (listing, prev, places) = {
+        let (listing, prev, places, op) = {
             let mut s = self.shared.lock().unwrap();
-            (s.listing.take(), s.preview.take(), s.places.take())
+            (s.listing.take(), s.preview.take(), s.places.take(), s.op.take())
         };
         if let Some((ticket, r)) = listing {
             if ticket == self.list_gen {
                 self.loading = false;
+                let was = self.sel_entry().map(|e| (e.name.clone(), e.size));
+                let old_sel = self.sel;
                 match r {
                     Ok(all) => {
                         self.all = all;
@@ -529,14 +682,28 @@ impl Pane for Files {
                         self.error = Some(e);
                     }
                 }
+                self.shown.clear(); // its indices were into the old list
                 self.refilter();
-                if let Some(want) = self.want_sel.take() {
-                    if let Some(p) = self.shown.iter().position(|&i| self.all[i].name == want) {
-                        self.sel = p + 1;
-                    }
+                let want = self.want_sel.take();
+                match want.and_then(|w| self.shown.iter().position(|&i| self.all[i].name == w)) {
+                    Some(p) => self.sel = p + 1,
+                    // the one that was picked is gone (deleted, renamed): the cursor stays where it was
+                    None if was.is_some() => self.sel = old_sel.min(self.rows() - 1),
+                    None => {}
                 }
-                self.request_preview(false);
+                // the file on show changed on disk (an agent writing it): show it again
+                let now = self.sel_entry().map(|e| (e.name.clone(), e.size));
+                let grew = matches!((&was, &now), (Some(a), Some(b)) if a.0 == b.0 && a.1 != b.1);
+                self.request_preview(grew);
             }
+        }
+        if let Some(r) = op {
+            cx.notify(r.unwrap_or_else(|e| e));
+            self.refresh();
+        }
+        // the watcher saw a change: read the folder again (at most every REFRESH_GAP; a tick comes back for it)
+        if self.changed.load(Ordering::SeqCst) && !self.loading && self.last_load.elapsed() >= REFRESH_GAP {
+            self.refresh();
         }
         if let Some((ticket, p)) = prev {
             if ticket == self.prev_gen {
@@ -550,12 +717,25 @@ impl Pane for Files {
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         self.start(cx);
+        // back in view (from another tab or pane): read the folder again, something may have changed meanwhile
+        let back = cx.focused && (!self.was_focused || self.last_render.elapsed() > Duration::from_secs(2));
+        (self.was_focused, self.last_render) = (cx.focused, Instant::now());
+        if back && !self.loading && self.last_load.elapsed() > Duration::from_secs(1) {
+            self.refresh();
+        }
         let t = cx.theme;
         let os = format!("open with {}", Self::os_name());
-        let hints: Vec<(&str, &str)> = if self.focus_preview {
-            vec![("j/k", "scroll"), ("esc", "back to the list"), ("o", &os), ("p", "copy path"), ("t", "terminal here")]
+        let bin = format!("yes, move it to {}", preview::bin_name());
+        let hints: Vec<(&str, &str)> = if self.confirm.is_some() {
+            vec![("y", &bin), ("esc", "no")]
+        } else if let Some(a) = &self.ask {
+            vec![("enter", if matches!(a, Ask::New(_)) { "create" } else { "rename" }), ("esc", "cancel")]
+        } else if self.filtering {
+            vec![("type", "to filter"), ("↑↓", "move"), ("enter", "open"), ("esc", "clear")]
+        } else if self.focus_preview {
+            vec![("j/k", "scroll"), ("esc", "back to the list"), ("e", "edit"), ("o", &os), ("p", "copy path"), ("t", "terminal here")]
         } else {
-            vec![("enter", "open"), ("o", &os), ("p", "copy path"), ("t", "terminal here"), ("backspace", "up"), (".", "hidden")]
+            vec![("enter", "open"), ("/", "filter"), ("e", "edit"), ("n", "new"), ("R", "rename"), ("d", "delete"), ("c/x", "claude/codex here"), ("t", "terminal here"), ("o", &os), ("p", "copy path"), (".", "hidden"), ("backspace", "up")]
         };
         let body = ui::hint_line(f, area, &hints, t);
         let body = Rect { height: body.height.saturating_sub(1), ..body }; // a gap above the hints, like nest
@@ -566,12 +746,14 @@ impl Pane for Files {
                 self.draw_preview(f, body, cx);
             } else {
                 self.pv_rect = Rect::default();
-                self.draw_list(f, body, cx);
+                let list = self.draw_filter(f, body, cx);
+                self.draw_list(f, list, cx);
             }
+            self.draw_dialogs(f, area, cx);
             return;
         }
         let lw = (body.width * 2 / 5).clamp(26, 60);
-        let list = Rect { width: lw, ..body };
+        let list = self.draw_filter(f, Rect { width: lw, ..body }, cx);
         self.draw_list(f, list, cx);
         let t = cx.theme;
         let div_x = body.x + lw + 1;
@@ -580,12 +762,35 @@ impl Pane for Files {
         }
         let pv = Rect { x: div_x + 2, width: body.right().saturating_sub(div_x + 3), ..body };
         self.draw_preview(f, pv, cx);
+        self.draw_dialogs(f, area, cx);
+    }
+
+    fn tick_every(&self) -> Option<Duration> {
+        // the watcher saw a change too soon after the last read: come back for it
+        if self.changed.load(Ordering::SeqCst) { Some(REFRESH_GAP) } else { None }
     }
 
     fn key(&mut self, key: KeyEvent, cx: &mut Cx) -> bool {
         self.start(cx);
-        if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) && ui::typed_char(&key).is_none() {
-            return false; // (AltGr chars like ~ still count)
+        let typed = ui::typed_char(&key); // AltGr chars like ~ count
+        if self.confirm.is_some() {
+            // storage's rule: y does it, any other key leaves it
+            if matches!(typed, Some('y') | Some('Y')) {
+                self.trash_confirmed();
+            } else {
+                self.confirm = None;
+            }
+            return true;
+        }
+        if self.ask.is_some() {
+            self.ask_key(key, typed, cx);
+            return true;
+        }
+        if self.filtering && self.filter_key(key, typed) {
+            return true;
+        }
+        if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) && typed.is_none() {
+            return false;
         }
         let page = (self.list_rect.height.max(2) - 1) as usize;
         if self.focus_preview {
@@ -613,6 +818,11 @@ impl Pane for Files {
             KeyCode::End | KeyCode::Char('G') => self.select(usize::MAX / 2),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.open_sel(),
             KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => self.up(),
+            KeyCode::Esc if self.filter.is_some() => {
+                self.filter = None;
+                self.refilter();
+                self.request_preview(false);
+            }
             _ => return self.common_key(key, cx),
         }
         true
@@ -708,10 +918,26 @@ impl Files {
                     Err(e) => cx.notify(format!("can't copy: {e}")),
                 }
             }
-            KeyCode::Char('t') => {
-                let term = crate::panes::term::Term::shell(cx.config, Some(self.dir.clone()));
-                cx.act(Action::Open(Box::new(term), Place::Split));
-            }
+            KeyCode::Char('t') => self.launch(Launch::Shell, cx),
+            KeyCode::Char('c') => self.launch(Launch::Agent("claude"), cx),
+            KeyCode::Char('x') => self.launch(Launch::Agent("codex"), cx),
+            KeyCode::Char('e') => match self.sel_entry() {
+                Some(e) if !e.is_dir => {
+                    let path = self.dir.join(&e.name);
+                    self.launch(Launch::Edit(path), cx);
+                }
+                _ => cx.notify("pick a file to edit (e opens it in your editor beside this)"),
+            },
+            KeyCode::Char('/') => self.start_filter(),
+            KeyCode::Char('n') => self.ask = Some(Ask::New(String::new())),
+            KeyCode::Char('R') | KeyCode::F(2) => match self.sel_entry() {
+                Some(e) => self.ask = Some(Ask::Rename(e.name.clone(), e.name.clone())),
+                None => cx.notify("pick a file or folder to rename"),
+            },
+            KeyCode::Char('d') | KeyCode::Delete => match self.sel_entry() {
+                Some(e) => self.confirm = Some(self.dir.join(&e.name)),
+                None => cx.notify("pick a file or folder to delete (the top row is this folder itself)"),
+            },
             KeyCode::Char('.') => {
                 self.hidden = !self.hidden;
                 self.refilter();
@@ -730,6 +956,237 @@ impl Files {
             _ => return false,
         }
         true
+    }
+
+    /// Open a shell, an agent or the editor beside this pane, in this folder.
+    fn launch(&mut self, what: Launch, cx: &mut Cx) {
+        match (self.launcher)(&what, &self.dir, cx.config) {
+            Ok(p) => cx.act(Action::Open(p, Place::Split)),
+            Err(e) => cx.notify(e),
+        }
+    }
+
+    /// Keys in the name dialog (new / rename).
+    fn ask_key(&mut self, key: KeyEvent, typed: Option<char>, cx: &mut Cx) {
+        let Some(Ask::New(buf) | Ask::Rename(_, buf)) = &mut self.ask else { return };
+        match key.code {
+            KeyCode::Esc => self.ask = None,
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Enter => {
+                if let Some(a) = self.ask.take() {
+                    match self.do_ask(a) {
+                        Ok(msg) if msg.is_empty() => {}
+                        Ok(msg) | Err(msg) => cx.notify(msg),
+                    }
+                }
+            }
+            _ => {
+                if let Some(c) = typed {
+                    buf.push(c);
+                }
+            }
+        }
+    }
+
+    /// Make the file or folder, or rename; then read the folder with the result selected.
+    fn do_ask(&mut self, a: Ask) -> Result<String, String> {
+        match a {
+            Ask::New(name) => {
+                let folder = name.trim_end().ends_with(['/', '\\']);
+                let rel = name.trim().trim_end_matches(['/', '\\']);
+                let first = checked_name(rel, true)?;
+                let path = self.dir.join(rel);
+                if path.exists() {
+                    return Err(format!("{rel} is already there"));
+                }
+                let made = if folder {
+                    std::fs::create_dir_all(&path)
+                } else {
+                    path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::File::create_new(&path).map(|_| ()))
+                };
+                made.map_err(|e| format!("couldn't make {rel}: {e}"))?;
+                self.want_sel = Some(first);
+                self.load();
+                Ok(format!("made {}", pretty(&path)))
+            }
+            Ask::Rename(old, new) => {
+                let new = new.trim().to_string();
+                if new == old {
+                    return Ok(String::new());
+                }
+                checked_name(&new, false)?;
+                let (from, to) = (self.dir.join(&old), self.dir.join(&new));
+                // a different file of that name is there (on Windows "Readme" → "README" is the same file: fine)
+                if to.exists() && !old.eq_ignore_ascii_case(&new) {
+                    return Err(format!("{new} is already there"));
+                }
+                std::fs::rename(&from, &to).map_err(|e| format!("couldn't rename {old}: {e}"))?;
+                self.want_sel = Some(new.clone());
+                self.load();
+                Ok(format!("renamed {old} → {new}"))
+            }
+        }
+    }
+
+    /// y on "move it to the recycle bin?": off to a background thread (the shell call can take a moment).
+    fn trash_confirmed(&mut self) {
+        let Some(path) = self.confirm.take() else { return };
+        let (trash, shared, waker) = (self.trasher, self.shared.clone(), self.waker.clone());
+        std::thread::spawn(move || {
+            let bin = preview::bin_name();
+            let r = match trash(&path) {
+                Ok(()) => Ok(format!("{} is in {bin}", pretty(&path))),
+                Err(e) => Err(format!("couldn't move {} to {bin}: {e}", pretty(&path))),
+            };
+            shared.lock().unwrap().op = Some(r);
+            if let Some(w) = waker {
+                w.wake();
+            }
+        });
+    }
+
+    /// The filter box, above the list while a filter is set (music's search box). Returns the rect left for the list.
+    fn draw_filter(&mut self, f: &mut Frame, r: Rect, cx: &Cx) -> Rect {
+        let Some(q) = &self.filter else { return r };
+        if r.height < 6 {
+            return r;
+        }
+        let t = cx.theme;
+        let bx = Rect { height: 3, ..r };
+        let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(if self.filtering { t.accent } else { t.frame }));
+        let inner = block.inner(bx);
+        f.render_widget(block, bx);
+        let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+        let mut v = vec![Span::raw(q.clone())];
+        if self.filtering {
+            v.push(Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)));
+        }
+        if q.is_empty() {
+            v.push(Span::styled(" filter the names in this folder", ui::muted(t)));
+        }
+        f.render_widget(Paragraph::new(Line::from(v)), inner);
+        Rect { y: r.y + 3, height: r.height - 3, ..r }
+    }
+
+    /// The name dialog (new / rename) and the recycle-bin question, over the pane. Both name the full path.
+    fn draw_dialogs(&self, f: &mut Frame, area: Rect, cx: &Cx) {
+        let t = cx.theme;
+        if let Some(path) = &self.confirm {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let what = if path.is_dir() { "folder" } else { "file" };
+            let inner = ui::popup(f, area, dialog_w(path), 7, "are you sure?", t);
+            let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+            let iw = inner.width as usize;
+            let lines = vec![
+                Line::from(Span::styled(ui::fit(&format!("move the {what} {name} to {}?", preview::bin_name()), iw), Style::default().fg(t.danger).add_modifier(Modifier::BOLD))),
+                Line::raw(""),
+                Line::from(Span::styled(fit_tail(&pretty(path), iw), ui::muted(t))),
+                Line::raw(""),
+                Line::from([ui::key_hint("y", "yes", t), ui::key_hint("esc", "no", t)].concat()),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        if let Some(a) = &self.ask {
+            let (title, label, text, verb) = match a {
+                Ask::New(s) => ("new", "a name (end it with / for a folder)".to_string(), s, "create"),
+                Ask::Rename(old, s) => ("rename", format!("rename {old} to"), s, "rename"),
+            };
+            let target = self.dir.join(text.trim().trim_end_matches(['/', '\\']));
+            let inner = ui::popup(f, area, dialog_w(&target), 8, &format!("{}{title}", ui::lead("files")), t);
+            let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+            let iw = inner.width as usize;
+            let lines = vec![
+                Line::from(Span::styled(ui::fit(&label, iw), ui::muted(t))),
+                Line::from(vec![Span::styled("› ", ui::bold_accent(t)), Span::raw(text.clone()), Span::styled("▏", ui::accent(t))]),
+                Line::raw(""),
+                Line::from(Span::styled(fit_tail(&pretty(&target), iw), ui::muted(t))),
+                Line::raw(""),
+                Line::from([ui::key_hint("enter", verb, t), ui::key_hint("esc", "cancel", t)].concat()),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+    }
+}
+
+/// A dialog wide enough for the path it names (the popup keeps it on screen).
+fn dialog_w(path: &Path) -> u16 {
+    (UnicodeWidthStr::width(pretty(path).as_str()) as u16 + 6).max(72)
+}
+
+/// A path cut to `w` columns from the left, so the name at its end stays: "…\src\main.rs".
+fn fit_tail(s: &str, w: usize) -> String {
+    if UnicodeWidthStr::width(s) <= w {
+        return s.to_string();
+    }
+    let mut tail: Vec<char> = vec![];
+    let mut used = 1; // the …
+    for c in s.chars().rev() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > w {
+            break;
+        }
+        used += cw;
+        tail.push(c);
+    }
+    std::iter::once('…').chain(tail.into_iter().rev()).collect()
+}
+
+/// A name typed for a new file (`nested`: may hold subfolders, "src/new.rs") or a rename: it has to stay inside
+/// this folder. Returns its first part (what to select afterwards).
+fn checked_name(name: &str, nested: bool) -> Result<String, String> {
+    use std::path::Component;
+    if name.is_empty() {
+        return Err("type a name first".into());
+    }
+    let p = Path::new(name);
+    if !nested && p.components().count() != 1 {
+        return Err("just a name: a rename stays in this folder".into());
+    }
+    let mut parts = p.components();
+    let first = match parts.next() {
+        Some(Component::Normal(n)) => n.to_string_lossy().to_string(),
+        _ => return Err(format!("{name}: the name has to stay inside this folder")),
+    };
+    if parts.any(|c| !matches!(c, Component::Normal(_))) {
+        return Err(format!("{name}: the name has to stay inside this folder"));
+    }
+    Ok(first)
+}
+
+/// The real launcher: a shell, Claude Code / Codex, or your editor, working in `dir`.
+fn launch(what: &Launch, dir: &Path, cfg: &crate::config::Config) -> Result<Box<dyn Pane>, String> {
+    let here = Some(dir.to_path_buf());
+    match what {
+        Launch::Shell => Ok(Box::new(crate::panes::term::Term::shell(cfg, here))),
+        Launch::Agent(name) => crate::panes::open_agent(name, here).ok_or_else(|| format!("{name} isn't installed · your AIs (F3) installs it")),
+        Launch::Edit(file) => {
+            let configured = ["VISUAL", "EDITOR"].iter().filter_map(|v| std::env::var(v).ok()).find(|v| !v.trim().is_empty());
+            let (prog, args, title) = editor_command(file, configured.as_deref(), crate::config::which);
+            Ok(Box::new(crate::panes::term::Term::new(&title, "notes", &prog, args, here)))
+        }
+    }
+}
+
+/// How to open `file` in an editor: $VISUAL / $EDITOR ("code --wait" works), else a terminal editor this system
+/// has (Microsoft Edit on Windows, nano elsewhere), else notepad / vi. `find` looks a program up on PATH.
+/// Returns (program, args, pane title).
+fn editor_command(file: &Path, configured: Option<&str>, find: impl Fn(&str) -> Option<PathBuf>) -> (String, Vec<String>, String) {
+    let mut words: Vec<String> = configured.map(|c| c.split_whitespace().map(String::from).collect()).unwrap_or_default();
+    if words.is_empty() {
+        let (first, fallback) = if cfg!(windows) { ("edit", "notepad") } else { ("nano", "vi") };
+        words.push(if find(first).is_some() { first } else { fallback }.to_string());
+    }
+    let prog = words.remove(0);
+    let stem = Path::new(&prog).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| prog.clone());
+    let name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let mut args = words;
+    args.push(file.to_string_lossy().to_string());
+    // .cmd shims (code.cmd from npm or VS Code) need cmd.exe to run them
+    match find(&prog).map(|p| p.to_string_lossy().to_string()) {
+        Some(p) if cfg!(windows) && (p.ends_with(".cmd") || p.ends_with(".bat")) => ("cmd.exe".into(), [vec!["/c".into(), p], args].concat(), format!("{stem} · {name}")),
+        _ => (prog, args, format!("{stem} · {name}")),
     }
 }
 
@@ -904,6 +1361,236 @@ pub(crate) mod tests {
         if cfg!(windows) {
             assert!(s.contains("C: drive"));
         }
+    }
+
+    fn names(p: &Files) -> Vec<String> {
+        p.shown.iter().map(|&i| p.all[i].name.clone()).collect()
+    }
+
+    fn pv_text(p: &Files) -> String {
+        match p.preview.as_ref().map(|x| &x.body) {
+            Some(Body::Text { lines, .. }) => lines.iter().flat_map(|l| l.iter().map(|(_, s)| s.as_str())).collect(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn files_filter_as_you_type() {
+        let d = fixture("files-filter");
+        let mut k = Kit::new();
+        let mut p = Files::new(Some(d.clone()));
+        settle(&mut k, &mut p);
+        let all = names(&p).len();
+        k.key(&mut p, KeyCode::Char('/'));
+        k.typ(&mut p, "MA"); // any case
+        assert_eq!(names(&p), ["main.rs"]);
+        assert_eq!(p.sel_entry().map(|e| e.name.as_str()), Some("main.rs"), "the top match is picked");
+        let s = snap(&mut k, &mut p, 150, 30, "target/snap/files-filter.html");
+        assert!(s.contains("│ MA") && s.contains(&format!("1 of {all} match “MA”")), "{s}");
+        // letters that are keys elsewhere (c, x, d, n...) type into the filter
+        k.key(&mut p, KeyCode::Backspace);
+        k.key(&mut p, KeyCode::Backspace);
+        k.typ(&mut p, "dx");
+        assert!(names(&p).is_empty() && p.ask.is_none() && p.confirm.is_none());
+        assert!(k.render(&mut p, 150, 30).contains("nothing matches"));
+        // esc drops the filter
+        k.key(&mut p, KeyCode::Esc);
+        assert_eq!(names(&p).len(), all);
+        assert!(p.filter.is_none() && !p.filtering);
+        // enter opens the top match: a folder, and the filter is gone in there
+        k.key(&mut p, KeyCode::Char('/'));
+        k.typ(&mut p, "sr");
+        k.key(&mut p, KeyCode::Enter);
+        k.wait_wake(&mut p, 300);
+        assert_eq!(p.dir, d.join("src"));
+        assert!(p.filter.is_none());
+    }
+
+    thread_local! {
+        static LAUNCHED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(vec![]) };
+    }
+
+    /// Stands in for the real launcher: records what it was asked to start, starts nothing.
+    fn fake_launch(what: &Launch, dir: &Path, _cfg: &crate::config::Config) -> Result<Box<dyn Pane>, String> {
+        let what = match what {
+            Launch::Shell => "shell".to_string(),
+            Launch::Agent("codex") => return Err("codex isn't installed · your AIs (F3) installs it".into()),
+            Launch::Agent(a) => a.to_string(),
+            Launch::Edit(f) => format!("edit {}", f.file_name().unwrap().to_string_lossy()),
+        };
+        LAUNCHED.with(|l| l.borrow_mut().push(format!("{what} in {}", dir.file_name().unwrap().to_string_lossy())));
+        Ok(Box::new(crate::panes::home::Home::new()))
+    }
+
+    #[test]
+    fn files_opens_agents_editor_and_shell_here() {
+        let d = fixture("files-launch");
+        let mut k = Kit::new();
+        let mut p = Files::new(Some(d.clone()));
+        p.launcher = fake_launch;
+        settle(&mut k, &mut p);
+        k.key(&mut p, KeyCode::Char('c'));
+        k.key(&mut p, KeyCode::Char('t'));
+        k.key(&mut p, KeyCode::Char('e')); // the folder row: nothing to edit
+        let idx = p.shown.iter().position(|&i| p.all[i].name == "main.rs").unwrap() + 1;
+        p.select(idx);
+        k.key(&mut p, KeyCode::Char('e'));
+        k.key(&mut p, KeyCode::Char('x')); // not installed: says so
+        let got = LAUNCHED.with(|l| l.borrow().clone());
+        assert_eq!(got, ["claude in files-launch", "shell in files-launch", "edit main.rs in files-launch"]);
+        let opened = k.actions.iter().filter(|a| matches!(a, Action::Open(_, Place::Split))).count();
+        assert_eq!(opened, 3, "each opens beside the files pane");
+        let notes = k.notices();
+        assert!(notes.iter().any(|n| n.starts_with("pick a file to edit")) && notes.iter().any(|n| n.contains("codex isn't installed")), "{notes:?}");
+    }
+
+    #[test]
+    fn files_editor_command() {
+        let f = Path::new("notes.md");
+        let none = |_: &str| None;
+        // $EDITOR with arguments
+        let (prog, args, title) = editor_command(f, Some("hx --vsplit"), none);
+        assert_eq!((prog.as_str(), args, title.as_str()), ("hx", vec!["--vsplit".to_string(), "notes.md".into()], "hx · notes.md"));
+        // nothing set: the system's terminal editor if it has one, else the fallback
+        let (prog, _, _) = editor_command(f, None, none);
+        assert_eq!(prog, if cfg!(windows) { "notepad" } else { "vi" });
+        let has_edit = |p: &str| (p == "edit" || p == "nano").then(|| PathBuf::from(p));
+        let (prog, _, _) = editor_command(f, None, has_edit);
+        assert_eq!(prog, if cfg!(windows) { "edit" } else { "nano" });
+        if cfg!(windows) {
+            // a .cmd shim (VS Code's code.cmd) runs through cmd.exe
+            let shim = |p: &str| (p == "code").then(|| PathBuf::from(r"C:\Tools\code.cmd"));
+            let (prog, args, _) = editor_command(f, Some("code --wait"), shim);
+            assert_eq!(prog, "cmd.exe");
+            assert_eq!(args, ["/c", r"C:\Tools\code.cmd", "--wait", "notes.md"]);
+        }
+    }
+
+    /// Stands in for the recycle bin: the scratch file is simply removed (tests never touch the real bin).
+    fn fake_trash(p: &Path) -> Result<(), String> {
+        if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }.map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn files_new_rename_delete() {
+        let d = fixture("files-ops");
+        let mut k = Kit::new();
+        let mut p = Files::new(Some(d.clone()));
+        p.trasher = fake_trash;
+        settle(&mut k, &mut p);
+        // n: a new file, then a folder (ending in /); the dialog names the full path
+        k.key(&mut p, KeyCode::Char('n'));
+        k.typ(&mut p, "todo.txt");
+        let s = snap(&mut k, &mut p, 150, 30, "target/snap/files-new.html");
+        assert!(s.contains("end it with / for a folder") && s.contains("todo.txt"), "{s}");
+        k.key(&mut p, KeyCode::Enter);
+        assert!(d.join("todo.txt").is_file());
+        k.wait_wake(&mut p, 400);
+        assert_eq!(p.sel_entry().map(|e| e.name.as_str()), Some("todo.txt"), "the new file is picked");
+        k.key(&mut p, KeyCode::Char('n'));
+        k.typ(&mut p, "drafts/");
+        k.key(&mut p, KeyCode::Enter);
+        assert!(d.join("drafts").is_dir());
+        k.wait_wake(&mut p, 400);
+        // a name that leaves the folder is refused
+        k.key(&mut p, KeyCode::Char('n'));
+        k.typ(&mut p, "../escape.txt");
+        k.key(&mut p, KeyCode::Enter);
+        assert!(!d.parent().unwrap().join("escape.txt").exists());
+        assert!(k.notices().iter().any(|n| n.contains("has to stay inside this folder")), "{:?}", k.notices());
+        // R renames the picked one (the box starts with its name)
+        let idx = p.shown.iter().position(|&i| p.all[i].name == "todo.txt").unwrap() + 1;
+        p.select(idx);
+        k.key(&mut p, KeyCode::Char('R'));
+        for _ in 0.."todo.txt".len() {
+            k.key(&mut p, KeyCode::Backspace);
+        }
+        k.typ(&mut p, "done.txt");
+        k.key(&mut p, KeyCode::Enter);
+        assert!(d.join("done.txt").is_file() && !d.join("todo.txt").exists());
+        k.wait_wake(&mut p, 400);
+        assert_eq!(p.sel_entry().map(|e| e.name.as_str()), Some("done.txt"));
+        // d asks first, naming the path; anything but y keeps it
+        k.key(&mut p, KeyCode::Char('d'));
+        let s = snap(&mut k, &mut p, 150, 30, "target/snap/files-delete.html");
+        assert!(s.contains("are you sure?") && s.contains("move the file done.txt to") && s.contains("files-ops") && s.contains("done.txt"), "{s}");
+        assert_eq!(fit_tail("C:/a/long/path/to/done.txt", 12), "…to/done.txt");
+        k.key(&mut p, KeyCode::Char('n'));
+        assert!(p.confirm.is_none() && d.join("done.txt").exists());
+        // y moves it (off the UI thread), then the list is read again and the cursor stays in place
+        let at = p.sel;
+        k.key(&mut p, KeyCode::Char('d'));
+        k.key(&mut p, KeyCode::Char('y'));
+        for _ in 0..20 {
+            k.wait_wake(&mut p, 50);
+            if !names(&p).iter().any(|n| n == "done.txt") {
+                break;
+            }
+        }
+        assert!(!d.join("done.txt").exists());
+        assert!(!names(&p).iter().any(|n| n == "done.txt"), "{:?}", names(&p));
+        assert!(k.notices().iter().any(|n| n.contains("done.txt is in")), "{:?}", k.notices());
+        assert_eq!(p.sel, at.min(p.rows() - 1));
+        // the folder row itself can't be deleted
+        p.select(0);
+        k.key(&mut p, KeyCode::Char('d'));
+        assert!(p.confirm.is_none());
+    }
+
+    /// The real recycle bin: moves a scratch file there (look for "oriel-trash-test.txt" in it afterwards).
+    #[test]
+    #[ignore] // touches the real recycle bin / trash: cargo test files_real_trash -- --ignored
+    fn files_real_trash() {
+        let d = scratch("files-real-trash");
+        let f = d.join("oriel-trash-test.txt");
+        std::fs::write(&f, "delete me").unwrap();
+        preview::to_trash(&f).unwrap();
+        assert!(!f.exists());
+    }
+
+    #[test]
+    fn files_sees_changes_on_disk() {
+        let d = fixture("files-watch");
+        let mut k = Kit::new();
+        let mut p = Files::new(Some(d.clone()));
+        settle(&mut k, &mut p);
+        assert!(p.watch.is_some() || !cfg!(windows), "a local folder can be watched");
+        let idx = p.shown.iter().position(|&i| p.all[i].name == "main.rs").unwrap() + 1;
+        p.select(idx);
+        k.wait_wake(&mut p, 300);
+        let until = |k: &mut Kit, p: &mut Files, ok: &dyn Fn(&Files) -> bool| {
+            for _ in 0..80 {
+                if ok(p) {
+                    return true;
+                }
+                k.wait_wake(p, 50);
+                k.poll(p); // what the ticks do
+            }
+            ok(p)
+        };
+        if p.watch.is_some() {
+            // something else writes files here (an agent, a download): they show up without r
+            std::fs::write(d.join("fresh.txt"), "new").unwrap();
+            assert!(until(&mut k, &mut p, &|p| names(p).iter().any(|n| n == "fresh.txt")), "{:?}", names(&p));
+            assert_eq!(p.sel_entry().map(|e| e.name.as_str()), Some("main.rs"), "the cursor stays put");
+            // the file on show grows: its preview follows
+            std::fs::write(d.join("main.rs"), "fn main() {}
+// a line an agent added
+").unwrap();
+            assert!(until(&mut k, &mut p, &|p| pv_text(p).contains("a line an agent added")), "{}", pv_text(&p));
+            // the picked file vanishes: the cursor stays on its row instead of jumping to the top
+            let at = p.sel;
+            std::fs::remove_file(d.join("main.rs")).unwrap();
+            assert!(until(&mut k, &mut p, &|p| !names(p).iter().any(|n| n == "main.rs")));
+            assert_eq!(p.sel, at.min(p.rows() - 1));
+        }
+        // no watcher (some network drives): coming back to the pane reads it again
+        p.watch = None;
+        p.last_load = Instant::now() - Duration::from_secs(5);
+        std::fs::write(d.join("later.txt"), "x").unwrap();
+        p.was_focused = false;
+        k.render(&mut p, 150, 44);
+        assert!(until(&mut k, &mut p, &|p| names(p).iter().any(|n| n == "later.txt")), "{:?}", names(&p));
     }
 
     #[test]

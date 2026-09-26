@@ -39,8 +39,22 @@ pub struct Term {
     /// (program, why) when the requested program didn't start: the pane runs the default shell instead, under a
     /// red banner.
     failed: Option<(String, String)>,
-    /// The program's exit status once it has ended (success?), set by the thread that waits on it.
-    exit: Arc<Mutex<Option<bool>>>,
+    /// The program's exit code once it has ended (0 = success), set by the thread that waits on it.
+    exit: Arc<Mutex<Option<u32>>>,
+    /// What was asked for, to run it again (r on a pane whose program failed).
+    spec: Spec,
+    /// The failure has been reported (alert) and the pane is being kept so its output can be read.
+    announced: bool,
+}
+
+/// How a Term was started: enough to start it again.
+#[derive(Clone)]
+struct Spec {
+    title: String,
+    prog: String,
+    args: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
+    alert: Option<String>,
 }
 
 /// Programs that are coding agents (by executable name), so their panes get status dots from the start.
@@ -64,6 +78,10 @@ impl Term {
             cmd.env_remove(k);
         }
         cmd.env("ORIEL", "1");
+        // oriel started by its full path: `oriel` still works in its own terminals
+        if let Some(path) = std::env::current_exe().ok().and_then(|e| with_dir_on_path(e.parent()?, cmd.get_env("PATH"))) {
+            cmd.env("PATH", path);
+        }
         let (child, failed) = match pair.slave.spawn_command(cmd) {
             Ok(c) => (c, None),
             Err(e) => {
@@ -108,7 +126,34 @@ impl Term {
             exit_alert: None,
             failed,
             exit: Arc::new(Mutex::new(None)),
+            spec: Spec { title: title.to_string(), prog: prog.to_string(), args, cwd, alert: None },
+            announced: false,
         }
+    }
+
+    /// The exit code, once the program has ended with an error: the pane stays open so you can read why.
+    fn failed_code(&self) -> Option<u32> {
+        if !self.exited.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.exit.lock().unwrap().filter(|&c| c != 0)
+    }
+
+    /// Start the same program again in this pane (r on a failed one).
+    fn rerun(&mut self) {
+        let s = self.spec.clone();
+        let mut t = Term::new(&s.title, self.icon, &s.prog, s.args, s.cwd);
+        if let Some(what) = s.alert {
+            t = t.alert_on_exit(&what);
+        }
+        *self = t; // the old one has ended: dropping it kills nothing
+    }
+
+    /// Move the scrollback view to `lines` back (clamped to what exists).
+    fn scroll_to(&mut self, lines: usize) {
+        let mut p = self.parser.lock().unwrap();
+        p.screen_mut().set_scrollback(lines);
+        self.scroll = p.screen().scrollback();
     }
 
     /// Rows the failed-to-start banner takes at the top of the pane.
@@ -119,6 +164,7 @@ impl Term {
     /// When the command ends, say so in the event center: `what` is e.g. "Firefox".
     pub fn alert_on_exit(mut self, what: &str) -> Term {
         self.exit_alert = Some(what.to_string());
+        self.spec.alert = Some(what.to_string());
         self
     }
 
@@ -133,7 +179,6 @@ impl Term {
         let waiter_waker = Waker { id: waker.id, tx: waker.tx.clone() };
         let parser = self.parser.clone();
         let writer = self.writer.clone();
-        let exited = self.exited.clone();
         let (last_output, born) = (self.last_output.clone(), self.born);
         std::thread::spawn(move || {
             let mut buf = [0u8; 16384];
@@ -156,7 +201,8 @@ impl Term {
                     }
                 }
             }
-            exited.store(true, Ordering::SeqCst);
+            // the end of the output isn't the end of the program: the thread below says when it has ended (with
+            // its exit code, which decides whether the pane closes)
             waker.wake();
         });
         // ConPTY keeps the output open after the program ends (the reader above never sees EOF on Windows), so a
@@ -165,7 +211,7 @@ impl Term {
             let (exit, exited) = (self.exit.clone(), self.exited.clone());
             std::thread::spawn(move || {
                 if let Ok(s) = child.wait() {
-                    *exit.lock().unwrap() = Some(s.success());
+                    *exit.lock().unwrap() = Some(if s.success() { 0 } else { s.exit_code().max(1) });
                 }
                 exited.store(true, Ordering::SeqCst);
                 waiter_waker.wake();
@@ -235,7 +281,9 @@ impl Term {
         ]
         .iter()
         .any(|m| text.contains(m));
-        if working || blocked {
+        // an agent's idle prompt (Claude Code's footer, Codex's key line): so shift+enter is a new line from the start
+        let idle = ["? for shortcuts", "⏎ send"].iter().any(|m| text.contains(m));
+        if working || blocked || idle {
             self.agent = true;
         }
         if !self.agent {
@@ -275,7 +323,11 @@ impl Drop for Term {
 
 impl Pane for Term {
     fn title(&self) -> String {
-        if self.scroll > 0 { format!("{} · scrolled {}", self.title, self.scroll) } else { self.title.clone() }
+        let t = match self.failed_code() {
+            Some(c) => format!("{} · exited with {}", self.title, code_text(c)),
+            None => self.title.clone(),
+        };
+        if self.scroll > 0 { format!("{t} · scrolled {}", self.scroll) } else { t }
     }
     fn icon(&self) -> &'static str {
         self.icon
@@ -289,36 +341,42 @@ impl Pane for Term {
             // the shell that stood in for it exiting says nothing about the program: it never ran
             return Some((crate::alerts::Kind::BuildFailed, format!("{what}: couldn't start {prog} ({e})")));
         }
-        // the output can close a moment before the waiting thread has the exit status: give it a little time
-        let mut ok = *self.exit.lock().unwrap();
-        for _ in 0..10 {
-            if ok.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(15));
-            ok = *self.exit.lock().unwrap();
-        }
-        Some(match ok {
-            Some(true) => (crate::alerts::Kind::Download, format!("{what}: done")),
-            Some(false) => (crate::alerts::Kind::BuildFailed, format!("{what}: failed (see the terminal output next time with alt n)")),
+        // the waiting thread sets the exit code before it says the program ended
+        Some(match *self.exit.lock().unwrap() {
+            Some(0) => (crate::alerts::Kind::Download, format!("{what}: done")),
+            Some(c) => (crate::alerts::Kind::BuildFailed, format!("{what}: failed with exit code {} · its output is still in the pane", code_text(c))),
             None => (crate::alerts::Kind::Download, format!("{what}: ended (couldn't tell whether it worked)")),
         })
     }
 
+    /// A program that ended cleanly closes its pane; one that failed keeps it (dimmed, with a footer) so the error
+    /// can be read. Enter or esc closes it then, r runs it again.
     fn alive(&self) -> bool {
-        !self.exited.load(Ordering::SeqCst)
+        !self.exited.load(Ordering::SeqCst) || self.failed_code().is_some()
     }
     fn activity(&self) -> Option<Activity> {
-        self.status
+        if self.failed_code().is_some() { None } else { self.status }
     }
     fn wants_mouse(&self) -> bool {
         self.parser.lock().map(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None).unwrap_or(false)
     }
     fn tick_every(&self) -> Option<Duration> {
         // agents get re-checked so "working" turns into "idle/done" when they go quiet
-        if self.agent { Some(Duration::from_millis(400)) } else { None }
+        if self.agent && self.failed_code().is_none() { Some(Duration::from_millis(400)) } else { None }
     }
-    fn poll(&mut self, _cx: &mut Cx) {
+    fn poll(&mut self, cx: &mut Cx) {
+        if let Some(c) = self.failed_code() {
+            // it ended with an error: say so once (the pane stays, so the output can be read)
+            if !self.announced {
+                self.announced = true;
+                if let Some(note) = self.exit_note() {
+                    cx.alert(note.0, note.1);
+                } else if self.agent {
+                    cx.alert(crate::alerts::Kind::BuildFailed, format!("{} exited with {}", self.title, code_text(c)));
+                }
+            }
+            return;
+        }
         if self.last_scan.elapsed() < Duration::from_millis(200) {
             return;
         }
@@ -338,6 +396,18 @@ impl Pane for Term {
                 let st = Style::default().fg(cx.theme.danger).add_modifier(Modifier::BOLD);
                 f.render_widget(ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(crate::ui::fit(&line, area.width as usize), st)), Rect { height: 1, ..area });
                 Rect { y: area.y + 1, height: area.height - 1, ..area }
+            }
+            _ => area,
+        };
+        let failed = self.failed_code();
+        let area = match failed {
+            Some(c) if area.height > 1 => {
+                // the footer takes the last row; the screen shrinks (its top scrolls back), so the error stays in view
+                let line = format!(" exited with {} · enter or esc closes · r reruns", code_text(c));
+                let st = Style::default().fg(cx.theme.danger).add_modifier(Modifier::BOLD);
+                let r = Rect { y: area.bottom() - 1, height: 1, ..area };
+                f.render_widget(ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(crate::ui::fit(&line, area.width as usize), st)), r);
+                Rect { height: area.height - 1, ..area }
             }
             _ => area,
         };
@@ -370,6 +440,9 @@ impl Pane for Term {
                 if cell.inverse() {
                     m |= Modifier::REVERSED;
                 }
+                if failed.is_some() {
+                    m |= Modifier::DIM; // it has ended: the output is there to read, not to type into
+                }
                 style = style.add_modifier(m);
                 let s = cell.contents();
                 if let Some(bc) = buf.cell_mut(Position { x: area.x + col, y: area.y + row }) {
@@ -378,7 +451,7 @@ impl Pane for Term {
                 }
             }
         }
-        if cx.focused && !screen.hide_cursor() && self.scroll == 0 {
+        if cx.focused && !screen.hide_cursor() && self.scroll == 0 && failed.is_none() {
             let (r, c) = screen.cursor_position();
             if r < area.height && c < area.width {
                 f.set_cursor_position(Position { x: area.x + c, y: area.y + r });
@@ -386,7 +459,35 @@ impl Pane for Term {
         }
     }
 
-    fn key(&mut self, key: KeyEvent, _cx: &mut Cx) -> bool {
+    fn key(&mut self, key: KeyEvent, cx: &mut Cx) -> bool {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT) && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        // scrollback from the keyboard (xterm's keys): never sent to the program
+        let page = (self.size.0 as usize).saturating_sub(1).max(1);
+        let back = match key.code {
+            KeyCode::PageUp if shift => Some(self.scroll + page),
+            KeyCode::PageDown if shift => Some(self.scroll.saturating_sub(page)),
+            KeyCode::Home if shift => Some(usize::MAX),
+            KeyCode::End if shift => Some(0),
+            _ => None,
+        };
+        if let Some(n) = back {
+            self.scroll_to(n);
+            return true;
+        }
+        if self.failed_code().is_some() {
+            // the program has ended: enter/esc close the pane, r starts it again
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc => cx.act(crate::pane::Action::Close),
+                KeyCode::Char('r') | KeyCode::Char('R') => self.rerun(),
+                _ => {}
+            }
+            return true;
+        }
+        if self.agent && newline_key(&key) {
+            // shift+enter in Claude Code / Codex: a new line, not "send" (they read ESC CR as alt+enter)
+            self.send(b"\x1b\r");
+            return true;
+        }
         let app_cursor = self.parser.lock().unwrap().screen().application_cursor();
         if let Some(bytes) = encode_key(key, app_cursor) {
             self.send(&bytes);
@@ -405,18 +506,34 @@ impl Pane for Term {
     }
 
     fn mouse(&mut self, ev: MouseEvent, area: Rect, _cx: &mut Cx) {
-        let (mode, enc) = {
+        let (mode, enc, alt_screen, app_cursor) = {
             let p = self.parser.lock().unwrap();
-            (p.screen().mouse_protocol_mode(), p.screen().mouse_protocol_encoding())
+            let s = p.screen();
+            (s.mouse_protocol_mode(), s.mouse_protocol_encoding(), s.alternate_screen(), s.application_cursor())
         };
         let col = ev.column.saturating_sub(area.x) + 1;
         let row = ev.row.saturating_sub(area.y + self.banner_h()) + 1;
         if mode == vt100::MouseProtocolMode::None {
-            // the program doesn't want the mouse: the wheel scrolls our scrollback
-            match ev.kind {
-                MouseEventKind::ScrollUp => self.scroll += 3,
-                MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
-                _ => {}
+            let up = match ev.kind {
+                MouseEventKind::ScrollUp => true,
+                MouseEventKind::ScrollDown => false,
+                _ => return,
+            };
+            if alt_screen && self.failed_code().is_none() {
+                // a full-screen program without mouse mode (less, man, git's pager): the alternate screen has no
+                // scrollback, so the wheel sends arrow keys, like xterm's "alternate scroll"
+                let arrow: &[u8] = match (up, app_cursor) {
+                    (true, true) => b"\x1bOA",
+                    (true, false) => b"\x1b[A",
+                    (false, true) => b"\x1bOB",
+                    (false, false) => b"\x1b[B",
+                };
+                self.send(&arrow.repeat(3));
+            } else if up {
+                // the program doesn't want the mouse: the wheel scrolls our scrollback
+                self.scroll_to(self.scroll + 3);
+            } else {
+                self.scroll_to(self.scroll.saturating_sub(3));
             }
             return;
         }
@@ -437,6 +554,29 @@ impl Pane for Term {
         };
         self.send(&bytes);
     }
+}
+
+/// Shift+enter / ctrl+enter: the keys coding agents take for a new line in their prompt.
+fn newline_key(k: &KeyEvent) -> bool {
+    k.code == KeyCode::Enter && k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// An exit code for people: Windows crash codes (0xC0000005...) read better in hex.
+fn code_text(c: u32) -> String {
+    if c > 0xFFFF { format!("0x{c:08X}") } else { c.to_string() }
+}
+
+/// PATH with `dir` in front, unless it's already on it (None then, or when it can't be joined).
+fn with_dir_on_path(dir: &std::path::Path, path: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let norm = |p: &std::path::Path| {
+        let s = p.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+        if cfg!(windows) { s.to_lowercase().replace('/', "\\") } else { s }
+    };
+    let parts: Vec<std::path::PathBuf> = path.map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
+    if parts.iter().any(|p| norm(p) == norm(dir)) {
+        return None;
+    }
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(parts)).ok()
 }
 
 fn btn(b: MouseButton) -> u16 {
@@ -600,25 +740,173 @@ mod tests {
         assert_eq!(scrollback_rows(&mut p), 0);
     }
 
-    /// A program that ends: the pane notices (on Windows too, where ConPTY never closes the output) and the exit
-    /// alert tells success from failure.
-    #[test]
-    fn term_program_exit_closes_the_pane_with_its_result() {
-        for (code, want) in [(3, crate::alerts::Kind::BuildFailed), (0, crate::alerts::Kind::Download)] {
-            let (prog, args) = if cfg!(windows) { ("cmd.exe", vec!["/c".to_string(), format!("exit {code}")]) } else { ("sh", vec!["-c".to_string(), format!("exit {code}")]) };
-            let mut k = crate::testkit::Kit::new();
-            let mut t = Term::new("install thing", "package", prog, args, None).alert_on_exit("thing");
-            assert!(t.failed.is_none());
-            k.render(&mut t, 80, 10); // starts it
-            let t0 = Instant::now();
-            while t.alive() && t0.elapsed() < Duration::from_secs(10) {
-                k.wait_wake(&mut t, 50);
-            }
-            assert!(!t.alive(), "exit {code}: the pane should close when the program ends");
-            let (kind, text) = t.exit_note().unwrap();
-            assert_eq!(kind, want, "exit {code}: {text}");
-            assert_eq!(text.ends_with("done"), code == 0, "{text}");
+    fn shell_cmd(win: &str, unix: &str) -> (&'static str, Vec<String>) {
+        if cfg!(windows) { ("cmd.exe", vec!["/c".into(), win.into()]) } else { ("sh", vec!["-c".into(), unix.into()]) }
+    }
+
+    /// Start the pane's program and wait for it to end (on Windows too, where ConPTY never closes the output).
+    fn run_to_end(k: &mut crate::testkit::Kit, t: &mut Term) {
+        k.render(t, 80, 10); // starts it
+        let t0 = Instant::now();
+        while !t.exited.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(10) {
+            k.wait_wake(t, 50);
         }
+        assert!(t.exited.load(Ordering::SeqCst), "the program should have ended");
+    }
+
+    #[test]
+    fn term_clean_exit_closes_the_pane() {
+        let (prog, args) = shell_cmd("exit 0", "exit 0");
+        let mut k = crate::testkit::Kit::new();
+        let mut t = Term::new("install thing", "package", prog, args, None).alert_on_exit("thing");
+        assert!(t.failed.is_none());
+        run_to_end(&mut k, &mut t);
+        assert!(!t.alive(), "exit 0: the pane closes");
+        let (kind, text) = t.exit_note().unwrap();
+        assert_eq!(kind, crate::alerts::Kind::Download);
+        assert!(text.ends_with("done"), "{text}");
+    }
+
+    /// A program that fails (Claude Code not signed in, a crashed worker, a failed install) keeps its pane, so the
+    /// error can be read; enter closes it, r runs it again.
+    #[test]
+    fn term_failed_program_keeps_its_pane() {
+        let (prog, args) = shell_cmd("echo not signed in & exit 3", "echo not signed in; exit 3");
+        let mut k = crate::testkit::Kit::new();
+        let mut t = Term::new("claude code", "claude", prog, args, None).alert_on_exit("thing");
+        run_to_end(&mut k, &mut t);
+        assert!(t.alive(), "a failed program keeps its pane");
+        assert_eq!(t.failed_code(), Some(3));
+        assert!(t.title().ends_with("exited with 3"), "{}", t.title());
+        // the output is still there, above the footer
+        let mut s = String::new();
+        for _ in 0..60 {
+            s = k.render(&mut t, 80, 10);
+            if s.contains("not signed in") {
+                break;
+            }
+            k.wait_wake(&mut t, 50);
+        }
+        let _ = k.render_html(&mut t, 80, 10, "target/snap/term-exited.html");
+        assert!(s.contains("not signed in"), "{s}");
+        assert!(s.lines().nth(9).unwrap_or_default().contains("exited with 3 · enter or esc closes · r reruns"), "{s}");
+        // one alert, with the exit code in it
+        k.poll(&mut t);
+        k.poll(&mut t);
+        let notes = k.notices();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("thing: failed with exit code 3"), "{notes:?}");
+        assert_eq!((t.activity(), t.tick_every()), (None, None));
+        // typing goes nowhere; r runs it again in the same pane
+        assert!(k.key(&mut t, KeyCode::Char('x')));
+        k.key(&mut t, KeyCode::Char('r'));
+        assert!(!t.exited.load(Ordering::SeqCst) && t.failed_code().is_none());
+        assert_eq!(t.title(), "claude code");
+        run_to_end(&mut k, &mut t);
+        assert_eq!(t.failed_code(), Some(3), "it ran again");
+        k.actions.clear();
+        k.key(&mut t, KeyCode::Enter);
+        assert!(matches!(k.actions.last(), Some(crate::pane::Action::Close)), "enter closes it");
+        assert_eq!(code_text(0xC0000005), "0xC0000005");
+    }
+
+    /// Captures what a pane sends to its program.
+    #[derive(Clone, Default)]
+    struct Sent(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sent {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn take(s: &Sent) -> Vec<u8> {
+        std::mem::take(&mut *s.0.lock().unwrap())
+    }
+
+    /// A pane that's never drawn (its program's output isn't read) and whose keys land in `Sent`.
+    fn quiet_term() -> (Term, Sent) {
+        let (prog, args) = shell_cmd("pause", "sleep 30");
+        let mut t = Term::new("quiet", "term", prog, args, None);
+        let sent = Sent::default();
+        t.writer = Arc::new(Mutex::new(Box::new(sent.clone())));
+        (t, sent)
+    }
+
+    #[test]
+    fn term_keyboard_scrollback_and_alternate_scroll() {
+        let mut k = crate::testkit::Kit::new();
+        let (mut t, sent) = quiet_term();
+        {
+            let mut p = t.parser.lock().unwrap();
+            for i in 0..100 {
+                p.process(format!("line {i}\r\n").as_bytes());
+            }
+        }
+        let sh = KeyModifiers::SHIFT;
+        k.key_mod(&mut t, KeyCode::PageUp, sh);
+        assert_eq!(t.scroll, 23, "a page is the screen less a line");
+        assert!(t.title().ends_with("scrolled 23"), "{}", t.title());
+        k.key_mod(&mut t, KeyCode::Home, sh);
+        assert_eq!(t.scroll, 77, "the top of the scrollback");
+        k.key_mod(&mut t, KeyCode::PageDown, sh);
+        assert_eq!(t.scroll, 54);
+        k.key_mod(&mut t, KeyCode::End, sh);
+        assert_eq!(t.scroll, 0);
+        assert!(take(&sent).is_empty(), "scrollback keys never reach the program");
+        // the wheel scrolls back on the normal screen; a key goes to the program and back to live
+        let area = Rect::new(0, 0, 80, 24);
+        let wheel = |kind| MouseEvent { kind, column: 5, row: 5, modifiers: KeyModifiers::NONE };
+        k.mouse(&mut t, wheel(MouseEventKind::ScrollUp), area);
+        assert_eq!(t.scroll, 3);
+        k.key(&mut t, KeyCode::Char('a'));
+        assert_eq!((t.scroll, take(&sent)), (0, b"a".to_vec()));
+        // a full-screen program without mouse mode (less, man, git log): the wheel sends arrows
+        t.parser.lock().unwrap().process(b"\x1b[?1049h");
+        k.mouse(&mut t, wheel(MouseEventKind::ScrollUp), area);
+        k.mouse(&mut t, wheel(MouseEventKind::ScrollDown), area);
+        assert_eq!(t.scroll, 0);
+        assert_eq!(take(&sent), b"\x1b[A\x1b[A\x1b[A\x1b[B\x1b[B\x1b[B");
+        t.parser.lock().unwrap().process(b"\x1b[?1h"); // application cursor keys
+        k.mouse(&mut t, wheel(MouseEventKind::ScrollUp), area);
+        assert_eq!(take(&sent), b"\x1bOA\x1bOA\x1bOA");
+    }
+
+    #[test]
+    fn term_shift_enter_is_a_newline_in_agents() {
+        let mut k = crate::testkit::Kit::new();
+        let (mut t, sent) = quiet_term();
+        k.key_mod(&mut t, KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(take(&sent), b"\r", "a shell gets a plain enter");
+        t.agent = true;
+        k.key_mod(&mut t, KeyCode::Enter, KeyModifiers::SHIFT);
+        k.key_mod(&mut t, KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(take(&sent), b"\x1b\r\x1b\r", "Claude Code / Codex read ESC CR as a new line");
+        k.key(&mut t, KeyCode::Enter);
+        assert_eq!(take(&sent), b"\r", "enter still sends");
+        // Claude Code's idle footer marks a pane as an agent before it has done anything
+        let (mut t, _) = quiet_term();
+        assert!(!t.agent);
+        t.parser.lock().unwrap().process("╭────╮\r\n│ >  │\r\n╰────╯\r\n  ? for shortcuts".as_bytes());
+        t.scan();
+        assert!(t.agent && t.status.is_some(), "gets a status dot too");
+    }
+
+    #[test]
+    fn term_puts_oriels_folder_on_path() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+        let dir = if cfg!(windows) { Path::new(r"C:\Tools\oriel") } else { Path::new("/opt/oriel") };
+        let path = if cfg!(windows) { r"C:\Windows;C:\bin" } else { "/usr/bin:/bin" };
+        let got = with_dir_on_path(dir, Some(OsStr::new(path))).unwrap();
+        let parts: Vec<_> = std::env::split_paths(&got).collect();
+        assert_eq!((parts[0].as_path(), parts.len()), (dir, 3), "{got:?}");
+        // already on it (any case, a trailing slash): left alone
+        let has = if cfg!(windows) { r"C:\Windows;c:\tools\ORIEL\" } else { "/usr/bin:/opt/oriel/" };
+        assert!(with_dir_on_path(dir, Some(OsStr::new(has))).is_none());
+        assert!(with_dir_on_path(dir, None).is_some());
     }
 
     #[test]

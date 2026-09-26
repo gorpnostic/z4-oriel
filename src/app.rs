@@ -673,9 +673,10 @@ impl App {
                 }
                 Action::GotoApp(a) => self.goto_app(a),
                 Action::AppKey(a, c) => {
-                    let here = self.cur;
+                    // stay where we are: an app tab opened now sorts in ahead of your own tabs, so find ours again
+                    let here = self.tabs[self.cur].focus;
                     self.goto_app(a); // opens it if it isn't yet
-                    self.cur = here;
+                    self.cur = self.tabs.iter().position(|t| t.root.contains(here)).unwrap_or(self.cur);
                     if let Some(id) = self.tabs.iter().find(|t| t.app == Some(a)).map(|t| t.focus) {
                         self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), cx));
                     }
@@ -898,10 +899,9 @@ impl App {
                 return;
             }
             if n == 12 {
-                // play/pause from anywhere, if the music app is open
-                if let Some(id) = self.tabs.iter().find(|t| t.app == Some("music")).map(|t| t.focus) {
-                    self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), cx));
-                }
+                // play/pause from anywhere: opens the music app in the background if it isn't yet (like /play)
+                let from = self.focused();
+                self.apply(from, vec![Action::AppKey("music", ' ')]);
                 return;
             }
         }
@@ -1999,6 +1999,21 @@ mod tests {
         }
         let s = snap(&mut app, "palette");
         assert!(s.contains("theme ocean"), "theme list missing");
+    }
+
+    /// F12 works before music has been opened: it opens it in the background (and doesn't switch to it, even from
+    /// a tab of your own that the new app tab sorts in ahead of).
+    #[test]
+    fn app_f12_opens_music_in_the_background() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config::default(), tx);
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        let mine = app.focused();
+        assert!(!app.tabs.iter().any(|t| t.app == Some("music")));
+        // (never drawn after this, so the library never loads and nothing can start playing)
+        app.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        assert!(app.tabs.iter().any(|t| t.app == Some("music")), "F12 opened music");
+        assert_eq!(app.focused(), mine, "and left you where you were");
     }
 
     #[test]

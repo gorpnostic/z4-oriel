@@ -67,7 +67,7 @@ fn topics() -> Vec<Topic> {
         ]},
         Topic { icon: "window", title: "keys & tabs", app: "", items: vec![
             H("apps and tabs"),
-            K("F1–F10", "switch apps (F12 plays/pauses music from anywhere)"),
+            K("F1–F10", "switch apps (F12 plays/pauses music from anywhere, even before you've opened it)"),
             K("alt t", "a new tab of your own (it starts on a launcher)"),
             K("alt 1–9", "go to one of your tabs"),
             K("double-click a tab", "rename it (also right-click → rename, or ctrl+space then ,)"),
@@ -97,6 +97,14 @@ fn topics() -> Vec<Topic> {
             K("drag", "select text in any pane; copied when you let go (shift+drag in programs that use the mouse)"),
             K("ctrl+v / right-click", "paste text (your terminal's own paste)"),
             K("alt v", "paste a clipboard image or copied files as a path — Claude Code and Codex attach it"),
+            Gap,
+            H("the same keys in every app"),
+            K("j k  ·  ↑ ↓", "move down / up in any list"),
+            K("/", "filter or search the list (esc clears it)"),
+            K("enter", "open or run what's picked"),
+            K("x  ·  delete", "remove it: kill a process, dismiss an alert, delete a plan (files: d, to the recycle bin)"),
+            K("esc", "back out: close the box, clear the filter, cancel"),
+            K("?  ·  F10", "help for the app you're in"),
         ]},
         Topic { icon: "ai", title: "chat", app: "ai", items: vec![
             H("talking to an AI"),
@@ -185,6 +193,8 @@ fn topics() -> Vec<Topic> {
             K("s  ·  r", "shuffle · repeat"),
             K("/", "search"),
             K("tab", "library · most played · playlists"),
+            K("R", "rescan your music folders (tags read before are remembered, so it's quick)"),
+            P("A song counts as played after 30 seconds, or half of it if it's shorter, so skipping through a list doesn't fill \"most played\"."),
             P("A song that won't open or decode is skipped (the reason stays under the controls). .opus files are listed but can't play yet: oriel has no Opus decoder."),
         ]},
         Topic { icon: "system", title: "system", app: "system", items: vec![
@@ -198,10 +208,17 @@ fn topics() -> Vec<Topic> {
         Topic { icon: "files", title: "files", app: "files", items: vec![
             K("enter", "open a folder / preview a file"),
             K("backspace", "up a folder"),
+            K("/", "filter the names as you type: ↑↓ pick, enter opens the top match, esc clears"),
+            K("e", "edit the file in your editor ($EDITOR, else a terminal editor, else notepad), beside this"),
+            K("n", "a new file (end the name with / for a folder)"),
+            K("R  ·  F2", "rename"),
+            K("d  ·  delete", "move it to the recycle bin (asks first, naming the path)"),
+            K("c  ·  x", "Claude Code · Codex working in this folder, beside this"),
+            K("t", "a terminal in this folder"),
             K("o", "open with your system's app"),
             K("p", "copy the path"),
-            K("t", "a terminal in this folder"),
             K(".", "show hidden files"),
+            K("r", "read the folder again (it also updates by itself when files change)"),
             P("The sidebar lists home, desktop, downloads, documents and your drives."),
         ]},
         Topic { icon: "notes", title: "notes", app: "notes", items: vec![
@@ -228,6 +245,8 @@ fn topics() -> Vec<Topic> {
             K("a  ·  enter", "add a plan: \"2pm dentist\", \"10:30 standup\", or just \"buy milk\""),
             K("j k", "pick one of the day's plans"),
             K("e  ·  x  ·  u", "edit it · delete it · undo the delete"),
+            K("shift ← →  ·  shift ↑ ↓", "move the picked plan a day · a week"),
+            P("The sidebar shows what's next: a timed plan drops off an hour after it starts. The reminder for a plan just after midnight comes ten minutes before, the evening before."),
         ]},
         Topic { icon: "storage", title: "storage", app: "storage", items: vec![
             P("Views: cleanup · big folders · installed apps · get apps · search (tab to switch)."),
@@ -238,10 +257,18 @@ fn topics() -> Vec<Topic> {
             K("r", "rescan"),
         ]},
         Topic { icon: "term", title: "terminal", app: "terminal", items: vec![
-            P("A real shell (PowerShell on Windows, your $SHELL elsewhere). Anything runs in it — including Claude Code or Codex, which then get status dots on their tab."),
+            P("A real shell (PowerShell on Windows, your $SHELL elsewhere). Anything runs in it — including Claude Code or Codex, which then get status dots on their tab. `oriel` itself is always on its PATH."),
             K("alt n", "another terminal beside it"),
-            K("wheel", "scroll back"),
+            K("wheel", "scroll back (in less, man or git log it scrolls the page)"),
+            K("shift pgup / pgdn", "scroll back a page from the keyboard"),
+            K("shift home / end", "the top of the scrollback · back to now"),
+            K("shift+enter", "a new line in Claude Code or Codex (ctrl+enter too) — enter sends"),
             K("drag", "copy text"),
+            Gap,
+            H("when the program ends"),
+            P("A program that finishes cleanly closes its pane. One that fails (not signed in, a crash, a failed install) keeps it, dimmed, so you can read why, with the exit code at the bottom."),
+            K("enter  ·  esc", "close it"),
+            K("r", "run it again"),
         ]},
         Topic { icon: "theme", title: "themes & config", app: "themes", items: vec![
             K("alt p → theme", "pick a theme with live preview"),
@@ -272,6 +299,21 @@ fn topics() -> Vec<Topic> {
             K("agents refuse actions", "/perms in chat (ask · edits · plan · bypass)"),
             K("update didn't stick", "close oriel and run the install line again"),
         ]},
+        Topic { icon: "package", title: "updates", app: "updates", items: vec![
+            P("oriel looks for a new version once a day, quietly (nothing happens offline). When one is out, the bottom of the sidebar says so and an alert tells you."),
+            K("alt p → updates", "what's new in every release since yours"),
+            K("enter", "update now: download it, check it runs, swap it in (the new one starts next time)"),
+            K("r  (twice)", "roll back to the version you had before"),
+            K("c", "check again now"),
+            Gap,
+            H("from a shell"),
+            K("oriel update", "the same, without opening oriel"),
+            K("oriel rollback", "back to the version before the last update"),
+            K("oriel changelog", "what's new in recent releases"),
+            Gap,
+            H("kept versions"),
+            P("Each update keeps a copy of the version it replaces, the last three, so a rollback always has something to go back to. They live in update/previous in oriel's data folder (%APPDATA%\\oriel on Windows, ~/.local/share/oriel on Linux). On Windows the replaced oriel.exe also steps aside as oriel.exe.old-<time> next to the new one until the next update clears it."),
+        ]},
     ]
 }
 
@@ -282,11 +324,52 @@ pub struct Help {
     query: String,
     searching: bool,
     hits: Vec<(Rect, usize)>,
+    /// Lines of the topic on show that hold the search (from the last render), and which one n / N is on.
+    matches: Vec<usize>,
+    cur_match: usize,
+    /// Scroll to the first (or last) match at the next render: the query or the topic just changed.
+    jump: Option<Jump>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Jump {
+    First,
+    Last,
 }
 
 impl Help {
     pub fn new() -> Help {
-        Help { topics: topics(), sel: 0, scroll: 0, query: String::new(), searching: false, hits: vec![] }
+        Help { topics: topics(), sel: 0, scroll: 0, query: String::new(), searching: false, hits: vec![], matches: vec![], cur_match: 0, jump: None }
+    }
+
+    /// Move to the next (or previous) topic that matches the search, landing on its first (last) match.
+    fn step_topic(&mut self, down: bool) {
+        let shown = self.shown();
+        let Some(pos) = shown.iter().position(|&i| i == self.sel).or(if shown.is_empty() { None } else { Some(0) }) else { return };
+        let to = if down { (pos + 1).min(shown.len() - 1) } else { pos.saturating_sub(1) };
+        if to != pos {
+            self.sel = shown[to];
+            self.scroll = 0;
+            self.jump = (!self.query.is_empty()).then_some(if down { Jump::First } else { Jump::Last });
+        }
+    }
+
+    /// n / N: the next match in this topic, then on into the next matching topic.
+    fn step_match(&mut self, down: bool) {
+        if down && self.cur_match + 1 < self.matches.len() {
+            self.cur_match += 1;
+        } else if !down && self.cur_match > 0 && !self.matches.is_empty() {
+            self.cur_match -= 1;
+        } else {
+            let before = self.sel;
+            self.step_topic(down);
+            if self.sel == before {
+                // no topic further on: wrap round to the other end of this one
+                self.jump = Some(if down { Jump::First } else { Jump::Last });
+            }
+            return;
+        }
+        self.scroll = self.matches[self.cur_match].saturating_sub(3);
     }
 
     /// Topics matching the search (all when empty).
@@ -315,6 +398,7 @@ impl Help {
             self.scroll = 0;
             self.query.clear();
             self.searching = false;
+            self.jump = None;
         }
     }
 }
@@ -333,8 +417,15 @@ impl Pane for Help {
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         self.pick_context();
         let t = cx.theme;
-        let hints: &[(&str, &str)] = if self.searching { &[("type", "to search"), ("enter", "done"), ("esc", "clear")] } else { &[("↑↓", "topic"), ("pgup/pgdn", "scroll"), ("/", "search"), ("F1–F9", "back to an app")] };
-        let area = ui::hint_line(f, area, hints, t);
+        let found = if self.matches.is_empty() { "no match here".to_string() } else { format!("match {} of {}", self.cur_match + 1, self.matches.len()) };
+        let hints: Vec<(&str, &str)> = if self.searching {
+            vec![("type", "to search"), ("↑↓", "matching topics"), ("enter", "done"), ("esc", "clear")]
+        } else if !self.query.is_empty() {
+            vec![("n/N", &found), ("↑↓", "topic"), ("/", "search again"), ("esc", "clear")]
+        } else {
+            vec![("↑↓", "topic"), ("pgup/pgdn", "scroll"), ("/", "search"), ("F1–F9", "back to an app")]
+        };
+        let area = ui::hint_line(f, area, &hints, t);
         let body = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(1) };
         if self.shown().is_empty() {
             // don't leave the old topic up as if it matched
@@ -397,6 +488,27 @@ impl Pane for Help {
                 Gap => lines.push(Line::raw("")),
             }
         }
+        // the search: every hit lit up, and the view on the first one when the query or topic just changed
+        let q = self.query.to_lowercase();
+        self.matches.clear();
+        if !q.is_empty() {
+            let hl = Style::default().fg(t.accent).add_modifier(Modifier::BOLD | Modifier::REVERSED);
+            for (n, l) in lines.iter_mut().enumerate() {
+                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                if text.to_lowercase().contains(&q) {
+                    self.matches.push(n);
+                    *l = highlight(std::mem::take(l), &q, hl);
+                }
+            }
+        }
+        match self.jump.take() {
+            Some(j) if !self.matches.is_empty() => {
+                self.cur_match = if j == Jump::First { 0 } else { self.matches.len() - 1 };
+                self.scroll = self.matches[self.cur_match].saturating_sub(3);
+            }
+            Some(_) => self.scroll = 0,
+            None => self.cur_match = self.cur_match.min(self.matches.len().saturating_sub(1)),
+        }
         let h = body.height as usize;
         self.scroll = self.scroll.min(lines.len().saturating_sub(h));
         let visible: Vec<Line> = lines.into_iter().skip(self.scroll).take(h).collect();
@@ -409,13 +521,21 @@ impl Pane for Help {
                 KeyCode::Esc => {
                     self.query.clear();
                     self.searching = false;
+                    self.jump = None;
                 }
                 KeyCode::Enter => self.searching = false,
+                // move between the topics that match without leaving the search box
+                KeyCode::Down | KeyCode::Tab => self.step_topic(true),
+                KeyCode::Up | KeyCode::BackTab => self.step_topic(false),
                 KeyCode::Backspace => {
                     self.query.pop();
+                    self.jump = Some(Jump::First);
                 }
                 _ => match ui::typed_char(&k) {
-                    Some(c) => self.query.push(c),
+                    Some(c) => {
+                        self.query.push(c);
+                        self.jump = Some(Jump::First);
+                    }
                     None => return false,
                 },
             }
@@ -440,23 +560,21 @@ impl Pane for Help {
             }
             return true;
         }
-        let pos = shown.iter().position(|&i| i == self.sel).unwrap_or(0);
         match k.code {
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.sel = shown[(pos + 1).min(shown.len().saturating_sub(1))];
-                self.scroll = 0;
-            }
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                self.sel = shown[pos.saturating_sub(1)];
-                self.scroll = 0;
-            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.step_topic(true),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => self.step_topic(false),
+            KeyCode::Char('n') if !self.query.is_empty() => self.step_match(true),
+            KeyCode::Char('N') if !self.query.is_empty() => self.step_match(false),
             KeyCode::PageDown | KeyCode::Char(' ') => self.scroll += 10,
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Char('/') => {
                 self.searching = true;
                 self.query.clear();
             }
-            KeyCode::Esc if !self.query.is_empty() => self.query.clear(),
+            KeyCode::Esc if !self.query.is_empty() => {
+                self.query.clear();
+                self.matches.clear();
+            }
             _ => return false,
         }
         true
@@ -507,6 +625,35 @@ impl Pane for Help {
     }
 }
 
+/// `line` with every (case-insensitive) occurrence of `q` in `hl`. A hit that runs across two spans (a key and
+/// its description) isn't lit, and neither is text whose lowercase changes length (rare scripts).
+fn highlight(line: Line<'static>, q: &str, hl: Style) -> Line<'static> {
+    let mut out: Vec<Span<'static>> = vec![];
+    for sp in line.spans {
+        let text = sp.content.to_string();
+        let lower = text.to_lowercase();
+        if lower.len() != text.len() || !lower.contains(q) {
+            out.push(sp);
+            continue;
+        }
+        let mut at = 0;
+        for (i, _) in lower.match_indices(q) {
+            if i < at || !text.is_char_boundary(i) || !text.is_char_boundary(i + q.len()) {
+                continue;
+            }
+            if i > at {
+                out.push(Span::styled(text[at..i].to_string(), sp.style));
+            }
+            out.push(Span::styled(text[i..i + q.len()].to_string(), sp.style.patch(hl)));
+            at = i + q.len();
+        }
+        if at < text.len() {
+            out.push(Span::styled(text[at..].to_string(), sp.style));
+        }
+    }
+    Line::from(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +679,73 @@ mod tests {
         }
         let side = k.render_side(&mut h, 30, 20);
         assert!(side.contains("keys & tabs") && !side.contains("music"), "{side}");
+    }
+
+    /// Searching lands on the match (lit up) rather than the top of the topic; arrows and n / N move between hits.
+    #[test]
+    fn help_search_goes_to_the_match() {
+        let mut k = Kit::new();
+        let mut h = Help::new();
+        k.key(&mut h, KeyCode::Char('/'));
+        k.typ(&mut h, "clipboard");
+        let s = k.render(&mut h, 100, 16); // a short pane: the hit is far below the fold
+        let _ = k.render_html(&mut h, 100, 16, "target/snap/help-search.html");
+        assert_eq!(h.topics[h.sel].title, "keys & tabs");
+        assert!(h.scroll > 10, "scrolled down to it: {}", h.scroll);
+        assert!(s.contains("paste a clipboard image"), "{s}");
+        assert_eq!(h.matches.len(), 1);
+        // the hit itself is highlighted
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 16)).unwrap();
+        term.draw(|f| {
+            let mut acts = vec![];
+            let mut cx = crate::pane::Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut acts, focused: true, time: 1.0 };
+            h.render(f, f.area(), &mut cx);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let lit: String = (0..16).flat_map(|y| (0..100).map(move |x| (x, y))).filter(|&(x, y)| buf[(x, y)].modifier.contains(Modifier::REVERSED)).map(|(x, y)| buf[(x, y)].symbol().to_string()).collect();
+        assert_eq!(lit, "clipboard");
+        // ↑↓ while still typing: the other matching topics (and their first hit)
+        k.key(&mut h, KeyCode::Backspace);
+        k.typ(&mut h, "d");
+        k.key(&mut h, KeyCode::Esc);
+        k.key(&mut h, KeyCode::Char('/'));
+        k.typ(&mut h, "rollback");
+        let shown = h.shown();
+        assert!(shown.len() >= 2, "rollback is in two topics");
+        k.render(&mut h, 100, 16);
+        let first = h.sel;
+        k.key(&mut h, KeyCode::Down);
+        assert!(h.searching, "still typing");
+        assert_ne!(h.sel, first);
+        k.render(&mut h, 100, 16);
+        assert!(!h.matches.is_empty() && h.cur_match == 0);
+        k.key(&mut h, KeyCode::Up);
+        assert_eq!(h.sel, first);
+        // enter, then n / N step through the hits, on into the next topic
+        k.key(&mut h, KeyCode::Enter);
+        h.jump = Some(Jump::First);
+        k.render(&mut h, 100, 16);
+        let n = h.matches.len();
+        for _ in 0..n {
+            k.key(&mut h, KeyCode::Char('n'));
+        }
+        k.render(&mut h, 100, 16);
+        assert_ne!(h.sel, first, "n past the last hit goes on to the next topic");
+        k.key(&mut h, KeyCode::Char('N'));
+        k.render(&mut h, 100, 16);
+        assert_eq!(h.sel, first, "N goes back");
+        assert_eq!(h.cur_match, h.matches.len() - 1, "…to its last hit");
+    }
+
+    #[test]
+    fn help_has_an_updates_topic() {
+        let mut k = Kit::new();
+        set_context("updates");
+        let mut h = Help::new();
+        let s = k.render(&mut h, 120, 40);
+        assert_eq!(h.topics[h.sel].title, "updates");
+        assert!(s.contains("oriel rollback") && s.contains("update/previous"), "{s}");
     }
 
     #[test]

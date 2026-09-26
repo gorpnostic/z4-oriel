@@ -4,7 +4,7 @@
 use crate::pane::{Cx, Pane};
 use crate::panes::files::clock;
 use crate::ui;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::{Position, Rect},
@@ -69,6 +69,10 @@ fn now() -> (i64, u32) {
     (days_from_civil(l.year as i64, l.month, l.day), l.hour * 60 + l.min)
 }
 
+fn at_before(at: Option<u32>, mins: u32) -> bool {
+    at.is_some_and(|a| a < mins)
+}
+
 fn hhmm(m: u32) -> String {
     format!("{:02}:{:02}", m / 60, m % 60)
 }
@@ -85,10 +89,12 @@ pub fn parse_time(s: &str) -> (Option<u32>, String) {
     } else {
         (f.as_str(), false, false)
     };
-    let (h, m) = match num.split_once(':').or_else(|| num.split_once('.')) {
+    // "14.30" is a time, "1.5 miles" isn't: a '.' only counts with two digits after it
+    let dot = num.split_once('.').filter(|(_, m)| m.len() == 2 && m.bytes().all(|b| b.is_ascii_digit()));
+    let (h, m) = match num.split_once(':').or(dot) {
         Some((h, m)) => (h.parse::<u32>().ok(), m.parse::<u32>().ok()),
         // a bare number only counts as a time with am/pm ("3 apples" is not 3 o'clock)
-        None if pm || am => (num.parse::<u32>().ok(), Some(0)),
+        None if (pm || am) && !num.contains('.') => (num.parse::<u32>().ok(), Some(0)),
         None => (None, None),
     };
     match (h, m) {
@@ -122,6 +128,8 @@ pub struct Calendar {
     reminded: HashSet<(i64, u32, String)>,
     cells: Vec<(Rect, i64)>,
     side_hits: Vec<(Rect, i64)>,
+    /// A fixed (day, minute) instead of the clock, for tests.
+    fake_now: Option<(i64, u32)>,
 }
 
 pub fn store_path() -> PathBuf {
@@ -148,9 +156,36 @@ impl Calendar {
 
     pub fn open_at(path: PathBuf) -> Calendar {
         let (today, _) = now();
-        let mut c = Calendar { plans: load(&path), path, sel: today, today, pick: 0, input: None, undo: None, reminded: HashSet::new(), cells: vec![], side_hits: vec![] };
+        let mut c = Calendar { plans: load(&path), path, sel: today, today, pick: 0, input: None, undo: None, reminded: HashSet::new(), cells: vec![], side_hits: vec![], fake_now: None };
         c.sort();
         c
+    }
+
+    /// (today, minutes since midnight): the clock, or the test's.
+    fn now(&self) -> (i64, u32) {
+        self.fake_now.unwrap_or_else(now)
+    }
+
+    /// A timed plan that ended a while ago (an hour after it started): it no longer counts as coming up.
+    fn finished(&self, p: &Plan) -> bool {
+        let (today, mins) = self.now();
+        p.day < today || (p.day == today && p.at.is_some_and(|a| a + 60 < mins))
+    }
+
+    /// Point `pick` at this plan (after adding, editing or moving it), so e / x act on it next.
+    fn pick_plan(&mut self, p: &Plan) {
+        self.sel = p.day;
+        if let Some(k) = self.on(p.day).iter().position(|&i| self.plans[i] == *p) {
+            self.pick = k;
+        }
+    }
+
+    /// Move the picked plan `by` days (shift+arrows); the selection goes with it.
+    fn move_plan(&mut self, i: usize, by: i64) {
+        self.plans[i].day += by;
+        let p = self.plans[i].clone();
+        self.save();
+        self.pick_plan(&p);
     }
 
     fn sort(&mut self) {
@@ -184,7 +219,7 @@ impl Calendar {
 
     fn plan_line(&self, p: &Plan, width: usize, t: &crate::theme::Theme) -> Line<'static> {
         let time = p.at.map(hhmm).unwrap_or_else(|| "all day".into());
-        let past = p.day < self.today || (p.day == self.today && p.at.is_some_and(|a| a + 60 < now().1));
+        let past = self.finished(p);
         let text_style = if past { Style::default().fg(t.muted) } else { Style::default() };
         Line::from(vec![Span::styled(format!("{time:<8}"), ui::accent(t)), Span::styled(ui::fit(&p.text, width.saturating_sub(9)), text_style)])
     }
@@ -198,9 +233,17 @@ impl Pane for Calendar {
     fn icon(&self) -> &'static str {
         "calendar"
     }
+    /// What's next today: "next 14:00 dentist" (a timed plan still to come or under way), else the day's first
+    /// all-day plan.
     fn badge(&self) -> Option<String> {
-        let n = self.on(self.today).len();
-        (n > 0).then(|| format!("{n} today"))
+        let (today, _) = self.now();
+        let on = self.on(today);
+        let next = on.iter().map(|&i| &self.plans[i]).find(|p| p.at.is_some() && !self.finished(p));
+        if let Some(p) = next {
+            return Some(format!("next {} {}", hhmm(p.at.unwrap_or(0)), p.text));
+        }
+        let all_day = on.iter().map(|&i| &self.plans[i]).find(|p| p.at.is_none())?;
+        Some(format!("today: {}", all_day.text))
     }
     fn tick_every(&self) -> Option<Duration> {
         Some(Duration::from_secs(15))
@@ -211,7 +254,7 @@ impl Pane for Calendar {
 
     /// Reminders: a toast when a timed plan starts (and the date rolls over at midnight).
     fn poll(&mut self, cx: &mut Cx) {
-        let (today, mins) = now();
+        let (today, mins) = self.now();
         if today != self.today {
             if self.sel == self.today {
                 self.sel = today;
@@ -219,15 +262,17 @@ impl Pane for Calendar {
             self.today = today;
         }
         for p in &self.plans {
-            if let (true, Some(at)) = (p.day == today, p.at) {
+            // today's, and tomorrow's first ten minutes (a 00:05 plan gets its heads-up at 23:55)
+            if let (true, Some(at)) = (p.day == today || (p.day == today + 1 && at_before(p.at, 10)), p.at) {
+                let until = (p.day - today) * 1440 + at as i64 - mins as i64;
                 // ten minutes before, and when it starts
                 let soon = (p.day, at + 10_000, p.text.clone());
-                if mins + 10 >= at && mins < at && !self.reminded.contains(&soon) {
-                    cx.alert(crate::alerts::Kind::Calendar, format!("in {} min: {} {}", at - mins, hhmm(at), p.text));
+                if (1..=10).contains(&until) && !self.reminded.contains(&soon) {
+                    cx.alert(crate::alerts::Kind::Calendar, format!("in {until} min: {} {}", hhmm(at), p.text));
                     self.reminded.insert(soon);
                 }
                 let key = (p.day, at, p.text.clone());
-                if mins >= at && mins < at + 10 && !self.reminded.contains(&key) {
+                if p.day == today && mins >= at && mins < at + 10 && !self.reminded.contains(&key) {
                     cx.alert(crate::alerts::Kind::Calendar, format!("now: {} {}", hhmm(at), p.text));
                     self.reminded.insert(key);
                 }
@@ -239,7 +284,7 @@ impl Pane for Calendar {
         let t = cx.theme;
         let hints: &[(&str, &str)] = match self.input {
             Some(_) => &[("type", "a plan, a time first if it has one: 2pm dentist"), ("enter", "save"), ("esc", "cancel")],
-            None => &[("← → ↑ ↓", "day"), ("[ ]", "month"), ("t", "today"), ("a", "add"), ("j k", "pick"), ("e", "edit"), ("x", "delete")],
+            None => &[("← → ↑ ↓", "day"), ("[ ]", "month"), ("t", "today"), ("a", "add"), ("j k", "pick"), ("e", "edit"), ("shift ← →", "move it"), ("x", "delete")],
         };
         let area = ui::hint_line(f, area, hints, t);
         let body = Rect { x: area.x + 1, y: area.y, width: area.width.saturating_sub(2), height: area.height };
@@ -366,19 +411,24 @@ impl Pane for Calendar {
                     buf.pop();
                 }
                 KeyCode::Enter => {
-                    match self.input.take() {
+                    let saved = match self.input.take() {
                         Some(Input::Add(s)) if !s.trim().is_empty() => {
                             let (at, text) = parse_time(&s);
                             self.plans.push(Plan { day: self.sel, at, text });
+                            self.plans.last().cloned()
                         }
                         Some(Input::Edit(i, s)) if !s.trim().is_empty() && i < self.plans.len() => {
                             let (at, text) = parse_time(&s);
                             self.plans[i].at = at;
                             self.plans[i].text = text;
+                            Some(self.plans[i].clone())
                         }
-                        _ => {}
-                    }
+                        _ => None,
+                    };
                     self.save();
+                    if let Some(p) = saved {
+                        self.pick_plan(&p); // the sort may have moved it: e / x next act on this one
+                    }
                 }
                 _ => {
                     if let Some(c) = ui::typed_char(&k) {
@@ -390,6 +440,20 @@ impl Pane for Calendar {
         }
         let on = self.on(self.sel);
         let picked = on.get(self.pick.min(on.len().saturating_sub(1))).copied();
+        // shift+arrows carry the picked plan to another day (a week with ↑ ↓)
+        if k.modifiers.contains(KeyModifiers::SHIFT) {
+            let by = match k.code {
+                KeyCode::Left => -1,
+                KeyCode::Right => 1,
+                KeyCode::Up => -7,
+                KeyCode::Down => 7,
+                _ => 0,
+            };
+            if let (Some(i), true) = (picked, by != 0) {
+                self.move_plan(i, by);
+                return true;
+            }
+        }
         match k.code {
             KeyCode::Left | KeyCode::Char('h') => self.go(self.sel - 1),
             KeyCode::Right | KeyCode::Char('l') => self.go(self.sel + 1),
@@ -451,7 +515,8 @@ impl Pane for Calendar {
         let mut y = area.y;
         f.render_widget(Paragraph::new(Span::styled("coming up", ui::muted(t))), Rect { y, height: 1, ..area });
         y += 1;
-        let soon: Vec<&Plan> = self.plans.iter().filter(|p| p.day >= self.today && p.day < self.today + 14).collect();
+        // what's still ahead: this morning's plans are gone from it by the evening
+        let soon: Vec<&Plan> = self.plans.iter().filter(|p| p.day >= self.today && p.day < self.today + 14 && !self.finished(p)).collect();
         if soon.is_empty() {
             f.render_widget(Paragraph::new(Span::styled("nothing in the next two weeks", ui::muted(t))), Rect { y, height: 1, ..area });
         }
@@ -500,6 +565,10 @@ mod tests {
         assert_eq!(parse_time("12am midnight snack"), (Some(0), "midnight snack".into()));
         assert_eq!(parse_time("3 apples"), (None, "3 apples".into()), "a bare number isn't a time");
         assert_eq!(parse_time("buy milk"), (None, "buy milk".into()));
+        // a '.' is a time separator only with two digits after it
+        assert_eq!(parse_time("14.30 lunch"), (Some(14 * 60 + 30), "lunch".into()));
+        assert_eq!(parse_time("1.5 miles run"), (None, "1.5 miles run".into()));
+        assert_eq!(parse_time("2.5pm maybe"), (None, "2.5pm maybe".into()));
     }
 
     #[test]
@@ -526,6 +595,7 @@ mod tests {
         let mut c = Calendar::open_at(path.clone());
         c.today = days_from_civil(2026, 9, 25);
         c.sel = c.today;
+        c.fake_now = Some((c.today, 9 * 60));
         k.key(&mut c, KeyCode::Char('a'));
         k.typ(&mut c, "2pm dentist");
         k.key(&mut c, KeyCode::Enter);
@@ -541,7 +611,7 @@ mod tests {
         assert_eq!(load(&path).len(), 3, "saved");
         let s = k.render_html(&mut c, 140, 40, "target/snap/calendar.html");
         assert!(s.contains("September 2026") && s.contains("dentist") && s.contains("14:00") && s.contains("today"), "{s}");
-        assert_eq!(c.badge().as_deref(), Some("2 today"));
+        assert_eq!(c.badge().as_deref(), Some("next 14:00 dentist"));
         let side = k.render_side(&mut c, 34, 12);
         assert!(side.contains("coming up") && side.contains("standup") && side.contains("tmrw"), "{side}");
         // edit the picked one (all-day first), then delete and undo
@@ -559,5 +629,78 @@ mod tests {
         // months roll over
         k.key(&mut c, KeyCode::Char(']'));
         assert_eq!(civil_from_days(c.sel).1, 10);
+    }
+
+    #[test]
+    fn calendar_moves_plans_and_picks_the_new_one() {
+        let path = std::path::absolute("target/test-scratch/calendar-move.json").unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut k = Kit::new();
+        let mut c = Calendar::open_at(path.clone());
+        let d = days_from_civil(2026, 9, 25);
+        (c.today, c.sel, c.fake_now) = (d, d, Some((d, 8 * 60)));
+        for p in ["3pm later", "1pm sooner"] {
+            k.key(&mut c, KeyCode::Char('a'));
+            k.typ(&mut c, p);
+            k.key(&mut c, KeyCode::Enter);
+        }
+        // the plan just added is the picked one, although the sort put it first: x removes it, not "later"
+        k.key(&mut c, KeyCode::Char('x'));
+        assert_eq!(c.plans.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["later"]);
+        k.key(&mut c, KeyCode::Char('u'));
+        // shift+→ carries the picked plan to tomorrow, the selection with it; shift+↓ a week on
+        let sooner = c.plans.iter().position(|p| p.text == "sooner").unwrap();
+        c.pick = c.on(d).iter().position(|&i| i == sooner).unwrap();
+        k.key_mod(&mut c, KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!(c.sel, d + 1);
+        assert_eq!(c.plans.iter().find(|p| p.text == "sooner").map(|p| p.day), Some(d + 1));
+        k.key_mod(&mut c, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!((c.sel, load(&path).iter().find(|p| p.text == "sooner").map(|p| p.day)), (d + 8, Some(d + 8)), "moved and saved");
+        k.key_mod(&mut c, KeyCode::Left, KeyModifiers::SHIFT);
+        assert_eq!(c.sel, d + 7);
+        // an edit keeps the pick on the plan it changed
+        k.key(&mut c, KeyCode::Char('e'));
+        for _ in 0..20 {
+            k.key(&mut c, KeyCode::Backspace);
+        }
+        k.typ(&mut c, "7am sooner still");
+        k.key(&mut c, KeyCode::Enter);
+        let on = c.on(c.sel);
+        assert_eq!(c.plans[on[c.pick]].text, "sooner still");
+    }
+
+    #[test]
+    fn calendar_coming_up_badge_and_midnight_reminders() {
+        let path = std::path::absolute("target/test-scratch/calendar-soon.json").unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut k = Kit::new();
+        let mut c = Calendar::open_at(path);
+        let d = days_from_civil(2026, 9, 25);
+        c.plans = vec![
+            Plan { day: d, at: Some(9 * 60), text: "standup".into() },
+            Plan { day: d, at: Some(14 * 60), text: "dentist".into() },
+            Plan { day: d, at: Some(18 * 60), text: "gym".into() },
+            Plan { day: d, at: None, text: "buy milk".into() },
+            Plan { day: d + 1, at: Some(5), text: "late call".into() },
+        ];
+        c.sort();
+        (c.today, c.sel, c.fake_now) = (d, d, Some((d, 15 * 60 + 30)));
+        // at half three: the morning's plans (over an hour ago) are no longer "coming up"; the badge names the next
+        assert_eq!(c.badge().as_deref(), Some("next 18:00 gym"));
+        let side = k.render_side(&mut c, 34, 12);
+        assert!(!side.contains("standup") && !side.contains("dentist") && side.contains("gym") && side.contains("buy milk"), "{side}");
+        // late evening, nothing timed left: the all-day plan
+        c.fake_now = Some((d, 22 * 60));
+        assert_eq!(c.badge().as_deref(), Some("today: buy milk"));
+        // 23:55: a heads-up for tomorrow's 00:05, then "now" at midnight
+        c.fake_now = Some((d, 23 * 60 + 55));
+        k.poll(&mut c);
+        assert!(k.notices().iter().any(|n| n == "in 10 min: 00:05 late call"), "{:?}", k.notices());
+        k.actions.clear();
+        k.poll(&mut c);
+        assert!(k.notices().is_empty(), "once");
+        c.fake_now = Some((d + 1, 5));
+        k.poll(&mut c);
+        assert_eq!(k.notices(), ["now: 00:05 late call"]);
     }
 }

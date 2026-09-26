@@ -54,7 +54,8 @@ pub struct Shared {
     pub shuffle: bool,
     pub repeat: Repeat,
     pub error: Option<String>,
-    /// Bumps whenever the current track changes (or restarts), so the UI knows to refresh cover/lyrics/marks.
+    /// Bumps whenever the current track changes (or restarts, or its play is counted), so the UI knows to
+    /// refresh cover/lyrics/marks and "most played".
     pub changed: u64,
 }
 
@@ -120,6 +121,7 @@ impl Engine {
             player: None,
             orig: vec![],
             rng: seed(),
+            pending: None,
         };
         std::thread::Builder::new().name("oriel-music".into()).spawn(move || inner.run()).ok();
         Engine { tx, shared, scope }
@@ -142,6 +144,8 @@ struct Inner {
     /// The queue in its original order, to restore when shuffle is turned off.
     orig: Vec<Track>,
     rng: u64,
+    /// The song that started but hasn't played long enough to count yet (see `count_play`).
+    pending: Option<String>,
 }
 
 impl Inner {
@@ -164,7 +168,36 @@ impl Inner {
             if ended {
                 self.ended();
             }
+            self.count_play();
         }
+    }
+
+    /// A song counts as played once it has played 30 seconds or half its length, whichever is less (not when it
+    /// starts: skipping through a list mustn't make "most played" the songs you skipped).
+    fn count_play(&mut self) {
+        let Some(id) = &self.pending else { return };
+        let (pos, dur, current) = {
+            let s = self.shared.lock().unwrap();
+            (s.pos, s.dur, s.track.as_ref().is_some_and(|t| &t.id == id))
+        };
+        if !current {
+            self.pending = None;
+            return;
+        }
+        let need = if dur > 0.0 { (dur / 2.0).min(30.0) } else { 30.0 };
+        if pos < need {
+            return;
+        }
+        let id = self.pending.take().unwrap_or_default();
+        let mut st = self.state.lock().unwrap();
+        *st.plays.entry(id.clone()).or_insert(0) += 1;
+        st.last = Some(id);
+        if self.persist {
+            library::save_state(&st);
+        }
+        drop(st);
+        self.shared.lock().unwrap().changed += 1;
+        self.wake();
     }
 
     fn wake(&self) {
@@ -342,14 +375,8 @@ impl Inner {
                 return;
             }
         }
-        if count {
-            let mut st = self.state.lock().unwrap();
-            *st.plays.entry(track.id.clone()).or_insert(0) += 1;
-            st.last = Some(track.id.clone());
-            if self.persist {
-                library::save_state(&st);
-            }
-        }
+        // counted later, once it has really played (count_play, from the run loop)
+        self.pending = if count { Some(track.id.clone()) } else { None };
         self.wake();
     }
 
@@ -614,6 +641,7 @@ mod tests {
             player: None,
             orig: vec![],
             rng: 1,
+            pending: None,
         }
     }
 
@@ -674,6 +702,40 @@ mod tests {
         drop(s);
         assert!(e.sink.is_none() && e.player.is_none());
         assert!(e.state.lock().unwrap().plays.is_empty(), "a song that never played isn't counted");
+    }
+
+    #[test]
+    fn music_counts_a_play_only_after_listening() {
+        let t = Track { id: "song".into(), title: "song".into(), ..Default::default() };
+        let mut e = inner(vec![t.clone()]);
+        let plays = |e: &Inner| e.state.lock().unwrap().plays.get("song").copied().unwrap_or(0);
+        let at = |e: &mut Inner, pos: f64, dur: f64| {
+            let mut s = e.shared.lock().unwrap();
+            s.track = Some(t.clone());
+            (s.pos, s.dur) = (pos, dur);
+        };
+        // just started (a skip): not a play
+        e.pending = Some("song".into());
+        at(&mut e, 4.0, 200.0);
+        e.count_play();
+        assert_eq!(plays(&e), 0);
+        // 30 seconds in: counted, once
+        at(&mut e, 30.5, 200.0);
+        e.count_play();
+        e.count_play();
+        assert_eq!(plays(&e), 1);
+        assert_eq!(e.state.lock().unwrap().last.as_deref(), Some("song"));
+        // a short song counts at half its length
+        e.pending = Some("song".into());
+        at(&mut e, 12.0, 20.0);
+        e.count_play();
+        assert_eq!(plays(&e), 2);
+        // skipped to another song before it counted: dropped
+        e.pending = Some("other".into());
+        at(&mut e, 100.0, 200.0);
+        e.count_play();
+        assert!(e.pending.is_none());
+        assert_eq!(plays(&e), 2);
     }
 
     #[test]

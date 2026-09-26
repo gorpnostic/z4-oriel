@@ -70,6 +70,8 @@ struct Load {
     status: String,
     done: bool,
     version: u64,
+    /// Which scan may publish: a rescan (R) bumps it, and an older scan still running stops.
+    run: u64,
 }
 
 enum LyricState {
@@ -135,6 +137,10 @@ pub struct Music {
     side_hits: Vec<(Rect, String)>,
     table_h: usize,
     last_click: Option<(usize, Instant)>,
+    /// Play/pause (F12, /play) came before the library was in: start the last song played once it is.
+    play_when_loaded: bool,
+    /// Starts a library load (spawn_loader; tests swap in one that doesn't read the disk).
+    scan: fn(Vec<String>, Arc<Mutex<Load>>, Arc<Mutex<Option<Waker>>>),
 }
 
 impl Music {
@@ -178,6 +184,8 @@ impl Music {
             side_hits: vec![],
             table_h: 20,
             last_click: None,
+            play_when_loaded: false,
+            scan: spawn_loader,
         }
     }
 
@@ -271,6 +279,10 @@ impl Music {
 
     fn toggle(&mut self) -> Option<String> {
         if self.engine.shared.lock().unwrap().track.is_none() {
+            if self.rows.is_empty() && !self.loaded {
+                self.play_when_loaded = true; // F12 before the library is in: play once it is (sync)
+                return None;
+            }
             return self.play_sel();
         }
         self.engine.send(Cmd::Toggle);
@@ -333,6 +345,18 @@ impl Music {
             self.by_id = lib.tracks.iter().enumerate().map(|(i, t)| (t.id.clone(), i)).collect();
             self.lib = lib;
             self.refill();
+            if self.play_when_loaded && !self.rows.is_empty() {
+                // asked to play before the songs were in: pick up where you left off
+                self.play_when_loaded = false;
+                let last = self.state.lock().unwrap().last.clone();
+                if let Some(n) = last.and_then(|id| self.rows.iter().position(|&i| self.lib.tracks[i].id == id)) {
+                    self.sel = n;
+                }
+                self.play_sel();
+            }
+        }
+        if self.loaded && self.rows.is_empty() {
+            self.play_when_loaded = false; // nothing to play
         }
         // track change -> cover + lyrics
         let (changed, track, playing) = {
@@ -647,7 +671,7 @@ impl Music {
             } else if !self.query.is_empty() {
                 (format!("nothing matches “{}”", self.query), "esc clears the search".into())
             } else if self.lib.tracks.is_empty() {
-                (format!("no songs found{}", if self.lib.source.is_empty() { String::new() } else { format!(" in {}", self.lib.source) }), "add folders under [music] in config.toml".into())
+                (format!("no songs found{}", if self.lib.source.is_empty() { String::new() } else { format!(" in {}", self.lib.source) }), "add folders under [music] in config.toml, then R rescans".into())
             } else if most {
                 ("nothing played yet".into(), String::new())
             } else {
@@ -750,13 +774,23 @@ impl Music {
 }
 
 /// Load the library off the UI thread: audio-player's library.json when it's there, else a folder scan (names
-/// first, tags filled in as they're read).
+/// first, tags filled in as they're read; tags read before come from the cache, so only new or changed files are
+/// probed). Calling it again (R) supersedes a scan still running.
 fn spawn_loader(folders: Vec<String>, slot: Arc<Mutex<Load>>, waker: Arc<Mutex<Option<Waker>>>) {
+    let run = {
+        let mut l = slot.lock().unwrap();
+        l.run += 1;
+        l.run
+    };
     std::thread::Builder::new()
         .name("oriel-music-scan".into())
         .spawn(move || {
-            let publish = |lib: Option<Lib>, status: String, done: bool| {
+            // false once a newer scan has started: this one stops
+            let publish = |lib: Option<Lib>, status: String, done: bool| -> bool {
                 let mut l = slot.lock().unwrap();
+                if l.run != run {
+                    return false;
+                }
                 if lib.is_some() {
                     l.lib = lib;
                 }
@@ -765,31 +799,50 @@ fn spawn_loader(folders: Vec<String>, slot: Arc<Mutex<Load>>, waker: Arc<Mutex<O
                 l.version += 1;
                 drop(l);
                 wake(&waker);
+                true
             };
             let mut note = String::new();
             if let Some(dir) = library::app_dir() {
                 match library::load_app(&dir) {
-                    Ok(lib) => return publish(Some(lib), String::new(), true),
+                    Ok(lib) => {
+                        publish(Some(lib), String::new(), true);
+                        return;
+                    }
                     Err(e) => note = e,
                 }
             }
             let roots = library::scan_roots(&folders);
             let source = roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ");
             if roots.is_empty() {
-                return publish(Some(Lib::default()), note, true);
+                publish(Some(Lib::default()), note, true);
+                return;
             }
-            publish(None, format!("scanning {source}…"), false);
+            if !publish(None, format!("scanning {source}…"), false) {
+                return;
+            }
             let files = library::find_audio(&roots);
             let mut tracks: Vec<Track> = files.iter().map(|p| library::bare_track(p)).collect();
-            let n = tracks.len();
-            publish(Some(Lib { tracks: tracks.clone(), playlists: vec![], source: source.clone() }), format!("reading tags… 0/{n}"), false);
-            for i in 0..n {
+            let tags_file = library::tags_path();
+            let mut cache = library::load_tags(&tags_file);
+            let todo = cache.apply(&mut tracks);
+            let n = todo.len();
+            let lib = |tracks: &Vec<Track>| Some(Lib { tracks: tracks.clone(), playlists: vec![], source: source.clone() });
+            if n > 0 && !publish(lib(&tracks), format!("reading tags… 0/{n}"), false) {
+                return;
+            }
+            for (k, &i) in todo.iter().enumerate() {
                 library::read_tags(&mut tracks[i]);
-                if i % 50 == 49 && i + 1 < n {
-                    publish(Some(Lib { tracks: tracks.clone(), playlists: vec![], source: source.clone() }), format!("reading tags… {}/{n}", i + 1), false);
+                cache.put(&tracks[i]);
+                if k % 50 == 49 && k + 1 < n && !publish(lib(&tracks), format!("reading tags… {}/{n}", k + 1), false) {
+                    return;
                 }
             }
-            publish(Some(Lib { tracks, playlists: vec![], source }), note, true);
+            let before = cache.files.len();
+            cache.keep_only(&tracks);
+            if n > 0 || cache.files.len() != before {
+                library::save_tags(&tags_file, &cache);
+            }
+            publish(lib(&tracks), note, true);
         })
         .ok();
 }
@@ -837,7 +890,7 @@ impl Pane for Music {
         let hints: &[(&str, &str)] = if self.searching {
             &[("type", "to filter"), ("↑/↓", "move"), ("enter", "done"), ("esc", "clear")]
         } else {
-            &[("space", "play/pause"), ("←/→", "seek"), ("n/p", "next/prev"), ("+/-", "volume"), ("s", "shuffle"), ("r", "repeat"), ("/", "search"), ("enter", "play"), ("F1", "ai")]
+            &[("space", "play/pause"), ("←/→", "seek"), ("n/p", "next/prev"), ("+/-", "volume"), ("s", "shuffle"), ("r", "repeat"), ("/", "search"), ("enter", "play"), ("R", "rescan")]
         };
         // drop hints from the end until the line fits (narrow panes)
         let mut n = hints.len();
@@ -919,6 +972,13 @@ impl Pane for Music {
             KeyCode::Char('-') | KeyCode::Char('_') => self.volume(-0.05),
             KeyCode::Char('s') => self.shuffle(),
             KeyCode::Char('r') => self.repeat(),
+            KeyCode::Char('R') => {
+                // the folders again (new songs, the config's folders now); tags already read are remembered
+                self.loaded = false;
+                self.status = "rescanning…".into();
+                (self.scan)(cx.config.music.folders.clone(), self.load.clone(), self.waker.clone());
+                cx.notify(format!("{}rescanning your music", ui::lead("music")));
+            }
             KeyCode::Char('/') => self.searching = true,
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
@@ -1037,9 +1097,23 @@ mod tests {
             .map(|i| Track { id: format!("t{i}"), path: format!("/nope/{i}.mp3").into(), title: format!("Artist {i} - Song number {i} (Official Video)"), artist: format!("Artist {i}"), duration: 100.0 + i as f64 * 7.0, plays: (i % 4) as u64, ..Default::default() })
             .collect();
         let playlists = vec![library::Playlist { id: "p1".into(), name: "Vibe Coding".into(), ids: vec!["t1".into(), "t3".into(), "t5".into()] }];
-        let load = Arc::new(Mutex::new(Load { lib: Some(Lib { tracks, playlists, source: "test".into() }), status: String::new(), done: true, version: 1 }));
+        let load = Arc::new(Mutex::new(Load { lib: Some(Lib { tracks, playlists, source: "test".into() }), status: String::new(), done: true, version: 1, run: 1 }));
         let _ = k;
-        Music::build(state, waker, engine, load)
+        let mut m = Music::build(state, waker, engine, load);
+        m.scan = fake_scan;
+        m
+    }
+
+    /// A "rescan" that finds five songs, without touching the disk.
+    fn fake_scan(_folders: Vec<String>, slot: Arc<Mutex<Load>>, waker: Arc<Mutex<Option<Waker>>>) {
+        let mut l = slot.lock().unwrap();
+        l.run += 1;
+        let tracks = (0..5).map(|i| Track { id: format!("t{i}"), path: format!("/nope/{i}.mp3").into(), title: format!("Rescanned {i}"), ..Default::default() }).collect();
+        l.lib = Some(Lib { tracks, playlists: vec![], source: "test".into() });
+        (l.status, l.done) = (String::new(), true);
+        l.version += 1;
+        drop(l);
+        wake(&waker);
     }
 
     #[test]
@@ -1111,6 +1185,54 @@ mod tests {
         assert_eq!(sh.index, 2, "tried to the end of the list, then stopped");
     }
 
+    /// F12 / /play before the library has loaded: remembered, and the last song played starts once it's in.
+    #[test]
+    fn music_play_before_the_library_is_in() {
+        let mut k = Kit::new();
+        let state = Arc::new(Mutex::new(State { last: Some("t2".into()), ..State::default() }));
+        let waker = Arc::new(Mutex::new(None));
+        let engine = Engine::new(state.clone(), waker.clone(), false);
+        let load = Arc::new(Mutex::new(Load::default()));
+        let mut p = Music::build(state, waker, engine, load.clone());
+        // not focused: F12 from another app (App::key sends it as AppKey("music", ' '))
+        let mut cx_actions = vec![];
+        let mut cx = crate::pane::Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut cx_actions, focused: false, time: 1.0 };
+        p.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &mut cx);
+        assert!(p.play_when_loaded);
+        // the library arrives (none of these files exist, so the engine reports it can't open the song)
+        let tracks: Vec<Track> = (0..4).map(|i| Track { id: format!("t{i}"), path: format!("/nope/{i}.mp3").into(), title: format!("song {i}"), ..Default::default() }).collect();
+        *load.lock().unwrap() = Load { lib: Some(Lib { tracks, playlists: vec![], source: "test".into() }), status: String::new(), done: true, version: 1, run: 1 };
+        k.render(&mut p, 150, 30);
+        assert!(!p.play_when_loaded);
+        assert_eq!(p.sel, 2, "the last song played is picked");
+        for _ in 0..40 {
+            k.wait_wake(&mut p, 50);
+            if p.snap().error.is_some() {
+                break;
+            }
+        }
+        let sh = p.engine.shared.lock().unwrap();
+        assert_eq!(sh.queue.first().map(|t| t.id.as_str()), Some("t0"), "the whole view is queued");
+        assert!(sh.track.is_some(), "it tried to play");
+    }
+
+    #[test]
+    fn music_rescan_key() {
+        let mut k = Kit::new();
+        let mut p = fake(&k, 3);
+        k.render(&mut p, 150, 30);
+        let run = p.load.lock().unwrap().run;
+        k.key(&mut p, KeyCode::Char('R'));
+        assert!(!p.loaded && p.load.lock().unwrap().run == run + 1, "a new scan, which an older one can't publish over");
+        assert!(k.notices().iter().any(|n| n.contains("rescanning")));
+        let s = k.render(&mut p, 150, 30);
+        assert!(p.loaded && p.lib.tracks.len() == 5 && s.contains("Rescanned 4"), "{s}");
+        // the empty state says how to get songs in, and that R looks again
+        let mut p = fake(&k, 0);
+        let s = k.render(&mut p, 150, 30);
+        assert!(s.contains("no songs found") && s.contains("R rescans"), "{s}");
+    }
+
     #[test]
     fn music_types_altgr_chars_in_search() {
         let mut k = Kit::new();
@@ -1176,7 +1298,7 @@ mod tests {
         assert!(s.playing, "not playing: {:?}", s.error);
         assert!(s.pos > 0.3, "position didn't move: {}", s.pos);
         assert!(p.badge().unwrap().starts_with('▶'));
-        assert_eq!(state.lock().unwrap().plays.values().sum::<u64>(), 1);
+        assert_eq!(state.lock().unwrap().plays.values().sum::<u64>(), 0, "a second of it isn't a play yet");
         // seek + pause
         k.key(&mut p, KeyCode::Right);
         k.wait_wake(&mut p, 300);
