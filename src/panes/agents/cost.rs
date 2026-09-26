@@ -13,7 +13,7 @@ pub struct Cost {
 }
 
 /// $/MTok: input, 5-minute cache write, 1-hour cache write, cache read, output.
-fn claude_price(model: &str) -> (f64, f64, f64, f64, f64) {
+pub(super) fn claude_price(model: &str) -> (f64, f64, f64, f64, f64) {
     let m = model.to_lowercase();
     if m.contains("opus-5-5") || m.contains("opus-5.5") {
         (4.0, 5.0, 8.0, 0.20, 20.0)
@@ -138,7 +138,7 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
 // ------------------------------------------------------------------ codex
 
 /// $/MTok: input, cached input, output.
-fn codex_price(model: &str) -> (f64, f64, f64) {
+pub(super) fn codex_price(model: &str) -> (f64, f64, f64) {
     let m = model.to_lowercase();
     if m.contains("sol") {
         (4.0, 0.40, 20.0)

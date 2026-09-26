@@ -5,21 +5,21 @@ use super::*;
 use crate::testkit::Kit;
 use crossterm::event::KeyCode;
 
-fn scratch(name: &str) -> PathBuf {
+pub(super) fn scratch(name: &str) -> PathBuf {
     let nanos = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("test-scratch").join(format!("agents-{name}-{nanos}"));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
 
-fn sh(dir: &Path, args: &[&str]) -> String {
+pub(super) fn sh(dir: &Path, args: &[&str]) -> String {
     let o = git::run(dir, args);
     assert!(o.ok, "git {args:?} failed: {}", o.stderr);
     o.stdout.trim().to_string()
 }
 
 /// A fresh repo with one commit on master.
-fn temp_repo(dir: &Path) -> PathBuf {
+pub(super) fn temp_repo(dir: &Path) -> PathBuf {
     let repo = dir.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     sh(&repo, &["init", "-q", "-b", "master"]);
@@ -33,7 +33,7 @@ fn temp_repo(dir: &Path) -> PathBuf {
     repo
 }
 
-fn noop_agent() -> (String, Vec<String>) {
+pub(super) fn noop_agent() -> (String, Vec<String>) {
     if cfg!(windows) { ("cmd.exe".into(), vec!["/c".into(), "exit".into()]) } else { ("true".into(), vec![]) }
 }
 
@@ -45,7 +45,7 @@ fn pane(dir: &Path, repo: &Path) -> Agents {
 }
 
 /// Poll until `cond` holds (or fail after `ms`).
-fn until(k: &mut Kit, p: &mut Agents, ms: u64, what: &str, cond: impl Fn(&Agents) -> bool) {
+pub(super) fn until(k: &mut Kit, p: &mut Agents, ms: u64, what: &str, cond: impl Fn(&Agents) -> bool) {
     let deadline = Instant::now() + Duration::from_millis(ms);
     loop {
         k.poll(p);
@@ -308,11 +308,11 @@ fn agents_plan_parse_and_args() {
 }
 
 /// A board with a card in every state, for the snapshots.
-fn demo(dir: &Path) -> Agents {
+pub(super) fn demo(dir: &Path) -> Agents {
     let mut p = Agents::with_paths(Paths { agents: dir.join("agents"), wt: dir.join("wt") });
     p.booted = true;
     p.repo_loading = false;
-    p.repo = Some(git::RepoInfo { root: PathBuf::from(if cfg!(windows) { r"C:\Code\devtools\oriel" } else { "/home/leif/code/oriel" }), name: "oriel".into(), branch: "master".into() });
+    p.repo = Some(git::RepoInfo { root: PathBuf::from(if cfg!(windows) { r"C:\code\demo" } else { "/home/you/code/demo" }), name: "demo".into(), branch: "master".into() });
     p.agents = KINDS.iter().map(|k| (k.0, if k.0 == "kimi" { None } else { Some(PathBuf::from(k.0)) })).collect();
     let repo = p.repo_key();
     let now = store::now();
@@ -351,7 +351,7 @@ fn demo(dir: &Path) -> Agents {
         (t.added, t.removed, t.files) = (940, 18, 11);
         t.finished = now - 7000;
     });
-    p.store.repos = vec![repo, if cfg!(windows) { r"C:\Code\games\rnr-drift".into() } else { "/home/leif/code/rnr-drift".into() }];
+    p.store.repos = vec![repo, if cfg!(windows) { r"C:\code\website".into() } else { "/home/you/code/website".into() }];
     p
 }
 
@@ -368,7 +368,7 @@ fn agents_snapshots_board_form_diff() {
     }
     let side = k.render_side(&mut p, 30, 16);
     println!("{side}");
-    assert!(side.contains("new task") && side.contains("rnr-drift") && side.contains("running"));
+    assert!(side.contains("new task") && side.contains("website") && side.contains("running"));
     assert_eq!(p.badge().as_deref(), Some("1 running · 1 ⚠"));
 
     // the new-task form, part filled in
@@ -416,7 +416,7 @@ fn agents_snapshots_empty_and_picker() {
     assert!(matches!(p.mode, Mode::Repo(_)));
     let picker = snap(&mut k, &mut p, "repo");
     println!("{picker}");
-    assert!(picker.contains("open a repo") && picker.contains("rnr-drift"));
+    assert!(picker.contains("open a repo") && picker.contains("website"));
     // a path that isn't a repo: an error, the picker stays
     k.typ(&mut p, &dir.join("nope").display().to_string());
     k.key(&mut p, KeyCode::Enter);

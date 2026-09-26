@@ -68,11 +68,168 @@ pub struct Task {
     pub finished: i64,
     /// Follow-up sessions started with `c` (0 = only the first run).
     pub followups: u32,
+    /// "headless" = runs in the background with its output parsed (lead runs); anything else = a terminal tab.
+    pub mode: String,
+    /// The lead run this task belongs to (empty = made by hand).
+    pub run: String,
+    /// The roster worker running it, and its tier.
+    pub worker: String,
+    pub tier: String,
+    /// Waiting in TODO for a free worker slot (lead runs start these by themselves).
+    pub queued: bool,
+    /// Caps from the roster: claude --max-turns / --max-budget-usd (others are stopped past the budget).
+    pub max_turns: u32,
+    pub budget_usd: f64,
+    /// Files the agent edited, as it reported them.
+    pub touched: Vec<String>,
+    /// Its last few actions, newest last ("Edit src/app.rs").
+    pub recent: Vec<String>,
+    /// Last conflict check against the branch it merges into: files that conflict (empty = clean or unknown).
+    pub conflicts: Vec<String>,
+    // ---- the lead's plan for it
+    /// The lead's own id for this task (what its depends_on lists use).
+    pub key: String,
+    /// Globs it may edit, files to read first, tasks (keys or ids) that must be merged before it starts.
+    pub owns: Vec<String>,
+    pub reads: Vec<String>,
+    pub depends_on: Vec<String>,
+    /// A command that proves it works; part of its merge gate.
+    pub acceptance: String,
+    /// S | M
+    pub size: String,
+    pub kind: String,
+    // ---- what happened
+    /// The worker's closing report: summary, blocked/done, questions.
+    pub summary: String,
+    pub blocked: bool,
+    pub questions: Vec<String>,
+    /// Lines changed per file: (path, added, removed).
+    pub file_stats: Vec<(String, u64, u64)>,
+    /// Last merge gate: "" = not run, else "pass" or the first lines of the failure.
+    pub gate: String,
+    /// Fix rounds in the same session after a conflict or gate failure, and fresh re-dispatches.
+    pub attempts: u32,
+    pub redispatches: u32,
+    /// The lead asked to merge it: after a fix round, oriel merges it by itself.
+    pub want_merge: bool,
+    /// Notes carried into a fresh re-dispatch (what went wrong before).
+    pub history: Vec<String>,
+}
+
+/// How a roster worker has done so far (shown to the lead in roster()).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct Record {
+    pub tasks: u32,
+    pub merged: u32,
+    pub first_try: u32,
+    pub gate_fails: u32,
+    pub conflicts: u32,
+    pub retries: u32,
+    pub failed: u32,
+    pub tokens: u64,
+    pub cost_usd: f64,
+    pub secs: i64,
 }
 
 impl Task {
     pub fn tag(&self) -> String {
         format!("agent-task:{}", self.id)
+    }
+    pub fn headless(&self) -> bool {
+        self.mode == "headless"
+    }
+    /// Remember an action for the card and task_status (keeps the last dozen).
+    pub fn remember(&mut self, s: &str) {
+        let s: String = s.chars().take(160).collect();
+        if s.is_empty() || self.recent.last() == Some(&s) {
+            return;
+        }
+        self.recent.push(s);
+        if self.recent.len() > 12 {
+            self.recent.remove(0);
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RunState {
+    /// making the integration branch
+    #[default]
+    Starting,
+    /// the lead is working
+    Running,
+    /// the lead finished: the integration branch is ready for the user's review
+    Review,
+    /// the user merged the integration branch
+    Merged,
+    /// stopped by the user (or the lead failed); the integration branch is kept
+    Stopped,
+    /// thrown away: the integration branch is gone
+    Discarded,
+}
+
+impl RunState {
+    pub fn active(self) -> bool {
+        matches!(self, RunState::Starting | RunState::Running)
+    }
+    /// Still worth showing at the top of the board.
+    pub fn open(self) -> bool {
+        matches!(self, RunState::Starting | RunState::Running | RunState::Review | RunState::Stopped)
+    }
+}
+
+/// A lead run: one goal, one lead agent orchestrating workers, one integration branch they all merge into.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct Run {
+    pub id: String,
+    pub repo: String,
+    pub goal: String,
+    /// The lead agent (claude | codex | kimi) and its model.
+    pub agent: String,
+    pub model: String,
+    /// "mcp" = the lead calls oriel's tools itself; "text" = it answers with JSON actions each turn.
+    pub protocol: String,
+    pub state: RunState,
+    /// oriel/lead-<slug>: every worker branches off it and is squash-merged back into it.
+    pub branch: String,
+    /// The user's branch it started from (and merges into at the end), and its commit then.
+    pub base_branch: String,
+    pub base_sha: String,
+    /// The lead's own read-only checkout of the integration branch.
+    pub worktree: String,
+    pub session_id: String,
+    /// The lead's own spend, and the caps.
+    pub cost_usd: f64,
+    pub lead_budget_usd: f64,
+    pub budget_usd: f64,
+    pub max_parallel: u32,
+    /// What the lead did, one line each, newest last (kept short).
+    pub log: Vec<String>,
+    /// Progress notes the lead posted (unix secs, text).
+    pub notes: Vec<(i64, String)>,
+    /// The lead's closing summary.
+    pub summary: String,
+    pub error: String,
+    /// Lead turns so far (text protocol) or 1 (MCP).
+    pub turns: u32,
+    pub merged: u32,
+    pub created: i64,
+    pub finished: i64,
+}
+
+impl Run {
+    pub fn log(&mut self, s: &str) {
+        let s: String = s.replace('\n', " ").chars().take(200).collect();
+        if s.trim().is_empty() {
+            return;
+        }
+        self.log.push(s);
+        if self.log.len() > 60 {
+            self.log.remove(0);
+        }
     }
 }
 
@@ -82,6 +239,9 @@ pub struct Store {
     /// Repos the board has worked on, most recent first.
     pub repos: Vec<String>,
     pub tasks: Vec<Task>,
+    pub runs: Vec<Run>,
+    /// Per roster worker name.
+    pub records: std::collections::BTreeMap<String, Record>,
 }
 
 /// Where the orchestrator keeps things. `agents` = tasks.json + status/, `wt` = the worktrees.

@@ -3,16 +3,34 @@
 //! hooks (`oriel report`) and the terminal's screen-scraped activity say what it's doing; a diff view reviews
 //! the work, and `m` squash-merges it back. Design: docs/ai-research.md §3.
 //!
+//! Lead mode (`L`, lead.rs): one goal, a lead agent of the user's choosing (Claude Code, Codex, Kimi Code)
+//! orchestrating headless workers from the roster on an integration branch, through oriel's MCP tools (mcp.rs)
+//! or a JSON text protocol. `w` watches it all side by side, `t` takes a worker over in a terminal tab.
+//!
 //! Nothing slow runs on the UI thread: git, transcript parsing and status-file reads all happen on background
 //! threads that send a `Msg` back and wake the pane.
 
 mod cost;
 mod git;
 mod input;
+mod lead;
+#[cfg(test)]
+mod lead_tests;
+mod lead_view;
+mod mcp;
+mod plan;
+mod roster;
+mod run;
 mod store;
+mod stream;
 #[cfg(test)]
 mod tests;
 mod view;
+
+/// `oriel mcp-lead <port> <token>`: the MCP stdio server a lead's CLI starts (bridges to the running oriel).
+pub fn mcp_lead(port: &str, token: &str) {
+    mcp::serve_stdio(port, token);
+}
 
 use crate::pane::{Action, Activity, Cx, Pane, Waker};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -21,7 +39,7 @@ use ratatui::{
     Frame,
     layout::{Position, Rect},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -118,6 +136,28 @@ enum Msg {
     Merged(String, Result<String, String>),
     Removed(String, Result<(), String>, Then),
     Plan(Result<(Vec<(String, String)>, f64), String>),
+    // ---- lead mode
+    /// A headless worker's live event, and its end.
+    Worker(String, stream::Ev),
+    WorkerDone(String, run::Outcome),
+    /// Post-run check: per-file stats, conflicts with the integration branch, a finished conflict resolution.
+    Checked(String, Option<Vec<(String, u64, u64)>>, Result<Vec<String>, String>, Option<Result<(), String>>),
+    /// The lead's live event, the end of one of its turns, its end.
+    Lead(String, stream::Ev),
+    LeadTurn(String, run::Outcome),
+    LeadDone(String, Result<String, String>),
+    /// The lead's MCP tools didn't load: it continues on the text protocol.
+    LeadProto(String),
+    /// A lead tool call to answer.
+    Call(mcp::Call),
+    RunStarted(String, Result<git::RunStarted, String>),
+    RunMerged(String, Result<String, git::MergeErr>),
+    Resolve(String, Result<Vec<String>, String>, Option<lead::Reply>),
+    Redispatched(String, Result<(), String>, crate::config::RosterEntry),
+    RunFinal(String, Result<String, String>),
+    RunCleaned(String, Result<(), String>),
+    TookOver(String),
+    Limits(roster::Limits),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -142,6 +182,28 @@ struct Live {
     /// a git job is running for it
     busy: bool,
     refreshed: Option<Instant>,
+    // ---- headless (lead-mode) workers
+    /// Its live transcript.
+    log: Vec<stream::Entry>,
+    /// Set while its process runs; storing true stops it.
+    stop: Option<Arc<AtomicBool>>,
+    /// Cost/tokens before this process started (follow-ups add to them).
+    cost_base: f64,
+    tokens_base: u64,
+    /// When it stops: open it in a terminal tab / discard it (answer the lead) / the watchdog's (reason, fresh).
+    takeover: bool,
+    discard: Option<lead::Reply>,
+    nudge: Option<(String, bool)>,
+    /// Answer the lead once a removal finishes.
+    reply: Option<lead::Reply>,
+    resolving: bool,
+    checking: bool,
+    // watchdog evidence
+    last_event: Option<Instant>,
+    repeat: (String, u32),
+    fails: HashMap<String, u32>,
+    calls_since_edit: u32,
+    nudged: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -150,6 +212,9 @@ enum Pending {
     Discard,
     Delete,
     Retry,
+    StopRun,
+    MergeRun,
+    DiscardRun,
 }
 
 struct Confirm {
@@ -184,6 +249,59 @@ struct Picker {
     checking: bool,
 }
 
+/// `L`: a new lead run.
+struct LeadForm {
+    field: usize, // 0 goal, 1 lead agent, 2 model, 3 max parallel, 4 run budget, 5 start
+    goal: Input,
+    agent: usize,
+    model: Input,
+    parallel: Input,
+    budget: Input,
+    err: String,
+}
+
+/// `R`: the roster, editable.
+struct RosterView {
+    sel: usize,
+    edit: Option<RosterEdit>,
+}
+
+struct RosterEdit {
+    /// None = a new worker
+    idx: Option<usize>,
+    field: usize, // 0 name, 1 agent, 2 model, 3 tier, 4 good at, 5 max turns, 6 budget, 7 save
+    name: Input,
+    agent: usize,
+    model: Input,
+    tier: usize,
+    good_at: Input,
+    turns: Input,
+    budget: Input,
+    enabled: bool,
+    err: String,
+}
+
+/// `w`: the lead and its workers side by side, live.
+struct WatchView {
+    run: String,
+    sel: usize,
+}
+
+/// One agent's live transcript, full screen.
+#[derive(Clone, PartialEq)]
+enum LogTarget {
+    Lead(String),
+    Task(String),
+}
+
+struct LogView {
+    target: LogTarget,
+    /// Lines up from the bottom (0 = follow the newest).
+    scroll: usize,
+    /// Came from the watch view (esc goes back there).
+    back: Option<String>,
+}
+
 enum Mode {
     Board,
     Form(Form),
@@ -192,6 +310,10 @@ enum Mode {
     Comment(String, Input),
     Plan(Input),
     Repo(Picker),
+    LeadForm(LeadForm),
+    Roster(RosterView),
+    Watch(WatchView),
+    Log(LogView),
 }
 
 #[derive(Clone)]
@@ -202,6 +324,8 @@ enum Hit {
     DiffBody,
     Repo(String),
     NewTask,
+    LeadPanel,
+    Tile(usize),
 }
 
 pub struct Agents {
@@ -236,11 +360,42 @@ pub struct Agents {
     fake_agent: Option<(String, Vec<String>)>,
     /// Tests: detect the repo here instead of the current directory.
     start_dir: Option<PathBuf>,
+    // ---- lead mode
+    lead_cfg: crate::config::LeadConfig,
+    /// The config's roster (empty = defaults from what's installed, see `roster()`).
+    roster: Vec<crate::config::RosterEntry>,
+    runs_live: HashMap<String, lead::RunLive>,
+    waiters: Vec<lead::Waiter>,
+    /// Held by every git job that touches a worktree's real index or the integration branch.
+    merge_lock: Arc<Mutex<()>>,
+    merge_queue: VecDeque<String>,
+    merging: Option<String>,
+    limits: roster::Limits,
+    limit_paths: Option<roster::LimitPaths>,
+    limits_read: Option<Instant>,
+    /// Vendors paused by a rejected rate limit, until (unix secs).
+    paused: HashMap<String, i64>,
+    /// When a worker on (agent, model) last started (starts are staggered so caches warm up).
+    last_start: HashMap<(String, String), Instant>,
+    stagger: Duration,
+    hung_after: Duration,
+    /// The lead panel at the top of the board has the keyboard.
+    lead_focus: bool,
+    /// Tests: run these instead of real workers / leads.
+    fake_worker: Option<run::Fake>,
+    fake_lead: Option<run::Fake>,
+    /// The oriel binary lead CLIs start as their MCP server (tests point it at the built binary).
+    mcp_exe: Option<PathBuf>,
 }
 
 impl Agents {
-    pub fn new(_cfg: &crate::config::Config) -> Self {
-        Self::with_paths(Paths::default())
+    pub fn new(cfg: &crate::config::Config) -> Self {
+        let mut a = Self::with_paths(Paths::default());
+        a.lead_cfg = cfg.lead.clone();
+        a.roster = cfg.roster.clone();
+        a.stagger = Duration::from_secs(cfg.lead.stagger_s as u64);
+        a.limit_paths = Some(roster::LimitPaths::real());
+        a
     }
 
     fn with_paths(paths: Paths) -> Self {
@@ -266,7 +421,7 @@ impl Agents {
         for t in &store.tasks {
             live.insert(t.id.clone(), Live { since: Some(Instant::now()), ..Default::default() });
         }
-        Agents {
+        let mut a = Agents {
             paths,
             store,
             repo: None,
@@ -292,7 +447,27 @@ impl Agents {
             hook_exe: std::env::current_exe().ok(),
             fake_agent: None,
             start_dir: None,
-        }
+            lead_cfg: crate::config::LeadConfig::default(),
+            roster: vec![],
+            runs_live: HashMap::new(),
+            waiters: vec![],
+            merge_lock: Arc::new(Mutex::new(())),
+            merge_queue: VecDeque::new(),
+            merging: None,
+            limits: roster::Limits::default(),
+            limit_paths: None,
+            limits_read: None,
+            paused: HashMap::new(),
+            last_start: HashMap::new(),
+            stagger: Duration::from_secs(5),
+            hung_after: Duration::from_secs(300),
+            lead_focus: false,
+            fake_worker: None,
+            fake_lead: None,
+            mcp_exe: None,
+        };
+        a.settle_after_restart();
+        a
     }
 
     // ------------------------------------------------------------------ plumbing
@@ -438,14 +613,12 @@ impl Agents {
 
     fn today(&self) -> f64 {
         let now = crate::panes::files::clock::local(store::now());
-        self.store
-            .tasks
-            .iter()
-            .filter(|t| {
-                let d = crate::panes::files::clock::local(t.started.max(t.created));
-                (d.year, d.month, d.day) == (now.year, now.month, now.day)
-            })
-            .fold(0.0, |a, t| a + t.cost_usd)
+        let same = |t: i64| {
+            let d = crate::panes::files::clock::local(t);
+            (d.year, d.month, d.day) == (now.year, now.month, now.day)
+        };
+        // workers, plus the leads that orchestrated them
+        self.store.tasks.iter().filter(|t| same(t.started.max(t.created))).fold(0.0, |a, t| a + t.cost_usd) + self.store.runs.iter().filter(|r| same(r.created)).fold(0.0, |a, r| a + r.cost_usd)
     }
 
     // ------------------------------------------------------------------ the state machine
@@ -461,11 +634,38 @@ impl Agents {
         if self.follow_tabs(cx) {
             dirty = true;
         }
+        // lead mode: start what can start, merge what's queued, watch the workers, answer waits
+        let runs = self.store.runs.iter().any(|r| r.state.active()) || !self.merge_queue.is_empty() || self.merging.is_some() || self.live.values().any(|l| l.stop.is_some());
+        if runs || !self.waiters.is_empty() {
+            let before = (self.store.tasks.iter().filter(|t| t.status == Status::Running).count(), self.merge_queue.len(), self.merging.clone());
+            self.schedule(cx);
+            self.pump_merges(cx);
+            self.watchdog();
+            self.check_waiters();
+            self.watch_budgets(cx);
+            if before != (self.store.tasks.iter().filter(|t| t.status == Status::Running).count(), self.merge_queue.len(), self.merging.clone()) {
+                dirty = true;
+            }
+        }
+        self.refresh_limits(cx, runs);
         if dirty {
             self.save();
         }
-        let any = self.store.tasks.iter().any(|t| t.status.active());
+        let any = self.store.tasks.iter().any(|t| t.status.active()) || runs;
         self.active.store(any, Ordering::Relaxed);
+    }
+
+    /// Plan limits for the roster: read at boot and every minute while a run is going (background).
+    fn refresh_limits(&mut self, cx: &Cx, running: bool) {
+        let Some(p) = self.limit_paths.clone() else { return };
+        let due = match self.limits_read {
+            None => true,
+            Some(t) => running && t.elapsed() > Duration::from_secs(60),
+        };
+        if due {
+            self.limits_read = Some(Instant::now());
+            self.spawn(cx, move |send| send(Msg::Limits(roster::read(&p, store::now()))));
+        }
     }
 
     fn on_msg(&mut self, m: Msg, cx: &mut Cx) {
@@ -570,6 +770,17 @@ impl Agents {
             }
             Msg::Removed(id, r, then) => {
                 self.live(&id).busy = false;
+                if let Some(reply) = self.live(&id).reply.take() {
+                    let _ = reply.send(r.clone().map(|_| format!("{id} discarded")));
+                    if r.is_ok() {
+                        if let Some(run) = self.task(&id).map(|t| t.run.clone()) {
+                            let title = self.task(&id).map(|t| t.title.clone()).unwrap_or_default();
+                            if let Some(x) = self.run_mut(&run) {
+                                x.log(&format!("discarded {title}"));
+                            }
+                        }
+                    }
+                }
                 let sp = self.paths.status(&id);
                 let Some(t) = self.task_mut(&id) else { return };
                 match r {
@@ -614,13 +825,40 @@ impl Agents {
                     Err(e) => cx.notify(format!("plan failed: {e}")),
                 }
             }
+            Msg::Worker(id, e) => self.on_worker_ev(&id, e),
+            Msg::WorkerDone(id, o) => self.on_worker_done(&id, o, cx),
+            Msg::Checked(id, stats, conflicts, resolved) => self.on_checked(&id, stats, conflicts, resolved, cx),
+            Msg::Lead(id, e) => self.on_lead_ev(&id, e),
+            Msg::LeadTurn(id, o) => self.on_lead_turn(&id, o),
+            Msg::LeadDone(id, r) => self.on_lead_done(&id, r, cx),
+            Msg::LeadProto(id) => {
+                if let Some(r) = self.run_mut(&id) {
+                    r.protocol = "text".into();
+                    r.log("MCP tools didn't load — switched to the text protocol");
+                }
+            }
+            Msg::Call(c) => self.on_call(c, cx),
+            Msg::RunStarted(id, r) => self.on_run_started(&id, r, cx),
+            Msg::RunMerged(id, r) => self.on_run_merged(&id, r, cx),
+            Msg::Resolve(id, r, reply) => self.on_resolve(&id, r, reply, cx),
+            Msg::Redispatched(id, r, w) => self.on_redispatched(&id, r, w, cx),
+            Msg::RunFinal(id, r) => self.on_run_final(&id, r, cx),
+            Msg::RunCleaned(id, r) => self.on_run_cleaned(&id, r, cx),
+            Msg::TookOver(id) => self.on_took_over(&id, cx),
+            Msg::Limits(l) => {
+                // keep numbers the workers' own streams reported more recently
+                if !l.claude.is_empty() || self.limits.claude.is_empty() {
+                    self.limits.claude = l.claude;
+                }
+                self.limits.codex = l.codex;
+            }
         }
     }
 
     fn on_status(&mut self, id: &str, st: StatusFile, cx: &mut Cx) {
         let run_ts = self.live(id).run_ts;
         let Some(t) = self.task(id) else { return };
-        if st.ts + 2 < run_ts || !matches!(t.status, Status::Running | Status::Blocked | Status::Review) {
+        if t.headless() || st.ts + 2 < run_ts || !matches!(t.status, Status::Running | Status::Blocked | Status::Review) {
             return;
         }
         let refresh = {
@@ -693,10 +931,13 @@ impl Agents {
         }
         self.live(id).refreshed = Some(Instant::now());
         let id = id.to_string();
+        // tasks that ran headless before a take-over already know their cost from their stream
+        let from_stream = !t.run.is_empty();
         self.spawn(cx, move |send| {
             let wt = PathBuf::from(&t.worktree);
             let stats = if wt.is_dir() && !t.base_sha.is_empty() { git::stats(&wt, &t.base_sha).ok() } else { None };
             let c = match t.agent.as_str() {
+                _ if from_stream => None,
                 "claude" => Some(cost::claude_for_dir(&wt, &t.transcript_path, t.started)),
                 "codex" => Some(cost::codex_for_dir(&wt, t.started)),
                 _ => None,
@@ -709,7 +950,7 @@ impl Agents {
     fn follow_tabs(&mut self, cx: &mut Cx) -> bool {
         let Some(tagged) = self.tagged.clone() else { return false };
         let mut changed = false;
-        let ids: Vec<String> = self.store.tasks.iter().filter(|t| matches!(t.status, Status::Running | Status::Blocked | Status::Review)).map(|t| t.id.clone()).collect();
+        let ids: Vec<String> = self.store.tasks.iter().filter(|t| !t.headless() && matches!(t.status, Status::Running | Status::Blocked | Status::Review)).map(|t| t.id.clone()).collect();
         for id in ids {
             let tag = self.task(&id).unwrap().tag();
             let found = tagged.iter().find(|(t, _)| *t == tag).map(|x| x.1);
@@ -808,7 +1049,8 @@ impl Agents {
     /// TODO -> RUNNING: make the worktree (background), then open the agent's tab (on_started).
     fn start(&mut self, id: &str, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
-        if self.fake_agent.is_none() && self.installed(&t.agent).is_none() {
+        let faked = if t.headless() { self.fake_worker.is_some() } else { self.fake_agent.is_some() };
+        if !faked && self.installed(&t.agent).is_none() {
             let msg = format!("{} isn't installed — edit the task (e) to pick another agent", t.agent);
             self.task_mut(id).unwrap().error = msg.clone();
             cx.notify(msg);
@@ -817,10 +1059,20 @@ impl Agents {
         if self.live(id).busy {
             return;
         }
-        let Some(repo) = self.repo.clone() else { return };
+        // lead-run tasks branch off the run's integration branch, in the run's repo
+        let base = if t.run.is_empty() { None } else { self.run_ref(&t.run).map(|r| r.branch.clone()) };
+        let (root, name) = match (&base, &self.repo) {
+            (Some(_), _) => {
+                let root = PathBuf::from(&t.repo);
+                let name = root.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "repo".into());
+                (root, name)
+            }
+            (None, Some(r)) => (r.root.clone(), r.name.clone()),
+            (None, None) => return,
+        };
         let slug = store::slug(&t.title, &t.id);
-        let wt = self.paths.wt.join(&repo.name).join(&slug);
-        let hook = if t.agent == "claude" { self.hook_exe.clone() } else { None };
+        let wt = self.paths.wt.join(&name).join(&slug);
+        let hook = if t.agent == "claude" && !t.headless() { self.hook_exe.clone() } else { None };
         let _ = std::fs::remove_file(self.paths.status(id));
         {
             let t = self.task_mut(id).unwrap();
@@ -832,24 +1084,32 @@ impl Agents {
             t.question.clear();
             t.last = "creating worktree…".into();
         }
-        *self.live(id) = Live { busy: true, since: Some(Instant::now()), run_ts: store::now(), ..Default::default() };
-        self.select(id);
+        let log = std::mem::take(&mut self.live(id).log);
+        *self.live(id) = Live { busy: true, since: Some(Instant::now()), run_ts: store::now(), log, ..Default::default() };
+        if !t.headless() {
+            self.select(id);
+        }
         self.save();
-        let (id2, root) = (id.to_string(), repo.root.clone());
-        self.spawn(cx, move |send| send(Msg::Started(id2.clone(), git::start(&root, &wt, &slug, &id2, hook.as_deref()))));
+        let id2 = id.to_string();
+        self.spawn(cx, move |send| send(Msg::Started(id2.clone(), git::start_at(&root, &wt, &slug, &id2, hook.as_deref(), base.as_deref()))));
     }
 
     fn on_started(&mut self, id: &str, r: Result<git::Started, String>, cx: &mut Cx) {
         self.live(id).busy = false;
         match r {
             Err(e) => {
+                let headless = self.task(id).is_some_and(|t| t.headless());
                 if let Some(t) = self.task_mut(id) {
-                    t.status = Status::Todo;
+                    t.status = if headless { Status::Review } else { Status::Todo };
                     t.last.clear();
                     t.error = e.clone();
                 }
                 cx.notify(format!("couldn't start: {e}"));
-                self.select(id);
+                if headless {
+                    self.event_failed(id);
+                } else {
+                    self.select(id);
+                }
             }
             Ok(s) => {
                 let Some(t) = self.task_mut(id) else { return };
@@ -857,15 +1117,28 @@ impl Agents {
                 t.base_branch = s.base_branch;
                 t.base_sha = s.base_sha;
                 t.worktree = s.worktree.display().to_string();
-                t.last = format!("starting {}…", t.agent);
+                t.last = format!("starting {}…", if t.worker.is_empty() { &t.agent } else { &t.worker });
                 let t = t.clone();
-                self.open_agent(&t, &t.prompt, false, cx);
+                if t.headless() {
+                    self.start_worker(id, cx);
+                } else {
+                    self.open_agent(&t, &t.prompt, false, cx);
+                }
             }
         }
     }
 
+    fn event_failed(&mut self, id: &str) {
+        self.event(id, "failed");
+    }
+
     /// Open (or re-open) the task's agent tab in its worktree.
     fn open_agent(&mut self, t: &Task, prompt: &str, followup: bool, cx: &mut Cx) {
+        self.open_agent_with(t, agent_args(&t.agent, &t.model, prompt, followup), cx);
+    }
+
+    /// Open the task's agent tab with exactly these arguments.
+    fn open_agent_with(&mut self, t: &Task, agent_args: Vec<String>, cx: &mut Cx) {
         let (prog, args) = match &self.fake_agent {
             Some(f) => f.clone(),
             None => {
@@ -873,7 +1146,7 @@ impl Agents {
                     cx.notify(format!("{} isn't installed", t.agent));
                     return;
                 };
-                wrap_cmd(&bin, agent_args(&t.agent, &t.model, prompt, followup), &t.id)
+                wrap_cmd(&bin, agent_args, &t.id)
             }
         };
         let icon = KINDS.iter().find(|k| k.0 == t.agent).map(|k| k.1).unwrap_or("robot");
@@ -892,11 +1165,33 @@ impl Agents {
         }
         self.mode = Mode::Diff(DiffView { id: id.to_string(), data: None, file: 0, scroll: 0 });
         let id = id.to_string();
-        self.spawn(cx, move |send| send(Msg::Diff(id, git::diff(Path::new(&t.repo), Path::new(&t.worktree), &t.base_sha))));
+        // a lead-run task merges into its integration branch: check conflicts against that
+        let target = if t.run.is_empty() { None } else { self.run_ref(&t.run).map(|r| r.branch.clone()) };
+        self.spawn(cx, move |send| send(Msg::Diff(id, git::diff_against(Path::new(&t.repo), Path::new(&t.worktree), &t.base_sha, target.as_deref()))));
     }
 
     fn merge(&mut self, id: &str, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
+        if !t.run.is_empty() {
+            // a lead-run task lands on the run's integration branch, through the gated merge queue
+            if !t.headless() {
+                cx.act(Action::CloseTag(t.tag()));
+                if let Some(tm) = self.task_mut(id) {
+                    tm.mode = "headless".into();
+                    tm.status = Status::Review;
+                }
+            }
+            match self.queue_merge(id) {
+                Ok(_) => {
+                    let title = t.title.clone();
+                    if let Some(r) = self.run_mut(&t.run) {
+                        r.log(&format!("you queued {title} for merging"));
+                    }
+                }
+                Err(e) => cx.notify(e),
+            }
+            return;
+        }
         cx.act(Action::CloseTag(t.tag()));
         {
             let l = self.live(id);
@@ -937,6 +1232,15 @@ impl Agents {
             cx.notify("that task has no worktree any more");
             return;
         }
+        if t.headless() {
+            if self.live.get(id).is_some_and(|l| l.stop.is_some()) {
+                cx.notify("it's still working — comment when it's done, or t to take it over");
+                return;
+            }
+            self.worker_again(id, text, cx);
+            self.save();
+            return;
+        }
         self.open_agent(&t, text, true, cx);
         let tm = self.task_mut(id).unwrap();
         tm.status = Status::Running;
@@ -958,10 +1262,14 @@ impl Agents {
         self.spawn(cx, move |send| send(Msg::Plan(run_planner(&bin, &repo.root, &goal))));
     }
 
-    /// enter on a card: start it, jump to its agent, or review it.
+    /// enter on a card: start it, jump to its agent, or review it. Headless workers show their live transcript.
     fn activate(&mut self, cx: &mut Cx) {
         let Some(id) = self.selected() else { return };
         let t = self.task(&id).unwrap().clone();
+        if t.headless() {
+            self.mode = Mode::Log(LogView { target: LogTarget::Task(id), scroll: 0, back: None });
+            return;
+        }
         let pane = self.live(&id).pane;
         match t.status {
             Status::Todo => self.start(&id, cx),
@@ -982,7 +1290,11 @@ impl Agents {
         self.mode = Mode::Board;
         match c.what {
             Pending::Merge => self.merge(&c.id, cx),
+            Pending::Discard if self.task(&c.id).is_some_and(|t| !t.run.is_empty()) => self.discard_task(&c.id, None, cx),
             Pending::Discard => self.remove(&c.id, Then::Discarded, cx),
+            Pending::StopRun => self.stop_run(&c.id, cx),
+            Pending::MergeRun => self.merge_run(&c.id, cx),
+            Pending::DiscardRun => self.discard_run(&c.id, cx),
             Pending::Retry => self.remove(&c.id, Then::Retry, cx),
             Pending::Delete => {
                 self.store.tasks.retain(|t| t.id != c.id);
@@ -1044,14 +1356,54 @@ impl Agents {
 
     // ------------------------------------------------------------------ keys
 
+    /// Keys while the lead panel is focused. false = not ours (the board handles it).
+    fn lead_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
+        let Some(run) = self.current_run().cloned() else {
+            self.lead_focus = false;
+            return false;
+        };
+        match k.code {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.lead_focus = false,
+            KeyCode::Up | KeyCode::Char('k') => {}
+            KeyCode::Esc | KeyCode::Char('s') if run.state.active() => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::StopRun }),
+            KeyCode::Esc => self.lead_focus = false,
+            KeyCode::Char('w') => self.mode = Mode::Watch(WatchView { run: run.id, sel: 0 }),
+            KeyCode::Enter => self.mode = Mode::Log(LogView { target: LogTarget::Lead(run.id), scroll: 0, back: None }),
+            KeyCode::Char('d') if !run.branch.is_empty() => self.open_run_diff(&run.id, cx),
+            KeyCode::Char('m') if !run.state.active() && !run.branch.is_empty() => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::MergeRun }),
+            KeyCode::Char('x') => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::DiscardRun }),
+            KeyCode::Char('r') if run.state == store::RunState::Stopped => self.resume_run(&run.id, cx),
+            KeyCode::Char('d' | 'm' | 'r' | 's') => {}
+            _ => return false,
+        }
+        true
+    }
+
     fn board_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
+        if self.lead_focus {
+            if self.lead_key(k, cx) {
+                return true;
+            }
+        }
         let n = |s: &Self, c: usize| s.column(c).len();
         match k.code {
             KeyCode::Left | KeyCode::Char('h') => self.col = self.col.saturating_sub(1),
             KeyCode::Right | KeyCode::Char('l') => self.col = (self.col + 1).min(3),
             KeyCode::Tab => self.col = (self.col + 1) % 4,
             KeyCode::BackTab => self.col = (self.col + 3) % 4,
+            KeyCode::Up | KeyCode::Char('k') if self.row[self.col] == 0 && self.current_run().is_some() => self.lead_focus = true,
             KeyCode::Up | KeyCode::Char('k') => self.row[self.col] = self.row[self.col].min(n(self, self.col).saturating_sub(1)).saturating_sub(1),
+            KeyCode::Char('L') => {
+                if self.repo.is_some() {
+                    self.mode = Mode::LeadForm(self.new_lead_form());
+                }
+            }
+            KeyCode::Char('R') => self.mode = Mode::Roster(RosterView { sel: 0, edit: None }),
+            KeyCode::Char('w') => {
+                if let Some(r) = self.current_run() {
+                    self.mode = Mode::Watch(WatchView { run: r.id.clone(), sel: 0 });
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => self.row[self.col] = (self.row[self.col] + 1).min(n(self, self.col).saturating_sub(1)),
             KeyCode::Home | KeyCode::Char('g') => self.row[self.col] = 0,
             KeyCode::End | KeyCode::Char('G') => self.row[self.col] = n(self, self.col).saturating_sub(1),
@@ -1079,18 +1431,22 @@ impl Agents {
             }
             KeyCode::Enter => self.activate(cx),
             _ => {
-                let Some(id) = self.selected() else { return matches!(k.code, KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r')) };
+                let Some(id) = self.selected() else { return matches!(k.code, KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't')) };
                 let t = self.task(&id).unwrap().clone();
                 let busy = self.live(&id).busy;
                 let has_wt = !t.worktree.is_empty();
+                let running_headless = t.headless() && self.live(&id).stop.is_some();
+                let in_run = !t.run.is_empty();
                 match k.code {
                     KeyCode::Char('d') if has_wt => self.open_diff(&id, cx),
-                    KeyCode::Char('c') if has_wt && t.status != Status::Done && !busy => self.mode = Mode::Comment(id, Input::new("", true)),
-                    KeyCode::Char('m') if has_wt && !busy && matches!(t.status, Status::Review | Status::Running | Status::Blocked) => self.confirm(Pending::Merge),
-                    KeyCode::Char('x') if !busy && t.status == Status::Todo => self.confirm(Pending::Delete),
+                    KeyCode::Char('c') if has_wt && t.status != Status::Done && !busy && !running_headless => self.mode = Mode::Comment(id, Input::new("", true)),
+                    KeyCode::Char('m') if in_run && has_wt && !busy && t.status == Status::Review => self.confirm(Pending::Merge),
+                    KeyCode::Char('m') if !in_run && has_wt && !busy && matches!(t.status, Status::Review | Status::Running | Status::Blocked) => self.confirm(Pending::Merge),
+                    KeyCode::Char('x') if !busy && t.status == Status::Todo && !in_run => self.confirm(Pending::Delete),
                     KeyCode::Char('x') if !busy && t.status != Status::Done => self.confirm(Pending::Discard),
-                    KeyCode::Char('r') if !busy && t.status != Status::Todo && !(t.status == Status::Done && t.outcome == "merged") => self.confirm(Pending::Retry),
-                    KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r') => {}
+                    KeyCode::Char('r') if !in_run && !busy && t.status != Status::Todo && !(t.status == Status::Done && t.outcome == "merged") => self.confirm(Pending::Retry),
+                    KeyCode::Char('t') if t.headless() && has_wt && !busy => self.take_over(&id, cx),
+                    KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't') => {}
                     _ => return false,
                 }
             }
@@ -1118,19 +1474,27 @@ impl Agents {
             KeyCode::Home | KeyCode::Char('g') => v.scroll = 0,
             KeyCode::Char('R') => {
                 let id = v.id.clone();
-                self.open_diff(&id, cx);
+                if self.run_ref(&id).is_some() {
+                    self.open_run_diff(&id, cx);
+                } else {
+                    self.open_diff(&id, cx);
+                }
             }
             KeyCode::Char('m') => {
                 let id = v.id.clone();
-                self.mode = Mode::Confirm(Confirm { id, what: Pending::Merge });
+                let what = if self.run_ref(&id).is_some() { Pending::MergeRun } else { Pending::Merge };
+                self.mode = Mode::Confirm(Confirm { id, what });
             }
             KeyCode::Char('x') => {
                 let id = v.id.clone();
-                self.mode = Mode::Confirm(Confirm { id, what: Pending::Discard });
+                let what = if self.run_ref(&id).is_some() { Pending::DiscardRun } else { Pending::Discard };
+                self.mode = Mode::Confirm(Confirm { id, what });
             }
             KeyCode::Char('c') => {
                 let id = v.id.clone();
-                self.mode = Mode::Comment(id, Input::new("", true));
+                if self.task(&id).is_some() {
+                    self.mode = Mode::Comment(id, Input::new("", true));
+                }
             }
             KeyCode::Enter => {
                 let id = v.id.clone();
@@ -1291,6 +1655,26 @@ pub fn parse_plan(stdout: &str) -> Option<(Vec<(String, String)>, f64)> {
 impl Drop for Agents {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // stop every headless agent this pane started (their runners kill the process trees)
+        let mut any = false;
+        for l in self.live.values() {
+            if let Some(s) = &l.stop {
+                s.store(true, Ordering::SeqCst);
+                any = true;
+            }
+        }
+        for l in self.runs_live.values() {
+            if l.driving {
+                l.stop.store(true, Ordering::SeqCst);
+                any = true;
+            }
+        }
+        for w in self.waiters.drain(..) {
+            let _ = w.reply.send(Err("oriel is closing".into()));
+        }
+        if any && !cfg!(test) {
+            std::thread::sleep(Duration::from_millis(300)); // give the killers a moment before oriel exits
+        }
         // oriel is quitting: write the newest state now rather than trusting the writer thread to get there
         let mut closed = self.save_lock.lock().unwrap();
         if let Ok(j) = serde_json::to_vec_pretty(&self.store) {
@@ -1329,7 +1713,8 @@ impl Pane for Agents {
     }
     fn tick_every(&self) -> Option<Duration> {
         // elapsed times and spinners on running cards
-        if self.store.tasks.iter().any(|t| t.status.active() || self.live.get(&t.id).map(|l| l.busy).unwrap_or(false)) || self.planning {
+        let lead = self.store.runs.iter().any(|r| r.state.active()) || self.merging.is_some() || !self.waiters.is_empty();
+        if lead || self.store.tasks.iter().any(|t| t.status.active() || self.live.get(&t.id).map(|l| l.busy).unwrap_or(false)) || self.planning {
             Some(Duration::from_millis(250))
         } else {
             None
@@ -1362,6 +1747,10 @@ impl Pane for Agents {
             Mode::Diff(_) => self.diff_key(k, cx),
             Mode::Form(_) => self.form_key(k, cx),
             Mode::Repo(_) => self.picker_key(k, cx),
+            Mode::LeadForm(_) => self.lead_form_key(k, cx),
+            Mode::Roster(_) => self.roster_key(k),
+            Mode::Watch(_) => self.watch_key(k, cx),
+            Mode::Log(_) => self.log_key(k, cx),
             Mode::Confirm(_) => {
                 let Mode::Confirm(c) = std::mem::replace(&mut self.mode, Mode::Board) else { return true };
                 match k.code {
@@ -1411,23 +1800,67 @@ impl Pane for Agents {
                 p.input.insert(text.trim());
                 p.sel = 0;
             }
+            Mode::LeadForm(f) => match f.field {
+                2 => f.model.insert(text.trim()),
+                3 => f.parallel.insert(text.trim()),
+                4 => f.budget.insert(text.trim()),
+                _ => {
+                    f.field = 0;
+                    f.goal.insert(text)
+                }
+            },
+            Mode::Roster(RosterView { edit: Some(e), .. }) => match e.field {
+                0 => e.name.insert(text),
+                2 => e.model.insert(text),
+                4 => e.good_at.insert(text),
+                5 => e.turns.insert(text.trim()),
+                6 => e.budget.insert(text.trim()),
+                _ => {}
+            },
             _ => {}
         }
     }
 
     fn mouse(&mut self, ev: MouseEvent, _area: Rect, cx: &mut Cx) {
-        if !matches!(self.mode, Mode::Board | Mode::Diff(_)) {
+        if !matches!(self.mode, Mode::Board | Mode::Diff(_) | Mode::Watch(_) | Mode::Log(_)) {
             return; // a popup is open: the board under it doesn't take clicks
         }
         let pos = Position { x: ev.column, y: ev.row };
         let hit = self.hits.iter().rev().find(|(r, _)| r.contains(pos)).map(|h| h.1.clone());
+        if let Mode::Log(v) = &mut self.mode {
+            match ev.kind {
+                MouseEventKind::ScrollUp => v.scroll += 3,
+                MouseEventKind::ScrollDown => v.scroll = v.scroll.saturating_sub(3),
+                _ => {}
+            }
+            return;
+        }
         match (ev.kind, hit) {
             (MouseEventKind::Down(MouseButton::Left), Some(Hit::Card(c, r))) => {
+                self.lead_focus = false;
                 if self.col == c && self.row[c] == r {
                     self.activate(cx);
                 } else {
                     self.col = c;
                     self.row[c] = r;
+                }
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Hit::LeadPanel)) => {
+                if self.lead_focus {
+                    if let Some(r) = self.current_run() {
+                        self.mode = Mode::Log(LogView { target: LogTarget::Lead(r.id.clone()), scroll: 0, back: None });
+                    }
+                } else {
+                    self.lead_focus = true;
+                }
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Hit::Tile(i))) => {
+                if let Mode::Watch(w) = &mut self.mode {
+                    if w.sel == i {
+                        self.open_tile(i);
+                    } else {
+                        w.sel = i;
+                    }
                 }
             }
             (MouseEventKind::Down(MouseButton::Left), Some(Hit::Column(c))) => self.col = c,
@@ -1473,7 +1906,11 @@ impl Pane for Agents {
                     }
                 }
                 Some(Hit::NewTask) if self.repo.is_some() => self.mode = Mode::Form(self.new_form(None)),
-                Some(Hit::Column(c)) if matches!(self.mode, Mode::Board) => self.col = c,
+                Some(Hit::Column(c)) if matches!(self.mode, Mode::Board) => {
+                    self.col = c;
+                    self.lead_focus = false;
+                }
+                Some(Hit::LeadPanel) if matches!(self.mode, Mode::Board) => self.lead_focus = true,
                 _ => {}
             }
         }
