@@ -201,6 +201,7 @@ Flags checked against `--help` of the installed builds, and live where noted.
 - **Claude lead + worker (live, `agents_lead_live_claude_haiku`, haiku):** MCP worked end to end.
   - The first run cost **$1.15 in 7.7 min** because acceptance commands ran in `cmd.exe` while the model wrote bash. The run bounced the task, retried and re-planned 5×.
   - Fixed: gates now run in Git Bash on Windows (never the System32 WSL launcher), else PowerShell, else cmd. The lead is told which shell. A command that fails to *run* (`shell_trouble`) is reported to the lead as `acceptance_broken` and isn't bounced to the worker.
+  - The rerun was clean: plan → finished → queued → gate passed → merged → done, in **38 s for $0.14** (lead $0.11, worker $0.04).
 - Each fresh Claude session costs about 30k cache-write tokens of base prompt (~$0.04 on haiku). Fewer, bigger tasks beat many tiny ones.
 
 ### How a run works

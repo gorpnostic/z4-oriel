@@ -726,7 +726,7 @@ fn agents_lead_live_claude_haiku() {
     let r = p.run_ref(&id).unwrap().clone();
     println!("run: {:?} · protocol {} · lead ${:.4} · total ${:.4}", r.state, r.protocol, r.cost_usd, p.spend(&id));
     for l in &r.log {
-        println!("  {l}");
+        println!("LOG {l}");
     }
     for t in &p.store.tasks {
         println!("task {} {:?} {} ${:.4} {}", t.title, t.status, t.outcome, t.cost_usd, t.error);
