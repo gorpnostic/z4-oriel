@@ -840,7 +840,7 @@ impl Chat {
     }
 
     /// Plan windows, re-read in the background every minute while a Claude Code / Codex chat is on screen.
-    fn refresh_usage(&mut self) {
+    fn refresh_usage(&mut self, waker: crate::pane::Waker) {
         if cfg!(test) || !matches!(self.provider_of().as_str(), "claude" | "codex") || self.usage_read.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
             return;
         }
@@ -849,6 +849,7 @@ impl Chat {
         std::thread::spawn(move || {
             let got = crate::panes::agents::usage_limits().into_iter().map(|(a, w)| (a, w.label, w.pct)).collect();
             *into.lock().unwrap() = got;
+            waker.wake(); // redraw with the numbers
         });
     }
 
@@ -1023,7 +1024,7 @@ impl Chat {
                 }
             }
             "/cwd" => {
-                // a completed folder ends in a separator: C:\Code\ is C:\Code (a root stays a root)
+                // a completed folder ends in a separator: D:\work\ is D:\work (a root stays a root)
                 let trimmed = arg.trim_end_matches(['/', '\\']);
                 let arg = if trimmed.is_empty() || trimmed.ends_with(':') { arg.clone() } else { trimmed.to_string() };
                 let p = PathBuf::from(if arg.starts_with('~') { arg.replacen('~', &dirs::home_dir().unwrap_or_default().to_string_lossy(), 1) } else { arg.clone() });
@@ -1398,7 +1399,7 @@ impl Chat {
             let home = dirs::home_dir().unwrap_or_default().to_string_lossy().to_string();
             let real = |s: &str| if let Some(rest) = s.strip_prefix('~') { format!("{home}{rest}") } else { s.to_string() };
             let sep = typed.chars().rev().find(|c| *c == '/' || *c == '\\').unwrap_or(std::path::MAIN_SEPARATOR);
-            // "C:\Co" lists C:\ for names starting "Co"; "C:\Code\" lists C:\Code
+            // "D:\wo" lists D:\ for names starting "wo"; "D:\work\" lists D:\work
             let cut = typed.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
             let (parent, stem) = typed.split_at(cut);
             if !stem.is_empty() || Path::new(&real(typed)).is_dir() {
@@ -1436,8 +1437,8 @@ impl Chat {
     }
 
     /// Where a new agent chat could work: folders chats have used, then git repos under the usual code folders
-    /// (found once, in the background).
-    fn folder_choices(&self) -> Vec<(String, &'static str)> {
+    /// (found once, in the background: `waker` redraws the picker when they're in).
+    fn folder_choices(&self, waker: crate::pane::Waker) -> Vec<(String, &'static str)> {
         let mut v: Vec<(String, &'static str)> = self.arg_options("/cwd").into_iter().map(|(d, _)| (d, "used before")).collect();
         let repos = self.repos.lock().unwrap().clone();
         match repos {
@@ -1454,6 +1455,7 @@ impl Chat {
                 std::thread::spawn(move || {
                     let found = find_repos();
                     *into.lock().unwrap() = Some(found);
+                    waker.wake();
                 });
             }
             None => {}
@@ -2107,7 +2109,7 @@ impl Chat {
         };
         // a coding agent about to start in your home folder or System32: where should it work instead?
         let pick = self.needs_folder();
-        let mut folders = if pick { self.folder_choices() } else { vec![] };
+        let mut folders = if pick { self.folder_choices(cx.waker()) } else { vec![] };
         folders.truncate(8);
         folders.push((self.launch_dir.display().to_string(), "where oriel started · use it anyway"));
         let rows = if pick { folders.len() as u16 + 2 } else { SUGGESTIONS.len() as u16 };
@@ -2589,7 +2591,7 @@ impl Pane for Chat {
         if area.height < 5 {
             return;
         }
-        self.refresh_usage();
+        self.refresh_usage(cx.waker());
         // ---- the composer grows with what you type (up to COMPOSER_ROWS rows, then it scrolls)
         let text_w = (area.width as usize).saturating_sub(5).max(4); // the borders, "› ", a column for the cursor
         self.comp_w = text_w;
@@ -4293,7 +4295,7 @@ mod tests {
         assert!(risky_dir(&home) && !risky_dir(&home.join("proj")));
         assert!(risky_dir(Path::new(if cfg!(windows) { "C:\\" } else { "/" })));
         if cfg!(windows) {
-            assert!(risky_dir(Path::new("C:\\Windows\\System32")) && !risky_dir(Path::new("C:\\Code\\thing")));
+            assert!(risky_dir(Path::new("C:\\Windows\\System32")) && !risky_dir(Path::new("D:\\work\\thing")));
         } else {
             assert!(risky_dir(Path::new("/usr/bin")) && !risky_dir(Path::new("/srv/thing")));
         }
