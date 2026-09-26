@@ -42,7 +42,7 @@ Every app lives in the sidebar. Click one, or press its F-key.
 |---|---|---|
 | | **ai** | |
 | F1 | **chat** | Chat with Claude Code, Codex, Ollama, any OpenAI-compatible server, or the Anthropic API. Coding agents show their full live transcript as they work: every file read, edit (as a diff), command and output, plus their todo list ticking off. `/perms ask` makes them ask before each change. History is kept, and `/` opens a command menu. |
-| F2 | **agents** | An orchestrator for several coding agents at once. Each task gets its own git worktree and a Claude Code or Codex tab. A board shows todo / running / blocked / review / done, with the cost of each task. You get a notification when an agent needs you, then review its diff (with a conflict check) and squash-merge or discard it. `P` has a lead agent plan the tasks for you. |
+| F2 | **agents** | Run a whole team of coding agents. **Lead mode** (`L`): give one goal, pick any agent as the lead (Claude Code, Codex, Kimi…), and it plans the work and hands tasks to worker agents from your roster (`R`). Each worker runs in its own git worktree. Finished work goes through a merge queue with conflict checks and your tests, so workers can't break each other. The lead sees your plan limits and routes cheap work to cheap models. `w` watches the lead and every worker live, side by side, and `t` takes over any worker in a real terminal. You review the combined result once and merge it. There are also single tasks on a board with diff review. |
 | F3 | **your AIs** | Everything about your AI tools in one place. It shows which coding CLIs are installed and signed in, and installs or signs in to 12 of them with one key: Claude Code, Codex, Kimi, OpenCode, Aider, Copilot, Cursor, Qwen, Amp, Droid, Crush and Goose. It also shows your real plan limits with reset countdowns, token use and cost per day, and has token-saver presets. |
 | | **tools** | |
 | F4 | **music** | Plays your music folder: cover art, a live spectrum, synced lyrics, playlists, shuffle and repeat. `F12` plays/pauses from any app. |
@@ -53,6 +53,8 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | F9 | **terminal** | A real shell. Split it next to anything. |
 
 ![a Claude Code run: todos, edits as diffs, command output (dracula theme)](docs/screenshot-agent.png)
+
+![lead mode: a lead agent and its workers, live side by side](docs/screenshot-lead.png)
 
 <p align="center">
   <img src="docs/screenshot-agents.png" width="49%" alt="the agents board">
@@ -106,6 +108,11 @@ oriel uses whatever you already have and picks the first one it finds:
   compatible server: OpenRouter, LM Studio, llama.cpp…
 
 Switch the AI with `/provider`, and its model with `/model`. The menu lists that AI's models, including the models installed in Ollama. Both are remembered, each AI keeps its own model. Type `/` to see every command.
+
+**Lead mode and the roster:** the roster is the list of worker agents the lead can hand tasks to. Each entry has
+a model, cost tier, strengths and budget. It lives in the config (`[lead]`, `[[roster]]`), and `R` in the agents app
+edits it. A run has a total budget and stops starting new work when the budget is spent. The design notes are in
+[docs/research-orchestration.md](docs/research-orchestration.md).
 
 **Permissions for coding agents:** `/perms` sets what Claude Code and Codex may do in chat, and it's remembered for every chat:
 
