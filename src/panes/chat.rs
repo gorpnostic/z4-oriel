@@ -5,6 +5,7 @@
 mod activity;
 mod agent;
 pub mod approve;
+mod inbox;
 mod md;
 pub mod providers;
 mod store;
@@ -1355,6 +1356,12 @@ impl Pane for Chat {
     }
     fn wants_images(&self) -> bool {
         true
+    }
+    fn open_now(&self) -> Vec<crate::alerts::Open> {
+        self.open_items()
+    }
+    fn respond(&mut self, key: &str, r: crate::alerts::Reply, cx: &mut Cx) -> bool {
+        self.answer_open(key, r, cx)
     }
 
     fn poll(&mut self, cx: &mut Cx) {

@@ -55,6 +55,9 @@ pub enum Action {
     FocusPane(u64),
     /// FocusPane, or this app if that pane has closed since.
     FocusPaneOr(u64, &'static str),
+    /// Answer one of a pane's open items (Pane::open_now) by its key: the alerts app's 1-9, y / n; Go switches
+    /// to the pane first, then lets it show the item.
+    Respond(u64, String, crate::alerts::Reply),
     /// Switch to the tab holding the pane opened with this tag (no-op if it's gone).
     FocusTag(String),
     /// Close the pane opened with this tag.
@@ -212,6 +215,17 @@ pub trait Pane {
     /// Something the palette can send to chat from here: (what it is, the text), e.g. ("this note", its text).
     fn for_chat(&self) -> Option<(String, String)> {
         None
+    }
+    /// What's waiting on you here right now (a question, an approval, a stuck task, work to review), for the
+    /// alerts app's "open now" list. Asked before every draw, so it must be cheap. A pane whose activity() is
+    /// Blocked and lists nothing gets a plain "needs you" row from the app.
+    fn open_now(&self) -> Vec<crate::alerts::Open> {
+        vec![]
+    }
+    /// Answer one of them (the alerts app: 1-9, y / n), or show it (enter; the app has switched here already).
+    /// False = it's gone or has changed since it was listed.
+    fn respond(&mut self, _key: &str, _r: crate::alerts::Reply, _cx: &mut Cx) -> bool {
+        false
     }
 }
 

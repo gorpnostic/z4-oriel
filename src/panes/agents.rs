@@ -13,6 +13,7 @@
 mod batch;
 mod cost;
 mod git;
+mod inbox;
 mod input;
 mod lead;
 #[cfg(test)]
@@ -1861,6 +1862,12 @@ impl Pane for Agents {
     }
     fn wants_images(&self) -> bool {
         true
+    }
+    fn open_now(&self) -> Vec<crate::alerts::Open> {
+        self.open_items()
+    }
+    fn respond(&mut self, key: &str, r: crate::alerts::Reply, cx: &mut Cx) -> bool {
+        self.answer_open(key, r, cx)
     }
     fn tagged_panes(&mut self, live: &[(String, Option<Activity>)]) {
         let mine: Vec<(String, Option<Activity>)> = live.iter().filter(|(t, _)| t.starts_with("agent-task:")).cloned().collect();

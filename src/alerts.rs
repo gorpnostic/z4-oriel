@@ -1,7 +1,8 @@
 //! The event center: things worth knowing that happened while you were busy (an agent finished or needs you,
 //! an approval is waiting, a build failed, a plan is about to start, an install finished, memory is running out,
 //! an AI's usage is near its limit, a new version is out). Each one is a toast, a line in the alerts app, and,
-//! when the terminal isn't the window you're in, a desktop notification.
+//! when the terminal isn't the window you're in, a desktop notification. Above them sits what's open right now
+//! (`Open`): live state the panes report, not events, so it clears itself once answered.
 //!
 //! Kept in alerts.json, which every open oriel window shares: saving reads the file first and merges, so one
 //! window never wipes another's alerts, and the new file is swapped in whole, so a crash can't leave it torn.
@@ -252,6 +253,82 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     })
 }
 
+// ------------------------------------------------------------------ open now
+/// Something waiting on you right now. Not an event: live state, gathered again from the panes before every
+/// draw (a question or approval a chat is holding, a stuck or finished task, a terminal agent at a prompt), so
+/// it goes away by itself once it's answered. The alerts app lists these above the history and answers them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Open {
+    /// Approval (a question or a yes/no), NeedsYou (stuck, go look) or AgentDone (finished: ready to review)
+    pub kind: Kind,
+    /// the pane's own name for it, handed back with an answer so an answer can't land on a newer question
+    pub key: String,
+    /// one line for the list
+    pub text: String,
+    /// the peek (space): the whole question, or the result card
+    pub detail: Vec<String>,
+    /// the choices 1-9 answer it with, ticked ones marked when several can be picked
+    pub options: Vec<String>,
+    pub multi: bool,
+    pub ticked: Vec<bool>,
+    /// y / n answers it (an approval)
+    pub yes_no: bool,
+    /// the tagged tab it's about (a task's terminal): that tab's own red dot isn't listed twice
+    pub tag: Option<String>,
+    // ---- filled in by the app
+    /// the pane that holds it (answers go there, enter goes there), the tab it's in, and its app tab if any
+    pub pane: u64,
+    pub from: String,
+    pub app: Option<&'static str>,
+}
+
+impl Open {
+    pub fn new(kind: Kind, key: impl Into<String>, text: impl Into<String>) -> Open {
+        Open { kind, key: key.into(), text: text.into(), detail: vec![], options: vec![], multi: false, ticked: vec![], yes_no: false, tag: None, pane: 0, from: String::new(), app: None }
+    }
+    /// Waiting on you, rather than done and waiting to be looked at.
+    pub fn needs_you(&self) -> bool {
+        self.kind != Kind::AgentDone
+    }
+    /// (glyph, short name) for the list.
+    pub fn label(&self) -> (&'static str, &'static str) {
+        match self.kind {
+            Kind::AgentDone => ("◆", "review"),
+            k => k.label(),
+        }
+    }
+}
+
+/// How the alerts app answers an open item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// choice n (0-based); ticks it when several can be picked
+    Pick(usize),
+    /// allow, or send the ticked choices
+    Yes,
+    No,
+    /// show it (the app has already switched to its pane)
+    Go,
+}
+
+thread_local! {
+    static OPEN: RefCell<Vec<Open>> = const { RefCell::new(vec![]) };
+}
+
+/// The app's latest gathering: waiting on you first, then ready to review.
+pub fn set_open(mut l: Vec<Open>) {
+    l.sort_by_key(|o| !o.needs_you());
+    OPEN.with_borrow_mut(|o| {
+        if *o != l {
+            *o = l;
+        }
+    });
+}
+
+pub fn with_open<R>(f: impl FnOnce(&[Open]) -> R) -> R {
+    OPEN.with_borrow(|o| f(o))
+}
+
 // ------------------------------------------------------------------ what's been said, across restarts
 /// What the watchers and the update check have already said, shared by every window and kept across restarts,
 /// so none of it is said again each time oriel starts.
@@ -494,5 +571,15 @@ mod tests {
         let next = vec![("claude".to_string(), "5-hour".to_string(), 90.0, Some(3000))];
         assert_eq!(usage_due(&next, &mut later, 1500), vec![0]);
         assert!(!later.iter().any(|k| k.2 == 1000), "the old window dropped out");
+    }
+
+    #[test]
+    fn alerts_open_needs_you_first() {
+        set_open(vec![Open::new(Kind::AgentDone, "task:1", "fix tests is ready for review"), Open::new(Kind::Approval, "q:x", "claude asks: which?"), Open::new(Kind::NeedsYou, "term", "claude is waiting")]);
+        let got = with_open(|l| l.iter().map(|o| (o.key.clone(), o.needs_you())).collect::<Vec<_>>());
+        assert_eq!(got, [("q:x".to_string(), true), ("term".to_string(), true), ("task:1".to_string(), false)], "stable: waiting on you, then review");
+        assert_eq!(with_open(|l| l[2].label().1), "review");
+        set_open(vec![]);
+        assert!(with_open(|l| l.is_empty()));
     }
 }

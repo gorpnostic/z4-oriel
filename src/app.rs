@@ -267,6 +267,8 @@ pub struct App {
     update_ready: Option<String>,
     /// Is the terminal the window you're in? (desktop notifications only when it isn't)
     term_focused: bool,
+    /// the focused frame's "← 2 need you" as last drawn (a click opens the alerts app)
+    need_hit: Option<Rect>,
 }
 
 impl App {
@@ -312,6 +314,7 @@ impl App {
             _theme_watcher: None,
             update_ready: None,
             term_focused: true,
+            need_hit: None,
             renaming: None,
             next_tab: 1,
             confirm: None,
@@ -834,15 +837,75 @@ impl App {
         crate::alerts::mark_read_if(|a| a.pane.is_some_and(|p| l.contains(&p)));
     }
 
+    /// Everything waiting on you right now, gathered from the panes' own state before every draw: the alerts
+    /// app's "open now" list and the focused frame's "← 2 need you". A pane at a red dot that lists nothing
+    /// of its own (a coding agent in a terminal, found by its screen) gets a plain row.
+    fn gather_open(&mut self) {
+        use crate::alerts::{Kind, Open};
+        let tag_of: HashMap<PaneId, &String> = self.tags.iter().map(|(t, id)| (*id, t)).collect();
+        // each row with the tag of the tab it came from, if that tab was opened tagged
+        let mut rows: Vec<(Open, Option<String>)> = vec![];
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let mut l = vec![];
+            tab.root.leaves(&mut l);
+            for id in l {
+                let Some(p) = self.panes.get(&id) else { continue };
+                let mut mine = p.open_now();
+                if mine.is_empty() && p.activity() == Some(Activity::Blocked) {
+                    mine.push(Open::new(Kind::NeedsYou, "blocked", format!("{} is waiting for you", p.title())));
+                }
+                for mut o in mine {
+                    o.pane = id;
+                    o.from = self.tab_label(i);
+                    o.app = tab.app;
+                    rows.push((o, tag_of.get(&id).map(|t| t.to_string())));
+                }
+            }
+        }
+        // a task's terminal tab and the agents app would say the same thing twice: keep the agents' row (it knows
+        // the task), with what the terminal's screen shows added to its peek
+        let claimed: Vec<String> = rows.iter().filter_map(|(o, _)| o.tag.clone()).collect();
+        let mut screens: HashMap<String, Vec<String>> = HashMap::new();
+        let mut out = vec![];
+        for (o, own) in rows {
+            match own {
+                Some(t) if o.tag.is_none() && claimed.contains(&t) => {
+                    screens.insert(t, o.detail);
+                }
+                _ => out.push(o),
+            }
+        }
+        for o in &mut out {
+            if let Some(d) = o.tag.as_ref().and_then(|t| screens.remove(t)).filter(|d| !d.is_empty()) {
+                o.detail.push(String::new());
+                o.detail.extend(d);
+            }
+        }
+        crate::alerts::set_open(out);
+    }
+
+    /// How many open items need you in panes you can't see right now.
+    fn need_elsewhere(&self) -> usize {
+        let visible = self.visible();
+        crate::alerts::with_open(|l| l.iter().filter(|o| o.needs_you() && !visible.contains(&o.pane)).count())
+    }
+
     /// alt j: to whatever needs you. The newest unread "needs you" / "asking you" alert whose pane is still open,
-    /// else the next tab with a red dot, then one with a green dot. Each is marked read, so pressing it again
-    /// goes on to the next.
+    /// else the first open item waiting on you out of sight (a chat's question), else the next tab with a red
+    /// dot, then one with a green dot. Each is marked read, so pressing it again goes on to the next.
     fn jump(&mut self) {
         use crate::alerts::Kind;
         let hit = crate::alerts::with(|l| {
             l.iter().rev().filter(|a| !a.read && matches!(a.kind, Kind::NeedsYou | Kind::Approval)).find_map(|a| a.pane.filter(|p| self.panes.contains_key(p)))
         });
-        let to = hit.and_then(|p| self.tabs.iter().position(|t| t.root.contains(p)).map(|i| (i, p))).or_else(|| self.next_dot(Dot::Blocked)).or_else(|| self.next_dot(Dot::Done));
+        self.gather_open();
+        let visible = self.visible();
+        let open = crate::alerts::with_open(|l| l.iter().find(|o| o.needs_you() && !visible.contains(&o.pane)).map(|o| o.pane));
+        let to = hit
+            .or(open)
+            .and_then(|p| self.tabs.iter().position(|t| t.root.contains(p)).map(|i| (i, p)))
+            .or_else(|| self.next_dot(Dot::Blocked))
+            .or_else(|| self.next_dot(Dot::Done));
         match to {
             Some((i, p)) => self.focus_pane(i, p),
             None => self.notify("nothing else needs you right now"),
@@ -863,8 +926,10 @@ impl App {
     }
 
     /// The window title: how many agents need you and how many are working, so a glance at the terminal's tab
-    /// from another window says whether to come back.
-    fn title_text(&self) -> String {
+    /// from another window says whether to come back. A chat's question counts too (the open-now list, gathered
+    /// fresh: the title changes between draws).
+    fn title_text(&mut self) -> String {
+        self.gather_open();
         let (mut need, mut work) = (0, 0);
         for p in self.panes.values() {
             match p.activity() {
@@ -873,6 +938,7 @@ impl App {
                 _ => {}
             }
         }
+        need = need.max(crate::alerts::with_open(|l| l.iter().filter(|o| o.needs_you()).count()));
         let mut s = String::from("oriel");
         if need > 0 {
             s.push_str(&format!(" · {need} needs you"));
@@ -953,7 +1019,7 @@ impl App {
     fn look(&self) -> (Option<Rect>, Option<usize>, usize, usize, usize) {
         let pos = self.hover;
         let side_x = self.side_hits.iter().filter(|(_, h)| matches!(h, SideHit::CloseTab(_))).map(|x| x.0);
-        let hot = self.pane_close.iter().map(|x| x.0).chain(side_x).find(|r| r.contains(pos));
+        let hot = self.pane_close.iter().map(|x| x.0).chain(side_x).chain(self.need_hit).find(|r| r.contains(pos));
         let pane = self.outer.iter().find(|(_, r)| r.contains(pos)).and_then(|(id, _)| self.panes.get(id)).map(|p| p.hover()).unwrap_or(0);
         (hot, self.ctx.as_ref().map(|m| m.sel), pane, self.panes.len(), self.notices.len())
     }
@@ -1151,6 +1217,21 @@ impl App {
                         self.tabs[i].focus = id;
                     } else {
                         self.goto_app(app);
+                    }
+                }
+                Action::Respond(pane, key, reply) => {
+                    if reply == crate::alerts::Reply::Go {
+                        match self.tabs.iter().position(|t| t.root.contains(pane)) {
+                            Some(i) => self.focus_pane(i, pane),
+                            None => {
+                                self.notify("that pane is closed");
+                                continue;
+                            }
+                        }
+                    }
+                    let ok = self.with_pane(pane, |p, cx| p.respond(&key, reply, cx)).unwrap_or(false);
+                    if !ok && reply != crate::alerts::Reply::Go {
+                        self.notify("that one has changed since · enter goes to it");
                     }
                 }
                 Action::SetTheme(t) => {
@@ -2100,6 +2181,11 @@ impl App {
             }
         }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            // "← 2 need you" on the frame: the alerts app lists them
+            if self.need_hit.is_some_and(|r| r.contains(pos)) {
+                self.goto_app("alerts");
+                return;
+            }
             // the × on a pane's frame
             if let Some(&(_, id)) = self.pane_close.iter().find(|(r, _)| r.contains(pos)) {
                 self.request_close(id);
@@ -2209,6 +2295,8 @@ impl App {
 
     // ------------------------------------------------------------------ draw
     fn draw(&mut self, f: &mut Frame) {
+        // what's open right now, for the bell, the frames and the alerts app
+        self.gather_open();
         let area = f.area();
         let t = self.theme.clone();
         if !matches!(t.bg, ratatui::style::Color::Reset) {
@@ -2228,6 +2316,9 @@ impl App {
             self.body = Rect { y: self.body.y + 1, height: self.body.height - 1, ..self.body };
         }
 
+        // what's waiting on you elsewhere: said on the focused frame (not in alerts, which lists it all)
+        let need = if self.tabs[self.cur].app == Some("alerts") { 0 } else { self.need_elsewhere() };
+        self.need_hit = None;
         let tab = &self.tabs[self.cur];
         let mut rects = vec![];
         if tab.zoom {
@@ -2255,6 +2346,17 @@ impl App {
             }
             let inner = ui::frame(f, r, &title, sub.as_deref(), id == focus, &t);
             self.inner.push((id, inner));
+            if need > 0 && id == focus {
+                // bottom-left of the frame, clear of the subtitle on the right
+                let label = format!(" ← {need} need{} you ", if need == 1 { "s" } else { "" });
+                let (lw, sw) = (label.chars().count() as u16, sub.as_deref().map(|s| unicode_width::UnicodeWidthStr::width(s) as u16 + 2).unwrap_or(0));
+                if r.height > 2 && r.width > lw + sw + 6 {
+                    let b = Rect { x: r.x + 2, y: r.bottom() - 1, width: lw, height: 1 };
+                    let st = Style::default().fg(t.danger).add_modifier(Modifier::BOLD);
+                    f.render_widget(Paragraph::new(Span::styled(label, if b.contains(self.hover) { st.add_modifier(Modifier::REVERSED) } else { st })), b);
+                    self.need_hit = Some(b);
+                }
+            }
             if closable && r.width > 12 {
                 let b = Rect { x: r.right() - 5, y: r.y, width: 3, height: 1 };
                 let hot = b.contains(self.hover);
@@ -2402,6 +2504,7 @@ impl App {
         let time = self.start.elapsed().as_secs_f64();
         let cur_app = self.tabs[self.cur].app;
         let unread = crate::alerts::unread();
+        let waiting = crate::alerts::with_open(|l| l.iter().filter(|o| o.needs_you()).count());
         let extra = self.update_ready.is_some() as u16;
         let foot_n = (SIDEBAR.len() - FOOTER) as u16 + extra;
         // the footer (alerts, themes, help) needs room; without it, the new-alerts count goes in the title
@@ -2439,11 +2542,14 @@ impl App {
             let fy = fy + extra;
             for (k, &(name, icon, label, key)) in SIDEBAR[FOOTER..].iter().enumerate() {
                 let r = Rect { y: fy + k as u16, height: 1, ..inner };
-                let unread = if name == "alerts" { unread } else { 0 };
-                if unread > 0 {
-                    // the bell lights up with how many are new, and the key that goes to them
-                    let st = Style::default().fg(t.accent).add_modifier(Modifier::BOLD);
-                    let n = if r.width as usize >= label.len() + 18 { format!("{unread} new · alt j") } else { format!("{unread} new") };
+                let (unread, waiting) = if name == "alerts" { (unread, waiting) } else { (0, 0) };
+                if unread > 0 || waiting > 0 {
+                    // the bell lights up with how many are waiting on you (or new), and the key that goes to them
+                    let st = Style::default().fg(if waiting > 0 { t.danger } else { t.accent }).add_modifier(Modifier::BOLD);
+                    let n = if waiting > 0 { format!("{waiting} need{} you", if waiting == 1 { "s" } else { "" }) } else { format!("{unread} new") };
+                    // the key too, if it fits beside the whole label
+                    let with_key = format!("{n} · alt j");
+                    let n = if r.width as usize > label.len() + 3 + with_key.chars().count() { with_key } else { n };
                     let w = (r.width as usize).saturating_sub(n.chars().count() + 1);
                     let left = ui::fit(&format!("{}{label}", ui::lead(icon)), w);
                     let pad = w.saturating_sub(unicode_width::UnicodeWidthStr::width(left.as_str())) + 1;
@@ -3212,6 +3318,10 @@ mod tests {
         keys: Rc<RefCell<Vec<KeyEvent>>>,
         pastes: Rc<RefCell<Vec<String>>>,
         dir: Rc<RefCell<Option<std::path::PathBuf>>>,
+        /// what it lists as open now, what it was answered with, and whether it takes the answer
+        open: Rc<RefCell<Vec<crate::alerts::Open>>>,
+        replies: Rc<RefCell<Vec<(String, crate::alerts::Reply)>>>,
+        refuse: Rc<Cell<bool>>,
     }
     struct Fake {
         ctl: Ctl,
@@ -3244,6 +3354,13 @@ mod tests {
         }
         fn cwd(&self) -> Option<std::path::PathBuf> {
             self.ctl.dir.borrow().clone()
+        }
+        fn open_now(&self) -> Vec<crate::alerts::Open> {
+            self.ctl.open.borrow().clone()
+        }
+        fn respond(&mut self, key: &str, r: crate::alerts::Reply, _cx: &mut Cx) -> bool {
+            self.ctl.replies.borrow_mut().push((key.to_string(), r));
+            !self.ctl.refuse.get()
         }
     }
     fn fake(term: bool, images: bool) -> (Box<dyn Pane>, Ctl) {
@@ -4055,5 +4172,74 @@ mod tests {
         app.onboard.as_mut().unwrap().stage = crate::onboard::Stage::Tour { step, start: probe };
         let s = screen(&mut app, 150, 42);
         assert!(s.contains("ctrl+b then ,") && !s.contains("ctrl+space"), "{s}");
+    }
+
+    /// The open-now list: gathered from every pane before each draw (a red-dot terminal with nothing of its own
+    /// gets a plain row, a task's terminal isn't listed twice), counted on the focused frame, answered from the
+    /// alerts app through the pane that holds it, and enter goes there.
+    #[test]
+    fn app_open_now_from_every_pane() {
+        use crate::alerts::{Kind, Open, Reply};
+        let (mut app, _rx) = new_app();
+        crate::alerts::clear();
+        // a pane asking a question, and a terminal agent stuck at a prompt, each in a tab of its own
+        let (p, asker) = fake(false, false);
+        let mut q = Open::new(Kind::Approval, "q:which", "claude asks: which parser?");
+        q.options = vec!["nom".into(), "winnow".into()];
+        asker.open.borrow_mut().push(q);
+        app.new_tab(p);
+        let (asker_tab, asker_pane) = (app.tabs[app.cur].id, app.focused());
+        let (p, stuck) = fake(true, false);
+        stuck.act.set(Some(Activity::Blocked));
+        app.new_tab(p);
+        let (stuck_tab, stuck_pane) = (app.tabs[app.cur].id, app.focused());
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        let s = shot(&mut app, 150, 42, "need-you-footer");
+        assert_eq!(app.title_text(), "oriel · 2 needs you", "the question counts in the window title too");
+        let rows = crate::alerts::with_open(|l| l.iter().map(|o| (o.text.clone(), o.pane)).collect::<Vec<_>>());
+        assert_eq!(rows, [("claude asks: which parser?".to_string(), asker_pane), ("fake agent is waiting for you".to_string(), stuck_pane)]);
+        assert!(s.contains("← 2 need you"), "on the focused frame: {s}");
+        assert!(s.lines().any(|l| l.contains("alerts ") && l.contains("2 need you")), "and on the bell, name whole: {s}");
+        // alt j goes to the question (no alert was raised for it), then the stuck one
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::ALT);
+        assert_eq!(app.tabs[app.cur].id, asker_tab);
+        let s = screen(&mut app, 150, 42);
+        assert!(s.contains("← 1 needs you"), "what you're looking at isn't counted: {s}");
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::ALT);
+        assert_eq!(app.tabs[app.cur].id, stuck_tab);
+        // a click on the count opens the alerts app, which lists them (and doesn't count itself)
+        screen(&mut app, 150, 42);
+        let r = app.need_hit.expect("drawn");
+        app.mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: r.x + 2, row: r.y, modifiers: KeyModifiers::NONE });
+        assert_eq!(app.tabs[app.cur].app, Some("alerts"));
+        let s = shot(&mut app, 150, 42, "alerts-open-now");
+        assert!(s.contains("open now") && s.contains("which parser?") && s.contains("fake agent is waiting for you") && !s.contains("← "), "{s}");
+        // 2 answers the question through its pane, without leaving alerts
+        press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
+        assert_eq!(asker.replies.borrow().as_slice(), [("q:which".to_string(), Reply::Pick(1))]);
+        assert_eq!(app.tabs[app.cur].app, Some("alerts"));
+        // the pane says it has changed since: the alerts app says so
+        asker.refuse.set(true);
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert!(notice(&app).contains("changed since"), "{}", notice(&app));
+        // enter on the stuck terminal goes to it
+        asker.open.borrow_mut().clear();
+        screen(&mut app, 150, 42);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!((app.tabs[app.cur].id, app.focused()), (stuck_tab, stuck_pane));
+        // a task's terminal tab and the agents' row for that task: listed once, with the screen in the peek
+        let (p, task_term) = fake(true, false);
+        let mut screen_row = Open::new(Kind::NeedsYou, "term", "claude is waiting for you");
+        screen_row.detail = vec!["Do you want to proceed?".into()];
+        task_term.open.borrow_mut().push(screen_row);
+        app.apply(stuck_pane, vec![Action::OpenTagged { pane: p, tag: "agent-task:t1".into(), name: "fix tests".into(), focus: false }]);
+        let mut row = Open::new(Kind::NeedsYou, "task:t1", "fix tests needs you");
+        row.detail = vec!["waiting for you in its tab".into()];
+        row.tag = Some("agent-task:t1".into());
+        asker.open.borrow_mut().push(row);
+        screen(&mut app, 150, 42);
+        let rows = crate::alerts::with_open(|l| l.iter().map(|o| (o.text.clone(), o.detail.clone())).collect::<Vec<_>>());
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], ("fix tests needs you".to_string(), vec!["waiting for you in its tab".to_string(), String::new(), "Do you want to proceed?".to_string()]));
     }
 }

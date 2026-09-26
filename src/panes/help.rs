@@ -229,8 +229,12 @@ fn topics() -> Vec<Topic> {
         Topic { icon: "bell", title: "alerts", app: "alerts", items: vec![
             P("Everything worth knowing that happened while you were busy: an agent finished or needs you, an approval or question is waiting, a build or merge check failed, a plan starts soon, an install finished, memory is nearly full, an AI's usage is near its limit, a new oriel is out."),
             P("Each is a toast, a line here (the bell at the bottom of the sidebar shows how many are new) and, when the terminal isn't the window you're in, a desktop notification (desktop_notifications = false in the config turns those off)."),
-            K("enter", "go to where it happened"),
-            K("x  ·  c", "dismiss one · clear them all"),
+            P("On top, \"open now\": what's waiting on you right now, straight from each app: a chat's question or approval, a task that's stuck or ready for review, a run whose branch is ready, a coding agent in a terminal at a prompt. It clears itself once answered. Every frame counts the ones out of sight (← 2 need you; click it to come here)."),
+            K("space", "peek: the whole question and its choices, or the result card"),
+            K("1–9", "answer a chat's question (tick, when several can be picked; y sends them)"),
+            K("y  ·  n", "allow · deny an approval"),
+            K("enter", "go to it, or to where it happened"),
+            K("x  ·  c", "dismiss one · clear them all (the history)"),
         ]},
         Topic { icon: "calendar", title: "calendar", app: "calendar", items: vec![
             P("A month at a glance with the chosen day's plans beside it. Plans with a time pop up as a reminder when they start, whichever app you're in. The sidebar shows the next two weeks."),
