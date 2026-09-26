@@ -1946,7 +1946,9 @@ mod tests {
         c.chat.cwd = Some("C:\\work\\demo".into());
         c.chat.messages.push(store::Msg { role: "user".into(), content: prompt.into(), ..Default::default() });
         c.chat.messages.push(store::Msg { role: "assistant".into(), model: Some(provider.into()), ..Default::default() });
-        c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0, steer: None });
+        // a steerable AI gets a pipe, as a real run would (its far end is gone, so nothing is sent anywhere)
+        let steer = providers::steerable(provider).then(|| std::sync::mpsc::channel().0);
+        c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0, steer });
         c
     }
 
