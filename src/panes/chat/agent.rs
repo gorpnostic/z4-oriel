@@ -576,6 +576,17 @@ impl Claude {
         send(Ev::Todos(self.todos.clone()));
     }
 
+    /// A step's input side (fresh, cached and newly cached tokens) is how full the context is.
+    fn context(&mut self, usage: &Value, send: &mut dyn FnMut(Ev)) {
+        let n = |k: &str| usage[k].as_u64().unwrap_or(0);
+        let used = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+        if used > 0 {
+            // past 200k it can only be running with the million-token window, whatever the model's name says
+            let window = if used > 200_000 { context_window(&self.model).max(1_000_000) } else { context_window(&self.model) };
+            send(Ev::Context(used, window));
+        }
+    }
+
     fn usage(&mut self, send: &mut dyn FnMut(Ev)) {
         let live = self.tokens_done + self.msg_tokens.max(self.msg_chars / 4 + self.think_tokens);
         let total = live.max(self.result_tokens);
@@ -722,6 +733,7 @@ impl Claude {
                 let key = (parent.unwrap_or("").to_string(), e["index"].as_u64().unwrap_or(0));
                 match e["type"].as_str() {
                     Some("message_start") if parent.is_none() => {
+                        self.context(&e["message"]["usage"], send);
                         self.msg_tokens = e["message"]["usage"]["output_tokens"].as_u64().unwrap_or(0);
                         self.msg_chars = 0;
                         self.think_tokens = 0;
@@ -793,6 +805,9 @@ impl Claude {
                 }
             }
             Some("assistant") => {
+                if parent.is_none() && !self.streamed {
+                    self.context(&v["message"]["usage"], send);
+                }
                 for it in v["message"]["content"].as_array().into_iter().flatten() {
                     match it["type"].as_str() {
                         Some("tool_use") => {
@@ -951,6 +966,54 @@ pub struct Codex {
     errors: Vec<String>,
     /// Got to `turn.completed`: a run that ends without it was cut short.
     pub finished: bool,
+    /// The thread this run added to (its session log has the context numbers `exec --json` leaves out).
+    pub thread: String,
+}
+
+/// A model's context window: Claude's `[1m]` mode is a million tokens, anything else here 200k.
+pub fn context_window(model: &str) -> u64 {
+    if model.to_lowercase().contains("[1m]") { 1_000_000 } else { 200_000 }
+}
+
+/// Codex's `exec --json` only reports a turn's summed usage, which says nothing about how full the context is.
+/// Its session log does, per step: the last `token_count` event's tokens and `model_context_window`.
+pub fn codex_context(log: &str) -> Option<(u64, u64)> {
+    log.lines().rev().filter(|l| l.contains("token_count")).find_map(|l| {
+        let v: Value = serde_json::from_str(l).ok()?;
+        let info = &v["payload"]["info"];
+        let u = &info["last_token_usage"];
+        let window = info["model_context_window"].as_u64()?;
+        let used = u["total_tokens"].as_u64().filter(|t| *t > 1).unwrap_or_else(|| u["input_tokens"].as_u64().unwrap_or(0) + u["output_tokens"].as_u64().unwrap_or(0));
+        (used > 0 && window > 0).then_some((used, window))
+    })
+}
+
+/// The session log of Codex thread `thread` under `sessions` (`YYYY/MM/DD/rollout-…-<thread>.jsonl`), looking
+/// through the newest days first.
+pub fn codex_log(sessions: &Path, thread: &str) -> Option<PathBuf> {
+    if thread.is_empty() {
+        return None;
+    }
+    let sorted = |d: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(d).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+        v.sort_by(|a, b| b.cmp(a));
+        v
+    };
+    let mut days = 0;
+    for y in sorted(sessions) {
+        for m in sorted(&y) {
+            for d in sorted(&m) {
+                days += 1;
+                if days > 31 {
+                    return None;
+                }
+                if let Some(f) = sorted(&d).into_iter().find(|f| f.file_name().is_some_and(|n| n.to_string_lossy().contains(thread))) {
+                    return Some(f);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `"...pwsh.exe" -Command 'Get-Content x'` / `bash -lc 'ls'` -> the command inside.
@@ -975,6 +1038,7 @@ impl Codex {
         match ty {
             "thread.started" => {
                 if let Some(t) = v["thread_id"].as_str() {
+                    self.thread = t.to_string();
                     send(Ev::State("codex.thread".into(), t.to_string()));
                 }
             }

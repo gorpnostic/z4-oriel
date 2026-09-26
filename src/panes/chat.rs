@@ -4,9 +4,11 @@
 
 mod activity;
 mod agent;
+mod ckpt;
 pub mod approve;
 mod md;
 pub mod providers;
+mod review;
 mod store;
 
 /// A diff line's background for a theme (line tint, changed-word tint): the themes app previews with it.
@@ -19,6 +21,7 @@ pub(crate) fn render_markdown(text: &str, width: usize, t: &crate::theme::Theme)
 
 use crate::editor::Editor;
 use crate::pane::{Action, Cx, Pane};
+use crate::panes::agents::git;
 use crate::ui;
 use activity::{Block, Hit};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -46,6 +49,13 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/cwd", "<folder>", "folder Claude Code / Codex work in for this chat"),
     ("/perms", "<ask|edits|auto|plan|bypass|reset>", "what coding agents may do — remembered for every chat (shift+tab cycles) · reset forgets this chat's always-allows"),
     ("/effort", "<low|medium|high|xhigh|max|ultracode>", "how hard coding agents think — remembered for every chat"),
+    ("/diff", "[last|turn n]", "coding agents: everything this chat changed in its folder (last: the last turn only) · u in it goes back"),
+    ("/undo", "", "put the folder back as it was before the last turn (asks first, lists the new files it deletes)"),
+    ("/rewind", "<turn>", "pick one of your turns: its diff against now, or put the folder back to before it"),
+    ("/check", "[cmd|off]", "Claude Code / Codex: run a check after each turn, send failures back until it passes"),
+    ("/verify", "[cmd]", "run the check now: the last reply gets ✓ or ✗"),
+    ("/handoff", "[goal] [ai]", "the AI writes a handoff card and a fresh chat (maybe another AI) starts from it"),
+    ("/goal", "<condition>", "Claude Code's own /goal: it keeps going until the condition holds (other /commands pass through too)"),
     ("/open", "<chat>", "open a saved chat: type to search its title (or /chats) · ctrl+pgup/pgdn the previous / next"),
     ("/rename", "<title>", "rename this chat"),
     ("/copy", "[code [n]|all]", "copy the last reply · code: its last code block (n = further back) · all: the whole chat"),
@@ -144,12 +154,14 @@ const EFFORTS: &[(&str, &str)] = &[
 /// shift+tab walks through these, like Claude Code.
 const PERM_CYCLE: &[&str] = &["ask", "edits", "auto", "plan", "bypass"];
 
+/// The warning colour (themes don't have one of their own): auto mode, a filling context, a stale check.
+const WARN: ratatui::style::Color = ratatui::style::Color::Rgb(0xe6, 0xc4, 0x6a);
+
 /// The mode line on the input box, Claude Code style: glyph, words, colour.
 fn perm_badge(p: &str, t: &crate::theme::Theme) -> (&'static str, &'static str, ratatui::style::Color) {
-    use ratatui::style::Color;
     match p {
         "edits" => ("⏵⏵", "accept edits on", t.accent),
-        "auto" => ("⏵⏵", "auto mode on", Color::Rgb(0xe6, 0xc4, 0x6a)),
+        "auto" => ("⏵⏵", "auto mode on", WARN),
         "plan" => ("⏸", "plan mode on", t.shine),
         "bypass" => ("⏵⏵", "bypass permissions on", t.danger),
         _ => ("⏵", "asks before changes", t.muted),
@@ -205,6 +217,8 @@ struct Outcome {
     asked: bool,
     /// a plan was approved in this mode
     perms: Option<String>,
+    /// why this turn has no checkpoint
+    ckpt_err: Option<String>,
 }
 
 /// Answering a set of Claude's questions: which one, the highlighted choice, ticks (several allowed), your own
@@ -238,6 +252,86 @@ enum SideItem {
     /// by id: a reply finishing in the background can reorder the list between a draw and a click
     Chat(String),
 }
+
+/// What background work (git, checks) hands back to the pane. Everything names its chat by id: it may not be the
+/// one on screen by the time it's done.
+enum Job {
+    /// A turn is over (or /check, /verify asked): what it changed since its checkpoint, the folder as a tree, and
+    /// the check's result when one ran. `verify` = /verify asked, not the check loop.
+    Turn { chat: String, idx: usize, stat: Option<ckpt::Stats>, tree: Option<String>, check: Option<(String, Result<(), String>)>, verify: bool },
+    /// /diff: a checkpoint (reply `idx`'s) against the folder now.
+    Diff { chat: String, idx: usize, ckpt: String, r: Result<Vec<git::DiffFile>, String> },
+    /// /undo, /rewind: what going back to reply `idx`'s checkpoint would do.
+    Plan { chat: String, idx: usize, ckpt: String, r: Result<ckpt::Plan, String> },
+    Restored { chat: String, idx: usize, r: Result<ckpt::Plan, String> },
+}
+
+/// The diff view over the transcript (/diff).
+struct Review {
+    chat: String,
+    /// the reply whose checkpoint it starts from (u goes back to it)
+    idx: usize,
+    ckpt: String,
+    /// "since turn 1", "turn 4"
+    title: String,
+    data: Option<Result<Vec<git::DiffFile>, String>>,
+    file: usize,
+    scroll: usize,
+    hits: Vec<(Rect, usize)>,
+}
+
+/// Going back to a checkpoint, waiting for your y: what it would do (None while that's worked out).
+struct Restore {
+    chat: String,
+    idx: usize,
+    ckpt: String,
+    plan: Option<Result<ckpt::Plan, String>>,
+    /// y was pressed: it's being done
+    busy: bool,
+}
+
+/// A chat's check loop (/check), saved in the chat file so it carries on after a restart.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq)]
+struct Check {
+    cmd: String,
+    /// checks run so far, and the most it runs
+    turn: u32,
+    max: u32,
+    /// turns in a row that changed nothing
+    #[serde(default)]
+    idle: u32,
+    /// the folder after the last check (no change = no progress)
+    #[serde(default)]
+    tree: String,
+    /// on · passed · stalled · capped · off · broken
+    status: String,
+    /// "exit 101"
+    #[serde(default)]
+    last: String,
+}
+
+/// How many checks a loop runs before it stops and asks you.
+const CHECK_TURNS: u32 = 20;
+
+fn check_of(c: &store::Chat) -> Option<Check> {
+    c.extra.get("check").and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+fn set_check(c: &mut store::Chat, ck: &Check) {
+    if let Ok(v) = serde_json::to_value(ck) {
+        c.extra.insert("check".into(), v);
+    }
+}
+
+/// /handoff in progress: the card is being written; then a fresh chat starts from it.
+struct Handoff {
+    goal: String,
+    /// another AI to hand to (None = the same one)
+    provider: Option<String>,
+}
+
+/// What the AI is asked to write for /handoff.
+const HANDOFF_ASK: &str = "Write a handoff card so a fresh session (maybe a different AI) can pick this up without this conversation. Markdown, under 350 words, with these headings: **State** (what works now, what doesn't), **Decisions** (what was chosen, and why), **Files** (the paths that matter, one line each; point to specs and docs by path instead of copying them), **Check** (the command that verifies the work, whether it passes now, and the failing lines if not), **Next** (numbered next steps). Only the card: no preamble, no questions.";
 
 pub struct Chat {
     chats: Vec<store::Chat>,
@@ -318,6 +412,18 @@ pub struct Chat {
     queue: Vec<Queued>,
     /// ctrl+x was pressed: s sends now.
     chord_x: bool,
+    /// Background git work and checks handing back their results.
+    jobs: Arc<Mutex<Vec<Job>>>,
+    /// /diff's view, over the transcript while it's open.
+    review: Option<Review>,
+    /// /undo or /rewind waiting for your y.
+    restore: Option<Restore>,
+    /// Chats whose check is running now.
+    checking: HashSet<String>,
+    /// Chats writing a /handoff card.
+    handoffs: HashMap<String, Handoff>,
+    /// Chats already told why they have no checkpoints (said once, not every turn).
+    ckpt_warned: HashSet<String>,
 }
 
 impl Chat {
@@ -395,6 +501,12 @@ impl Chat {
             offset: crate::app::local_offset_secs(),
             queue: vec![],
             chord_x: false,
+            jobs: Arc::default(),
+            review: None,
+            restore: None,
+            checking: HashSet::new(),
+            handoffs: HashMap::new(),
+            ckpt_warned: HashSet::new(),
         }
     }
 
@@ -473,6 +585,8 @@ impl Chat {
         self.history_from = None;
         self.risky_ok = false;
         self.risky_armed = false;
+        self.review = None;
+        self.restore = None;
     }
 
     /// The chat's folder as the agent will get it, without touching the disk (it's drawn every frame).
@@ -568,16 +682,34 @@ impl Chat {
             // what you queued there and it didn't read is the next message, sent right away
             let text = run.queue.drain(..).map(|q| q.text).collect::<Vec<_>>().join("\n\n");
             drop(run);
+            self.chats.insert(0, c);
+            self.turn_ended(&id, !(out.failed || out.lost), cx);
             if !text.is_empty() && (out.failed || out.lost) {
                 self.info.push(format!("the reply in \"{title}\" failed, so what you queued there wasn't sent: {text}"));
             } else if !text.is_empty() {
-                c.messages.push(store::Msg { role: "user".into(), content: text, ..Default::default() });
-                let (stream, msg) = self.launch(&c, cx);
-                c.messages.push(msg);
-                self.parked.insert(id, Run { stream, asks: VecDeque::new(), questions: VecDeque::new(), qs: QState::default(), queue: vec![], since: Instant::now() });
+                self.send_to(&id, text, cx);
             }
-            self.chats.insert(0, c);
+            self.handoff_ready(&id, out.failed || out.lost, cx);
         }
+    }
+
+    /// Send `text` as your next message in chat `id`, on screen or not: a reply running there gets it queued, a
+    /// chat in the background starts its reply there.
+    fn send_to(&mut self, id: &str, text: String, cx: &mut Cx) {
+        if id == self.chat.id {
+            return self.send(text, cx);
+        }
+        if let Some(run) = self.parked.get_mut(id) {
+            run.queue.push(Queued { text, sent: false });
+            return;
+        }
+        let Some(i) = self.chats.iter().position(|c| c.id == id) else { return };
+        let mut c = self.chats.remove(i);
+        c.messages.push(store::Msg { role: "user".into(), content: text, ..Default::default() });
+        let (stream, msg) = self.launch(&c, cx);
+        c.messages.push(msg);
+        self.parked.insert(id.to_string(), Run { stream, asks: VecDeque::new(), questions: VecDeque::new(), qs: QState::default(), queue: vec![], since: Instant::now() });
+        self.chats.insert(0, c);
     }
 
     /// Save only if it differs from the saved copy — just looking at a chat mustn't bump it to the top.
@@ -879,11 +1011,14 @@ impl Chat {
             (None, None)
         };
         let pid: Arc<AtomicU32> = Arc::default();
+        let cwd = self.workdir_for(chat);
+        // a coding agent's folder is checkpointed first, so this turn can be looked at and undone
+        let snap = matches!(provider.as_str(), "claude" | "codex") && ckpt_allowed(&cwd);
         let req = providers::Request {
             provider: provider.clone(),
             model: chat.model.clone(),
             messages,
-            cwd: self.workdir_for(chat),
+            cwd: cwd.clone(),
             perms: self.perms.clone(),
             state: chat.state.clone(),
             cfg,
@@ -893,10 +1028,21 @@ impl Chat {
             since,
         };
         let (ib, waker) = (inbox.clone(), cx.waker());
-        providers::start(req, stop.clone(), move |ev| {
+        let send = move |ev| {
             ib.lock().unwrap().push(ev);
             waker.wake();
-        });
+        };
+        if snap {
+            let (id, turn, stop) = (chat.id.clone(), chat.messages.len(), stop.clone());
+            std::thread::spawn(move || {
+                send(Ev::Checkpoint(ckpt::Place::of(&cwd).and_then(|p| ckpt::snapshot(&p, &id, turn, &ckpt::CAPS))));
+                if !stop.load(Ordering::SeqCst) {
+                    providers::start(req, stop, send);
+                }
+            });
+        } else {
+            providers::start(req, stop.clone(), send);
+        }
         let stream = Stream { stop, inbox, status: String::new(), started: Instant::now(), tokens: 0, steer, pid, perms: self.perms.clone() };
         (stream, store::Msg { role: "assistant".into(), model: Some(provider), state_before: Some(chat.state.clone()), ..Default::default() })
     }
@@ -966,6 +1112,14 @@ impl Chat {
                 }
             }
             "/lead" | "/tasks" | "/task" => self.to_agents(cmd, &arg, cx),
+            "/diff" => self.diff_command(&arg, cx),
+            "/undo" => self.undo_command(cx),
+            "/rewind" => self.rewind_command(&arg, cx),
+            "/check" => self.check_command(&arg, cx),
+            "/verify" => self.verify_command(&arg, cx),
+            "/handoff" => self.handoff(&arg, cx),
+            "/goal" if arg.is_empty() => self.info.push("/goal <condition> — Claude Code keeps working until it holds (its evaluator reads the transcript; /check runs a real command)".into()),
+            "/goal" if self.provider_of() != "claude" => self.info.push("/goal is Claude Code's: /provider claude, or /check <cmd> runs a real check after each turn with any coding agent".into()),
             // /model <name>: a model for the current AI; the old "/model <ai> [model]" still works
             "/model" if !arg.is_empty() && !providers::PROVIDERS.iter().any(|p| p.0 == arg.split_whitespace().next().unwrap_or("").to_lowercase()) => {
                 let p = self.provider_of();
@@ -1191,6 +1345,9 @@ impl Chat {
                     self.info.push(format!("  {c} {a} — {d}"));
                 }
             }
+            // Claude Code's own /goal, and any /command it knows that oriel doesn't (yours, its skills), go to it
+            // as the message
+            _ if self.provider_of() == "claude" => self.send(line.trim().to_string(), cx),
             _ => self.info.push(format!("unknown command {cmd} — type / to see them")),
         }
     }
@@ -1345,6 +1502,7 @@ impl Chat {
                             .collect();
                     }
                     "/cwd" => return self.cwd_options(raw),
+                    "/rewind" | "/diff" => return self.turn_options(cmd).into_iter().filter(|m| hit(&m.left) || hit(m.fill[cmd.len()..].trim_start())).collect(),
                     _ => {}
                 }
                 if q.contains(' ') {
@@ -1361,6 +1519,28 @@ impl Chat {
                     .collect()
             }
         }
+    }
+
+    /// The turns /rewind and /diff can go back to, newest first: your prompt, and what the reply changed.
+    fn turn_options(&self, cmd: &str) -> Vec<MenuItem> {
+        let mut v = vec![];
+        if cmd == "/diff" {
+            v.push(MenuItem::pick("all".into(), "everything this chat changed since its first checkpoint".into(), "/diff all".into(), true));
+            v.push(MenuItem::pick("last".into(), "what the last turn changed".into(), "/diff last".into(), true));
+        }
+        for (idx, _) in ckpts(&self.chat).into_iter().rev() {
+            let n = turn_no(&self.chat, idx);
+            let prompt = self.chat.messages[..idx].iter().rev().find(|m| m.role == "user").map(|m| m.content.trim().lines().next().unwrap_or("").to_string()).unwrap_or_default();
+            // "+12 −3 · 2 files" off the reply's note, when it changed anything
+            let changed = self.chat.messages[idx].note.as_deref().and_then(|n| n.split(" · ").position(|p| p.starts_with('+')).map(|i| n.split(" · ").skip(i).take(2).collect::<Vec<_>>().join(" · ")));
+            let what = if cmd == "/rewind" { "d: its diff · y: the folder back to before it" } else { "its changes and everything after" };
+            let desc = match changed {
+                Some(c) => format!("{c} · {what}"),
+                None => what.to_string(),
+            };
+            v.push(MenuItem::pick(format!("turn {n} · {}", ui::fit(&prompt, 48)), desc, format!("{cmd} {n}"), true));
+        }
+        v
     }
 
     /// A saved chat's line in the /open menu: "yesterday · claude code · 4 messages".
@@ -1722,6 +1902,8 @@ impl Chat {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             (m.content.len(), m.note.as_deref().unwrap_or(""), m.steps.len(), m.parts.len(), width, cx.theme.name.as_str()).hash(&mut h);
+            // the check badge: /verify's result, and the check it looks for
+            (m.verified.as_deref(), self.chat.extra.get("check").map(|v| v.to_string())).hash(&mut h);
             h.finish()
         };
         if let Some((k, b)) = self.cache.get(&i) {
@@ -1866,6 +2048,21 @@ impl Chat {
                     ]));
                 } else {
                     out.extend(md::wrap(vec![Span::styled(n.clone(), Style::default().fg(t.muted))], width.saturating_sub(1), "  ", "  "));
+                }
+            }
+            // was its work checked? (a finished coding agent's reply that edited files or says it's done)
+            if !streaming_last && matches!(m.model.as_deref(), Some("claude" | "codex")) {
+                let check = check_of(&self.chat).map(|k| k.cmd);
+                if let Some((v, text)) = badge(m, check.as_deref()) {
+                    let (glyph, st) = match v {
+                        Verdict::Checked | Verdict::Failed => ("", Style::default().fg(if v == Verdict::Checked { t.good } else { t.danger })),
+                        Verdict::Stale => ("◌ ", Style::default().fg(WARN)),
+                        Verdict::NotRun => ("○ ", ui::muted(t)),
+                    };
+                    if m.note.is_none() {
+                        out.push(Line::raw(""));
+                    }
+                    out.push(Line::from(Span::styled(ui::fit(&format!("  {glyph}{text}"), width.saturating_sub(1)), st)));
                 }
             }
         }
@@ -2165,6 +2362,801 @@ impl Chat {
     }
 }
 
+// ------------------------------------------------------------ checkpoints, the check loop, handoffs
+impl Chat {
+    /// The chat with this id: the one on screen, or one in the list.
+    fn chat_ref(&self, id: &str) -> Option<&store::Chat> {
+        if self.chat.id == id { Some(&self.chat) } else { self.chats.iter().find(|c| c.id == id) }
+    }
+
+    fn chat_mut(&mut self, id: &str) -> Option<&mut store::Chat> {
+        if self.chat.id == id { Some(&mut self.chat) } else { self.chats.iter_mut().find(|c| c.id == id) }
+    }
+
+    /// Save chat `id`, on screen or not.
+    fn save_chat(&mut self, id: &str) {
+        if self.chat.id == id {
+            self.persist();
+        } else if let Some(c) = self.chats.iter_mut().find(|c| c.id == id) {
+            store::save(c);
+        }
+    }
+
+    /// Run `f` on a background thread; what it returns reaches `drain_jobs`.
+    fn spawn_job(&self, cx: &Cx, f: impl FnOnce() -> Job + Send + 'static) {
+        let (jobs, waker) = (self.jobs.clone(), cx.waker());
+        std::thread::spawn(move || {
+            let j = f();
+            jobs.lock().unwrap().push(j);
+            waker.wake();
+        });
+    }
+
+    fn drain_jobs(&mut self, cx: &mut Cx) {
+        let jobs: Vec<Job> = std::mem::take(&mut *self.jobs.lock().unwrap());
+        for j in jobs {
+            match j {
+                Job::Turn { chat, idx, stat, tree, check, verify } => self.on_turn(&chat, idx, stat, tree, check, verify, cx),
+                Job::Diff { chat, idx, ckpt, r } => {
+                    if let Some(v) = self.review.as_mut().filter(|v| v.chat == chat && v.idx == idx && v.ckpt == ckpt) {
+                        v.data = Some(r);
+                    }
+                }
+                Job::Plan { chat, idx, ckpt, r } => {
+                    if !self.restore.as_ref().is_some_and(|x| x.chat == chat && x.plan.is_none()) {
+                        continue; // cancelled meanwhile
+                    }
+                    let turn = self.chat_ref(&chat).map(|c| turn_no(c, idx)).unwrap_or(0);
+                    match r {
+                        Ok(p) if p.write.is_empty() && p.delete.is_empty() => {
+                            self.restore = None;
+                            self.info.push(format!("nothing to change: the folder is already as it was before turn {turn}"));
+                        }
+                        Ok(p) => {
+                            if let Some(rs) = self.restore.as_mut() {
+                                rs.idx = idx;
+                                rs.ckpt = ckpt;
+                                rs.plan = Some(Ok(p));
+                            }
+                            self.scroll = 0;
+                        }
+                        Err(e) => {
+                            self.restore = None;
+                            self.info.push(format!("can't go back: {e}"));
+                        }
+                    }
+                }
+                Job::Restored { chat, idx, r } => {
+                    if self.restore.as_ref().is_some_and(|x| x.chat == chat) {
+                        self.restore = None;
+                    }
+                    let turn = self.chat_ref(&chat).map(|c| turn_no(c, idx)).unwrap_or(0);
+                    let say = match r {
+                        Ok(p) => format!("the folder is back to before turn {turn}: {} restored, {} deleted", count(p.write.len(), "file", "files"), count(p.delete.len(), "new file", "new files")),
+                        Err(e) => format!("couldn't put the folder back: {e}"),
+                    };
+                    if chat == self.chat.id {
+                        self.info.push(say.clone());
+                    }
+                    cx.notify(say);
+                }
+            }
+        }
+    }
+
+    /// A reply just ended in chat `id`: what it changed goes on its note, and a check loop runs its check (not
+    /// after a reply that failed or that you stopped: `finished` = it ended by itself).
+    fn turn_ended(&mut self, id: &str, finished: bool, cx: &mut Cx) {
+        let Some(c) = self.chat_ref(id) else { return };
+        let Some(idx) = c.messages.len().checked_sub(1) else { return };
+        if c.messages[idx].role != "assistant" {
+            return;
+        }
+        let (ckpt, check) = (c.messages[idx].ckpt.clone(), self.loop_check(c).filter(|_| finished));
+        if ckpt.is_none() && check.is_none() {
+            return;
+        }
+        let dir = self.workdir_for(c);
+        self.run_turn_job(id, idx, dir, ckpt, check, false, cx);
+    }
+
+    /// The command chat `c`'s check loop runs, when it has one on (Claude Code and Codex only).
+    fn loop_check(&self, c: &store::Chat) -> Option<String> {
+        if !matches!(self.provider_for(c).as_str(), "claude" | "codex") {
+            return None;
+        }
+        check_of(c).filter(|k| k.status == "on").map(|k| k.cmd)
+    }
+
+    /// In the background: the folder now, what changed since `ckpt`, and the check's result.
+    #[allow(clippy::too_many_arguments)]
+    fn run_turn_job(&mut self, id: &str, idx: usize, dir: PathBuf, ckpt: Option<String>, check: Option<String>, verify: bool, cx: &Cx) {
+        if check.is_some() {
+            self.checking.insert(id.to_string());
+        }
+        let timeout = Duration::from_secs(cx.config.lead.gate_timeout_s.max(30) as u64);
+        let (chat, want_tree) = (id.to_string(), ckpt.is_some() || (check.is_some() && !verify));
+        self.spawn_job(cx, move || {
+            let place = if want_tree && ckpt_allowed(&dir) { ckpt::Place::of(&dir).ok() } else { None };
+            let tree = place.as_ref().and_then(|p| ckpt::tree(p, &ckpt::CAPS).ok());
+            let stat = match (&place, &ckpt, &tree) {
+                (Some(p), Some(c), Some(t)) => ckpt::stat(p, c, t).ok(),
+                _ => None,
+            };
+            let check = check.map(|cmd| {
+                let r = git::run_gate(&dir, &cmd, timeout, &[]);
+                (cmd, r)
+            });
+            Job::Turn { chat, idx, stat, tree, check, verify }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_turn(&mut self, id: &str, idx: usize, stat: Option<ckpt::Stats>, tree: Option<String>, check: Option<(String, Result<(), String>)>, verify: bool, cx: &mut Cx) {
+        use crate::alerts::Kind;
+        self.checking.remove(id);
+        let stamp = clock_hm();
+        let (title, edited, looping) = {
+            let Some(c) = self.chat_mut(id) else { return };
+            let looping = check_of(c).filter(|k| k.status == "on");
+            let Some(m) = c.messages.get_mut(idx).filter(|m| m.role == "assistant") else { return };
+            // "+212 −40 · 6 files" on the reply's note
+            if let Some(s) = stat.as_ref().filter(|s| s.files > 0) {
+                let add = format!("+{} −{} · {}", s.added, s.removed, count(s.files as usize, "file", "files"));
+                m.note = Some(match m.note.take().filter(|n| !n.is_empty()) {
+                    Some(n) if n.contains(&add) => n,
+                    Some(n) => format!("{n} · {add}"),
+                    None => add,
+                });
+            }
+            if let Some((cmd, r)) = &check {
+                m.verified = Some(match r {
+                    Ok(()) => format!("✓ checked {stamp} · {cmd}"),
+                    Err(e) => format!("✗ {} at {stamp} · {cmd}", exit_of(e)),
+                });
+            }
+            let edited = activity_edits(&m.parts) > 0;
+            (c.title.clone(), edited, looping)
+        };
+        self.save_chat(id);
+        let on_screen = id == self.chat.id;
+        let Some((cmd, r)) = check else { return };
+        if verify {
+            let line = match &r {
+                Ok(()) => format!("✓ {cmd} passes"),
+                Err(e) => format!("✗ {}", e.lines().next().unwrap_or("")),
+            };
+            if on_screen { self.info.push(line) } else { cx.notify(format!("{line} · {title}")) }
+            return;
+        }
+        let Some(mut ck) = looping.filter(|k| k.cmd == cmd) else { return };
+        ck.turn += 1;
+        let mut next = None;
+        match &r {
+            Ok(()) => {
+                ck.status = "passed".into();
+                ck.last = "passed".into();
+                cx.alert(Kind::AgentDone, format!("check passed after {}: {cmd} · {title}", count(ck.turn as usize, "check", "checks")));
+                if on_screen {
+                    self.info.push(format!("◎ {cmd} passes: the check loop is done"));
+                }
+            }
+            Err(e) => {
+                ck.last = exit_of(e);
+                // progress: it edited something, or the folder changed some other way
+                let progressed = edited || tree.as_ref().is_some_and(|t| *t != ck.tree);
+                if let Some(t) = &tree {
+                    ck.tree = t.clone();
+                }
+                ck.idle = if progressed { 0 } else { ck.idle + 1 };
+                let stop = if git::shell_trouble(e) {
+                    ck.status = "broken".into();
+                    Some(format!("the check command didn't run: {}", e.lines().nth(1).or(e.lines().next()).unwrap_or("").trim()))
+                } else if ck.idle >= 3 {
+                    ck.status = "stalled".into();
+                    Some("check loop stalled: 3 turns without a change".to_string())
+                } else if ck.turn >= ck.max {
+                    ck.status = "capped".into();
+                    Some(format!("check still failing after {} turns: {cmd}", ck.turn))
+                } else {
+                    next = Some(not_yet(&cmd, e, ck.turn, ck.max));
+                    None
+                };
+                if let Some(s) = stop {
+                    cx.alert(Kind::NeedsYou, format!("{s} · {title}"));
+                    if on_screen {
+                        self.info.push(format!("◎ {s} · /check to start again"));
+                    }
+                }
+            }
+        }
+        if let Some(c) = self.chat_mut(id) {
+            set_check(c, &ck);
+        }
+        self.save_chat(id);
+        if let Some(text) = next {
+            self.send_to(id, text, cx);
+        }
+    }
+
+    /// The check a chat runs when /check or /verify doesn't name one: the one last used in this folder, else the
+    /// configured gate, else a compile check oriel can tell from the project.
+    fn default_check(&self, dir: &Path, cx: &Cx) -> Option<String> {
+        remembered_check(dir)
+            .or_else(|| {
+                let g = cx.config.lead.gate.trim();
+                (!g.is_empty() && g != "none" && g != "off").then(|| g.to_string())
+            })
+            .or_else(|| git::detect_gate(dir))
+    }
+
+    /// /check [cmd|off]: after each turn oriel runs the check itself; a failure goes back as the next message
+    /// until it passes, nothing changes for 3 turns, or it has tried CHECK_TURNS times.
+    fn check_command(&mut self, arg: &str, cx: &mut Cx) {
+        if !matches!(self.provider_of().as_str(), "claude" | "codex") {
+            self.info.push("/check runs a command after each turn of a coding agent (Claude Code or Codex) — /provider claude or codex first".into());
+            return;
+        }
+        let cur = check_of(&self.chat);
+        let on = cur.as_ref().is_some_and(|k| k.status == "on");
+        match arg {
+            "off" | "stop" => {
+                if let Some(mut k) = cur.filter(|_| on) {
+                    k.status = "off".into();
+                    set_check(&mut self.chat, &k);
+                    self.persist();
+                    cx.notify("check loop off");
+                } else {
+                    self.info.push("no check loop is on in this chat".into());
+                }
+            }
+            "" if on => {
+                let k = cur.unwrap_or_default();
+                self.info.push(format!("◎ checking with {} after each turn · {} of {} so far{} · /check off stops it", k.cmd, k.turn, k.max, if k.last.is_empty() { String::new() } else { format!(" · last: {}", k.last) }));
+            }
+            _ => {
+                let dir = self.workdir();
+                let Some(cmd) = (if arg.is_empty() { self.default_check(&dir, cx) } else { Some(arg.to_string()) }) else {
+                    self.info.push("/check <command> — e.g. /check cargo test: it runs after each turn, and a failure goes back to the agent until it passes".into());
+                    return;
+                };
+                remember_check(&dir, &cmd);
+                set_check(&mut self.chat, &Check { cmd: cmd.clone(), turn: 0, max: CHECK_TURNS, status: "on".into(), ..Default::default() });
+                self.persist();
+                self.info.push(format!("◎ check on: {cmd} runs after each turn (up to {CHECK_TURNS}) until it passes; a failure goes back as your next message · /check off stops it"));
+                // a reply is already there and nothing's running: check it now
+                if let Some(idx) = self.chat.messages.iter().rposition(|m| m.role == "assistant").filter(|_| self.stream.is_none()) {
+                    self.run_turn_job(&self.chat.id.clone(), idx, dir, None, Some(cmd), false, cx);
+                }
+            }
+        }
+    }
+
+    /// /verify [cmd]: run the check now; the last reply's badge says what it found.
+    fn verify_command(&mut self, arg: &str, cx: &mut Cx) {
+        let dir = self.workdir();
+        let cmd = if arg.is_empty() { check_of(&self.chat).filter(|k| k.status == "on").map(|k| k.cmd).or_else(|| self.default_check(&dir, cx)) } else { Some(arg.to_string()) };
+        let Some(cmd) = cmd else {
+            self.info.push("/verify <command> — e.g. /verify cargo test (next time it remembers it for this folder)".into());
+            return;
+        };
+        let Some(idx) = self.chat.messages.iter().rposition(|m| m.role == "assistant") else {
+            self.info.push("no reply to verify yet".into());
+            return;
+        };
+        if !arg.is_empty() {
+            remember_check(&dir, &cmd);
+        }
+        self.info.push(format!("◎ running {cmd}…"));
+        self.run_turn_job(&self.chat.id.clone(), idx, dir, None, Some(cmd), true, cx);
+    }
+
+    /// /handoff [goal] [ai]: the AI writes a handoff card now; when it's done a fresh chat starts from it
+    /// (handoff_ready), with the same AI or the one named.
+    fn handoff(&mut self, arg: &str, cx: &mut Cx) {
+        if !self.chat.messages.iter().any(|m| m.role == "assistant") {
+            self.info.push("nothing to hand off yet: /handoff carries a long chat over to a fresh one".into());
+            return;
+        }
+        if self.stream.is_some() {
+            self.info.push("the reply is still running: /handoff when it's done (or esc it first)".into());
+            return;
+        }
+        let mut words: Vec<&str> = arg.split_whitespace().collect();
+        let mut to = None;
+        if let Some(id) = words.last().map(|w| w.to_lowercase()).filter(|w| providers::is_known(w)) {
+            if !self.avail.contains(&id.as_str()) {
+                self.info.push(format!("{} isn't set up on this computer", providers::label(&id)));
+                return;
+            }
+            to = Some(id);
+            words.pop();
+        }
+        let goal = words.join(" ");
+        let ask = if goal.is_empty() { HANDOFF_ASK.to_string() } else { format!("{HANDOFF_ASK}\n\nThe next session's goal: {goal}. Shape **Next** around it.") };
+        let who = providers::label(to.as_deref().unwrap_or(&self.provider_of())).to_lowercase();
+        self.handoffs.insert(self.chat.id.clone(), Handoff { goal, provider: to });
+        self.send(ask, cx);
+        self.info.push(format!("writing a handoff card: a fresh {who} chat starts from it when it's done"));
+    }
+
+    /// A reply ended in chat `id`: if it was a /handoff card, a fresh chat starts from it (on screen if this one
+    /// was, else in the background).
+    fn handoff_ready(&mut self, id: &str, failed: bool, cx: &mut Cx) {
+        if !self.handoffs.contains_key(id) || (id == self.chat.id && self.stream.is_some()) || self.parked.contains_key(id) {
+            return; // not one, or a queued message is being answered first
+        }
+        let Some(h) = self.handoffs.remove(id) else { return };
+        let Some(parent) = self.chat_ref(id).cloned() else { return };
+        let card = parent.messages.last().filter(|m| m.role == "assistant").map(|m| m.content.trim().to_string()).unwrap_or_default();
+        if failed || card.is_empty() {
+            self.info.push("the handoff card didn't come back: /handoff again to retry".into());
+            return;
+        }
+        let p = h.provider.clone().unwrap_or_else(|| self.provider_for(&parent));
+        let mut child = store::Chat::new(&p);
+        child.model = self.models.get(&p).cloned().filter(|m| !m.is_empty());
+        child.cwd = parent.cwd.clone();
+        child.title = parent.title.clone();
+        child.extra.insert("parent".into(), serde_json::Value::String(parent.id.clone()));
+        let next = if h.goal.is_empty() { "Read it, then say in two or three lines where things stand and what you'd do first. Don't change anything yet.".to_string() } else { format!("Next: {}", h.goal) };
+        let first = format!("Handoff from an earlier session (\"{}\"):\n\n{card}\n\n{next}", parent.title);
+        let who = providers::label(&p).to_lowercase();
+        if id == self.chat.id {
+            self.persist_if_changed();
+            self.chat = child;
+            self.fresh_view();
+            self.send(first, cx);
+            self.chat.title = parent.title.clone();
+            self.info.push(format!("↳ handed off from \"{}\" (still in the list) · {who} starts from the card", parent.title));
+        } else {
+            let cid = child.id.clone();
+            self.chats.insert(0, child);
+            self.send_to(&cid, first, cx);
+            cx.alert(crate::alerts::Kind::AgentDone, format!("handed off: {who} continues \"{}\" in a fresh chat", parent.title));
+        }
+    }
+
+    /// /diff [last|<turn>]: the diff view, from a checkpoint to the folder as it is now.
+    fn diff_command(&mut self, arg: &str, cx: &mut Cx) {
+        let cks = ckpts(&self.chat);
+        let Some(first) = cks.first().cloned() else {
+            self.info.push(NO_CKPT.into());
+            return;
+        };
+        let pick = match arg.trim() {
+            "" | "all" => Some(first),
+            "last" => cks.last().cloned(),
+            n => n.trim_start_matches("turn").trim().parse::<usize>().ok().and_then(|t| cks.iter().find(|(i, _)| turn_no(&self.chat, *i) == t).cloned()),
+        };
+        match pick {
+            Some((idx, sha)) => self.open_review(idx, sha, cx),
+            None => self.info.push(format!("no checkpoint for turn {arg} — /rewind lists the ones there are")),
+        }
+    }
+
+    fn open_review(&mut self, idx: usize, sha: String, cx: &mut Cx) {
+        let turn = turn_no(&self.chat, idx);
+        let first = ckpts(&self.chat).first().is_some_and(|f| f.0 == idx);
+        let title = if first { format!("everything this chat changed (since turn {turn})") } else { format!("changes since turn {turn}") };
+        self.review = Some(Review { chat: self.chat.id.clone(), idx, ckpt: sha.clone(), title, data: None, file: 0, scroll: 0, hits: vec![] });
+        let (dir, chat) = (self.workdir(), self.chat.id.clone());
+        self.spawn_job(cx, move || {
+            let r = ckpt::Place::of(&dir).and_then(|p| {
+                if !ckpt::exists(&p, &sha) {
+                    return Err("that checkpoint isn't in this folder's history (was the chat's folder changed?)".into());
+                }
+                let now = ckpt::tree(&p, &ckpt::CAPS)?;
+                ckpt::diff(&p, &sha, &now)
+            });
+            Job::Diff { chat, idx, ckpt: sha, r }
+        });
+    }
+
+    /// /undo: back to before the last turn that changed anything (asks first).
+    fn undo_command(&mut self, cx: &mut Cx) {
+        let cks = ckpts(&self.chat);
+        if cks.is_empty() {
+            self.info.push(NO_CKPT.into());
+        } else if self.stream.is_some() {
+            self.info.push("the reply is still changing files: stop it first (esc), then /undo".into());
+        } else {
+            self.start_restore(cks.into_iter().rev().collect(), cx);
+        }
+    }
+
+    /// /rewind <turn>: back to before that turn (asks first; d shows the diff instead).
+    fn rewind_command(&mut self, arg: &str, cx: &mut Cx) {
+        let cks = ckpts(&self.chat);
+        if cks.is_empty() {
+            self.info.push(NO_CKPT.into());
+            return;
+        }
+        let t = arg.trim().trim_start_matches("turn").trim();
+        let Some(ck) = t.parse::<usize>().ok().and_then(|t| cks.iter().find(|(i, _)| turn_no(&self.chat, *i) == t).cloned()) else {
+            self.info.push("/rewind <turn> — type /rewind and a space: your turns are listed (↑↓ enter)".into());
+            return;
+        };
+        if self.stream.is_some() {
+            self.info.push("the reply is still changing files: stop it first (esc)".into());
+            return;
+        }
+        self.start_restore(vec![ck], cx);
+    }
+
+    /// Work out what going back would do, then ask. `cands` newest first: the first that differs from now wins
+    /// (so /undo twice goes back two turns).
+    fn start_restore(&mut self, cands: Vec<(usize, String)>, cx: &mut Cx) {
+        let Some((idx, sha)) = cands.first().cloned() else { return };
+        self.review = None;
+        self.restore = Some(Restore { chat: self.chat.id.clone(), idx, ckpt: sha.clone(), plan: None, busy: false });
+        let (dir, chat, single) = (self.workdir(), self.chat.id.clone(), cands.len() == 1);
+        self.spawn_job(cx, move || {
+            let r = ckpt::Place::of(&dir).and_then(|p| {
+                let now = ckpt::tree(&p, &ckpt::CAPS)?;
+                for (i, c) in &cands {
+                    let plan = ckpt::plan(&p, c, &now)?;
+                    if single || !plan.write.is_empty() || !plan.delete.is_empty() {
+                        return Ok((*i, c.clone(), plan));
+                    }
+                }
+                Err("the folder is already as it was before every turn this chat has a checkpoint for".to_string())
+            });
+            match r {
+                Ok((idx, ckpt, plan)) => Job::Plan { chat, idx, ckpt, r: Ok(plan) },
+                Err(e) => Job::Plan { chat, idx, ckpt: sha, r: Err(e) },
+            }
+        });
+    }
+
+    /// y on a restore: do it.
+    fn confirm_restore(&mut self, cx: &mut Cx) {
+        let dir = self.workdir();
+        let Some(r) = self.restore.as_mut() else { return };
+        let Some(Ok(plan)) = r.plan.clone() else { return };
+        r.busy = true;
+        let (chat, idx, sha) = (r.chat.clone(), r.idx, r.ckpt.clone());
+        self.spawn_job(cx, move || {
+            let r = ckpt::Place::of(&dir).and_then(|p| ckpt::restore(&p, &sha, &plan)).map(|_| plan);
+            Job::Restored { chat, idx, r }
+        });
+    }
+
+    /// The restore prompt above the box: what would come back and what would go.
+    fn restore_lines(&self, width: usize, cx: &Cx) -> Vec<Line<'static>> {
+        let t = cx.theme;
+        let Some(r) = self.restore.as_ref().filter(|r| r.chat == self.chat.id) else { return vec![] };
+        let bar = Span::styled("  ▌ ", Style::default().fg(t.shine));
+        let muted = ui::muted(t);
+        let turn = turn_no(&self.chat, r.idx);
+        let mut out = vec![Line::raw("")];
+        let Some(Ok(plan)) = &r.plan else {
+            out.push(Line::from(vec![bar, Span::styled(format!("{} working out what going back to before turn {turn} would change…", SPIN[(cx.time * 10.0) as usize % SPIN.len()]), muted)]));
+            return out;
+        };
+        let prompt = self.chat.messages[..r.idx.min(self.chat.messages.len())].iter().rev().find(|m| m.role == "user").map(|m| m.content.lines().next().unwrap_or("").to_string()).unwrap_or_default();
+        out.push(Line::from(vec![
+            bar.clone(),
+            Span::styled("put the folder back to before turn ", Style::default().fg(t.shine).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{turn}"), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" ({}) ?", ui::fit(&prompt, width.saturating_sub(48))), Style::default().fg(t.fg)),
+        ]));
+        let back = if plan.write.len() == 1 { "comes back as it was" } else { "come back as they were" };
+        out.push(Line::from(vec![bar.clone(), Span::styled(format!("  {} {back}", count(plan.write.len(), "file", "files")), muted)]));
+        if !plan.delete.is_empty() {
+            let names = plan.delete.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+            let more = if plan.delete.len() > 6 { format!(" and {} more", plan.delete.len() - 6) } else { String::new() };
+            let gone = if plan.delete.len() == 1 { "made since is deleted" } else { "made since are deleted" };
+            out.push(Line::from(vec![bar.clone(), Span::styled(format!("  {} {gone}: ", count(plan.delete.len(), "file", "files")), Style::default().fg(t.danger)), Span::styled(ui::fit(&format!("{names}{more}"), width.saturating_sub(40)), Style::default().fg(t.fg))]));
+        }
+        // another reply working in the same folder would carry on over the top of it
+        let here = self.workdir_label();
+        for (id, _) in self.parked.iter() {
+            if let Some(c) = self.chats.iter().find(|c| c.id == *id && c.cwd.as_deref().map(PathBuf::from).as_ref() == Some(&here)) {
+                out.push(Line::from(vec![bar.clone(), Span::styled(format!("  ⚠ \"{}\" is still running in this folder", c.title), Style::default().fg(t.shine))]));
+            }
+        }
+        if r.busy {
+            out.push(Line::from(vec![bar, Span::styled("putting it back…", muted)]));
+        } else {
+            out.push(Line::from(vec![bar, Span::styled("y", ui::bold_accent(t)), Span::styled(" put it back  ", muted), Span::styled("d", ui::bold_accent(t)), Span::styled(" show the diff first  ", muted), Span::styled("esc", ui::bold_accent(t)), Span::styled(" leave it", muted)]));
+        }
+        out
+    }
+
+    /// Keys in the diff view.
+    fn review_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
+        let Some(v) = self.review.as_mut() else { return false };
+        let n = v.data.as_ref().and_then(|d| d.as_ref().ok()).map(|d| d.len()).unwrap_or(0);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.review = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                v.file = v.file.saturating_sub(1);
+                v.scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                v.file = (v.file + 1).min(n.saturating_sub(1));
+                v.scroll = 0;
+            }
+            KeyCode::PageUp => v.scroll = v.scroll.saturating_sub(20),
+            KeyCode::PageDown | KeyCode::Char(' ') => v.scroll += 20,
+            KeyCode::Home => v.scroll = 0,
+            KeyCode::Char('u') => {
+                let ck = (v.idx, v.ckpt.clone());
+                if self.stream.is_some() {
+                    self.info.push("the reply is still changing files: stop it first (esc)".into());
+                    self.review = None;
+                } else {
+                    self.start_restore(vec![ck], cx);
+                }
+            }
+            KeyCode::Char('r') => {
+                let (idx, sha) = (v.idx, v.ckpt.clone());
+                self.open_review(idx, sha, cx);
+            }
+            // anything else (F-keys, alt) goes to the app
+            _ => return false,
+        }
+        true
+    }
+
+    /// The diff view, over the whole pane.
+    fn draw_review(&mut self, f: &mut Frame, area: Rect, cx: &Cx) {
+        let t = cx.theme;
+        let hints = [("↑↓", "file"), ("pgup/pgdn", "scroll"), ("u", "put the folder back to before it"), ("r", "reload"), ("esc", "back to the chat")];
+        let body = ui::hint_line(f, area, &hints, t);
+        let body = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };
+        let Some(v) = self.review.as_mut() else { return };
+        let mut right = vec![];
+        match &v.data {
+            None => right.push(Span::styled(format!("{} reading the diff", SPIN[(cx.time * 10.0) as usize % SPIN.len()]), ui::muted(t))),
+            Some(Err(e)) => right.push(Span::styled(e.clone(), Style::default().fg(t.danger))),
+            Some(Ok(d)) => {
+                let (a, r) = review::totals(d);
+                right.extend([Span::styled(format!("+{a}"), Style::default().fg(t.good).add_modifier(Modifier::BOLD)), Span::styled(format!(" −{r}"), Style::default().fg(t.danger).add_modifier(Modifier::BOLD)), Span::styled(format!(" · {}", count(d.len(), "file", "files")), ui::muted(t))]);
+            }
+        }
+        let left = format!("◆ {}", v.title);
+        let rw: usize = right.iter().map(|s| s.content.width()).sum();
+        let lw = (body.width as usize).saturating_sub(rw + 1);
+        let mut head = vec![Span::styled(ui::fit(&left, lw), Style::default().fg(t.fg).add_modifier(Modifier::BOLD))];
+        head.push(Span::raw(" ".repeat(lw.saturating_sub(ui::fit(&left, lw).width()) + 1)));
+        head.extend(right);
+        f.render_widget(Paragraph::new(Line::from(head)), Rect { height: 1, ..body });
+        let main = Rect { y: body.y + 2, height: body.height.saturating_sub(2), ..body };
+        v.hits.clear();
+        if let Some(Ok(d)) = &v.data {
+            v.hits = review::draw(f, main, d, &mut v.file, &mut v.scroll, t);
+        }
+    }
+
+    /// "◎ check · turn 4/20 · last: exit 101" for the box's top edge, while a check loop is on.
+    fn check_status(&self) -> Option<String> {
+        let k = check_of(&self.chat).filter(|k| k.status == "on")?;
+        if self.checking.contains(&self.chat.id) {
+            return Some(format!("◎ running {}…", k.cmd));
+        }
+        let last = if k.last.is_empty() { String::new() } else { format!(" · last: {}", k.last) };
+        Some(format!("◎ check · {}/{}{last}", k.turn, k.max))
+    }
+
+    /// How full the context is on this chat's AI: (used, window), from its latest reply.
+    fn context_fill(&self) -> Option<(u64, u64)> {
+        let p = self.provider_of();
+        let last = self.chat.messages.iter().rev().find(|m| m.role == "assistant")?;
+        if last.model.as_deref() != Some(p.as_str()) {
+            return None; // another AI wrote the last reply: its numbers aren't this one's
+        }
+        self.chat.messages.iter().rev().filter(|m| m.role == "assistant" && m.model.as_deref() == Some(p.as_str())).find_map(|m| m.ctx).filter(|c| c.1 > 0)
+    }
+
+    /// "context 62% · /handoff?" once the context is past 60% or the conversation was compacted. Only a hint.
+    fn handoff_hint(&self) -> Option<String> {
+        if self.stream.is_some() || self.handoffs.contains_key(&self.chat.id) {
+            return None;
+        }
+        let pct = self.context_fill().map(|(u, w)| u * 100 / w).unwrap_or(0);
+        if pct >= 60 {
+            return Some(format!("context {pct}% · /handoff?"));
+        }
+        // the AI's 5-hour window nearly used up: another coding agent with room could carry on
+        let p = self.provider_of();
+        let five = self.usage.lock().unwrap().iter().filter(|u| u.0 == p && u.1 == "5-hour").map(|u| u.2).fold(0.0, f64::max);
+        if five >= 90.0 && self.chat.messages.iter().any(|m| m.role == "assistant") {
+            if let Some(to) = self.roomiest_other(&p) {
+                return Some(format!("5h {five:.0}% · /handoff {to}?"));
+            }
+        }
+        let last = self.chat.messages.iter().rev().find(|m| m.role == "assistant")?;
+        last.parts.iter().any(|p| matches!(p, store::Part::Mark { text } if text.contains("compacted"))).then(|| "compacted · /handoff?".to_string())
+    }
+
+    /// The other coding agent set up here with the most room left in its plan windows (for a handoff).
+    fn roomiest_other(&self, p: &str) -> Option<&'static str> {
+        let u = self.usage.lock().unwrap();
+        let fullest = |a: &str| u.iter().filter(|w| w.0 == a).map(|w| w.2).fold(0.0, f64::max);
+        ["claude", "codex"].into_iter().filter(|a| *a != p && self.avail.contains(a)).min_by(|a, b| fullest(a).partial_cmp(&fullest(b)).unwrap_or(std::cmp::Ordering::Equal))
+    }
+}
+
+/// Said when a chat has no checkpoints to diff or go back to.
+const NO_CKPT: &str = "no checkpoints in this chat yet: Claude Code and Codex chats take one before each reply (in a git repo, or a shadow copy for other folders)";
+
+/// Checkpoints are taken for a coding agent's folder unless it's your home folder, a drive root or the system
+/// (too big, and not a project). Tests only ever snapshot their own scratch folders.
+fn ckpt_allowed(dir: &Path) -> bool {
+    if cfg!(test) {
+        let scratch = std::path::absolute("target/test-scratch").unwrap_or_default();
+        return std::path::absolute(dir).is_ok_and(|d| d.starts_with(&scratch));
+    }
+    !risky_dir(dir)
+}
+
+/// The replies in a chat that have a checkpoint, oldest first: (message index, commit).
+fn ckpts(c: &store::Chat) -> Vec<(usize, String)> {
+    c.messages.iter().enumerate().filter_map(|(i, m)| m.ckpt.clone().filter(|_| m.role == "assistant").map(|s| (i, s))).collect()
+}
+
+/// Which of your turns message `idx` answers (1 = the first).
+fn turn_no(c: &store::Chat, idx: usize) -> usize {
+    c.messages[..idx.min(c.messages.len())].iter().filter(|m| m.role == "user").count()
+}
+
+/// "1 file", "3 files".
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// "14:02", local time.
+fn clock_hm() -> String {
+    let l = crate::panes::files::clock::local(crate::panes::files::clock::now_secs());
+    format!("{:02}:{:02}", l.hour, l.min)
+}
+
+/// "exit 101" / "timed out" out of a check's failure.
+fn exit_of(e: &str) -> String {
+    if e.contains("timed out") {
+        return "timed out".into();
+    }
+    e.split("(exit ").nth(1).and_then(|r| r.split(')').next()).map(|n| format!("exit {n}")).unwrap_or_else(|| "failed".into())
+}
+
+/// The check loop's next message after a failure: what failed, the first lines, and what to do.
+fn not_yet(cmd: &str, err: &str, turn: u32, max: u32) -> String {
+    let (head, rest) = err.split_once('\n').unwrap_or((err, ""));
+    let body = if rest.trim().is_empty() { String::new() } else { format!("\n\n```\n{}\n```", rest.trim_end()) };
+    format!("◎ check {turn} of {max}: not yet — {}{body}\n\nFix it, then end your turn: oriel runs {cmd} again when you stop.", head.trim_end_matches(':'))
+}
+
+/// Files a reply's calls edited, written or deleted.
+fn activity_edits(parts: &[store::Part]) -> usize {
+    tools_in(parts).iter().filter(|t| is_edit(t)).count()
+}
+
+fn is_edit(t: &store::Tool) -> bool {
+    matches!(t.label.as_str(), "Update" | "Write" | "Delete" | "Notebook") && t.status == "done"
+}
+
+/// Every call in a reply, subagents' included, in order.
+fn tools_in(parts: &[store::Part]) -> Vec<&store::Tool> {
+    fn walk<'a>(t: &'a store::Tool, out: &mut Vec<&'a store::Tool>) {
+        out.push(t);
+        t.children.iter().for_each(|c| walk(c, out));
+    }
+    let mut out = vec![];
+    for p in parts {
+        if let store::Part::Tool(t) = p {
+            walk(t, &mut out);
+        }
+    }
+    out
+}
+
+/// Words a command uses when it's a check (tests, builds, linters).
+const CHECK_WORDS: &[&str] = &["test", "tests", "pytest", "jest", "vitest", "mocha", "check", "clippy", "build", "vet", "tsc", "lint", "ruff", "mypy", "ctest", "make", "gradlew", "mvn"];
+
+/// Is this command the check? The chat's check command when there is one, else anything test- or build-like.
+fn is_check(cmd: &str, check: Option<&str>) -> bool {
+    let c = cmd.to_lowercase();
+    match check {
+        Some(k) => {
+            let key = k.to_lowercase().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+            !key.is_empty() && c.contains(&key)
+        }
+        None => c.split(|ch: char| ch.is_whitespace() || ch == '/' || ch == ';' || ch == '&').map(|w| w.trim_matches(|ch: char| !ch.is_alphanumeric())).any(|w| CHECK_WORDS.contains(&w)),
+    }
+}
+
+/// What a reply's last words say it did: done, fixed, tests passing.
+fn claims_done(text: &str) -> bool {
+    let t = text.to_lowercase();
+    const SAYS: &[&str] = &[
+        "tests pass", "tests now pass", "tests are passing", "tests all pass", "all tests", "test suite passes", "build passes", "builds cleanly", "build succeeds", "compiles", "all green", "is fixed",
+        "are fixed", "fixed it", "fixed the", "should work now", "works now", "now works", "is done", "all done", "done:", "complete:", "implemented",
+    ];
+    t.trim_start().starts_with("done") || SAYS.iter().any(|w| t.contains(w))
+}
+
+/// A reply's last words: its final text part (a coding agent's), else all of it.
+fn final_text(m: &store::Msg) -> &str {
+    m.parts.iter().rev().find_map(|p| if let store::Part::Text { text } = p { Some(text.as_str()) } else { None }).unwrap_or(&m.content)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Verdict {
+    /// the check ran after the last edit and passed (or /verify said so)
+    Checked,
+    Failed,
+    /// edits since the check last ran
+    Stale,
+    NotRun,
+}
+
+/// The line under a coding agent's finished reply that says whether its work was checked: a check ran after
+/// its last edit (✓, or ✗ if it failed), files were edited after the last check (stale), or nothing checked it
+/// (said only when its last words claim it's done or passing). /verify's result wins over all of that.
+fn badge(m: &store::Msg, check: Option<&str>) -> Option<(Verdict, String)> {
+    if let Some(v) = &m.verified {
+        return Some((if v.starts_with('✓') { Verdict::Checked } else { Verdict::Failed }, v.clone()));
+    }
+    let tools = tools_in(&m.parts);
+    let last_edit = tools.iter().rposition(|t| is_edit(t));
+    let claims = claims_done(final_text(m));
+    if last_edit.is_none() && !claims {
+        return None;
+    }
+    let last_run = tools.iter().rposition(|t| matches!(t.label.as_str(), "Bash" | "PowerShell" | "Run") && t.status != "running" && is_check(&t.target, check));
+    match (last_run, last_edit) {
+        (Some(r), e) if e.is_none_or(|e| r > e) => {
+            let t = tools[r];
+            if t.status == "done" && !t.summary.starts_with("exit ") {
+                Some((Verdict::Checked, format!("✓ checked after the last edit · {}", t.target)))
+            } else {
+                Some((Verdict::Failed, format!("✗ the check after the last edit failed ({}) · {}", if t.summary.is_empty() { "error" } else { &t.summary }, t.target)))
+            }
+        }
+        (Some(r), Some(_)) => {
+            let files: BTreeSet<&str> = tools[r + 1..].iter().filter(|t| is_edit(t)).map(|t| t.target.as_str()).collect();
+            Some((Verdict::Stale, format!("stale: {} edited since {} ran · /verify", count(files.len().max(1), "file", "files"), tools[r].target)))
+        }
+        // edits that nothing checked: only worth saying when it claims they work
+        _ if claims => Some((Verdict::NotRun, "not run: nothing checked this work · /verify runs the check".into())),
+        _ => None,
+    }
+}
+
+/// The check last used in each folder (/check, /verify with a command), in oriel's own data file.
+fn checks_file() -> PathBuf {
+    #[cfg(test)]
+    {
+        std::path::absolute("target/test-scratch/chat/checks.json").unwrap_or_default()
+    }
+    #[cfg(not(test))]
+    {
+        crate::config::data_dir().join("chat-checks.json")
+    }
+}
+
+fn folder_key(dir: &Path) -> String {
+    let s = dir.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+    if cfg!(windows) { s.to_lowercase().replace('/', "\\") } else { s }
+}
+
+fn remembered_check(dir: &Path) -> Option<String> {
+    let m: HashMap<String, String> = std::fs::read_to_string(checks_file()).ok().and_then(|s| serde_json::from_str(&s).ok())?;
+    m.get(&folder_key(dir)).cloned().filter(|c| !c.trim().is_empty())
+}
+
+fn remember_check(dir: &Path, cmd: &str) {
+    let path = checks_file();
+    let mut m: HashMap<String, String> = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    m.insert(folder_key(dir), cmd.to_string());
+    if let Some(p) = path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(&m).unwrap_or_default());
+}
+
 fn lines_block(lines: Vec<Line<'static>>, hits: Vec<(usize, Hit)>) -> Block {
     Block { lines: Rc::new(lines), hits: Rc::new(hits) }
 }
@@ -2368,6 +3360,9 @@ fn absorb(chat: &mut store::Chat, run: &mut Run, evs: Vec<Ev>, always: Option<&B
             }
             Ev::Status(st) => run.stream.status = st,
             Ev::Cost(c) => m.cost_usd = Some(c),
+            Ev::Context(used, window) => m.ctx = Some((used, window)),
+            Ev::Checkpoint(Ok(sha)) => m.ckpt = Some(sha),
+            Ev::Checkpoint(Err(e)) => out.ckpt_err = Some(e),
             Ev::Question(q) => {
                 let head = q.qs.first().map(|x| x.question.clone()).unwrap_or_default();
                 out.waiting.push(format!("{who} is asking you: {}", ui::fit(&head, 80)));
@@ -2495,6 +3490,7 @@ impl Pane for Chat {
 
     fn poll(&mut self, cx: &mut Cx) {
         use crate::alerts::Kind;
+        self.drain_jobs(cx);
         // ---- the chat on screen
         if let Some(mut run) = self.take_run() {
             let who = providers::label(&self.provider_of()).to_lowercase();
@@ -2520,6 +3516,11 @@ impl Pane for Chat {
                     let _ = tx.send(providers::Steer::Mode(p));
                 }
             }
+            if let Some(e) = &out.ckpt_err {
+                if self.ckpt_warned.insert(self.chat.id.clone()) {
+                    self.info.push(format!("no checkpoint for this turn: {e} (/undo can't go back past it)"));
+                }
+            }
             if let Some(d) = out.denied {
                 self.info.push(format!(
                     "{d} action{} blocked by the permission mode ({}). /perms ask to approve each one, /perms bypass to allow everything — saved for every chat.",
@@ -2542,6 +3543,8 @@ impl Pane for Chat {
             self.queue = std::mem::take(&mut run.queue);
             drop(run);
             self.persist();
+            let id = self.chat.id.clone();
+            self.turn_ended(&id, !(out.failed || out.lost), cx);
             // anything queued that the agent didn't take mid-reply is the next message
             if out.failed || out.lost {
                 self.unqueue_to_box("the reply failed");
@@ -2549,6 +3552,7 @@ impl Pane for Chat {
                 let text = self.queue.drain(..).map(|q| q.text).collect::<Vec<_>>().join("\n\n");
                 self.send(text, cx);
             }
+            self.handoff_ready(&id, out.failed || out.lost, cx);
         }
         self.poll_parked(cx);
     }
@@ -2558,9 +3562,15 @@ impl Pane for Chat {
         let has_activity = self.chat.messages.iter().any(|m| !m.parts.is_empty());
         let expand_hint = if self.expanded { "collapse" } else { "expand tools" };
         self.drawn = Some(Instant::now());
+        if self.review.as_ref().is_some_and(|v| v.chat == self.chat.id) {
+            return self.draw_review(f, area, cx);
+        }
         let prompt = !self.asks.is_empty() || !self.questions.is_empty();
+        let restoring = self.restore.as_ref().is_some_and(|r| r.chat == self.chat.id && matches!(r.plan, Some(Ok(_))) && !r.busy);
         let hints: Vec<(&str, &str)> = if self.confirm_delete {
             vec![("y", "delete this chat"), ("esc", "keep it")]
+        } else if restoring && self.input.is_empty() {
+            vec![("y", "put the folder back"), ("d", "show the diff"), ("esc", "leave it")]
         } else if prompt && !self.input.is_empty() {
             vec![("esc", "clear the box to answer"), ("enter", "queue it")]
         } else if !self.questions.is_empty() {
@@ -2620,8 +3630,10 @@ impl Pane for Chat {
             self.unseen = 0;
         }
         self.relayout = false;
-        // what's pinned above the composer while an agent works: an approval prompt, the status line, the todos
-        let mut pinned = self.pinned_lines(above.width as usize, cx);
+        // what's pinned above the composer: going back to a checkpoint; while an agent works, an approval prompt,
+        // the status line, the todos
+        let mut pinned = self.restore_lines(above.width as usize, cx);
+        pinned.extend(self.pinned_lines(above.width as usize, cx));
         if self.scroll > 0 && (self.unseen > 0 || self.stream.is_some()) {
             // scrolled up: say what's arriving below, and how to get back to it
             let what = if self.unseen > 0 { format!(" ↓ {} new line{} ", self.unseen, if self.unseen == 1 { "" } else { "s" }) } else { " ↓ still working below ".to_string() };
@@ -2773,6 +3785,22 @@ impl Pane for Chat {
                 f.render_widget(Paragraph::new(label), Rect { x: right_start, y: comp.bottom() - 1, width: lw, height: 1 });
             }
         }
+        // "ctx 38%": how full the context is (the warning colour from 50%, danger from 70%)
+        if let Some((used, window)) = self.context_fill().filter(|_| comp.width > 50) {
+            let pct = used * 100 / window;
+            let st = match pct {
+                70.. => Style::default().fg(t.danger).add_modifier(Modifier::BOLD),
+                50.. => Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                _ => ui::muted(t),
+            };
+            let label = Line::from(vec![Span::raw(" "), Span::styled(format!("ctx {pct}%"), st), Span::raw(" ")]);
+            let lw = label.width() as u16;
+            let x = if left_end > comp.x + 1 { left_end } else { comp.x + 2 };
+            if x + lw + 2 < right_start {
+                f.render_widget(Paragraph::new(label), Rect { x, y: comp.bottom() - 1, width: lw, height: 1 });
+                left_end = x + lw;
+            }
+        }
         // "$0.84 this chat · 5h 72%": what the chat has cost, and how full the AI's plan window is
         let spend = self.spend();
         let usage = if agent { self.usage_text() } else { None };
@@ -2811,6 +3839,22 @@ impl Pane for Chat {
             let lw = label.width() as u16;
             if lw > 8 {
                 f.render_widget(Paragraph::new(Span::styled(label, ui::muted(t))), Rect { x: comp.x + 2, y: comp.y, width: lw, height: 1 });
+            }
+        } else if agent || self.handoff_hint().is_some() {
+            // a check loop's progress, and a nudge towards /handoff when the context fills up
+            let mut sp = vec![Span::raw(" ")];
+            if let Some(s) = self.check_status().filter(|_| agent) {
+                sp.push(Span::styled(s, ui::accent(t)));
+                sp.push(Span::raw(" "));
+            }
+            if let Some(h) = self.handoff_hint() {
+                sp.push(Span::styled(h, Style::default().fg(WARN)));
+                sp.push(Span::raw(" "));
+            }
+            let room = top_right.saturating_sub(comp.x + 4) as usize;
+            let text: String = sp.iter().map(|s| s.content.as_ref()).collect();
+            if sp.len() > 1 && text.width() <= room {
+                f.render_widget(Paragraph::new(Line::from(sp)), Rect { x: comp.x + 2, y: comp.y, width: text.width() as u16, height: 1 });
             }
         }
         // ---- the text
@@ -2868,6 +3912,32 @@ impl Pane for Chat {
                 self.delete_chat(cx);
             }
             return true;
+        }
+        // the diff view takes the keys while it's open
+        if self.review.as_ref().is_some_and(|v| v.chat == self.chat.id) {
+            return self.review_key(k, cx);
+        }
+        // going back to a checkpoint: y does it, d shows the diff, esc leaves it (with nothing typed)
+        if let Some(r) = self.restore.as_ref().filter(|r| r.chat == self.chat.id && !r.busy && self.input.is_empty()) {
+            let ready = matches!(r.plan, Some(Ok(_)));
+            match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') if ready && !ctrl => {
+                    self.confirm_restore(cx);
+                    return true;
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') if ready && !ctrl => {
+                    let (idx, sha) = (r.idx, r.ckpt.clone());
+                    self.restore = None;
+                    self.open_review(idx, sha, cx);
+                    return true;
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') if !ctrl => {
+                    self.restore = None;
+                    self.info.push("left the folder as it is".into());
+                    return true;
+                }
+                _ => {}
+            }
         }
         // scrolling, ctrl+o and copying work whatever is waiting on you
         let view_key = matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) || (ctrl && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End | KeyCode::Char('o') | KeyCode::Char('y')));
@@ -3191,7 +4261,14 @@ impl Pane for Chat {
                 Some(false) => Span::styled(format!("{} ", SPIN[(cx.time * 10.0) as usize % SPIN.len()]), ui::accent(t)),
                 None => Span::raw("  "),
             };
-            f.render_widget(Paragraph::new(Line::from(vec![mark, Span::styled(ui::fit(&c.title, (r.width as usize).saturating_sub(2)), style)])), r);
+            // ↳ a chat that carries on from another one (/handoff)
+            let child = c.extra.get("parent").is_some();
+            let mut sp = vec![mark];
+            if child {
+                sp.push(Span::styled("↳ ", ui::muted(t)));
+            }
+            sp.push(Span::styled(ui::fit(&c.title, (r.width as usize).saturating_sub(if child { 4 } else { 2 })), style));
+            f.render_widget(Paragraph::new(Line::from(sp)), r);
             self.side_hits.push((r, SideItem::Chat(c.id.clone())));
         }
     }
@@ -4363,7 +5440,7 @@ mod tests {
         assert!(c.info.iter().any(|l| l.starts_with("⚠ claude code 5-hour window at 91%")), "{:?}", c.info);
         c.stop();
         // a plain AI shows no plan window
-        let mut p = plain_chat(&k, "hi", "yo");
+        let p = plain_chat(&k, "hi", "yo");
         *p.usage.lock().unwrap() = vec![("claude".into(), "5-hour".into(), 50.0)];
         assert!(p.usage_text().is_none());
     }
@@ -4734,6 +5811,355 @@ mod tests {
         let (h, since) = history(&ch, "claude");
         assert_eq!(since, Some(2));
         assert_eq!(h[2].1, "more");
+    }
+
+    // ------------------------------------------------------------ checkpoints, checks, context, handoffs
+
+    /// Poll until `done` holds (background git work and checks report back through the pane's poll).
+    fn wait_until(k: &mut Kit, c: &mut Chat, what: &str, mut done: impl FnMut(&Chat) -> bool) {
+        let t0 = Instant::now();
+        while !done(c) {
+            assert!(t0.elapsed() < Duration::from_secs(60), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(15));
+            k.poll(c);
+        }
+    }
+
+    /// A folder of its own under target/test-scratch (the only place tests take checkpoints), with no leftover
+    /// shadow history from an earlier run.
+    fn ckpt_folder(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let d = std::path::absolute(format!("target/test-scratch/chat/flow/{name}")).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for (f, text) in files {
+            std::fs::write(d.join(f), text).unwrap();
+        }
+        if let Some(s) = ckpt::Place::of(&d).unwrap().shadow {
+            let _ = std::fs::remove_dir_all(s);
+        }
+        d
+    }
+
+    /// A Claude Code chat working in `dir`, nothing running.
+    fn coding_chat(k: &Kit, dir: &Path) -> Chat {
+        let mut c = Chat::new(&k.config);
+        c.provider = "claude".into();
+        c.chat.provider = Some("claude".into());
+        c.chat.cwd = Some(dir.to_string_lossy().to_string());
+        c.avail = vec!["claude", "codex", "ollama"];
+        c
+    }
+
+    /// Send a message and let its reply end (in tests the AI answers with an error straight away; the folder's
+    /// checkpoint is taken first all the same).
+    fn turn(k: &mut Kit, c: &mut Chat, text: &str) {
+        enter(k, c, text);
+        wait_until(k, c, "the reply to end", |c| c.stream.is_none());
+    }
+
+    /// Checkpoints end to end: each coding-agent turn snapshots the folder first; the reply's note says what the
+    /// turn changed; /diff shows it all file by file; /undo puts the folder back a turn at a time (listing the
+    /// files it deletes, and only after y); /rewind lists your turns and d shows one's diff.
+    #[test]
+    fn chat_checkpoints_diff_undo_rewind() {
+        let mut k = Kit::new();
+        let d = ckpt_folder("undo", &[("a.txt", "one\n"), ("b.txt", "keep\n")]);
+        let mut c = coding_chat(&k, &d);
+        let _forget = Forget(c.chat.id.clone());
+        turn(&mut k, &mut c, "change a");
+        assert!(c.chat.messages[1].ckpt.is_some(), "a checkpoint before the first turn");
+        // the agent's work in turn 1: an edit and a new file; then the reply ends
+        std::fs::write(d.join("a.txt"), "ONE\nmore\n").unwrap();
+        std::fs::write(d.join("new.txt"), "fresh\n").unwrap();
+        {
+            let id = c.chat.id.clone();
+            let mut acts = vec![];
+            let mut cx = cx_of(&k, &mut acts, true);
+            c.turn_ended(&id, true, &mut cx);
+        }
+        wait_until(&mut k, &mut c, "the note's numbers", |c| c.chat.messages[1].note.as_deref().is_some_and(|n| n.contains("files")));
+        let note = c.chat.messages[1].note.clone().unwrap();
+        assert!(note.contains("+3 −1 · 2 files"), "{note}");
+        turn(&mut k, &mut c, "more");
+        assert!(c.chat.messages[3].ckpt.is_some());
+        std::fs::remove_file(d.join("b.txt")).unwrap(); // turn 2 deleted a file
+        // /diff: everything since the first checkpoint
+        enter(&mut k, &mut c, "/diff");
+        wait_until(&mut k, &mut c, "the diff", |c| c.review.as_ref().is_some_and(|v| v.data.is_some()));
+        let s = k.render_html(&mut c, 120, 30, "target/snap/chat-diff.html");
+        assert!(s.contains("everything this chat changed") && s.contains("new.txt") && s.contains("b.txt") && s.contains("3 files"), "{s}");
+        k.key(&mut c, KeyCode::Down);
+        assert_eq!(c.review.as_ref().unwrap().file, 1);
+        k.key(&mut c, KeyCode::Esc);
+        assert!(c.review.is_none());
+        // /undo: back to before turn 2 (b.txt comes back), nothing happens until y
+        enter(&mut k, &mut c, "/undo");
+        wait_until(&mut k, &mut c, "the restore plan", |c| c.restore.as_ref().is_some_and(|r| r.plan.is_some()));
+        let s = k.render(&mut c, 120, 30);
+        assert!(s.contains("before turn 2") && s.contains("1 file comes back as it was"), "{s}");
+        assert!(!d.join("b.txt").exists(), "not before y");
+        k.key(&mut c, KeyCode::Char('y'));
+        wait_until(&mut k, &mut c, "the restore", |c| c.restore.is_none());
+        assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap(), "keep\n");
+        assert!(d.join("new.txt").exists(), "turn 1's work is still there");
+        // /undo again: nothing left to undo in turn 2, so back to before turn 1 — new.txt is listed and deleted
+        enter(&mut k, &mut c, "/undo");
+        wait_until(&mut k, &mut c, "the second plan", |c| c.restore.as_ref().is_some_and(|r| r.plan.is_some()));
+        let s = k.render_html(&mut c, 120, 30, "target/snap/chat-undo.html");
+        assert!(s.contains("before turn 1") && s.contains("1 file made since is deleted: new.txt"), "{s}");
+        k.key(&mut c, KeyCode::Char('y'));
+        wait_until(&mut k, &mut c, "the second restore", |c| c.restore.is_none());
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "one\n");
+        assert!(!d.join("new.txt").exists());
+        assert!(c.info.iter().any(|l| l.contains("back to before turn 1")), "{:?}", c.info);
+        // /rewind lists your turns; picking one asks, and d shows its diff instead
+        c.input = "/rewind ".into();
+        c.cursor = 8;
+        let items: Vec<String> = c.menu().into_iter().map(|m| m.left).collect();
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items[0].starts_with("turn 2 · more") && items[1].starts_with("turn 1 · change a"), "{items:?}");
+        c.input.clear();
+        c.cursor = 0;
+        std::fs::write(d.join("a.txt"), "changed again\n").unwrap();
+        enter(&mut k, &mut c, "/rewind 1");
+        wait_until(&mut k, &mut c, "the rewind plan", |c| c.restore.as_ref().is_some_and(|r| r.plan.is_some()));
+        k.key(&mut c, KeyCode::Char('d'));
+        assert!(c.restore.is_none() && c.review.is_some());
+        wait_until(&mut k, &mut c, "the rewind diff", |c| c.review.as_ref().is_some_and(|v| v.data.is_some()));
+        let files = c.review.as_ref().unwrap().data.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["a.txt"]);
+        k.key(&mut c, KeyCode::Esc);
+        // a chat that never ran a coding agent has nothing to go back to
+        let mut p = plain_chat(&k, "hi", "yo");
+        enter(&mut k, &mut p, "/undo");
+        assert!(p.info.iter().any(|l| l.contains("no checkpoints")), "{:?}", p.info);
+    }
+
+    /// /check: oriel runs the check itself after each turn; a failure goes back to the agent as the next message
+    /// (exit code and first lines), a pass stops the loop with an alert and puts ✓ on the reply. A loop with no
+    /// progress stalls, one that keeps failing stops at its cap; both tell you. Only for coding agents.
+    #[test]
+    fn chat_check_loop() {
+        let mut k = Kit::new();
+        let d = ckpt_folder("check", &[("want.txt", "yes\n"), ("got.txt", "no\n")]);
+        let mut c = coding_chat(&k, &d);
+        let _forget = Forget(c.chat.id.clone());
+        c.chat.messages.push(user("make got.txt say yes"));
+        c.chat.messages.push(store::Msg { role: "assistant".into(), content: "Done: got.txt is fixed.".into(), model: Some("claude".into()), ..Default::default() });
+        let cmd = "git diff --no-index want.txt got.txt";
+        enter(&mut k, &mut c, &format!("/check {cmd}"));
+        assert_eq!(check_of(&c.chat).map(|k| k.status), Some("on".into()));
+        assert!(c.check_status().is_some_and(|s| s.contains("running")), "the check runs on the reply already there");
+        wait_until(&mut k, &mut c, "the check's verdict", |c| c.chat.messages.len() > 2);
+        let sent = c.chat.messages[2].content.clone();
+        assert!(sent.starts_with("◎ check 1 of 20: not yet") && sent.contains("exit 1") && sent.contains("-yes") && sent.contains("+no") && sent.contains(cmd), "{sent}");
+        assert!(c.chat.messages[1].verified.as_deref().is_some_and(|v| v.starts_with('✗')), "the reply it checked gets ✗");
+        wait_until(&mut k, &mut c, "that reply to end", |c| c.stream.is_none());
+        let s = k.render_html(&mut c, 120, 30, "target/snap/chat-check.html");
+        assert!(s.contains("◎ check · 1/20 · last: exit 1"), "{s}");
+        // the agent fixes it; its turn ends; the check passes
+        std::fs::write(d.join("got.txt"), "yes\n").unwrap();
+        let last = c.chat.messages.len() - 1;
+        c.chat.messages[last] = store::Msg { role: "assistant".into(), content: "Fixed it.".into(), model: Some("claude".into()), ..Default::default() };
+        {
+            let id = c.chat.id.clone();
+            let mut acts = vec![];
+            let mut cx = cx_of(&k, &mut acts, true);
+            c.turn_ended(&id, true, &mut cx);
+        }
+        wait_until(&mut k, &mut c, "the passing check", |c| check_of(&c.chat).is_some_and(|k| k.status != "on"));
+        let ck = check_of(&c.chat).unwrap();
+        assert_eq!((ck.status.as_str(), ck.turn), ("passed", 2));
+        assert!(k.notices().iter().any(|n| n.contains("check passed after 2 checks")), "{:?}", k.notices());
+        assert!(c.chat.messages[last].verified.as_deref().is_some_and(|v| v.starts_with("✓ checked") && v.contains(cmd)));
+        assert_eq!(remembered_check(&d).as_deref(), Some(cmd), "remembered for this folder");
+        // a loop that changes nothing stalls after 3 turns; one that keeps failing stops at its cap
+        let id = c.chat.id.clone();
+        let fail = || Some((cmd.to_string(), Err::<(), String>(format!("`{cmd}` failed (exit 1):\n-no\n+yes"))));
+        for (max, turns, want) in [(20, 4, "stalled"), (2, 2, "capped")] {
+            set_check(&mut c.chat, &Check { cmd: cmd.into(), turn: 0, max, status: "on".into(), ..Default::default() });
+            let mut acts = vec![];
+            for n in 0..turns {
+                c.stream = None;
+                let mut cx = cx_of(&k, &mut acts, true);
+                // the folder changes every turn under the cap; never in the stall
+                let tree = if want == "capped" { format!("t{n}") } else { "same".into() };
+                c.on_turn(&id, last, None, Some(tree), fail(), false, &mut cx);
+            }
+            assert_eq!(check_of(&c.chat).unwrap().status, want);
+            let said: Vec<String> = acts.iter().filter_map(|a| if let Action::Alert(crate::alerts::Kind::NeedsYou, s) = a { Some(s.clone()) } else { None }).collect();
+            assert_eq!(said.len(), 1, "{want}: {said:?}");
+            assert!(said[0].contains(if want == "stalled" { "stalled" } else { "still failing after 2" }), "{said:?}");
+        }
+        c.stream = None;
+        enter(&mut k, &mut c, "/check off");
+        assert!(c.info.iter().any(|l| l.contains("no check loop is on")), "{:?}", c.info);
+        // not for chats without tools
+        let mut p = plain_chat(&k, "hi", "yo");
+        enter(&mut k, &mut p, "/check cargo test");
+        assert!(p.info.iter().any(|l| l.contains("coding agent")) && check_of(&p.chat).is_none(), "{:?}", p.info);
+    }
+
+    /// The badge under a finished coding agent's reply: ✓ when a check ran after its last edit, ✗ when that check
+    /// failed, stale when files were edited after it, "not run" when it claims it's done but nothing checked it;
+    /// /verify's result wins. Nothing for a reply that neither edited nor claims anything.
+    #[test]
+    fn chat_check_badges() {
+        let tool = |label: &str, target: &str, status: &str, summary: &str| store::Part::Tool(store::Tool { label: label.into(), target: target.into(), status: status.into(), summary: summary.into(), ..Default::default() });
+        let msg = |parts: Vec<store::Part>, text: &str| {
+            let mut parts = parts;
+            parts.push(store::Part::Text { text: text.into() });
+            store::Msg { role: "assistant".into(), model: Some("claude".into()), content: text.into(), parts, ..Default::default() }
+        };
+        let edit = || tool("Update", "src/lib.rs", "done", "+3 -1");
+        let v = |m: &store::Msg| badge(m, None).map(|b| b.0);
+        assert_eq!(v(&msg(vec![edit(), tool("Bash", "cargo test", "done", "12 lines")], "All tests pass.")), Some(Verdict::Checked));
+        assert_eq!(v(&msg(vec![edit(), tool("Bash", "cargo test", "error", "exit 101")], "Done.")), Some(Verdict::Failed));
+        let stale = msg(vec![tool("Bash", "cargo test", "done", "12 lines"), edit(), tool("Write", "src/new.rs", "done", "")], "Tests pass now.");
+        let b = badge(&stale, None).unwrap();
+        assert_eq!(b.0, Verdict::Stale);
+        assert!(b.1.contains("2 files edited since cargo test ran"), "{}", b.1);
+        assert_eq!(v(&msg(vec![edit()], "Implemented it, all tests pass.")), Some(Verdict::NotRun));
+        assert_eq!(v(&msg(vec![edit()], "Here's a first pass; want me to go on?")), None, "an edit that claims nothing: no badge");
+        assert_eq!(v(&msg(vec![tool("Read", "src/lib.rs", "done", "")], "It reads a file.")), None);
+        // a subagent's check counts; a Bash that isn't a check doesn't
+        let mut agent = store::Tool { label: "Agent".into(), status: "done".into(), ..Default::default() };
+        agent.children.push(store::Tool { label: "Bash".into(), target: "npm test".into(), status: "done".into(), ..Default::default() });
+        assert_eq!(v(&msg(vec![edit(), store::Part::Tool(agent)], "Done.")), Some(Verdict::Checked));
+        assert_eq!(v(&msg(vec![edit(), tool("Bash", "ls -la", "done", "")], "All done.")), Some(Verdict::NotRun));
+        // the chat's own check command decides what counts
+        assert_eq!(badge(&msg(vec![edit(), tool("Bash", "cargo build", "done", "")], "Done."), Some("cargo test -q")).map(|b| b.0), Some(Verdict::NotRun));
+        let mut m = msg(vec![edit()], "Done.");
+        m.verified = Some("✓ checked 14:02 · cargo test".into());
+        assert_eq!(badge(&m, None), Some((Verdict::Checked, "✓ checked 14:02 · cargo test".into())));
+        // on screen, under the reply
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "fix it");
+        c.stream = None;
+        let last = c.chat.messages.len() - 1;
+        c.chat.messages[last] = stale;
+        let s = k.render_html(&mut c, 120, 30, "target/snap/chat-badge.html");
+        assert!(s.contains("stale: 2 files edited since cargo test ran · /verify"), "{s}");
+    }
+
+    /// Claude Code's own slash commands go to it as the message (/goal first of all); for other AIs /goal says
+    /// what to use instead, and an unknown command is still unknown.
+    #[test]
+    fn chat_slash_commands_pass_through_to_claude() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.provider = "claude".into();
+        c.chat.provider = Some("claude".into());
+        c.chat.cwd = Some(std::env::temp_dir().to_string_lossy().to_string());
+        let _forget = Forget(c.chat.id.clone());
+        enter(&mut k, &mut c, "/goal all tests pass");
+        assert_eq!(c.chat.messages.first().map(|m| m.content.as_str()), Some("/goal all tests pass"));
+        c.stop();
+        enter(&mut k, &mut c, "/my-skill do it");
+        assert_eq!(c.chat.messages.iter().filter(|m| m.role == "user").last().map(|m| m.content.as_str()), Some("/my-skill do it"));
+        c.stop();
+        let mut x = agent_chat(&k, "codex", "hi");
+        x.stream = None;
+        enter(&mut k, &mut x, "/goal tests pass");
+        assert!(x.info.iter().any(|l| l.contains("/goal is Claude Code's") && l.contains("/check")), "{:?}", x.info);
+        let mut o = plain_chat(&k, "hi", "yo");
+        enter(&mut k, &mut o, "/frobnicate");
+        assert!(o.info.iter().any(|l| l.contains("unknown command /frobnicate")), "{:?}", o.info);
+    }
+
+    /// How full the context is: Claude Code's usage (fresh + cached input) over its window, `[1m]` a million; Codex's
+    /// from its session log. On the box as "ctx 39%", and past 60% (or after a compaction, or with the 5-hour window
+    /// nearly used up) a hint to /handoff.
+    #[test]
+    fn chat_context_meter_and_hints() {
+        let mut p = agent::Claude::new(Path::new("C:\\work\\demo"));
+        let lines = [
+            r#"{"type":"system","subtype":"init","model":"claude-opus-4-5[1m]","session_id":"s"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":2000,"cache_read_input_tokens":300000,"cache_creation_input_tokens":8000,"output_tokens":1}}}}"#,
+        ];
+        let mut got = vec![];
+        for l in lines {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            p.feed(&v, 0, &mut |e| got.push(e)).unwrap();
+        }
+        assert!(got.iter().any(|e| matches!(e, Ev::Context(310_000, 1_000_000))), "{:?}", got.iter().filter(|e| matches!(e, Ev::Context(..))).count());
+        assert_eq!(agent::context_window("sonnet"), 200_000);
+        let log = [
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":90000},"last_token_usage":{"input_tokens":50000,"cached_input_tokens":40000,"output_tokens":900,"total_tokens":50900},"model_context_window":272000}}}"#,
+            r#"{"type":"response_item","payload":{"type":"message"}}"#,
+        ]
+        .join("\n");
+        assert_eq!(agent::codex_context(&log), Some((50_900, 272_000)));
+        // the session log is found by thread id, newest day first
+        let sessions = std::path::absolute("target/test-scratch/chat/codex-sessions").unwrap();
+        let _ = std::fs::remove_dir_all(&sessions);
+        let day = sessions.join("2026").join("09").join("26");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("rollout-2026-09-26T10-00-00-abc123.jsonl"), &log).unwrap();
+        assert_eq!(agent::codex_log(&sessions, "abc123").map(|f| f.file_name().unwrap().to_string_lossy().to_string()).as_deref(), Some("rollout-2026-09-26T10-00-00-abc123.jsonl"));
+        assert!(agent::codex_log(&sessions, "zzz").is_none());
+        // on the box
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "go");
+        deliver(&mut k, &mut c, [Ev::Context(78_000, 200_000), Ev::Token("ok".into()), Ev::Done { note: None }]);
+        let s = k.render(&mut c, 120, 24);
+        assert!(s.contains("ctx 39%") && !s.contains("/handoff?"), "{s}");
+        let last = c.chat.messages.len() - 1;
+        c.chat.messages[last].ctx = Some((130_000, 200_000));
+        let s = k.render_html(&mut c, 120, 24, "target/snap/chat-context.html");
+        assert!(s.contains("ctx 65%") && s.contains("context 65% · /handoff?"), "{s}");
+        // another AI wrote the last reply: its numbers aren't this one's
+        c.chat.messages[last].model = Some("codex".into());
+        assert!(c.context_fill().is_none());
+        c.chat.messages[last].model = Some("claude".into());
+        c.chat.messages[last].ctx = Some((20_000, 200_000));
+        c.chat.messages[last].parts.push(store::Part::Mark { text: "conversation compacted (from 180k tokens)".into() });
+        assert_eq!(c.handoff_hint().as_deref(), Some("compacted · /handoff?"));
+        c.chat.messages[last].parts.pop();
+        c.avail = vec!["claude", "codex"];
+        *c.usage.lock().unwrap() = vec![("claude".into(), "5-hour".into(), 93.0), ("codex".into(), "5-hour".into(), 10.0)];
+        assert_eq!(c.handoff_hint().as_deref(), Some("5h 93% · /handoff codex?"));
+    }
+
+    /// /handoff: the AI writes a card; when it's done a fresh chat (here with Codex) starts from it, the card and
+    /// the next goal as its first message, the old chat kept and linked as its parent (↳ in the list). A card that
+    /// doesn't come back says so.
+    #[test]
+    fn chat_handoff_to_a_fresh_chat() {
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "build the parser");
+        c.avail = vec!["claude", "codex"];
+        deliver(&mut k, &mut c, [Ev::Token("parser half done".into()), Ev::Done { note: None }]);
+        let parent = c.chat.id.clone();
+        let _forget = Forget(parent.clone());
+        enter(&mut k, &mut c, "/handoff finish the parser codex");
+        let ask = c.chat.messages.iter().rev().find(|m| m.role == "user").unwrap().content.clone();
+        assert!(ask.starts_with("Write a handoff card") && ask.contains("goal: finish the parser"), "{ask}");
+        assert!(c.info.iter().any(|l| l.contains("a fresh codex chat starts from it")), "{:?}", c.info);
+        // the card comes back
+        c.stream = Some(test_stream(None));
+        deliver(&mut k, &mut c, [Ev::Token("**State** lexer works\n**Next** 1. the parser".into()), Ev::Done { note: None }]);
+        assert_ne!(c.chat.id, parent, "a fresh chat is on screen");
+        let _forget2 = Forget(c.chat.id.clone());
+        assert_eq!(c.chat.provider.as_deref(), Some("codex"));
+        assert_eq!(c.chat.extra.get("parent").and_then(|v| v.as_str()), Some(parent.as_str()));
+        let first = &c.chat.messages[0].content;
+        assert!(first.starts_with("Handoff from an earlier session") && first.contains("**State** lexer works") && first.ends_with("Next: finish the parser"), "{first}");
+        assert!(c.chats.iter().any(|x| x.id == parent), "the old chat stays in the list");
+        c.stop();
+        c.persist();
+        let side = k.render_side(&mut c, 32, 12);
+        assert!(side.contains("↳"), "{side}");
+        // a failed card
+        let mut c = agent_chat(&k, "claude", "go");
+        deliver(&mut k, &mut c, [Ev::Token("ok".into()), Ev::Done { note: None }]);
+        let _forget3 = Forget(c.chat.id.clone());
+        let id = c.chat.id.clone();
+        enter(&mut k, &mut c, "/handoff");
+        c.stream = Some(test_stream(None));
+        deliver(&mut k, &mut c, [Ev::Error("network down".into())]);
+        assert_eq!(c.chat.id, id, "no fresh chat");
+        assert!(c.info.iter().any(|l| l.contains("handoff card didn't come back")), "{:?}", c.info);
     }
 }
 

@@ -99,6 +99,10 @@ pub enum Ev {
     Perms(String),
     /// What the reply cost so far, in dollars (the chat keeps a running total).
     Cost(f64),
+    /// How full the context is: input-side tokens of the latest step, and the model's window.
+    Context(u64, u64),
+    /// The folder's checkpoint from just before the reply started (its commit), or why there isn't one.
+    Checkpoint(Result<String, String>),
     Done { note: Option<String> },
     Error(String),
 }
@@ -367,6 +371,11 @@ fn transcript_of(messages: &[(String, String)], head: &str) -> String {
 /// What a resumed CLI session gets: the new message, plus whatever another AI said in this chat since the
 /// session last replied. A fresh session gets the whole conversation.
 fn prompt_for(req: &Request, resuming: bool) -> String {
+    let last = req.messages.last().map(|m| m.1.as_str()).unwrap_or("");
+    if req.provider == "claude" && last.starts_with('/') {
+        // Claude Code's own slash commands (/goal, /compact, your custom ones) only work as the whole message
+        return last.to_string();
+    }
     match req.since {
         _ if !resuming => transcript(req),
         Some(i) if i + 1 < req.messages.len() => transcript_of(&req.messages[i..], "Said in this chat since your last reply, by another AI:"),
@@ -697,6 +706,12 @@ fn codex(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Stri
     if !p.finished && !stop.load(Ordering::SeqCst) {
         return Err(exit.cut_short("codex"));
     }
+    // how full its context is comes from Codex's own session log
+    let thread = if p.thread.is_empty() { tid.unwrap_or_default() } else { p.thread.clone() };
+    let home = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from).or_else(|| dirs::home_dir().map(|h| h.join(".codex")));
+    if let Some((used, window)) = home.and_then(|h| agent::codex_log(&h.join("sessions"), &thread)).and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| agent::codex_context(&t)) {
+        send(Ev::Context(used, window));
+    }
     send(Ev::Done { note: Some(p.note(t0.elapsed())) });
     Ok(())
 }
@@ -780,6 +795,12 @@ mod tests {
         assert!(p.contains("another AI") && p.contains("User: c") && p.contains("Assistant: d") && !p.contains("User: a") && p.ends_with("e"), "{p}");
         req.since = Some(4); // nothing new besides the message itself
         assert_eq!(prompt_for(&req, true), "e");
+        // Claude Code's own slash commands (/goal…) only work as the whole message; other AIs get the transcript
+        req.messages.extend([m("assistant", "f"), m("user", "/goal tests pass")]);
+        assert_eq!((prompt_for(&req, false).as_str(), prompt_for(&req, true).as_str()), ("/goal tests pass", "/goal tests pass"));
+        req.provider = "codex".into();
+        assert!(prompt_for(&req, false).contains("User: a"));
+        req.provider = "claude".into();
         let v: Value = serde_json::from_str(&mode_request("plan", 1)).unwrap();
         assert_eq!(v["type"], "control_request");
         assert_eq!(v["request"]["subtype"], "set_permission_mode");

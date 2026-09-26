@@ -28,6 +28,17 @@ pub struct Msg {
     /// What the reply cost in dollars, when the AI says (Claude Code does): the chat adds them up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// On a coding agent's reply: the checkpoint of its folder taken just before it started (ckpt.rs), which
+    /// /diff, /undo and /rewind go back to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ckpt: Option<String>,
+    /// How full the context was on the reply's last step: (input-side tokens, the model's window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx: Option<(u64, u64)>,
+    /// What running the check after it said ("✓ checked 14:02 · cargo test"), from /verify or /check: it replaces
+    /// the badge worked out from its tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<String>,
 }
 
 impl Msg {

@@ -185,6 +185,12 @@ fn exclude(wt: &Path, pattern: &str) {
 /// Run `f` with a scratch index holding the worktree's full state (committed + uncommitted + untracked), so
 /// diffs see new files without touching the agent's real index.
 fn with_snapshot_index<R>(wt: &Path, f: impl FnOnce(&[(&str, &str)]) -> R) -> Result<R, String> {
+    snapshot_index(wt, &[], f)
+}
+
+/// `with_snapshot_index` leaving out whatever `pathspec` excludes (e.g. `:(exclude,glob)**/node_modules/**`); the
+/// chat's checkpoints use it.
+pub fn snapshot_index<R>(wt: &Path, pathspec: &[&str], f: impl FnOnce(&[(&str, &str)]) -> R) -> Result<R, String> {
     let real = ok(wt, &["rev-parse", "--git-path", "index"])?;
     let real = if Path::new(&real).is_absolute() { PathBuf::from(&real) } else { wt.join(&real) };
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
@@ -192,7 +198,12 @@ fn with_snapshot_index<R>(wt: &Path, f: impl FnOnce(&[(&str, &str)]) -> R) -> Re
     let _ = std::fs::copy(&real, &tmp); // keeps git's stat cache so `add -A` doesn't rehash everything
     let t = tmp.to_string_lossy().to_string();
     let env = [("GIT_INDEX_FILE", t.as_str())];
-    let o = run_env(wt, &["add", "-A"], &env);
+    let mut args = vec!["add", "-A"];
+    if !pathspec.is_empty() {
+        args.extend(["--", "."]);
+        args.extend(pathspec);
+    }
+    let o = run_env(wt, &args, &env);
     let r = if o.ok { Ok(f(&env)) } else { Err(err_line(&o, &["add"])) };
     let _ = std::fs::remove_file(&tmp);
     r

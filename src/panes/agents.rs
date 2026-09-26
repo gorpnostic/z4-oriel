@@ -12,7 +12,7 @@
 
 mod batch;
 mod cost;
-mod git;
+pub(crate) mod git;
 mod input;
 mod lead;
 #[cfg(test)]

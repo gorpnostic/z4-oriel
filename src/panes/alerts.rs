@@ -33,6 +33,19 @@ fn color(k: Kind, t: &crate::theme::Theme) -> Color {
     }
 }
 
+/// A coding agent's plan window nearly used up ("claude: 92% of your 5-hour limit used"): the other one, which
+/// `h` hands the chat on screen to (/handoff in the chat).
+fn handoff_to(a: &alerts::Alert) -> Option<&'static str> {
+    if a.kind != Kind::Usage {
+        return None;
+    }
+    match a.text.split(':').next()? {
+        "claude" => Some("codex"),
+        "codex" => Some("claude"),
+        _ => None,
+    }
+}
+
 /// The app an alert jumps to, as the sidebar names it.
 fn app_of(name: &str) -> Option<&'static str> {
     crate::app::SIDEBAR.iter().map(|a| a.0).chain(["updates"]).find(|a| *a == name)
@@ -52,9 +65,17 @@ impl Pane for Alerts {
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
-        let area = ui::hint_line(f, area, &[("↑↓", "pick"), ("enter", "go there"), ("x", "dismiss"), ("c", "clear all")], t);
-        let body = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(1) };
         let mut all = alerts::CENTER.lock().unwrap();
+        let n = all.len();
+        let to = (n > 0).then(|| handoff_to(&all[n - 1 - self.sel.min(n - 1)])).flatten();
+        let give = to.map(|to| format!("hand the chat to {to}"));
+        let mut hints = vec![("↑↓", "pick"), ("enter", "go there")];
+        if let Some(g) = &give {
+            hints.push(("h", g.as_str()));
+        }
+        hints.extend([("x", "dismiss"), ("c", "clear all")]);
+        let area = ui::hint_line(f, area, &hints, t);
+        let body = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(1) };
         self.rows.clear();
         if all.is_empty() {
             let lines = vec![
@@ -121,6 +142,11 @@ impl Pane for Alerts {
                     }
                 }
             }
+            // a usage alert: the chat carries on with the other coding agent (/handoff, in the box for you to send)
+            KeyCode::Char('h') => match idx.and_then(|i| handoff_to(&all[i])) {
+                Some(to) => cx.act(Action::AppPaste("ai", format!("/handoff {to}"))),
+                None => return false,
+            },
             KeyCode::Char('x') | KeyCode::Delete => {
                 if let Some(i) = idx {
                     all.remove(i);
@@ -158,8 +184,12 @@ mod tests {
     use crate::testkit::Kit;
     use crate::alerts::Alert;
 
+    /// The event center is one list for the whole process: its tests take turns.
+    static CENTER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn alerts_center() {
+        let _g = CENTER_TEST.lock().unwrap_or_else(|e| e.into_inner());
         {
             let mut c = alerts::CENTER.lock().unwrap();
             c.clear();
@@ -181,5 +211,29 @@ mod tests {
         assert_eq!(alerts::CENTER.lock().unwrap().len(), 2);
         k.key(&mut p, KeyCode::Char('c'));
         assert!(alerts::CENTER.lock().unwrap().is_empty());
+    }
+
+    /// h on a usage alert about one coding agent puts /handoff to the other one in the chat's box; on any other
+    /// alert it does nothing.
+    #[test]
+    fn alerts_usage_hands_off() {
+        let _g = CENTER_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut c = alerts::CENTER.lock().unwrap();
+            c.clear();
+            c.push(Alert { at: alerts::now() - 60, kind: Kind::AgentDone, text: "claude code finished".into(), app: Some("ai".into()), read: false, pane: None });
+            c.push(Alert { at: alerts::now(), kind: Kind::Usage, text: "claude: 92% of your 5-hour limit used, resets in 1h 5m".into(), app: Some("ais".into()), read: false, pane: None });
+        }
+        let mut k = Kit::new();
+        let mut p = Alerts::new();
+        let s = k.render(&mut p, 120, 12);
+        assert!(s.contains("hand the chat to codex"), "{s}");
+        k.key(&mut p, KeyCode::Char('h'));
+        assert!(k.actions.iter().any(|a| matches!(a, Action::AppPaste("ai", t) if t == "/handoff codex")), "{:?}", k.notices());
+        k.actions.clear();
+        k.key(&mut p, KeyCode::Down);
+        k.key(&mut p, KeyCode::Char('h'));
+        assert!(k.actions.is_empty(), "not a usage alert: nothing to hand off");
+        alerts::CENTER.lock().unwrap().clear();
     }
 }
