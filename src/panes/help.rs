@@ -202,6 +202,12 @@ fn topics() -> Vec<Topic> {
             K("ctrl+d", "delete the note (asks first)"),
             K("ctrl+z  ·  ctrl+y", "undo · redo"),
         ]},
+        Topic { icon: "bell", title: "alerts", app: "alerts", items: vec![
+            P("Everything worth knowing that happened while you were busy: an agent finished or needs you, an approval or question is waiting, a build or merge check failed, a plan starts soon, an install finished, memory is nearly full, an AI's usage is near its limit, a new oriel is out."),
+            P("Each is a toast, a line here (the bell at the bottom of the sidebar shows how many are new) and, when the terminal isn't the window you're in, a desktop notification (desktop_notifications = false in the config turns those off)."),
+            K("enter", "go to where it happened"),
+            K("x  ·  c", "dismiss one · clear them all"),
+        ]},
         Topic { icon: "calendar", title: "calendar", app: "calendar", items: vec![
             P("A month at a glance with the chosen day's plans beside it. Plans with a time pop up as a reminder when they start, whichever app you're in. The sidebar shows the next two weeks."),
             K("← → ↑ ↓", "move a day / a week (or click a day)"),

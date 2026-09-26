@@ -1296,6 +1296,7 @@ impl Pane for Chat {
     }
 
     fn poll(&mut self, cx: &mut Cx) {
+        let who = providers::label(&self.provider_of()).to_lowercase();
         let Some(s) = &mut self.stream else { return };
         let evs: Vec<Ev> = std::mem::take(&mut *s.inbox.lock().unwrap());
         let mut finished = false;
@@ -1318,6 +1319,10 @@ impl Pane for Chat {
                 Ev::Mark(text) => activity::push_mark(m, &text),
                 Ev::Status(st) => s.status = st,
                 Ev::Question(q) => {
+                    if !cx.focused {
+                        let head = q.qs.first().map(|x| x.question.clone()).unwrap_or_default();
+                        cx.alert(crate::alerts::Kind::Approval, format!("{who} is asking you: {}", ui::fit(&head, 80)));
+                    }
                     if self.questions.is_empty() {
                         self.qs = QState::default();
                     }
@@ -1328,6 +1333,9 @@ impl Pane for Chat {
                     if self.always.contains(&a.tool) {
                         let _ = a.reply.send(approve::Decision::Allow);
                     } else {
+                        if !cx.focused {
+                            cx.alert(crate::alerts::Kind::Approval, format!("{who} wants to: {} {}", a.label, ui::fit(&a.target, 60)));
+                        }
                         self.asks.push_back(a);
                     }
                 }
@@ -1369,6 +1377,13 @@ impl Pane for Chat {
             ));
         }
         if finished {
+            if !cx.focused {
+                if failed {
+                    cx.alert(crate::alerts::Kind::BuildFailed, format!("{who} stopped with an error: {}", self.chat.title));
+                } else {
+                    cx.alert(crate::alerts::Kind::AgentDone, format!("{who} finished: {}", self.chat.title));
+                }
+            }
             self.stream = None;
             self.asks.clear();
             self.questions.clear();

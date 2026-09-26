@@ -16,6 +16,8 @@ pub struct Config {
     pub startup: String,
     /// true = plain-text icons (for terminals without a Nerd Font)
     pub plain_icons: bool,
+    /// A desktop notification for alerts while the terminal isn't the window you're in.
+    pub desktop_notifications: bool,
     /// Where notes live (plain .md files); empty = oriel's data folder.
     pub notes_folder: String,
     pub ai: AiConfig,
@@ -111,6 +113,7 @@ impl Default for Config {
             prefix: "ctrl+space".into(),
             startup: "ai".into(),
             plain_icons: false,
+            desktop_notifications: true,
             notes_folder: String::new(),
             ai: AiConfig::default(),
             music: MusicConfig::default(),

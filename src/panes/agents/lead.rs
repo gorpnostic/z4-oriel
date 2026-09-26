@@ -386,7 +386,7 @@ impl Agents {
             if let Some(r) = self.run_mut(run) {
                 r.log(&format!("budget reached: ${spend:.2} of ${budget:.2} — no more workers"));
             }
-            cx.notify(format!("⚑ lead run hit its budget (${spend:.2} of ${budget:.2}) — no more workers"));
+            cx.alert(crate::alerts::Kind::Usage, format!("lead run hit its budget (${spend:.2} of ${budget:.2}): no more workers"));
         }
     }
 
@@ -623,14 +623,14 @@ impl Agents {
                 run.state = RunState::Review;
                 let msg = format!("lead finished · review {} (d) and merge it (m)", run.branch);
                 run.log(&msg);
-                cx.notify(format!("⚑ {msg}"));
+                cx.alert(crate::alerts::Kind::AgentDone, msg);
             }
             Err(e) if e == "stopped" => run.state = RunState::Stopped,
             Err(e) => {
                 run.state = RunState::Stopped;
                 run.error = e.clone();
                 run.log(&format!("lead stopped: {e}"));
-                cx.notify(format!("⚑ lead stopped: {e}"));
+                cx.alert(crate::alerts::Kind::BuildFailed, format!("lead stopped: {e}"));
             }
         }
     }
@@ -729,7 +729,7 @@ impl Agents {
                         r.log(&format!("✎ {text}"));
                     }
                     if needs {
-                        cx.notify(format!("⚑ the lead needs you: {text}"));
+                        cx.alert(crate::alerts::Kind::NeedsYou, format!("the lead needs you: {text}"));
                     }
                     Ok("noted on the board".into())
                 }
@@ -1318,14 +1318,14 @@ impl Agents {
             if t.want_merge && t.attempts > 0 {
                 return self.bounce_failed(id, &t.error.clone(), cx);
             }
-            cx.notify(format!("✗ {}: {} failed", t.worker, t.title));
+            cx.alert(crate::alerts::Kind::BuildFailed, format!("{}: {} failed", t.worker, t.title));
             return self.event(id, "failed");
         }
         if t.blocked {
             if let Some(tm) = self.task_mut(id) {
                 tm.want_merge = false;
             }
-            cx.notify(format!("⚑ {} is blocked: {}", t.title, t.questions.first().cloned().unwrap_or_default()));
+            cx.alert(crate::alerts::Kind::NeedsYou, format!("{} is blocked: {}", t.title, t.questions.first().cloned().unwrap_or_default()));
             return self.event(id, "blocked");
         }
         if t.want_merge {
@@ -1528,7 +1528,7 @@ impl Agents {
             tm.questions = vec![format!("merge failed: {why}")];
         }
         self.event(id, "blocked");
-        cx.notify(format!("⚑ a task needs attention: {why}"));
+        cx.alert(crate::alerts::Kind::BuildFailed, format!("a task's merge check failed: {}", why.lines().next().unwrap_or("")));
     }
 
     /// Start a task over with a fresh worker (a premium one, if the roster has another), carrying notes about
@@ -1542,7 +1542,7 @@ impl Agents {
                 tm.want_merge = false;
                 tm.blocked = true;
             }
-            cx.notify(format!("⚑ {} is blocked after several attempts", t.title));
+            cx.alert(crate::alerts::Kind::NeedsYou, format!("{} is blocked after several attempts", t.title));
             return self.event(id, "blocked");
         }
         let roster = self.roster();

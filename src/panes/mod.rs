@@ -1,6 +1,7 @@
 //! Every kind of pane, and the one factory that makes them by name (used by the launcher, palette and keys).
 
 pub mod agents;
+pub mod alerts;
 pub mod ais;
 pub mod calendar;
 pub mod chat;
@@ -57,6 +58,7 @@ pub fn open(name: &str, cfg: &Config) -> Option<Box<dyn Pane>> {
         "home" => Box::new(home::Home::new()),
         "help" => Box::new(help::Help::new()),
         "themes" => Box::new(themes::Themes::new()),
+        "alerts" => Box::new(alerts::Alerts::new()),
         "updates" => Box::new(updates::Updates::new()),
         _ => {
             let (_, prog, title) = AGENTS.iter().find(|a| a.0 == name)?;

@@ -22,6 +22,8 @@ pub enum Event {
     Clipboard(PaneId, Option<Vec<String>>, crossterm::event::KeyEvent),
     /// A newer oriel is out (the daily check at start).
     UpdateAvailable(String),
+    /// From a background watcher (memory, AI usage).
+    Alert(crate::alerts::Kind, String),
 }
 
 /// What a pane can ask the app to do.
@@ -31,6 +33,8 @@ pub enum Action {
     Open(Box<dyn Pane>, Place),
     Close,
     Notify(String),
+    /// Something for the event center (and a toast, and a desktop notification if you're elsewhere).
+    Alert(crate::alerts::Kind, String),
     SetTheme(String),
     /// Switch to this theme quietly (the themes app, as you edit): saved, no toast.
     ApplyTheme(String),
@@ -45,6 +49,8 @@ pub enum Action {
     /// Open a pane in a new tab of its own, named `name` and remembered by `tag` (e.g. an orchestrator task id),
     /// so it can be focused or closed later. Doesn't switch to it unless `focus` is true.
     OpenTagged { pane: Box<dyn Pane>, tag: String, name: String, focus: bool },
+    /// Switch to the tab holding this pane (the alerts app jumps back to where something happened).
+    FocusPane(u64),
     /// Switch to the tab holding the pane opened with this tag (no-op if it's gone).
     FocusTag(String),
     /// Close the pane opened with this tag.
@@ -79,6 +85,10 @@ impl Cx<'_> {
     }
     pub fn notify(&mut self, s: impl Into<String>) {
         self.actions.push(Action::Notify(s.into()));
+    }
+    /// A toast that's also kept in the event center.
+    pub fn alert(&mut self, kind: crate::alerts::Kind, s: impl Into<String>) {
+        self.actions.push(Action::Alert(kind, s.into()));
     }
     /// A Sender + id a background thread can use to wake the UI: `waker.wake()`.
     pub fn waker(&self) -> Waker {
@@ -120,6 +130,10 @@ pub trait Pane {
     fn poll(&mut self, _cx: &mut Cx) {}
     /// If Some, the app calls `poll` at least this often while the pane is visible.
     fn tick_every(&self) -> Option<Duration> {
+        None
+    }
+    /// When the pane's program has ended: what to tell the event center, if anything ("Firefox installed").
+    fn exit_note(&mut self) -> Option<(crate::alerts::Kind, String)> {
         None
     }
     /// True if `poll` should keep ticking while the pane isn't on screen (the calendar's reminders).

@@ -1,5 +1,6 @@
 //! oriel — a fast terminal workspace: tabs, tmux-style split panes, and built-in apps.
 
+mod alerts;
 mod app;
 mod clip;
 mod config;
@@ -101,7 +102,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, crossterm::event::EnableFocusChange)?;
     let tour = args.first().map(String::as_str) == Some("--tour");
     let mut app = app::App::new(cfg, tx);
     if tour {

@@ -599,7 +599,7 @@ impl Storage {
         #[cfg(not(test))]
         {
             let prog = crate::config::which(&cmd.prog).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| cmd.prog.clone());
-            let term = crate::panes::term::Term::new(title, icon, &prog, cmd.args.clone(), None);
+            let term = crate::panes::term::Term::new(title, icon, &prog, cmd.args.clone(), None).alert_on_exit(title);
             cx.act(Action::Open(Box::new(term), Place::Split));
         }
     }
@@ -702,7 +702,7 @@ impl Storage {
                 let e = &catalog::CATALOG[i];
                 let Some(c) = self.picks[i].as_ref().and_then(|p| p.install.clone()) else { return };
                 self.run_in_terminal(&format!("install {}", e.name), "package", &c, cx);
-                cx.notify(format!("installing {} — press r when it's done to refresh the ✓ marks", e.name));
+                cx.notify(format!("installing {} — the alerts say when it's done; r refreshes the ✓ marks", e.name));
             }
         }
     }

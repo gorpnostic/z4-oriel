@@ -44,6 +44,7 @@ pub const SIDEBAR: &[(&str, &str, &str, &str)] = &[
     ("storage", "storage", "storage", "F8"),
     ("terminal", "term", "terminal", "F9"),
     // ── pinned to the bottom of the sidebar
+    ("alerts", "bell", "alerts", ""),
     ("themes", "theme", "themes", ""),
     ("help", "search", "help", "F10"),
 ];
@@ -176,6 +177,8 @@ pub struct App {
     _theme_watcher: Option<notify::RecommendedWatcher>,
     /// A newer version is out: shown at the bottom of the sidebar.
     update_ready: Option<String>,
+    /// Is the terminal the window you're in? (desktop notifications only when it isn't)
+    term_focused: bool,
 }
 
 impl App {
@@ -210,6 +213,7 @@ impl App {
             _watcher: None,
             _theme_watcher: None,
             update_ready: None,
+            term_focused: true,
             renaming: None,
             ctx: None,
             onboard: None,
@@ -223,6 +227,11 @@ impl App {
         app._watcher = watch_omarchy(tx.clone());
         app._theme_watcher = watch_themes(tx.clone());
         if !cfg!(test) {
+            *crate::alerts::CENTER.lock().unwrap() = crate::alerts::load();
+            let t2 = tx.clone();
+            crate::alerts::watch(move |k, s| {
+                let _ = t2.send(Event::Alert(k, s));
+            });
             // once a day: is there a newer oriel? (in the background; quiet if offline)
             std::thread::spawn(move || {
                 if let Some(r) = crate::update::check(false).ok().and_then(|rs| crate::update::available(&rs)) {
@@ -425,6 +434,17 @@ impl App {
         self.notice = Some((s.into(), Instant::now()));
     }
 
+    /// Into the event center: a toast now, a line in alerts, and a desktop notification if you're elsewhere.
+    fn raise(&mut self, kind: crate::alerts::Kind, text: String, app: Option<&str>, pane: Option<PaneId>) {
+        // the thing it's about is right in front of you: no need to keep it
+        let in_view = self.term_focused && pane.is_some_and(|p| self.visible().contains(&p));
+        crate::alerts::push(crate::alerts::Alert { at: crate::alerts::now(), kind, text: text.clone(), app: app.map(String::from), read: in_view, pane });
+        self.notify(format!("{} {text}", kind.label().0));
+        if !self.term_focused && kind.loud() && self.config.desktop_notifications {
+            crate::alerts::desktop("oriel", &text);
+        }
+    }
+
     fn set_theme(&mut self, name: &str, save: bool) {
         self.theme = theme::get(name);
         if save {
@@ -512,10 +532,10 @@ impl App {
             let where_ = tab_no.map(|i| self.tab_label(i)).unwrap_or_default();
             if prev == Some(Activity::Working) && a == Activity::Idle && !seen {
                 self.done.insert(*id);
-                notes.push(format!("{} finished · {where_}", p.title()));
+                notes.push((crate::alerts::Kind::AgentDone, format!("{} finished · {where_}", p.title()), *id));
             }
             if a == Activity::Blocked && prev != Some(Activity::Blocked) && !seen {
-                notes.push(format!("{} needs you · {where_}", p.title()));
+                notes.push((crate::alerts::Kind::NeedsYou, format!("{} needs you · {where_}", p.title()), *id));
             }
             if seen {
                 self.done.remove(id);
@@ -532,8 +552,8 @@ impl App {
             }
         }
         self.done.retain(|id| self.panes.contains_key(id));
-        if let Some(n) = notes.pop() {
-            self.notify(n);
+        for (k, text, id) in notes {
+            self.raise(k, text, None, Some(id));
         }
     }
 
@@ -589,6 +609,9 @@ impl App {
     fn reap(&mut self) {
         let dead: Vec<PaneId> = self.panes.iter().filter(|(_, p)| !p.alive()).map(|(id, _)| *id).collect();
         for id in dead {
+            if let Some((k, s)) = self.panes.get_mut(&id).and_then(|p| p.exit_note()) {
+                self.raise(k, s, None, None);
+            }
             self.close(id);
         }
         if let Some((_, t)) = &self.notice {
@@ -618,6 +641,16 @@ impl App {
                 Action::Open(p, place) => self.open(p, place, from),
                 Action::Close => self.close(from),
                 Action::Notify(s) => self.notify(s),
+                Action::Alert(k, s) => {
+                    let app = self.tabs.iter().find(|t| t.root.contains(from)).and_then(|t| t.app);
+                    self.raise(k, s, app, Some(from));
+                }
+                Action::FocusPane(id) => {
+                    if let Some(i) = self.tabs.iter().position(|t| t.root.contains(id)) {
+                        self.cur = i;
+                        self.tabs[i].focus = id;
+                    }
+                }
                 Action::SetTheme(t) => {
                     if theme::names().iter().any(|n| *n == t) {
                         self.set_theme(&t, true);
@@ -708,9 +741,19 @@ impl App {
                 }
             },
             Event::UpdateAvailable(v) => {
-                self.notify(format!("{}oriel {v} is out · click it at the bottom of the sidebar, or alt p → updates", ui::lead("package")));
+                self.raise(crate::alerts::Kind::Update, format!("oriel {v} is out: click it at the bottom of the sidebar, or alt p → updates"), Some("updates"), None);
                 self.update_ready = Some(v);
             }
+            Event::Alert(k, s) => {
+                let app = match k {
+                    crate::alerts::Kind::Memory => Some("system"),
+                    crate::alerts::Kind::Usage => Some("ais"),
+                    _ => None,
+                };
+                self.raise(k, s, app, None);
+            }
+            Event::Input(CEvent::FocusGained) => self.term_focused = true,
+            Event::Input(CEvent::FocusLost) => self.term_focused = false,
             Event::ThemeFilesChanged => {
                 if self.theme.name == "omarchy" {
                     std::thread::sleep(Duration::from_millis(150)); // let omarchy finish swapping files
@@ -1419,7 +1462,16 @@ impl App {
             let fy = fy + extra;
             for (k, &(name, icon, label, key)) in SIDEBAR[FOOTER..].iter().enumerate() {
                 let r = Rect { y: fy + k as u16, height: 1, ..inner };
-                ui::side_row(f, r, icon, label, key, cur_app == Some(name), t);
+                let unread = if name == "alerts" { crate::alerts::unread() } else { 0 };
+                if unread > 0 {
+                    // the bell lights up with how many are new
+                    let st = Style::default().fg(t.accent).add_modifier(Modifier::BOLD);
+                    let n = format!("{unread} new");
+                    let w = (r.width as usize).saturating_sub(n.len() + 1);
+                    f.render_widget(Paragraph::new(Line::from(vec![Span::styled(ui::fit(&format!("{}{label}", ui::lead(icon)), w), st), Span::raw(" ".repeat(w.saturating_sub(ui::fit(&format!("{}{label}", ui::lead(icon)), w).chars().count()) + 1)), Span::styled(n, st)])), r);
+                } else {
+                    ui::side_row(f, r, icon, label, key, cur_app == Some(name), t);
+                }
                 self.side_hits.push((r, SideHit::App(name)));
             }
             Rect { height: inner.height - foot_n - 1, ..inner }

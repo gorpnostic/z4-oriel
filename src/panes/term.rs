@@ -32,6 +32,8 @@ pub struct Term {
     status: Option<Activity>,
     agent: bool,
     last_scan: Instant,
+    /// Tell the event center how this ended ("installing Firefox" -> "Firefox installed" / "failed").
+    exit_alert: Option<String>,
 }
 
 /// Programs that are coding agents (by executable name), so their panes get status dots from the start.
@@ -84,7 +86,14 @@ impl Term {
                 words.map(|w| std::path::Path::new(w).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default()).any(|n| AGENTS.contains(&n.as_str()))
             },
             last_scan: Instant::now(),
+            exit_alert: None,
         }
+    }
+
+    /// When the command ends, say so in the event center: `what` is e.g. "Firefox".
+    pub fn alert_on_exit(mut self, what: &str) -> Term {
+        self.exit_alert = Some(what.to_string());
+        self
     }
 
     pub fn shell(cfg: &crate::config::Config, cwd: Option<std::path::PathBuf>) -> Term {
@@ -215,6 +224,12 @@ impl Pane for Term {
     fn is_terminal(&self) -> bool {
         true
     }
+    fn exit_note(&mut self) -> Option<(crate::alerts::Kind, String)> {
+        let what = self.exit_alert.take()?;
+        let ok = self.child.try_wait().ok().flatten().map(|s| s.success()).unwrap_or(true);
+        Some(if ok { (crate::alerts::Kind::Download, format!("{what}: done")) } else { (crate::alerts::Kind::BuildFailed, format!("{what}: failed (see the terminal output next time with alt n)")) })
+    }
+
     fn alive(&self) -> bool {
         !self.exited.load(Ordering::SeqCst)
     }

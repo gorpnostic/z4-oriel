@@ -28,6 +28,19 @@ mod tests;
 mod view;
 
 /// `oriel mcp-lead <port> <token>`: the MCP stdio server a lead's CLI starts (bridges to the running oriel).
+/// Every AI's plan windows from disk, flattened: (agent, window). The event center warns near a limit.
+pub fn usage_limits() -> Vec<(String, roster::Window)> {
+    let now = crate::panes::files::clock::now_secs();
+    let l = roster::read(&roster::LimitPaths::real(), now);
+    l.claude.into_iter().map(|w| ("claude".to_string(), w)).chain(l.codex.into_iter().map(|w| ("codex".to_string(), w))).collect()
+}
+
+/// "2h 10m" until a unix time.
+pub fn until(ts: i64) -> String {
+    let s = (ts - crate::panes::files::clock::now_secs()).max(0);
+    if s >= 86400 { format!("{}d {}h", s / 86400, s % 86400 / 3600) } else if s >= 3600 { format!("{}h {}m", s / 3600, s % 3600 / 60) } else { format!("{}m", s / 60) }
+}
+
 pub fn mcp_lead(port: &str, token: &str) {
     mcp::serve_stdio(port, token);
 }
@@ -915,7 +928,7 @@ impl Agents {
         t.question.clear();
         t.last = why.to_string();
         let title = t.title.clone();
-        cx.notify(format!("◆ {title} is ready for review"));
+        cx.alert(crate::alerts::Kind::AgentDone, format!("{title} is ready for review"));
         if following {
             self.select(id);
         }

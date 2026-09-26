@@ -220,9 +220,15 @@ impl Pane for Calendar {
         }
         for p in &self.plans {
             if let (true, Some(at)) = (p.day == today, p.at) {
+                // ten minutes before, and when it starts
+                let soon = (p.day, at + 10_000, p.text.clone());
+                if mins + 10 >= at && mins < at && !self.reminded.contains(&soon) {
+                    cx.alert(crate::alerts::Kind::Calendar, format!("in {} min: {} {}", at - mins, hhmm(at), p.text));
+                    self.reminded.insert(soon);
+                }
                 let key = (p.day, at, p.text.clone());
                 if mins >= at && mins < at + 10 && !self.reminded.contains(&key) {
-                    cx.notify(format!("{}{} {}", ui::lead("calendar"), hhmm(at), p.text));
+                    cx.alert(crate::alerts::Kind::Calendar, format!("now: {} {}", hhmm(at), p.text));
                     self.reminded.insert(key);
                 }
             }
