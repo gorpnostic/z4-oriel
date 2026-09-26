@@ -439,8 +439,10 @@ fn system_kill_confirm() {
 }
 
 /// The real machine: background sampling, then time what the UI thread does per refresh. The probes run for
-/// real too (read-only: registry queries, the service list, netstat).
+/// real too (read-only: registry queries, the service list, netstat). Opt-in: it reads the real machine and its
+/// timing flakes under load. `cargo test system_live_and_timing -- --ignored --nocapture`
 #[test]
+#[ignore]
 fn system_live_and_timing() {
     let mut k = Kit::new();
     let mut p = System::new();
