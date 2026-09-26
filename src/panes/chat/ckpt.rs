@@ -153,8 +153,27 @@ fn pathspecs() -> Vec<String> {
         .collect()
 }
 
+/// Folders found too big lately, with why: they aren't listed again for a while (in a huge folder the listing is
+/// the slow part, and every turn would wait for it).
+static TOO_BIG: std::sync::Mutex<Vec<(PathBuf, usize, u64, Instant, String)>> = std::sync::Mutex::new(Vec::new());
+const TOO_BIG_FOR: Duration = Duration::from_secs(600);
+
 /// Too many or too big new files to snapshot quickly: why, else Ok.
 fn size_check(p: &Place, caps: &Caps) -> Result<(), String> {
+    let seen = |e: &(PathBuf, usize, u64, Instant, String)| e.0 == p.root && e.1 == caps.files && e.2 == caps.bytes;
+    if let Some(e) = TOO_BIG.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|e| seen(e) && e.3.elapsed() < TOO_BIG_FOR) {
+        return Err(e.4.clone());
+    }
+    let r = list_check(p, caps);
+    let mut memo = TOO_BIG.lock().unwrap_or_else(|e| e.into_inner());
+    memo.retain(|e| !seen(e) && e.3.elapsed() < TOO_BIG_FOR);
+    if let Err(why) = &r {
+        memo.push((p.root.clone(), caps.files, caps.bytes, Instant::now(), why.clone()));
+    }
+    r
+}
+
+fn list_check(p: &Place, caps: &Caps) -> Result<(), String> {
     let t0 = Instant::now();
     let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
     if p.shadow.is_none() {
@@ -485,6 +504,11 @@ mod tests {
         }
         let err = tree(&p, &Caps { files: 3, bytes: 1 << 30, secs: 60 }).unwrap_err();
         assert!(err.contains("new files (over 3)"), "{err}");
+        // said again at once for a while, without listing the folder again
+        for i in 5..10 {
+            write(&d, &format!("new{i}.txt"), "x");
+        }
+        assert_eq!(tree(&p, &Caps { files: 3, bytes: 1 << 30, secs: 60 }).unwrap_err(), err, "remembered, not listed again");
         assert!(tree(&p, &Caps { files: 100, bytes: 2, secs: 60 }).unwrap_err().contains("MB of new files"));
         assert_eq!(fnv("C:\\Work\\X\\"), fnv(if cfg!(windows) { "c:/work/x" } else { "C:\\Work\\X" }));
     }
