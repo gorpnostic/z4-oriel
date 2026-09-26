@@ -580,6 +580,21 @@ impl Pane for Notes {
     fn icon(&self) -> &'static str {
         "notes"
     }
+    fn reopen(&self) -> Option<&'static str> {
+        Some("notes")
+    }
+    fn resume_id(&self) -> Option<String> {
+        self.cur.clone()
+    }
+    fn resume(&mut self, id: &str) {
+        if self.list.iter().any(|m| m.id == id) {
+            self.open(id);
+        }
+    }
+    fn for_chat(&self) -> Option<(String, String)> {
+        let text = self.ed.text();
+        (!text.trim().is_empty()).then(|| ("this note".to_string(), text))
+    }
     fn tick_every(&self) -> Option<Duration> {
         match (self.dirty_at, &self.watch) {
             (Some(_), _) => Some(Duration::from_millis(250)), // the autosave second
@@ -1194,6 +1209,20 @@ mod tests {
             k.key_mod(&mut p, KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
         }
         assert_eq!(p.ed.text(), "x@{\\|~");
+    }
+
+    #[test]
+    fn notes_reopen_and_send_to_chat() {
+        let dir = scratch("notes-resume");
+        std::fs::write(dir.join("a.md"), "# first\n").unwrap();
+        std::fs::write(dir.join("b.md"), "# second\n\nsome spec\n").unwrap();
+        let mut p = Notes::open_in(dir.clone(), None);
+        p.resume("b");
+        assert_eq!((p.resume_id().as_deref(), p.title().as_str()), (Some("b"), "second"), "the note you had open comes back");
+        p.resume("deleted-since");
+        assert_eq!(p.resume_id().as_deref(), Some("b"));
+        assert_eq!(p.for_chat(), Some(("this note".to_string(), "# second\n\nsome spec\n".to_string())));
+        assert_eq!(p.reopen(), Some("notes"));
     }
 
     #[test]

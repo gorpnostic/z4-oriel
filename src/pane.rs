@@ -51,6 +51,8 @@ pub enum Action {
     GotoApp(&'static str),
     /// Send a key to an app's pane without switching to it (/play → the music app), opening it if needed.
     AppKey(&'static str, char),
+    /// Paste text into an app's pane (opening it if needed), and switch to it.
+    AppPaste(&'static str, String),
     ToggleSidebar,
     ToggleIcons,
     /// Replay the tour (settings › tools).
@@ -60,6 +62,11 @@ pub enum Action {
     OpenTagged { pane: Box<dyn Pane>, tag: String, name: String, focus: bool },
     /// Switch to the tab holding this pane (the alerts app jumps back to where something happened).
     FocusPane(u64),
+    /// FocusPane, or this app if that pane has closed since.
+    FocusPaneOr(u64, &'static str),
+    /// Answer one of a pane's open items (Pane::open_now) by its key: the alerts app's 1-9, y / n; Go switches
+    /// to the pane first, then lets it show the item.
+    Respond(u64, String, crate::alerts::Reply),
     /// Switch to the tab holding the pane opened with this tag (no-op if it's gone).
     FocusTag(String),
     /// Close the pane opened with this tag.
@@ -161,9 +168,29 @@ pub trait Pane {
     fn alive(&self) -> bool {
         true
     }
-    /// True if the pane wants raw keys (terminal): only the global Alt/prefix bindings are intercepted.
+    /// True if the pane wants raw keys (terminal): only the global Alt/prefix bindings are intercepted, and the
+    /// F-keys unless `wants_fkeys`.
     fn is_terminal(&self) -> bool {
         false
+    }
+    /// A full-screen program (htop, mc, vim) is running: bare F-keys go to it instead of switching apps.
+    fn wants_fkeys(&self) -> bool {
+        false
+    }
+    /// How many agents closing this pane would stop mid-work (a live reply, running workers). Closing or quitting
+    /// asks first while it's above 0. Default: a coding agent that's working or waiting on you.
+    fn busy(&self) -> usize {
+        matches!(self.activity(), Some(Activity::Working | Activity::Blocked)) as usize
+    }
+    /// ctrl+v here should try the clipboard for an image first (pasted as a file path): chat, agents, and
+    /// terminals running a coding agent. Everywhere else ctrl+v goes straight to the program.
+    fn wants_images(&self) -> bool {
+        self.activity().is_some()
+    }
+    /// Whatever the mouse hovering changes in this pane's drawing (e.g. the highlighted row). Mouse moves that
+    /// change neither this nor the app's own hover targets skip the redraw.
+    fn hover(&self) -> usize {
+        0
     }
     /// This app's own section of the left sidebar, under the app list (nest style): the chat list, playlists,
     /// places, sort options... `area` is the space left in the sidebar. Only called for app tabs.
@@ -184,6 +211,37 @@ pub trait Pane {
     }
     /// True when the program inside wants mouse events itself (so right-click goes to it, not our menu).
     fn wants_mouse(&self) -> bool {
+        false
+    }
+    /// The folder this pane works in (files' folder, a chat's /cwd, a task's worktree, a shell's folder): a
+    /// terminal opened from here (alt n) starts there, and it's saved with the session.
+    fn cwd(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+    /// The panes::open name that makes this pane again when oriel restarts ("terminal", "claude", "files"...).
+    /// None = it isn't brought back.
+    fn reopen(&self) -> Option<&'static str> {
+        None
+    }
+    /// What to reopen inside it next time (the open chat's or note's id)...
+    fn resume_id(&self) -> Option<String> {
+        None
+    }
+    /// ...and reopening it, at start.
+    fn resume(&mut self, _id: &str) {}
+    /// Something the palette can send to chat from here: (what it is, the text), e.g. ("this note", its text).
+    fn for_chat(&self) -> Option<(String, String)> {
+        None
+    }
+    /// What's waiting on you here right now (a question, an approval, a stuck task, work to review), for the
+    /// alerts app's "open now" list. Asked before every draw, so it must be cheap. A pane whose activity() is
+    /// Blocked and lists nothing gets a plain "needs you" row from the app.
+    fn open_now(&self) -> Vec<crate::alerts::Open> {
+        vec![]
+    }
+    /// Answer one of them (the alerts app: 1-9, y / n), or show it (enter; the app has switched here already).
+    /// False = it's gone or has changed since it was listed.
+    fn respond(&mut self, _key: &str, _r: crate::alerts::Reply, _cx: &mut Cx) -> bool {
         false
     }
 }

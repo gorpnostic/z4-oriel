@@ -158,7 +158,7 @@ pub enum Stage {
     Tour { step: usize, start: Probe },
 }
 
-const STARTS: &[(&str, &str)] = &[("ai", "chat"), ("agents", "agents"), ("home", "home screen"), ("terminal", "terminal"), ("music", "music")];
+const STARTS: &[(&str, &str)] = &[("last", "where you left off"), ("ai", "chat"), ("agents", "agents"), ("home", "home screen"), ("terminal", "terminal"), ("music", "music")];
 const STEPS_SETUP: usize = 6; // theme, icons, music, notes, defaults, AIs
 
 /// What the app should do after a key/click. Setup pages only send a value you actually changed.
@@ -204,6 +204,10 @@ pub struct Onboard {
     /// esc ends the tour right now (not while a terminal has the keyboard): the card's end button says which
     esc_ends: bool,
     hits: Vec<(Rect, Btn)>,
+    /// the tour card, drawn over the app: clicks on it are its own, not the pane's underneath
+    card: Rect,
+    /// the prefix key as configured, for the tour's text
+    prefix: String,
 }
 
 /// Quick count of audio files under a folder (bounded: at most 20k entries, 4 levels down). None = no such folder.
@@ -356,12 +360,14 @@ impl Onboard {
             counting: false,
             esc_ends: true,
             hits: vec![],
+            card: Rect::default(),
+            prefix: crate::config::prefix(cfg),
         }
     }
 
     /// Straight into the tour (a replay: palette "take the tour", `oriel --tour`). The setup pages can't be
     /// reached from here, so none of their data is gathered (no looking for AIs on the network).
-    pub fn tour(theme_now: &str, probe: &Probe) -> Onboard {
+    pub fn tour(theme_now: &str, probe: &Probe, prefix: &str) -> Onboard {
         Onboard {
             stage: Stage::Tour { step: 0, start: probe.clone() },
             themes: vec![],
@@ -381,6 +387,8 @@ impl Onboard {
             counting: false,
             esc_ends: true,
             hits: vec![],
+            card: Rect::default(),
+            prefix: prefix.to_string(),
         }
     }
 
@@ -565,6 +573,23 @@ impl Onboard {
         (true, Out::None)
     }
 
+    /// Pasted text (ctrl+v of a folder path) into the folder field that's up; swallowed by any other setup
+    /// screen, so it never lands in the pane behind.
+    pub fn paste(&mut self, text: &str) {
+        let text = text.trim();
+        // Explorer's "copy as path" wraps it in quotes
+        let text = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(text);
+        let clean = |input: &mut String| input.extend(text.chars().filter(|c| !c.is_control()));
+        match &mut self.stage {
+            Stage::Music { input, found } => {
+                clean(input);
+                *found = count_audio(input);
+            }
+            Stage::Notes { input } => clean(input),
+            _ => {}
+        }
+    }
+
     fn advance(&mut self, probe: &Probe) -> Out {
         if let Stage::Tour { step, start } = &mut self.stage {
             if *step + 1 >= STEPS.len() {
@@ -608,13 +633,14 @@ impl Onboard {
                 });
             }
         }
-        (self.is_modal(), Out::None)
+        (self.is_modal() || self.card.contains(pos), Out::None)
     }
 
     // ------------------------------------------------------------------ drawing
     pub fn draw(&mut self, f: &mut Frame, area: Rect, t: &Theme, time: f64) {
         self.hits.clear();
         self.pump_count();
+        self.card = Rect::default();
         let (n, title) = match &self.stage {
             // the welcome is always ultra, whatever theme is set
             Stage::Welcome => return self.draw_welcome(f, area, &theme::get("ultra"), time),
@@ -795,10 +821,12 @@ impl Onboard {
 
     fn draw_tour(&mut self, f: &mut Frame, area: Rect, t: &Theme, step: usize) {
         let s = &STEPS[step];
+        let body = s.body.replace("ctrl+space", &self.prefix);
         let w = 58.min(area.width.saturating_sub(4));
-        let body_lines = (s.body.chars().count() as u16).div_ceil(w.saturating_sub(4).max(1)) + 1;
+        let body_lines = (body.chars().count() as u16).div_ceil(w.saturating_sub(4).max(1)) + 1;
         let h = 4 + body_lines + if s.keys.is_empty() { 0 } else { 2 };
         let r = Rect { x: area.right().saturating_sub(w + 2), y: area.bottom().saturating_sub(h + 1), width: w, height: h.min(area.height) };
+        self.card = r;
         f.render_widget(Clear, r);
         let title = format!("tour · {}/{} · {}", step + 1, STEPS.len(), s.title);
         let inner = ui::frame(f, r, &title, None, true, t);
@@ -808,7 +836,7 @@ impl Onboard {
             f.render_widget(Paragraph::new(Span::styled(" × ", Style::default().fg(t.accent))), x);
             self.hits.push((x, Btn::End));
         }
-        let mut lines = vec![Line::raw(s.body)];
+        let mut lines = vec![Line::raw(body)];
         if !s.keys.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![Span::styled("try  ", ui::muted(t)), Span::styled(s.keys, Style::default().fg(t.accent).add_modifier(Modifier::BOLD))]));
@@ -972,7 +1000,7 @@ mod tests {
     /// then esc goes to the program and the card's button just says "end tour".
     #[test]
     fn onboard_tour_esc_leaves_terminals_alone() {
-        let mut o = Onboard::tour("oriel", &Probe::default());
+        let mut o = Onboard::tour("oriel", &Probe::default(), "ctrl+space");
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let t = theme::get("oriel");
         let mut shot = |o: &mut Onboard| -> String {

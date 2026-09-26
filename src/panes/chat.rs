@@ -5,6 +5,7 @@
 mod activity;
 mod agent;
 pub mod approve;
+mod inbox;
 mod md;
 pub mod providers;
 mod store;
@@ -1318,12 +1319,68 @@ impl Chat {
     }
 }
 
+impl Chat {
+    /// The pane is going away mid-reply: take in what the agent said since the last poll, then stop it (its
+    /// runner kills the process tree) and save the reply as stopped. False if nothing was running.
+    fn wind_down(&mut self) -> bool {
+        let Some(s) = &self.stream else { return false };
+        let evs: Vec<Ev> = std::mem::take(&mut *s.inbox.lock().unwrap());
+        if let Some(m) = self.chat.messages.last_mut().filter(|m| m.role == "assistant") {
+            for ev in evs {
+                match ev {
+                    Ev::Token(t) => activity::push_text(m, &t),
+                    Ev::Thinking { text, tokens } => activity::push_thinking(m, &text, tokens),
+                    Ev::Tool(tool) => activity::upsert_tool(m, tool),
+                    Ev::Todos(items) => activity::set_todos(m, items),
+                    Ev::Mark(text) => activity::push_mark(m, &text),
+                    _ => {}
+                }
+            }
+        }
+        if cfg!(test) {
+            // tests build chats mid-reply by hand: stop them, but never save one into the real chat list
+            if let Some(s) = self.stream.take() {
+                s.stop.store(true, Ordering::SeqCst);
+            }
+        } else {
+            self.stop();
+        }
+        true
+    }
+}
+
+/// The pane closing (or oriel quitting) mid-reply: stop the agent's process tree and keep what it said so far.
+impl Drop for Chat {
+    fn drop(&mut self) {
+        if self.wind_down() && !cfg!(test) {
+            // the runner checks its stop flag every 100 ms: let it start the kill before oriel exits
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+}
+
 impl Pane for Chat {
     fn title(&self) -> String {
         if self.chat.messages.is_empty() { "new chat".into() } else { self.chat.title.to_lowercase() }
     }
     fn icon(&self) -> &'static str {
         "ai"
+    }
+    fn cwd(&self) -> Option<PathBuf> {
+        // where its agents work (without workdir()'s fallback, which makes a folder)
+        Some(self.chat.cwd.clone().map(PathBuf::from).unwrap_or_else(|| self.launch_dir.clone())).filter(|d| d.is_dir())
+    }
+    fn reopen(&self) -> Option<&'static str> {
+        Some("ai")
+    }
+    fn resume_id(&self) -> Option<String> {
+        // a chat that's been saved (an empty new one has nothing to come back to)
+        self.chats.iter().any(|c| c.id == self.chat.id).then(|| self.chat.id.clone())
+    }
+    fn resume(&mut self, id: &str) {
+        if let Some(i) = self.chats.iter().position(|c| c.id == id) {
+            self.open_chat(i);
+        }
     }
     fn subtitle(&self) -> Option<String> {
         let p = self.provider_of();
@@ -1339,6 +1396,18 @@ impl Pane for Chat {
     }
     fn tick_every(&self) -> Option<Duration> {
         self.stream.as_ref().map(|_| Duration::from_millis(100))
+    }
+    fn busy(&self) -> usize {
+        self.stream.is_some() as usize
+    }
+    fn wants_images(&self) -> bool {
+        true
+    }
+    fn open_now(&self) -> Vec<crate::alerts::Open> {
+        self.open_items()
+    }
+    fn respond(&mut self, key: &str, r: crate::alerts::Reply, cx: &mut Cx) -> bool {
+        self.answer_open(key, r, cx)
     }
 
     /// Something was remembered elsewhere (another chat's /perms or /model, setup, a hand edit): new chats here use
@@ -1980,6 +2049,31 @@ mod tests {
         c.input.clear();
         c.cursor = 0;
         println!("{}", k.render_side(&mut c, 32, 24));
+    }
+
+    #[test]
+    fn chat_reopens_the_chat_you_left() {
+        let k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        assert_eq!(c.resume_id(), None, "a blank new chat has nothing to come back to");
+        c.chats = (0..3)
+            .map(|i| {
+                let mut ch = store::Chat::new("claude");
+                ch.id = format!("r{i}");
+                ch.messages.push(store::Msg { role: "user".into(), content: format!("hi {i}"), ..Default::default() });
+                ch
+            })
+            .collect();
+        c.resume("r2");
+        assert_eq!((c.chat.id.as_str(), c.resume_id().as_deref()), ("r2", Some("r2")));
+        c.resume("gone"); // deleted since: stays put
+        assert_eq!(c.chat.id, "r2");
+        assert_eq!(c.reopen(), Some("ai"));
+        // alt n from here opens the terminal in the chat's folder
+        let d = std::path::absolute("target/test-scratch/shell").unwrap();
+        std::fs::create_dir_all(&d).unwrap();
+        c.chat.cwd = Some(d.display().to_string());
+        assert_eq!(c.cwd(), Some(d));
     }
 
     #[test]
@@ -2708,6 +2802,23 @@ mod tests {
         println!("{s}");
         assert!(s.contains("hi there") && s.contains("looked it up"));
         assert!(!s.contains("retired"));
+    }
+
+    #[test]
+    fn chat_closing_mid_reply_stops_the_agent() {
+        let k = Kit::new();
+        let c = agent_chat(&k, "claude", "fix the flaky test");
+        let stop = c.stream.as_ref().unwrap().stop.clone();
+        assert_eq!(c.busy(), 1, "closing or quitting asks first");
+        drop(c); // the pane closing, or oriel quitting
+        assert!(stop.load(Ordering::SeqCst), "the agent's process tree is told to stop, not left running unseen");
+        // what it said after the last poll isn't lost with the pane
+        let mut c = agent_chat(&k, "claude", "fix the flaky test");
+        c.stream.as_ref().unwrap().inbox.lock().unwrap().push(Ev::Token("half an answer".into()));
+        assert!(c.wind_down());
+        assert!(c.stream.is_none() && c.busy() == 0);
+        assert!(serde_json::to_string(c.chat.messages.last().unwrap()).unwrap().contains("half an answer"));
+        assert!(!c.wind_down(), "nothing left running");
     }
 }
 

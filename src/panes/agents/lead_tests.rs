@@ -29,6 +29,21 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `inner`, but the first `n` workers to start wait for each other before doing anything: nothing finishes (and
+/// frees a slot) until all of them are in, so `order` names exactly the tasks the board scheduled first, whichever
+/// of their threads happens to get going first.
+fn first_together(inner: run::Fake, n: usize, order: Arc<Mutex<Vec<String>>>) -> run::Fake {
+    Arc::new(move |spec: &run::Spec, stop: &AtomicBool, on: &mut dyn FnMut(Ev)| -> run::Outcome {
+        let first = spec.prompt.lines().find(|l| l.starts_with("TASK ")).unwrap_or("").to_string();
+        order.lock().unwrap().push(first);
+        let t0 = std::time::Instant::now();
+        while order.lock().unwrap().len() < n && !stop.load(Ordering::SeqCst) && t0.elapsed() < std::time::Duration::from_secs(60) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        inner(spec, stop, on)
+    })
+}
+
 /// A worker that does what its goal's script says.
 fn fake_worker(seen: Arc<Mutex<Vec<String>>>) -> run::Fake {
     let n = Arc::new(AtomicUsize::new(0));
@@ -213,7 +228,8 @@ fn agents_batch_runs_without_a_lead() {
     let repo = temp_repo(&dir);
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let mut k = Kit::new();
-    let mut p = lead_pane(&dir, &repo, fake_worker(seen.clone()), fake_text_lead(json!([]), 0, Arc::default()));
+    let order: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut p = lead_pane(&dir, &repo, first_together(fake_worker(seen.clone()), 2, order.clone()), fake_text_lead(json!([]), 0, Arc::default()));
     p.lead_cfg.gate = gate_cmd();
     p.lead_cfg.max_parallel = 2;
     k.render(&mut p, 150, 44);
@@ -241,10 +257,10 @@ fn agents_batch_runs_without_a_lead() {
     assert!(r.manual && r.merged == 3, "{r:?}
 {:#?}", p.store.tasks);
     assert!(r.branch.contains("batch-"), "{}", r.branch);
-    // two start together (the order their threads report in is up to the OS): the urgent one is one of them,
-    // though it was added last
-    let first_two: Vec<String> = seen.lock().unwrap().iter().take(2).cloned().collect();
-    assert!(first_two.iter().any(|s| s.contains(&c)), "the urgent one started first: {first_two:?}");
+    // the two slots went to the urgent one (though it was added last) and a; b waited for a slot. (The first two
+    // hold each other up, so this is the board's choice, not which worker thread got going first.)
+    let first_two: Vec<String> = order.lock().unwrap().iter().take(2).cloned().collect();
+    assert!(first_two.iter().any(|s| s.contains(&c)) && first_two.iter().any(|s| s.contains(&a)), "the urgent one started first: {first_two:?}");
     assert_eq!(p.task(&b).unwrap().attempts, 1, "b failed the gate once and went back to its worker");
     for (f, want) in [("a.txt", "aaa"), ("b.txt", "fixed"), ("c.txt", "sea")] {
         assert_eq!(sh(&repo, &["show", &format!("{}:{f}", r.branch)]), want);

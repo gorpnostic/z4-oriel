@@ -158,7 +158,9 @@ impl Env {
     /// Without looking anything up on PATH (the palette opens this often): shells and agents are left out, so
     /// those rows show their raw value.
     pub fn quick() -> Env {
-        let mut starts: Vec<(String, String)> = crate::app::SIDEBAR.iter().map(|s| (s.0.to_string(), s.2.to_string())).collect();
+        // "last" first: the default, your tabs and splits as you left them (session.rs)
+        let mut starts: Vec<(String, String)> = vec![("last".into(), "where you left off".into())];
+        starts.extend(crate::app::SIDEBAR.iter().map(|s| (s.0.to_string(), s.2.to_string())));
         starts.push(("home".into(), "home screen".into()));
         starts.push(("updates".into(), "updates".into()));
         Env { themes: crate::theme::names(), starts, ..Env::default() }

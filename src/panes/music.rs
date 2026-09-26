@@ -923,7 +923,7 @@ impl Pane for Music {
         let hints: &[(&str, &str)] = if self.searching {
             &[("type", "to filter"), ("↑/↓", "move"), ("enter", "done"), ("esc", "clear")]
         } else {
-            &[("space", "play/pause"), ("←/→", "seek"), ("n/p", "next/prev"), ("+/-", "volume"), ("s", "shuffle"), ("r", "repeat"), ("/", "search"), ("enter", "play"), ("R", "rescan")]
+            &[("space", "play/pause"), ("←/→", "seek"), ("n/p", "next/prev"), ("+/-", "volume"), ("s", "shuffle"), ("r", "repeat"), ("/", "search"), ("enter", "play"), ("R", "rescan"), ("F1", "chat")]
         };
         // drop hints from the end until the line fits (narrow panes)
         let mut n = hints.len();

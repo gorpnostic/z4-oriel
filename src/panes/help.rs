@@ -67,23 +67,29 @@ fn topics() -> Vec<Topic> {
         ]},
         Topic { icon: "window", title: "keys & tabs", app: "", items: vec![
             H("apps and tabs"),
-            K("F1–F10", "switch apps (F12 plays/pauses music from anywhere, even before you've opened it)"),
+            K("F1–F10", "switch apps; the app's own key again goes back to where you were, so F10 opens help and closes it (F12 plays/pauses music, opening it first if it isn't yet)"),
+            K("F-keys in a terminal", "a full-screen program there (htop, mc, vim; not a coding agent) gets them; ctrl+space then the F-key switches apps"),
             K("alt t", "a new tab of your own (it starts on a launcher)"),
             K("on the launcher", "a letter opens that app (its F-key is shown too); sidebar apps go to their tab, t c x open here"),
-            K("alt 1–9", "go to one of your tabs"),
+            K("alt 1–9", "go to one of your tabs (ctrl+space then 1–9 too; alt p finds the rest by name)"),
+            K("alt j", "jump to what needs you: the newest agent waiting on you, then tabs with a red ●, then a green ● (again for the next)"),
+            K("alt 0", "the next tab that needs you or finished; when none do, back to the tab you were on"),
+            K("ctrl+space ;", "back to the tab you were on before"),
+            K("click a toast", "go to what it's about (an agent that finished or needs you)"),
             K("double-click a tab", "rename it (also right-click → rename, or ctrl+space then ,)"),
-            K("× on a tab / middle-click", "close that tab"),
+            K("× on a tab / middle-click", "close that tab (app tabs stay open)"),
             K("alt s", "hide or show the sidebar (remembered)"),
             K("alt ,", "settings: every setting in one place"),
             Gap,
             H("panes (splits)"),
-            K("alt n", "open a terminal beside the current pane (alt enter works too outside Windows Terminal)"),
+            K("alt n", "open a terminal beside the current pane, in its folder (files' folder, a chat's /cwd, a task's worktree); alt enter works too outside Windows Terminal"),
             K("alt ← ↑ ↓ →", "move between panes"),
             K("alt shift ← ↑ ↓ →", "resize the pane"),
             K("drag a divider", "resize with the mouse"),
-            K("alt z", "zoom the pane (again to unzoom)"),
-            K("alt w / × on the frame", "close the pane"),
-            K("right-click", "menu: split, zoom, rename, new tab, close"),
+            K("alt z", "zoom the pane (again, or alt ← ↑ ↓ →, to unzoom; the frame says · zoomed)"),
+            K("alt w / × on the frame", "close the pane (not an app's only pane)"),
+            K("agents at work", "closing or quitting asks first: y (or the same key again) · n keeps them"),
+            K("right-click", "menu: split, zoom, rename, new tab, close, paste; with text selected, copy it or ask chat about it"),
             Gap,
             H("tmux-style keys: ctrl+space, then…"),
             K("|  or  v", "split right"),
@@ -91,14 +97,22 @@ fn topics() -> Vec<Topic> {
             K("h j k l", "move (H J K L resize)"),
             K("x  ·  z", "close pane · zoom"),
             K("c  ·  n  ·  p", "new tab · next tab · previous tab"),
-            K(",  ·  &", "rename tab · close tab"),
+            K("1–9  ·  ;", "one of your tabs · back to the last tab"),
+            K(",  ·  &  ·  < >", "rename tab · close tab · move it up / down"),
+            K("a m s f g e", "open beside this: chat · music · system · files · storage · notes"),
+            K("C  ·  X", "open Claude Code · Codex beside this"),
+            K("q", "quit oriel"),
             K("t  ·  space", "themes · palette"),
             K("ctrl+space twice", "send ctrl+space to the program"),
+            K("an alt key", "goes to the program as is: ctrl+space then alt p is Claude Code's own alt p (model), not the palette"),
             Gap,
             H("copy and paste"),
             K("drag", "select text in any pane; copied when you let go (shift+drag in programs that use the mouse)"),
-            K("ctrl+v / right-click", "paste text (your terminal's own paste)"),
+            K("ctrl+v", "paste text (your terminal's own paste)"),
+            K("right-click → paste", "paste text in any pane that doesn't use the mouse itself"),
+            K("right-click → ask chat", "with text selected: it goes to chat as a code block, ready for your question"),
             K("alt v", "paste a clipboard image or copied files as a path — Claude Code and Codex attach it"),
+            K("ctrl+v", "does the same in chat, agents and a terminal running Claude Code or Codex; other programs get it as is"),
             Gap,
             H("the same keys in every app"),
             K("j k  ·  ↑ ↓", "move down / up in any list"),
@@ -222,6 +236,7 @@ fn topics() -> Vec<Topic> {
             K("t", "a terminal in this folder"),
             K("o", "open with your system's app"),
             K("p", "copy the path"),
+            K("a", "ask chat about it: its path goes into chat (Claude Code and Codex read the file)"),
             K(".", "show hidden files"),
             K("r", "read the folder again (it also updates by itself when files change)"),
             P("The sidebar lists home, desktop, downloads, documents and your drives."),
@@ -234,13 +249,18 @@ fn topics() -> Vec<Topic> {
             K("ctrl+f", "find a note by its title or text: ↑↓ pick, enter opens, esc closes"),
             K("ctrl+d", "delete the note (asks first)"),
             K("ctrl+z  ·  ctrl+y", "undo · redo"),
+            K("alt p → send", "\"send this note to chat\" pastes it into chat's box"),
             P("Notes are plain .md files, so other programs can change them too: new ones show up in the sidebar, and an outside change to the open note is loaded. If you had unsaved edits, it asks: r reloads theirs, ctrl+s keeps yours."),
         ]},
         Topic { icon: "bell", title: "alerts", app: "alerts", items: vec![
             P("Everything worth knowing that happened while you were busy: an agent finished or needs you, an approval or question is waiting, a build or merge check failed, a plan starts soon, an install finished, memory is nearly full, an AI's usage is near its limit, a new oriel is out."),
             P("Each is a toast, a line here (the bell at the bottom of the sidebar shows how many are new) and, when the terminal isn't the window you're in, a desktop notification for the kinds you pick: settings › alerts turns them off, picks the kinds (\"needs you\" but not \"finished\", say), sets the memory and usage warnings and the calendar's early reminder, and sends a test notification."),
-            K("enter", "go to where it happened"),
-            K("x  ·  c", "dismiss one · clear them all"),
+            P("On top, \"open now\": what's waiting on you right now, straight from each app: a chat's question or approval, a task that's stuck or ready for review, a run whose branch is ready, a coding agent in a terminal at a prompt. It clears itself once answered. Every frame counts the ones out of sight (← 2 need you; click it to come here)."),
+            K("space", "peek: the whole question and its choices, or the result card"),
+            K("1–9", "answer a chat's question (tick, when several can be picked; y sends them)"),
+            K("y  ·  n", "allow · deny an approval"),
+            K("enter", "go to it, or to where it happened"),
+            K("x  ·  c", "dismiss one · clear them all (the history)"),
         ]},
         Topic { icon: "calendar", title: "calendar", app: "calendar", items: vec![
             P("A month at a glance with the chosen day's plans beside it. Plans with a time pop up as a reminder when they start, whichever app you're in. The sidebar shows the next two weeks."),
@@ -263,11 +283,12 @@ fn topics() -> Vec<Topic> {
         ]},
         Topic { icon: "term", title: "terminal", app: "terminal", items: vec![
             P("A real shell (PowerShell on Windows, your $SHELL elsewhere). Anything runs in it — including Claude Code or Codex, which then get status dots on their tab. `oriel` itself is always on its PATH."),
-            K("alt n", "another terminal beside it"),
+            K("alt n", "another terminal beside it, in the same folder (it follows cd when the prompt reports it)"),
             K("wheel", "scroll back (in less, man or git log it scrolls the page)"),
             K("shift pgup / pgdn", "scroll back a page from the keyboard"),
             K("shift home / end", "the top of the scrollback · back to now"),
             K("shift+enter", "a new line in Claude Code or Codex (ctrl+enter too) — enter sends"),
+            K("F1–F12", "switch apps at a prompt or from a coding agent; full-screen programs (htop, mc, vim) get them; ctrl+space then the F-key does the other"),
             K("drag", "copy text"),
             Gap,
             H("when the program ends"),
@@ -316,6 +337,7 @@ fn topics() -> Vec<Topic> {
             K("oriel changelog", "what's new in recent releases"),
             K("oriel --tour", "replay the tour"),
             K("oriel <app>", "start straight in an app this once, e.g. oriel music (your startup app stays as it is)"),
+            K("startup = \"last\"", "the default: oriel reopens your tabs, their splits and folders, and the app and chat you were in (startup = \"ai\" etc. always starts there)"),
         ]},
         Topic { icon: "search", title: "troubleshooting", app: "", items: vec![
             K("icons are boxes", "your terminal font has no icons — install a Nerd Font, or palette → \"toggle nerd font icons\" (remembered)"),
@@ -346,6 +368,8 @@ fn topics() -> Vec<Topic> {
 
 pub struct Help {
     topics: Vec<Topic>,
+    /// the prefix key as configured: the text says it instead of ctrl+space
+    prefix: String,
     sel: usize,
     scroll: usize,
     query: String,
@@ -366,7 +390,17 @@ enum Jump {
 
 impl Help {
     pub fn new() -> Help {
-        Help { topics: topics(), sel: 0, scroll: 0, query: String::new(), searching: false, hits: vec![], matches: vec![], cur_match: 0, jump: None }
+        Help { topics: topics(), prefix: "ctrl+space".into(), sel: 0, scroll: 0, query: String::new(), searching: false, hits: vec![], matches: vec![], cur_match: 0, jump: None }
+    }
+
+    /// Say `prefix` wherever the text says ctrl+space (config prefix = "ctrl+b"...).
+    pub fn prefix(mut self, prefix: &str) -> Help {
+        self.prefix = prefix.to_string();
+        self
+    }
+
+    fn say(&self, s: &str) -> String {
+        if self.prefix == "ctrl+space" { s.to_string() } else { s.replace("ctrl+space", &self.prefix) }
     }
 
     /// Move to the next (or previous) topic that matches the search, landing on its first (last) match.
@@ -408,8 +442,8 @@ impl Help {
                     let t = &self.topics[i];
                     t.title.contains(&q)
                         || t.items.iter().any(|it| match it {
-                            H(s) | P(s) => s.to_lowercase().contains(&q),
-                            K(a, b) => a.to_lowercase().contains(&q) || b.to_lowercase().contains(&q),
+                            H(s) | P(s) => self.say(s).to_lowercase().contains(&q),
+                            K(a, b) => self.say(a).to_lowercase().contains(&q) || self.say(b).to_lowercase().contains(&q),
                             Gap => false,
                         })
                 }
@@ -440,6 +474,10 @@ impl Pane for Help {
     fn icon(&self) -> &'static str {
         "search"
     }
+    /// A new prefix key (settings): the text says it from now on.
+    fn config_changed(&mut self, cfg: &crate::config::Config) {
+        self.prefix = crate::config::prefix(cfg);
+    }
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         self.pick_context();
@@ -466,7 +504,7 @@ impl Pane for Help {
         }
         let topic = &self.topics[self.sel];
         let w = body.width as usize;
-        let key_w = topic.items.iter().filter_map(|it| if let K(a, _) = it { Some(unicode_width::UnicodeWidthStr::width(*a)) } else { None }).max().unwrap_or(10).clamp(8, 28);
+        let key_w = topic.items.iter().filter_map(|it| if let K(a, _) = it { Some(unicode_width::UnicodeWidthStr::width(self.say(a).as_str())) } else { None }).max().unwrap_or(10).clamp(8, 28);
         let mut lines: Vec<Line> = vec![Line::from(Span::styled(format!("{}{}", ui::lead(topic.icon), topic.title), Style::default().fg(t.accent).add_modifier(Modifier::BOLD))), Line::raw("")];
         let wrap = |s: &str, indent: usize, width: usize| -> Vec<String> {
             let mut out = vec![];
@@ -491,23 +529,24 @@ impl Pane for Help {
                     if lines.len() > 2 && lines.last().is_some_and(|l| l.width() > 0) {
                         lines.push(Line::raw(""));
                     }
-                    lines.push(Line::from(Span::styled(s.to_string(), Style::default().fg(t.shine).add_modifier(Modifier::BOLD))));
+                    lines.push(Line::from(Span::styled(self.say(s), Style::default().fg(t.shine).add_modifier(Modifier::BOLD))));
                 }
                 P(s) => {
-                    for l in wrap(s, 0, w) {
+                    for l in wrap(&self.say(s), 0, w) {
                         lines.push(Line::from(Span::styled(l, Style::default().fg(t.muted))));
                     }
                 }
                 K(a, b) => {
                     let key_st = Style::default().fg(t.accent).add_modifier(Modifier::BOLD);
+                    let a = self.say(a);
                     // a key wider than the column gets a line of its own, the description starts under it
-                    let own_line = unicode_width::UnicodeWidthStr::width(*a) > key_w;
+                    let own_line = unicode_width::UnicodeWidthStr::width(a.as_str()) > key_w;
                     if own_line {
                         lines.push(Line::from(Span::styled(format!("  {a}"), key_st)));
                     }
-                    let desc = wrap(b, key_w + 4, w);
+                    let desc = wrap(&self.say(b), key_w + 4, w);
                     for (n, d) in desc.iter().enumerate() {
-                        let k = if n == 0 && !own_line { a.to_string() } else { String::new() };
+                        let k = if n == 0 && !own_line { a.clone() } else { String::new() };
                         let pad = key_w.saturating_sub(unicode_width::UnicodeWidthStr::width(k.as_str()));
                         lines.push(Line::from(vec![Span::styled(format!("  {k}{}", " ".repeat(pad)), key_st), Span::raw(format!("  {d}"))]));
                     }
@@ -816,5 +855,18 @@ mod tests {
         for l in s.lines() {
             assert!(unicode_width::UnicodeWidthStr::width(l) <= w as usize - 2, "{l}");
         }
+    }
+
+    #[test]
+    fn help_says_your_prefix() {
+        let mut k = Kit::new();
+        let mut h = Help::new().prefix("ctrl+b");
+        h.sel = h.topics.iter().position(|t| t.title == "keys & tabs").unwrap();
+        let s = k.render(&mut h, 150, 90);
+        assert!(s.contains("tmux-style keys: ctrl+b, then") && s.contains("ctrl+b twice") && !s.contains("ctrl+space"), "{s}");
+        assert!(s.contains("alt j") && s.contains("C  ·  X"), "{s}");
+        // and search finds it by the name you use
+        h.query = "ctrl+b".into();
+        assert!(h.shown().contains(&h.sel));
     }
 }

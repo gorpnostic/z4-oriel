@@ -59,6 +59,9 @@ impl Pane for Home {
     fn icon(&self) -> &'static str {
         "home"
     }
+    fn reopen(&self) -> Option<&'static str> {
+        Some("home")
+    }
     fn tick_every(&self) -> Option<Duration> {
         Some(RECHECK)
     }
@@ -67,6 +70,9 @@ impl Pane for Home {
             self.avail = Home::apps();
             self.avail_at = Instant::now();
         }
+    }
+    fn hover(&self) -> usize {
+        self.sel
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {

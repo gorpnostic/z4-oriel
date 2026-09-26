@@ -139,7 +139,7 @@ impl Pane for Updates {
             lines.push(Line::from(Span::styled("  checking GitHub for releases…", ui::muted(t))));
         }
         match &st.result {
-            Some(Ok(v)) => lines.push(Line::from(Span::styled(format!("  ✓ {v} is installed: quit oriel (ctrl+space q) and start it again to use it"), Style::default().fg(t.good)))),
+            Some(Ok(v)) => lines.push(Line::from(Span::styled(format!("  ✓ {v} is installed: quit oriel ({} q) and start it again to use it", crate::config::prefix(cx.config)), Style::default().fg(t.good)))),
             Some(Err(e)) => lines.push(Line::from(Span::styled(format!("  ✗ {e}"), Style::default().fg(t.danger)))),
             None => {}
         }

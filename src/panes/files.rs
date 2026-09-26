@@ -660,6 +660,12 @@ impl Pane for Files {
     fn icon(&self) -> &'static str {
         "files"
     }
+    fn cwd(&self) -> Option<PathBuf> {
+        Some(self.dir.clone())
+    }
+    fn reopen(&self) -> Option<&'static str> {
+        Some("files")
+    }
 
     fn poll(&mut self, cx: &mut Cx) {
         self.start(cx);
@@ -738,7 +744,7 @@ impl Pane for Files {
         } else if self.focus_preview {
             vec![("j/k", "scroll"), ("esc", "back to the list"), ("e", "edit"), ("o", &os), ("p", "copy path"), ("t", "terminal here")]
         } else {
-            vec![("enter", "open"), ("/", "filter"), ("e", "edit"), ("n", "new"), ("R", "rename"), ("d", "delete"), ("c/x", "claude/codex here"), ("t", "terminal here"), ("o", &os), ("p", "copy path"), (".", "hidden"), ("backspace", "up")]
+            vec![("enter", "open"), ("/", "filter"), ("e", "edit"), ("n", "new"), ("R", "rename"), ("d", "delete"), ("c/x", "claude/codex here"), ("t", "terminal here"), ("a", "ask chat"), ("o", &os), ("p", "copy path"), (".", "hidden"), ("backspace", "up")]
         };
         let body = ui::hint_line(f, area, &hints, t);
         let body = Rect { height: body.height.saturating_sub(1), ..body }; // a gap above the hints, like nest
@@ -922,6 +928,11 @@ impl Files {
                 }
             }
             KeyCode::Char('t') => self.launch(Launch::Shell, cx),
+            // ask chat about it: the path goes into chat's box (Claude Code and Codex read the file themselves)
+            KeyCode::Char('a') => {
+                let p = self.sel_path().to_string_lossy().to_string();
+                cx.act(Action::AppPaste("ai", format!("{} ", crate::clip::paste_form(&[p]))));
+            }
             KeyCode::Char('c') => self.launch(Launch::Agent("claude"), cx),
             KeyCode::Char('x') => self.launch(Launch::Agent("codex"), cx),
             KeyCode::Char('e') => match self.sel_entry() {
@@ -946,7 +957,8 @@ impl Files {
                 self.refilter();
                 self.request_preview(false);
             }
-            KeyCode::Char('r') | KeyCode::F(5) => {
+            // (not F5: that's the system app everywhere)
+            KeyCode::Char('r') => {
                 self.want_sel = self.sel_entry().map(|e| e.name.clone());
                 self.load();
                 self.request_preview(true);
@@ -1358,6 +1370,23 @@ pub(crate) mod tests {
         let ev = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: r.x + 8, row: r.y + 1, modifiers: KeyModifiers::NONE };
         k.mouse(&mut p, ev, r);
         assert_eq!(p.sel, 1);
+        // r refreshes; F5 (and shift+F5) are left to the app: F5 is the system app from everywhere
+        assert!(k.key(&mut p, KeyCode::Char('r')));
+        assert!(!k.key(&mut p, KeyCode::F(5)) && !k.key_mod(&mut p, KeyCode::F(5), KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn files_ask_chat_and_folder() {
+        let d = fixture("files-ask");
+        let mut k = Kit::new();
+        let mut p = Files::new(Some(d.clone()));
+        settle(&mut k, &mut p);
+        assert_eq!((p.cwd(), p.reopen()), (Some(d.clone()), Some("files")), "a terminal from here starts in this folder");
+        let idx = p.shown.iter().position(|&i| p.all[i].name == "main.rs").unwrap() + 1;
+        p.select(idx);
+        assert!(k.key(&mut p, KeyCode::Char('a')));
+        let want = format!("{} ", crate::clip::paste_form(&[d.join("main.rs").to_string_lossy().to_string()]));
+        assert!(k.actions.iter().any(|a| matches!(a, Action::AppPaste("ai", t) if *t == want)), "the path goes to chat");
     }
 
     #[test]

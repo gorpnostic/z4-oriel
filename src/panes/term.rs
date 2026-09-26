@@ -34,6 +34,8 @@ pub struct Term {
     status: Option<Activity>,
     agent: bool,
     last_scan: Instant,
+    /// While it's waiting on you: the bottom of its screen (the question and its choices), for the alerts app.
+    prompt: Vec<String>,
     /// Tell the event center how this ended ("installing Firefox" -> "Firefox installed" / "failed").
     exit_alert: Option<String>,
     /// (program, why) when the requested program didn't start: the pane runs the default shell instead, under a
@@ -48,6 +50,13 @@ pub struct Term {
     /// Keep the pane when the program fails. Not for your own shell: `exit` after a failed command (bash hands
     /// back its status) is you closing it, not an error to read.
     keep_failed: bool,
+    /// The folder it started in, and the one the shell last said it's in (OSC 7 / Windows Terminal's OSC 9;9,
+    /// sent by prompts like starship and oh-my-posh), set by the reader thread.
+    dir: Option<std::path::PathBuf>,
+    osc_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
+    /// What it comes back as when oriel restarts: "terminal" for a shell, "claude" / "codex"; None for the rest
+    /// (installs, an orchestrator's workers).
+    reopen: Option<&'static str>,
 }
 
 /// How a Term was started: enough to start it again.
@@ -126,12 +135,16 @@ impl Term {
                 words.map(|w| std::path::Path::new(w).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default()).any(|n| AGENTS.contains(&n.as_str()))
             },
             last_scan: Instant::now(),
+            prompt: vec![],
             exit_alert: None,
             failed,
             exit: Arc::new(Mutex::new(None)),
             spec: Spec { title: title.to_string(), prog: prog.to_string(), args, cwd, alert: None },
             announced: false,
             keep_failed: true,
+            dir,
+            osc_dir: Arc::default(),
+            reopen: None,
         }
     }
 
@@ -147,6 +160,8 @@ impl Term {
     fn rerun(&mut self) {
         let s = self.spec.clone();
         let mut t = Term::new(&s.title, self.icon, &s.prog, s.args, s.cwd);
+        t.reopen = self.reopen;
+        t.keep_failed = self.keep_failed;
         if let Some(what) = s.alert {
             t = t.alert_on_exit(&what);
         }
@@ -165,6 +180,12 @@ impl Term {
         self.failed.is_some() as u16
     }
 
+    /// Brought back as `name` (a panes::open name) when oriel restarts where you left off.
+    pub fn reopen_as(mut self, name: &'static str) -> Term {
+        self.reopen = Some(name);
+        self
+    }
+
     /// When the command ends, say so in the event center: `what` is e.g. "Firefox".
     pub fn alert_on_exit(mut self, what: &str) -> Term {
         self.exit_alert = Some(what.to_string());
@@ -175,7 +196,7 @@ impl Term {
     pub fn shell(cfg: &crate::config::Config, cwd: Option<std::path::PathBuf>) -> Term {
         let (prog, args) = crate::config::default_shell(cfg);
         let name = std::path::Path::new(&prog).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(prog.clone());
-        let mut t = Term::new(&name, "term", &prog, args, cwd);
+        let mut t = Term::new(&name, "term", &prog, args, cwd).reopen_as("terminal");
         t.keep_failed = false;
         t
     }
@@ -186,6 +207,7 @@ impl Term {
         let parser = self.parser.clone();
         let writer = self.writer.clone();
         let (last_output, born) = (self.last_output.clone(), self.born);
+        let osc_dir = self.osc_dir.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 16384];
             loop {
@@ -202,6 +224,9 @@ impl Term {
                             let _ = writer.lock().unwrap().write_all(format!("\x1b[{};{}R", r + 1, c + 1).as_bytes());
                         }
                         drop(p);
+                        if let Some(d) = osc_cwd(data) {
+                            *osc_dir.lock().unwrap() = Some(d);
+                        }
                         last_output.store(born.elapsed().as_millis() as u64, Ordering::Relaxed);
                         waker.wake();
                     }
@@ -263,14 +288,16 @@ impl Term {
     /// Read the bottom of the screen for an agent's tell-tale lines: "esc to interrupt" while it works,
     /// a permission prompt or question when it's waiting on you.
     fn scan(&mut self) {
-        let text = {
+        let tail: Vec<String> = {
             let p = self.parser.lock().unwrap();
             let s = p.screen();
             let (_, cols) = s.size();
             let rows: Vec<String> = s.rows(0, cols).collect();
-            let tail: Vec<&String> = rows.iter().rev().filter(|r| !r.trim().is_empty()).take(14).collect();
-            tail.iter().rev().map(|r| r.to_lowercase()).collect::<Vec<_>>().join("\n")
+            let mut tail: Vec<String> = rows.into_iter().rev().filter(|r| !r.trim().is_empty()).take(14).collect();
+            tail.reverse();
+            tail
         };
+        let text = tail.iter().map(|r| r.to_lowercase()).collect::<Vec<_>>().join("\n");
         let working = ["esc to interrupt", "esc to cancel", "ctrl+c to interrupt", "ctrl-c to interrupt"].iter().any(|m| text.contains(m));
         let blocked = [
             "do you want to",
@@ -295,6 +322,9 @@ impl Term {
         if !self.agent {
             return;
         }
+        // what it's asking, as the screen shows it (a prompt box's borders trimmed off)
+        let unboxed = |r: &String| r.trim_end().trim_matches(|c| matches!(c, '│' | '╭' | '╮' | '╰' | '╯' | '─' | ' ')).to_string();
+        self.prompt = if blocked { tail.iter().map(unboxed).filter(|r| !r.is_empty()).collect() } else { vec![] };
         let quiet_ms = (self.born.elapsed().as_millis() as u64).saturating_sub(self.last_output.load(Ordering::Relaxed));
         self.status = Some(if blocked {
             Activity::Blocked
@@ -308,6 +338,51 @@ impl Term {
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The last folder a shell reported in this output: OSC 7 (`ESC ] 7 ; file://host/path BEL`, percent-encoded)
+/// or Windows Terminal's OSC 9;9 (`ESC ] 9 ; 9 ; "C:\path" BEL`), ended by BEL or ESC \. Only folders that exist.
+fn osc_cwd(data: &[u8]) -> Option<std::path::PathBuf> {
+    let mut found = None;
+    let mut i = 0;
+    while let Some(at) = data[i..].windows(2).position(|w| w == b"\x1b]").map(|p| p + i) {
+        let body = &data[at + 2..];
+        let end = body.iter().position(|&b| b == 0x07 || b == 0x1b).unwrap_or(body.len());
+        let s = String::from_utf8_lossy(&body[..end]);
+        let path = if let Some(url) = s.strip_prefix("7;") {
+            // file://host/path: drop the host; /C:/x on Windows is C:/x
+            let rest = url.strip_prefix("file://").unwrap_or(url);
+            let p = &rest[rest.find('/').unwrap_or(rest.len())..];
+            let p = percent_decode(p);
+            let bytes = p.as_bytes();
+            if cfg!(windows) && bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' { Some(p[1..].to_string()) } else { Some(p) }
+        } else {
+            s.strip_prefix("9;9;").map(|p| p.trim_matches('"').to_string())
+        };
+        if let Some(p) = path.filter(|p| !p.is_empty()).map(std::path::PathBuf::from).filter(|p| p.is_dir()) {
+            found = Some(p);
+        }
+        i = at + 2 + end;
+    }
+    found
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(v) = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 fn color(c: vt100::Color) -> Color {
@@ -341,6 +416,12 @@ impl Pane for Term {
     fn is_terminal(&self) -> bool {
         true
     }
+    fn cwd(&self) -> Option<std::path::PathBuf> {
+        self.osc_dir.lock().ok().and_then(|d| d.clone()).or_else(|| self.dir.clone())
+    }
+    fn reopen(&self) -> Option<&'static str> {
+        self.reopen
+    }
     fn exit_note(&mut self) -> Option<(crate::alerts::Kind, String)> {
         let what = self.exit_alert.take()?;
         if let Some((prog, e)) = &self.failed {
@@ -363,8 +444,22 @@ impl Pane for Term {
     fn activity(&self) -> Option<Activity> {
         if self.failed_code().is_some() { None } else { self.status }
     }
+    fn open_now(&self) -> Vec<crate::alerts::Open> {
+        if self.status != Some(Activity::Blocked) {
+            return vec![];
+        }
+        // seen from the alerts app, answered here: the keys are Claude Code's or Codex's, not ours to guess at
+        let mut o = crate::alerts::Open::new(crate::alerts::Kind::NeedsYou, "term", format!("{} is waiting for you", self.title));
+        o.detail = self.prompt.clone();
+        vec![o]
+    }
     fn wants_mouse(&self) -> bool {
         self.parser.lock().map(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None).unwrap_or(false)
+    }
+    fn wants_fkeys(&self) -> bool {
+        // full-screen programs (htop, mc, nano, vim) use the alternate screen or the mouse; a shell prompt doesn't.
+        // Coding agents (opencode is full-screen too) have no use for F-keys, and switching apps from them matters.
+        !self.agent && self.parser.lock().map(|p| p.screen().alternate_screen() || p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None).unwrap_or(false)
     }
     fn tick_every(&self) -> Option<Duration> {
         // agents get re-checked so "working" turns into "idle/done" when they go quiet
@@ -934,5 +1029,65 @@ mod tests {
         let (kind, text) = t.exit_note().unwrap();
         assert_eq!(kind, crate::alerts::Kind::BuildFailed);
         assert!(text.starts_with("thing: couldn't start"), "{text}");
+    }
+
+    #[test]
+    fn term_fkeys_go_to_full_screen_programs() {
+        let (prog, args): (&str, Vec<String>) = if cfg!(windows) { ("cmd.exe", vec!["/c".into(), "exit".into()]) } else { ("sh", vec!["-c".into(), "true".into()]) };
+        let mut t = Term::new("htop", "term", prog, args, None);
+        assert!(!t.wants_fkeys(), "at a shell prompt F-keys switch apps");
+        t.parser.lock().unwrap().process(b"\x1b[?1049h"); // the program goes full-screen (alternate screen)
+        assert!(t.wants_fkeys());
+        t.agent = true; // a coding agent that's full-screen (opencode) still leaves F-keys to switch apps
+        assert!(!t.wants_fkeys());
+    }
+
+    #[test]
+    fn term_knows_its_folder() {
+        let d = std::path::absolute("target/test-scratch/shell/term dir").unwrap();
+        let sub = d.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (prog, args): (&str, Vec<String>) = if cfg!(windows) { ("cmd.exe", vec!["/c".into(), "exit".into()]) } else { ("sh", vec!["-c".into(), "true".into()]) };
+        let t = Term::new("sh", "term", prog, args, Some(d.clone()));
+        assert_eq!(t.cwd(), Some(d.clone()), "where it started");
+        assert_eq!(t.reopen(), None, "a plain command isn't reopened");
+        assert_eq!(t.reopen_as("terminal").reopen(), Some("terminal"));
+        // the shell reports where it cd'd to: OSC 7 (percent-encoded, with a host) and Windows Terminal's 9;9
+        let url = format!("file://host{}{}", if cfg!(windows) { "/" } else { "" }, sub.display().to_string().replace('\\', "/").replace(' ', "%20"));
+        assert_eq!(osc_cwd(format!("prompt\x1b]7;{url}\x07$ ").as_bytes()), Some(sub.clone()), "{url}");
+        assert_eq!(osc_cwd(format!("\x1b]9;9;\"{}\"\x1b\\", d.display()).as_bytes()), Some(d.clone()));
+        // the last one wins; a folder that doesn't exist and other OSCs (titles) are ignored
+        let two = format!("\x1b]9;9;{}\x07\x1b]0;title\x07\x1b]9;9;{}\x07", d.display(), sub.display());
+        assert_eq!(osc_cwd(two.as_bytes()), Some(sub.clone()));
+        assert_eq!(osc_cwd(b"\x1b]9;9;/no/such/folder\x07"), None);
+        assert_eq!(osc_cwd(b"\x1b]0;just a title\x07"), None);
+    }
+
+    /// A coding agent at a permission prompt: its screen's question and choices are what the alerts app peeks at,
+    /// and it drops off the open list once it's working again.
+    #[test]
+    fn term_waiting_agent_says_what_it_asks() {
+        let (prog, args): (&str, Vec<String>) = if cfg!(windows) { ("cmd.exe", vec!["/c".into(), "exit".into()]) } else { ("sh", vec!["-c".into(), "true".into()]) };
+        let mut t = Term::new("claude", "claude", prog, args, None);
+        let screen = [
+            "╭──────────────────────────────╮",
+            "│ Bash command                 │",
+            "│   cargo publish              │",
+            "│ Do you want to proceed?      │",
+            "│ ❯ 1. Yes                     │",
+            "│   2. No, and tell Claude     │",
+            "╰──────────────────────────────╯",
+        ];
+        t.parser.lock().unwrap().process(format!("\x1b[2J\x1b[H{}\r\n", screen.join("\r\n")).as_bytes());
+        t.scan();
+        assert_eq!(t.activity(), Some(Activity::Blocked));
+        let open = t.open_now();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].text, "claude is waiting for you");
+        assert_eq!(open[0].detail, ["Bash command", "cargo publish", "Do you want to proceed?", "❯ 1. Yes", "2. No, and tell Claude"], "the box's borders are trimmed off");
+        assert!(open[0].options.is_empty() && !open[0].yes_no, "not answered from alerts: the keys are the agent's");
+        t.parser.lock().unwrap().process(b"\x1b[2J\x1b[H* Publishing... (esc to interrupt)\r\n");
+        t.scan();
+        assert!(t.open_now().is_empty() && t.prompt.is_empty());
     }
 }

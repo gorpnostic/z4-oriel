@@ -235,8 +235,9 @@ pub fn side_row(f: &mut Frame, r: Rect, icon: &str, label: &str, right: &str, on
     let style = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default() };
     let left_w = r.width.saturating_sub(rw + 1) as usize;
     let text = fit(&format!("{lead}{label}"), left_w);
+    // the spare column goes between the two, so a long label never runs into the hint ("pwsh2 panes")
     let spans = vec![
-        Span::styled(format!("{text:<left_w$}"), style),
+        Span::styled(format!("{text:<left_w$} "), style),
         Span::styled(right.to_string(), if on { style } else { Style::default().fg(t.muted) }),
     ];
     f.render_widget(Paragraph::new(Line::from(spans)), r);

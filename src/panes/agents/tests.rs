@@ -307,6 +307,21 @@ fn agents_plan_parse_and_args() {
     assert_eq!(store::slug("Fix the PTY resize!", "abc123"), "fix-the-pty-resize-c123");
 }
 
+#[test]
+fn agents_terminal_opens_in_the_selected_worktree() {
+    let dir = scratch("cwd");
+    let mut p = demo(&dir);
+    // TODO column, no worktree yet: the repo
+    assert_eq!(p.cwd(), p.repo.as_ref().map(|r| r.root.clone()));
+    // a running task with its worktree on disk: there
+    let wt = dir.join("wt").join("fix-resize");
+    std::fs::create_dir_all(&wt).unwrap();
+    let id = p.store.tasks.iter().find(|t| t.status == Status::Running).unwrap().id.clone();
+    p.store.tasks.iter_mut().find(|t| t.id == id).unwrap().worktree = wt.display().to_string();
+    p.select(&id);
+    assert_eq!(p.cwd(), Some(wt));
+}
+
 /// A board with a card in every state, for the snapshots.
 pub(super) fn demo(dir: &Path) -> Agents {
     let mut p = Agents::with_paths(Paths { agents: dir.join("agents"), wt: dir.join("wt") });

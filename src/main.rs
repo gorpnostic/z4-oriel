@@ -9,20 +9,21 @@ mod layout;
 mod onboard;
 mod pane;
 mod panes;
+mod session;
 mod testkit;
 mod theme;
 mod ui;
 mod update;
 
 use crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture},
     execute,
 };
 use std::sync::mpsc;
 
 fn help(prefix: &str) -> String {
     format!(
-        "oriel {} — a terminal workspace\n\n  oriel              open (starts in the ai app)\n  oriel <app>        open straight into an app, this time only: ai agents ais terminal claude codex music system files notes calendar storage settings themes help\n  oriel --config     print the config file path (the settings app, alt , inside, changes all of it)\n  oriel update       update to the latest release (keeps this one for rollback)\n  oriel rollback     go back to the version before the last update\n  oriel changelog    what's new in recent releases\n  oriel --tour       replay the tour\n  oriel --version\n\nInside: F1-F9 apps, F10 help (every key and how-to), alt p palette, alt n terminal split, {prefix} = tmux-style prefix.",
+        "oriel {} — a terminal workspace\n\n  oriel              open where you left off (your tabs, splits and chat)\n  oriel <app>        open straight into an app, this time only: ai agents ais terminal claude codex music system files notes calendar storage settings themes help\n  oriel --config     print the config file path (the settings app, alt , inside, changes all of it)\n  oriel update       update to the latest release (keeps this one for rollback)\n  oriel rollback     go back to the version before the last update\n  oriel changelog    what's new in recent releases\n  oriel --tour       replay the tour\n  oriel --version\n\nInside: F1-F9 apps, F10 help (every key and how-to), alt p palette, alt n terminal split, {prefix} = tmux-style prefix.",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -108,7 +109,16 @@ fn main() -> anyhow::Result<()> {
     });
 
     let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, crossterm::event::EnableFocusChange)?;
+    // ratatui's panic hook only undoes raw mode and the alternate screen: turn our modes off too, or a crash leaves
+    // the shell printing mouse and focus escape codes
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange, crossterm::terminal::SetTitle(""), crossterm::style::Print("\x1b[23;0t"));
+        prev(info);
+    }));
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
+    // keep the terminal's own title to put back at exit (terminals with a title stack; others ignore it)
+    let _ = execute!(std::io::stdout(), crossterm::style::Print("\x1b[22;0t"));
     let tour = args.first().map(String::as_str) == Some("--tour");
     let mut app = app::App::with_start(cfg, tx, start);
     if let Some(e) = broken {
@@ -118,7 +128,9 @@ fn main() -> anyhow::Result<()> {
         app.start_tour();
     }
     let res = app.run(&mut terminal, rx);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+    // the title oriel set ("oriel · 1 needs you") goes: empty resets it to the terminal's default, and the pop
+    // brings back the one from before where the terminal keeps a stack
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange, crossterm::terminal::SetTitle(""), crossterm::style::Print("\x1b[23;0t"));
     ratatui::restore();
     res
 }

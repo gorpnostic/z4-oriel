@@ -13,6 +13,7 @@
 mod batch;
 mod cost;
 mod git;
+mod inbox;
 pub(crate) mod input;
 mod lead;
 #[cfg(test)]
@@ -1832,6 +1833,11 @@ impl Pane for Agents {
     fn icon(&self) -> &'static str {
         "robot"
     }
+    fn cwd(&self) -> Option<PathBuf> {
+        // the selected task's worktree, else the repo
+        let wt = self.selected().and_then(|id| self.store.tasks.iter().find(|t| t.id == id).map(|t| PathBuf::from(&t.worktree)));
+        wt.filter(|w| !w.as_os_str().is_empty() && w.is_dir()).or_else(|| self.repo.as_ref().map(|r| r.root.clone()))
+    }
     fn subtitle(&self) -> Option<String> {
         let repo = self.repo.as_ref()?;
         let today = self.today();
@@ -1871,6 +1877,19 @@ impl Pane for Agents {
         self.roster = cfg.roster.clone();
         self.stagger = Duration::from_secs(cfg.lead.stagger_s as u64);
         self.hung_after = Duration::from_secs(cfg.lead.hung_after_s.max(60) as u64);
+    }
+    fn busy(&self) -> usize {
+        // headless workers and the lead runs this pane drives: they stop when it goes
+        self.live.values().filter(|l| l.stop.is_some()).count() + self.runs_live.values().filter(|l| l.driving).count()
+    }
+    fn wants_images(&self) -> bool {
+        true
+    }
+    fn open_now(&self) -> Vec<crate::alerts::Open> {
+        self.open_items()
+    }
+    fn respond(&mut self, key: &str, r: crate::alerts::Reply, cx: &mut Cx) -> bool {
+        self.answer_open(key, r, cx)
     }
     fn tagged_panes(&mut self, live: &[(String, Option<Activity>)]) {
         let mine: Vec<(String, Option<Activity>)> = live.iter().filter(|(t, _)| t.starts_with("agent-task:")).cloned().collect();
