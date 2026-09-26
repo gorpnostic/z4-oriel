@@ -323,12 +323,17 @@ impl Music {
         self.sel = (self.sel as isize + d).clamp(0, n - 1) as usize;
     }
 
-    /// Pull in whatever the background threads produced. Memory only, cheap: safe from render.
-    fn sync(&mut self, cx: &Cx) {
+    /// Let the background threads (library, engine, cover, lyrics) wake this pane.
+    fn listen(&mut self, cx: &Cx) {
         if !self.has_waker {
             *self.waker.lock().unwrap() = Some(cx.waker());
             self.has_waker = true;
         }
+    }
+
+    /// Pull in whatever the background threads produced. Memory only, cheap: safe from render.
+    fn sync(&mut self, cx: &Cx) {
+        self.listen(cx);
         // library
         let fresh = {
             let mut l = self.load.lock().unwrap();
@@ -918,6 +923,14 @@ impl Pane for Music {
     }
 
     fn key(&mut self, key: KeyEvent, cx: &mut Cx) -> bool {
+        if !self.has_waker {
+            // F12 / /play reach a music pane that has never been drawn (a background tab): from now on the library
+            // arriving wakes it, and if it's already in, a wake of our own pulls it in, so play_when_loaded plays
+            self.listen(cx);
+            if self.load.lock().unwrap().version != self.load_gen {
+                cx.waker().wake();
+            }
+        }
         let typed = ui::typed_char(&key); // AltGr chars included
         if key.modifiers.intersects(KeyModifiers::ALT) && typed.is_none() {
             return false;
@@ -1199,10 +1212,12 @@ mod tests {
         let mut cx = crate::pane::Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut cx_actions, focused: false, time: 1.0 };
         p.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &mut cx);
         assert!(p.play_when_loaded);
-        // the library arrives (none of these files exist, so the engine reports it can't open the song)
+        // the library arrives, the way the loader hands it over (the pane is in a background tab: never drawn, so
+        // only the wake gets it there). None of these files exist, so the engine reports it can't open the song.
         let tracks: Vec<Track> = (0..4).map(|i| Track { id: format!("t{i}"), path: format!("/nope/{i}.mp3").into(), title: format!("song {i}"), ..Default::default() }).collect();
         *load.lock().unwrap() = Load { lib: Some(Lib { tracks, playlists: vec![], source: "test".into() }), status: String::new(), done: true, version: 1, run: 1 };
-        k.render(&mut p, 150, 30);
+        wake(&p.waker);
+        assert!(k.wait_wake(&mut p, 300), "the key registered the pane for wakes");
         assert!(!p.play_when_loaded);
         assert_eq!(p.sel, 2, "the last song played is picked");
         for _ in 0..40 {
@@ -1214,6 +1229,21 @@ mod tests {
         let sh = p.engine.shared.lock().unwrap();
         assert_eq!(sh.queue.first().map(|t| t.id.as_str()), Some("t0"), "the whole view is queued");
         assert!(sh.track.is_some(), "it tried to play");
+        drop(sh);
+
+        // the library landed before the key did (and before anything could wake the pane): the key's own wake
+        // pulls it in
+        let state = Arc::new(Mutex::new(State { last: Some("t1".into()), ..State::default() }));
+        let waker = Arc::new(Mutex::new(None));
+        let engine = Engine::new(state.clone(), waker.clone(), false);
+        let tracks: Vec<Track> = (0..3).map(|i| Track { id: format!("t{i}"), path: format!("/nope/{i}.mp3").into(), title: format!("song {i}"), ..Default::default() }).collect();
+        let load = Arc::new(Mutex::new(Load { lib: Some(Lib { tracks, playlists: vec![], source: "test".into() }), status: String::new(), done: true, version: 1, run: 1 }));
+        let mut p = Music::build(state, waker, engine, load);
+        let mut cx_actions = vec![];
+        let mut cx = crate::pane::Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut cx_actions, focused: false, time: 1.0 };
+        p.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &mut cx);
+        assert!(k.wait_wake(&mut p, 300));
+        assert!(!p.play_when_loaded && p.sel == 1, "played the last song once the wake pulled the library in");
     }
 
     #[test]

@@ -633,6 +633,7 @@ fn trash_os(path: &Path) -> Result<(), String> {
     const FOF_NOCONFIRMATION: u16 = 0x10;
     const FOF_ALLOWUNDO: u16 = 0x40;
     const FOF_NOERRORUI: u16 = 0x400;
+    const FOF_WANTNUKEWARNING: u16 = 0x4000;
     // a list of paths, each NUL-terminated, the list ending in another NUL
     let from: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
     let mut op = FileOp {
@@ -640,14 +641,19 @@ fn trash_os(path: &Path) -> Result<(), String> {
         func: FO_DELETE,
         from: from.as_ptr(),
         to: std::ptr::null(),
-        flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
+        // no questions, except one: an item the bin can't take (too big, a drive without a bin) would otherwise be
+        // deleted for good without a word, and oriel promised the recycle bin; WANTNUKEWARNING makes Windows ask
+        flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING,
         aborted: 0,
         mappings: std::ptr::null_mut(),
         title: std::ptr::null(),
     };
     // SAFETY: one Win32 call on a stack struct laid out as the API expects; `from` outlives it
     let r = unsafe { SHFileOperationW(&mut op) };
-    if r != 0 || op.aborted != 0 {
+    if op.aborted != 0 {
+        return Err("cancelled: it stays where it is".into());
+    }
+    if r != 0 {
         return Err(format!("windows said no (code {r:#x}): is it open in another program?"));
     }
     Ok(())

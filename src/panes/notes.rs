@@ -440,6 +440,7 @@ impl Notes {
         std::thread::spawn(move || {
             let hits = Self::md_files(&dir)
                 .into_iter()
+                .take_while(|_| newest.load(Ordering::SeqCst) == g) // typed on: stop reading for the old query
                 .filter(|p| std::fs::read_to_string(p).is_ok_and(|t| t.to_lowercase().contains(&q)))
                 .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
                 .collect();

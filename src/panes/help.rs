@@ -266,7 +266,7 @@ fn topics() -> Vec<Topic> {
             K("drag", "copy text"),
             Gap,
             H("when the program ends"),
-            P("A program that finishes cleanly closes its pane. One that fails (not signed in, a crash, a failed install) keeps it, dimmed, so you can read why, with the exit code at the bottom."),
+            P("A program that finishes cleanly closes its pane. One that fails (not signed in, a crash, a failed install) keeps it, dimmed, so you can read why, with the exit code at the bottom. A plain shell closes whenever you exit it."),
             K("enter  ·  esc", "close it"),
             K("r", "run it again"),
         ]},

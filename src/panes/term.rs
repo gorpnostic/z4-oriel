@@ -45,6 +45,9 @@ pub struct Term {
     spec: Spec,
     /// The failure has been reported (alert) and the pane is being kept so its output can be read.
     announced: bool,
+    /// Keep the pane when the program fails. Not for your own shell: `exit` after a failed command (bash hands
+    /// back its status) is you closing it, not an error to read.
+    keep_failed: bool,
 }
 
 /// How a Term was started: enough to start it again.
@@ -128,12 +131,13 @@ impl Term {
             exit: Arc::new(Mutex::new(None)),
             spec: Spec { title: title.to_string(), prog: prog.to_string(), args, cwd, alert: None },
             announced: false,
+            keep_failed: true,
         }
     }
 
     /// The exit code, once the program has ended with an error: the pane stays open so you can read why.
     fn failed_code(&self) -> Option<u32> {
-        if !self.exited.load(Ordering::SeqCst) {
+        if !self.keep_failed || !self.exited.load(Ordering::SeqCst) {
             return None;
         }
         self.exit.lock().unwrap().filter(|&c| c != 0)
@@ -171,7 +175,9 @@ impl Term {
     pub fn shell(cfg: &crate::config::Config, cwd: Option<std::path::PathBuf>) -> Term {
         let (prog, args) = crate::config::default_shell(cfg);
         let name = std::path::Path::new(&prog).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(prog.clone());
-        Term::new(&name, "term", &prog, args, cwd)
+        let mut t = Term::new(&name, "term", &prog, args, cwd);
+        t.keep_failed = false;
+        t
     }
 
     fn start_reader(&mut self, waker: Waker) {
@@ -808,6 +814,12 @@ mod tests {
         k.key(&mut t, KeyCode::Enter);
         assert!(matches!(k.actions.last(), Some(crate::pane::Action::Close)), "enter closes it");
         assert_eq!(code_text(0xC0000005), "0xC0000005");
+        // your own shell ending with an error (bash's `exit` after a failed command) is you closing it: it goes
+        let (prog, args) = shell_cmd("exit 3", "exit 3");
+        let mut t = Term::new("shell", "term", prog, args, None);
+        t.keep_failed = false; // what Term::shell sets
+        run_to_end(&mut k, &mut t);
+        assert!(!t.alive(), "a shell you exit closes, whatever its last status");
     }
 
     /// Captures what a pane sends to its program.

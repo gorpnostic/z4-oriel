@@ -272,12 +272,12 @@ impl Files {
     }
 
     /// Read the folder again, keeping the selection: something changed on disk, or the pane is back in view.
+    /// (The entry to keep is taken when the new listing lands, not now: you may move on while it's read.)
     fn refresh(&mut self) {
         if self.waker.is_none() {
             return;
         }
         self.changed.store(false, Ordering::SeqCst);
-        self.want_sel = self.sel_entry().map(|e| e.name.clone());
         self.load();
     }
 
@@ -684,7 +684,9 @@ impl Pane for Files {
                 }
                 self.shown.clear(); // its indices were into the old list
                 self.refilter();
-                let want = self.want_sel.take();
+                // what asked for this listing picked a name (the folder we came up from, a new file), else the
+                // cursor stays on whatever it's on now
+                let want = self.want_sel.take().or_else(|| was.as_ref().map(|w| w.0.clone()));
                 match want.and_then(|w| self.shown.iter().position(|&i| self.all[i].name == w)) {
                     Some(p) => self.sel = p + 1,
                     // the one that was picked is gone (deleted, renamed): the cursor stays where it was
@@ -717,10 +719,11 @@ impl Pane for Files {
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         self.start(cx);
-        // back in view (from another tab or pane): read the folder again, something may have changed meanwhile
+        // back in view (from another tab or pane) with no watcher on the folder (some network drives): read it
+        // again, something may have changed meanwhile. A watcher already caught every change, hidden or not.
         let back = cx.focused && (!self.was_focused || self.last_render.elapsed() > Duration::from_secs(2));
         (self.was_focused, self.last_render) = (cx.focused, Instant::now());
-        if back && !self.loading && self.last_load.elapsed() > Duration::from_secs(1) {
+        if back && self.watch.is_none() && !self.loading && self.last_load.elapsed() > Duration::from_secs(1) {
             self.refresh();
         }
         let t = cx.theme;
@@ -1018,8 +1021,9 @@ impl Files {
                 }
                 checked_name(&new, false)?;
                 let (from, to) = (self.dir.join(&old), self.dir.join(&new));
-                // a different file of that name is there (on Windows "Readme" → "README" is the same file: fine)
-                if to.exists() && !old.eq_ignore_ascii_case(&new) {
+                // a different file of that name is there: never rename over it ("Readme" → "README" is the same
+                // file on Windows, but two files on Linux)
+                if to.exists() && !same_file(&from, &to) {
                     return Err(format!("{new} is already there"));
                 }
                 std::fs::rename(&from, &to).map_err(|e| format!("couldn't rename {old}: {e}"))?;
@@ -1131,6 +1135,20 @@ fn fit_tail(s: &str, w: usize) -> String {
         tail.push(c);
     }
     std::iter::once('…').chain(tail.into_iter().rev()).collect()
+}
+
+/// Whether two paths are one file (a rename that only changes case on a case-insensitive disk).
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        matches!((std::fs::metadata(a), std::fs::metadata(b)), (Ok(x), Ok(y)) if x.dev() == y.dev() && x.ino() == y.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows folders are case-insensitive: the same name in another case is the same file
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    }
 }
 
 /// A name typed for a new file (`nested`: may hold subfolders, "src/new.rs") or a rename: it has to stay inside
@@ -1535,6 +1553,21 @@ pub(crate) mod tests {
         p.select(0);
         k.key(&mut p, KeyCode::Char('d'));
         assert!(p.confirm.is_none());
+        // a rename never lands on another file, even one whose name only differs in case (two files on Linux);
+        // changing just the case of a name is fine
+        std::fs::write(d.join("keep.txt"), "mine").unwrap();
+        std::fs::write(d.join("case.txt"), "x").unwrap();
+        assert!(p.do_ask(Ask::Rename("case.txt".into(), "keep.txt".into())).is_err());
+        assert!(p.do_ask(Ask::Rename("case.txt".into(), "Case.txt".into())).is_ok());
+        let on_disk: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        assert!(on_disk.iter().any(|n| n == "Case.txt"), "{on_disk:?}");
+        assert_eq!(std::fs::read_to_string(d.join("keep.txt")).unwrap(), "mine");
+        #[cfg(unix)]
+        {
+            std::fs::write(d.join("KEEP.txt"), "theirs").unwrap();
+            assert!(p.do_ask(Ask::Rename("keep.txt".into(), "KEEP.txt".into())).is_err());
+            assert_eq!(std::fs::read_to_string(d.join("KEEP.txt")).unwrap(), "theirs");
+        }
     }
 
     /// The real recycle bin: moves a scratch file there (look for "oriel-trash-test.txt" in it afterwards).
@@ -1574,15 +1607,27 @@ pub(crate) mod tests {
             assert!(until(&mut k, &mut p, &|p| names(p).iter().any(|n| n == "fresh.txt")), "{:?}", names(&p));
             assert_eq!(p.sel_entry().map(|e| e.name.as_str()), Some("main.rs"), "the cursor stays put");
             // the file on show grows: its preview follows
-            std::fs::write(d.join("main.rs"), "fn main() {}
-// a line an agent added
-").unwrap();
+            std::fs::write(d.join("main.rs"), "fn main() {}\n// a line an agent added\n").unwrap();
             assert!(until(&mut k, &mut p, &|p| pv_text(p).contains("a line an agent added")), "{}", pv_text(&p));
             // the picked file vanishes: the cursor stays on its row instead of jumping to the top
             let at = p.sel;
             std::fs::remove_file(d.join("main.rs")).unwrap();
             assert!(until(&mut k, &mut p, &|p| !names(p).iter().any(|n| n == "main.rs")));
             assert_eq!(p.sel, at.min(p.rows() - 1));
+            // a re-read that lands after you've moved on keeps you where you are now, not where you were
+            p.refresh();
+            p.select(1);
+            let moved = p.sel_entry().map(|e| e.name.clone());
+            assert!(until(&mut k, &mut p, &|p| !p.loading));
+            assert_eq!(p.sel_entry().map(|e| e.name.clone()), moved);
+        }
+        // with a watcher, coming back to the pane doesn't read it again (the watcher already caught any change)
+        if p.watch.is_some() {
+            let reads = p.list_gen;
+            p.was_focused = false;
+            p.last_load = Instant::now() - Duration::from_secs(5);
+            k.render(&mut p, 150, 44);
+            assert_eq!(p.list_gen, reads);
         }
         // no watcher (some network drives): coming back to the pane reads it again
         p.watch = None;
@@ -1591,6 +1636,59 @@ pub(crate) mod tests {
         p.was_focused = false;
         k.render(&mut p, 150, 44);
         assert!(until(&mut k, &mut p, &|p| names(p).iter().any(|n| n == "later.txt")), "{:?}", names(&p));
+    }
+
+    /// The new boxes and lines (filter, name dialog, bin question, notes' conflict line and finder, help with no
+    /// hits) survive panes squeezed down to nothing.
+    #[test]
+    fn tools_tiny_panes_dont_panic() {
+        let sizes = [(1, 1), (2, 2), (5, 3), (12, 4), (30, 6), (49, 8), (50, 5), (60, 7)];
+        let d = fixture("files-tiny");
+        let mut k = Kit::new();
+        let mut p = Files::new(Some(d.clone()));
+        settle(&mut k, &mut p);
+        k.key(&mut p, KeyCode::Char('/'));
+        k.typ(&mut p, "ma");
+        for (w, h) in sizes {
+            k.render(&mut p, w, h);
+        }
+        k.key(&mut p, KeyCode::Esc);
+        p.select(1);
+        k.key(&mut p, KeyCode::Char('d'));
+        for (w, h) in sizes {
+            k.render(&mut p, w, h);
+        }
+        k.key(&mut p, KeyCode::Esc);
+        k.key(&mut p, KeyCode::Char('n'));
+        k.typ(&mut p, "a/very/long/name/for/a/new/file.txt");
+        for (w, h) in sizes {
+            k.render(&mut p, w, h);
+        }
+        k.key(&mut p, KeyCode::Esc);
+
+        let nd = scratch("notes-tiny");
+        std::fs::write(nd.join("a.md"), "# a\n\ntext").unwrap();
+        let mut n = crate::panes::notes::Notes::open_in(nd, None);
+        k.key_mod(&mut n, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        k.typ(&mut n, "zz");
+        for (w, h) in sizes {
+            k.render(&mut n, w, h);
+            k.render_side(&mut n, w, h);
+        }
+
+        let mut hp = crate::panes::help::Help::new();
+        k.key(&mut hp, KeyCode::Char('/'));
+        k.typ(&mut hp, "zzzz");
+        for (w, h) in sizes {
+            k.render(&mut hp, w, h);
+            k.render_side(&mut hp, w, h);
+        }
+        k.key(&mut hp, KeyCode::Esc);
+        k.key(&mut hp, KeyCode::Char('/'));
+        k.typ(&mut hp, "rollback");
+        for (w, h) in sizes {
+            k.render(&mut hp, w, h);
+        }
     }
 
     #[test]
