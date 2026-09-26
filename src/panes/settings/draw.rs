@@ -246,12 +246,15 @@ impl Settings {
         match &self.edit {
             Some(Edit::Key { .. }) => return vec![("press", "the new prefix: ctrl+<letter> or ctrl+space"), ("esc", "cancel")],
             Some(Edit::Text { item, id, .. }) => {
-                let what = if item.is_some() || id == "notes_folder" {
-                    "a folder"
-                } else if row.is_some_and(|r| matches!(r.ctl, Ctl::Secret { .. })) {
-                    "the key (it stays hidden)"
-                } else {
-                    "a value"
+                let what = match row.map(|r| &r.ctl) {
+                    _ if item.is_some() || id == "notes_folder" => "a folder",
+                    Some(Ctl::Secret { .. }) => "the key (it stays hidden)",
+                    Some(Ctl::Number { unit: Unit::Secs, .. }) => "seconds",
+                    Some(Ctl::Number { unit: Unit::Min, .. }) => "minutes",
+                    Some(Ctl::Number { unit: Unit::Pct, .. }) => "a percentage",
+                    Some(Ctl::Number { unit: Unit::Usd, .. }) => "dollars, like 2.50",
+                    Some(Ctl::Number { .. }) => "a number",
+                    _ => "a value",
                 };
                 let mut h = vec![("type", what)];
                 if what == "a folder" {
