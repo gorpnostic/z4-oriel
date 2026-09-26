@@ -40,6 +40,8 @@ pub enum Action {
     SetTheme(String),
     /// Switch to this theme quietly (the themes app, as you edit): saved, no toast.
     ApplyTheme(String),
+    /// Show this theme without saving it (settings' live preview; the previous one is sent back on esc).
+    PreviewTheme(String),
     /// Change the config (use `cx.edit_config`). The app is its only writer: it re-reads config.toml, applies
     /// this, saves, and calls `config_changed` on every pane.
     Config(Box<dyn FnOnce(&mut Config) + Send>),
@@ -51,6 +53,8 @@ pub enum Action {
     AppKey(&'static str, char),
     ToggleSidebar,
     ToggleIcons,
+    /// Replay the tour (settings › tools).
+    Tour,
     /// Open a pane in a new tab of its own, named `name` and remembered by `tag` (e.g. an orchestrator task id),
     /// so it can be focused or closed later. Doesn't switch to it unless `focus` is true.
     OpenTagged { pane: Box<dyn Pane>, tag: String, name: String, focus: bool },

@@ -59,6 +59,8 @@ pub struct Notes {
     /// The folder's modified time when the list was last read. A note added or removed from outside (chat's
     /// /note, a sync tool, an editor) changes it, and `poll` re-reads the list.
     seen: Option<std::time::SystemTime>,
+    /// Opens the new folder when notes_folder changes (settings › folders). Off for tests' own folders.
+    follow: bool,
 }
 
 impl Notes {
@@ -70,7 +72,11 @@ impl Notes {
             Self::open_in(std::path::absolute("target/test-scratch/notes-app").unwrap_or_default(), None)
         }
         #[cfg(not(test))]
-        Self::open_in(crate::config::notes_dir(cfg), None)
+        {
+            let mut n = Self::open_in(crate::config::notes_dir(cfg), None);
+            n.follow = true;
+            n
+        }
     }
 
     /// Notes kept in `dir`; `import_from` is nest's folder to copy from on first run (tests pass their own).
@@ -92,6 +98,7 @@ impl Notes {
             side_hits: vec![],
             side_scroll: 0,
             seen: None,
+            follow: false,
         };
         if let Some(src) = import_from {
             n.import(&src);
@@ -356,6 +363,18 @@ impl Pane for Notes {
     fn tick_every(&self) -> Option<Duration> {
         // autosave soon after typing stops; otherwise look for notes added from outside now and then
         Some(if self.dirty_at.is_some() { Duration::from_millis(250) } else { Duration::from_secs(2) })
+    }
+
+    /// A new notes folder (settings › folders) opens here at once; what you were typing is saved first, where it
+    /// was.
+    fn config_changed(&mut self, cfg: &crate::config::Config) {
+        let dir = crate::config::notes_dir(cfg);
+        if self.follow && dir != self.dir {
+            let previewing = self.previewing;
+            *self = Self::open_in(dir, None); // the old one saves as it's dropped
+            self.follow = true;
+            self.previewing = previewing;
+        }
     }
 
     fn poll(&mut self, _cx: &mut Cx) {
@@ -698,5 +717,26 @@ mod tests {
         assert_eq!(p.title(), "mine", "the open note stays open");
         assert!(std::fs::read_to_string(dir.join("mine.md")).unwrap().contains('!'), "and its edit was saved");
         assert!(k.render_side(&mut p, 30, 10).contains("a saved reply"));
+    }
+
+    /// A new notes folder from settings opens right away, after the note being typed is saved in the old one.
+    #[test]
+    fn notes_follow_a_new_notes_folder() {
+        let (a, b) = (scratch("notes-follow-a"), scratch("notes-follow-b"));
+        std::fs::write(a.join("old.md"), "# old\n").unwrap();
+        std::fs::write(b.join("synced.md"), "# synced\n").unwrap();
+        let mut k = Kit::new();
+        let mut p = Notes::open_in(a.clone(), None);
+        p.follow = true;
+        k.typ(&mut p, "!");
+        k.config.notes_folder = b.to_string_lossy().to_string();
+        p.config_changed(&k.config);
+        assert_eq!(p.dir, b);
+        assert_eq!(p.title(), "synced");
+        assert!(std::fs::read_to_string(a.join("old.md")).unwrap().contains('!'), "the edit was saved where it was typed");
+        // the same folder again: nothing happens
+        k.typ(&mut p, "?");
+        p.config_changed(&k.config);
+        assert!(p.dirty_at.is_some(), "still the same open note");
     }
 }

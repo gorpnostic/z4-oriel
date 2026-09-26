@@ -45,6 +45,7 @@ pub const SIDEBAR: &[(&str, &str, &str, &str)] = &[
     ("terminal", "term", "terminal", "F9"),
     // ── pinned to the bottom of the sidebar
     ("alerts", "bell", "alerts", ""),
+    ("settings", "cog", "settings", "alt ,"),
     ("themes", "theme", "themes", ""),
     ("help", "search", "help", "F10"),
 ];
@@ -70,6 +71,8 @@ enum Cmd {
     Tour,
     Open(&'static str, Place),
     Theme(String),
+    /// open settings on this row (the palette's "setting: …" entries)
+    Setting(String),
     SplitRight,
     SplitDown,
     Close,
@@ -186,6 +189,8 @@ pub struct App {
     update_ready: Option<String>,
     /// Is the terminal the window you're in? (desktop notifications only when it isn't)
     term_focused: bool,
+    /// The memory/usage watcher's thresholds (settings › alerts changes them live).
+    alert_th: std::sync::Arc<crate::alerts::Thresholds>,
 }
 
 impl App {
@@ -199,6 +204,8 @@ impl App {
     pub fn with_start(config: Config, tx: Sender<Event>, start: Option<String>) -> App {
         let theme = theme::get(&config.theme);
         ui::NERD.store(std::env::var("ORIEL_PLAIN").is_err() && !config.plain_icons, std::sync::atomic::Ordering::Relaxed);
+        let alert_th = crate::alerts::Thresholds::new(&config.alerts);
+        let sidebar = config.sidebar;
         let mut app = App {
             panes: HashMap::new(),
             tabs: vec![],
@@ -217,7 +224,7 @@ impl App {
             outer: vec![],
             side_hits: vec![],
             side_area: None,
-            sidebar: true,
+            sidebar,
             body: Rect::default(),
             drag: None,
             sel: None,
@@ -232,6 +239,7 @@ impl App {
             config_reload_at: None,
             update_ready: None,
             term_focused: true,
+            alert_th: alert_th.clone(),
             renaming: None,
             ctx: None,
             onboard: None,
@@ -248,15 +256,17 @@ impl App {
         if !cfg!(test) {
             *crate::alerts::CENTER.lock().unwrap() = crate::alerts::load();
             let t2 = tx.clone();
-            crate::alerts::watch(move |k, s| {
+            crate::alerts::watch(alert_th, move |k, s| {
                 let _ = t2.send(Event::Alert(k, s));
             });
-            // once a day: is there a newer oriel? (in the background; quiet if offline)
-            std::thread::spawn(move || {
-                if let Some(r) = crate::update::check(false).ok().and_then(|rs| crate::update::available(&rs)) {
-                    let _ = tx.send(Event::UpdateAvailable(r.version));
-                }
-            });
+            // once a day: is there a newer oriel? (in the background; quiet if offline; settings › tools turns it off)
+            if app.config.update_check {
+                std::thread::spawn(move || {
+                    if let Some(r) = crate::update::check(false).ok().and_then(|rs| crate::update::available(&rs)) {
+                        let _ = tx.send(Event::UpdateAvailable(r.version));
+                    }
+                });
+            }
             if let Some((from, to)) = crate::update::just_updated() {
                 app.notify(format!("{}updated {from} → {to} · alt p → updates for what's new", ui::lead("package")));
             }
@@ -469,7 +479,7 @@ impl App {
         let in_view = self.term_focused && pane.is_some_and(|p| self.visible().contains(&p));
         crate::alerts::push(crate::alerts::Alert { at: crate::alerts::now(), kind, text: text.clone(), app: app.map(String::from), read: in_view, pane });
         self.notify(format!("{} {text}", kind.label().0));
-        if !self.term_focused && kind.loud() && self.config.desktop_notifications {
+        if !self.term_focused && kind.loud(&self.config) {
             crate::alerts::desktop("oriel", &text);
         }
     }
@@ -512,8 +522,19 @@ impl App {
         self.set_config(c);
     }
 
-    /// A new config is in effect: every open pane hears about it.
+    /// A new config is in effect: what the app shows follows it at once (theme, icons, sidebar, the watcher's
+    /// thresholds; the prefix is read on every key), and every open pane hears about it.
     fn set_config(&mut self, c: Config) {
+        if c.theme != self.config.theme && self.palette.is_none() {
+            self.theme = theme::get(&c.theme);
+        }
+        if c.plain_icons != self.config.plain_icons && std::env::var("ORIEL_PLAIN").is_err() {
+            ui::NERD.store(!c.plain_icons, std::sync::atomic::Ordering::Relaxed);
+        }
+        if c.sidebar != self.config.sidebar {
+            self.sidebar = c.sidebar;
+        }
+        self.alert_th.set(&c.alerts);
         self.config = c;
         for p in self.panes.values_mut() {
             p.config_changed(&self.config);
@@ -531,12 +552,6 @@ impl App {
                 }
                 if c == self.config {
                     return; // our own save coming back
-                }
-                if c.theme != self.config.theme && self.palette.is_none() {
-                    self.theme = theme::get(&c.theme);
-                }
-                if c.plain_icons != self.config.plain_icons && std::env::var("ORIEL_PLAIN").is_err() {
-                    ui::NERD.store(!c.plain_icons, std::sync::atomic::Ordering::Relaxed);
                 }
                 self.set_config(c);
             }
@@ -767,6 +782,7 @@ impl App {
                         self.notify(format!("⚠ {p}"));
                     }
                 }
+                Action::PreviewTheme(t) => self.set_theme(&t, false),
                 Action::Config(f) => self.edit_config(f),
                 Action::Palette(q) => {
                     self.open_palette();
@@ -806,8 +822,9 @@ impl App {
                         self.close(id);
                     }
                 }
-                Action::ToggleSidebar => self.sidebar = !self.sidebar,
+                Action::ToggleSidebar => self.toggle_sidebar(),
                 Action::ToggleIcons => self.run_cmd(Cmd::Icons),
+                Action::Tour => self.start_tour(),
                 Action::Quit => self.quit = true,
             }
         }
@@ -891,9 +908,19 @@ impl App {
         }
     }
 
+    /// alt s, /sidebar: hide or show the sidebar, and remember it for the next start.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar = !self.sidebar;
+        let on = self.sidebar;
+        if self.config.sidebar != on {
+            self.edit_config(move |c| c.sidebar = on);
+        }
+    }
+
     // ------------------------------------------------------------------ keys
     fn is_prefix(&self, k: &KeyEvent) -> bool {
-        let spec = self.config.prefix.to_lowercase();
+        // a bare key or alt+… in the config would break typing: ctrl+space then (settings shows why)
+        let spec = config::prefix(&self.config);
         let (need_ctrl, key) = match spec.strip_prefix("ctrl+") {
             Some(rest) => (true, rest.to_string()),
             None => (false, spec.clone()),
@@ -1040,12 +1067,12 @@ impl App {
                         self.cur = t;
                     }
                 }
-                's' => self.sidebar = !self.sidebar,
+                's' => self.toggle_sidebar(),
                 'p' => self.open_palette(),
                 'z' => self.run_cmd(Cmd::Zoom),
                 'w' => self.run_cmd(Cmd::Close),
                 't' => self.run_cmd(Cmd::NewTab),
-                '[' | ',' if false => {}
+                ',' => self.goto_app("settings"),
                 _ => return false,
             },
             _ => return false,
@@ -1144,6 +1171,10 @@ impl App {
             }
             Cmd::Help => self.open_help(),
             Cmd::Tour => self.start_tour(),
+            Cmd::Setting(id) => {
+                panes::settings::jump(&id);
+                self.goto_app("settings");
+            }
             Cmd::Quit => self.quit = true,
         }
     }
@@ -1184,6 +1215,10 @@ impl App {
         items.push((format!("{}toggle nerd font icons", ui::lead("theme")), Cmd::Icons));
         items.push((format!("{}help: every key, command and how-to  F10", ui::lead("search")), Cmd::Help));
         items.push((format!("{}take the tour", ui::lead("window")), Cmd::Tour));
+        // every setting, by name: opens settings on its row
+        for (label, id) in panes::settings::palette_items(&self.config) {
+            items.push((format!("{}setting: {label}", ui::lead("cog")), Cmd::Setting(id)));
+        }
         items.push((format!("{}quit oriel", ui::lead("quit")), Cmd::Quit));
         self.palette = Some(Palette { query: String::new(), sel: 0, items, theme_before: self.theme.name.clone() });
         self.palette_seen += 1;
@@ -1669,8 +1704,9 @@ impl App {
                 ui::rule(f, Rect { y, height: 1, ..inner }, t);
                 y += 1;
             }
-            if y + 1 < inner.bottom() {
-                let r = Rect { y: y + 1, height: inner.bottom() - y - 1, ..inner };
+            // straight under the rule, like your tabs under theirs (a tall list, like help's topics, needs the row)
+            if y < inner.bottom() {
+                let r = Rect { y, height: inner.bottom() - y, ..inner };
                 let id = self.tabs[self.cur].focus;
                 let mut actions = vec![];
                 if let Some(p) = self.panes.get_mut(&id) {
@@ -2139,6 +2175,51 @@ mod tests {
         app.reload_config();
         assert!(app.config_broken.is_none() && app.config.prefix == "ctrl+b");
         assert!(app.notice.as_ref().unwrap().0.contains("reads fine again"));
+    }
+
+    /// Settings: alt , opens it, the palette has a row per setting that opens on it, a change applies live (the
+    /// sidebar, the prefix), alt s is remembered, and a theme preview isn't saved.
+    #[test]
+    fn app_settings_app() {
+        let p = scratch_config("app-settings", "theme = \"oriel\"\n");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config { theme: "oriel".into(), ..Config::default() }, tx);
+        app.cfg_path = Some(p.clone());
+        let mut term = Terminal::new(TestBackend::new(160, 44)).unwrap();
+        app.key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::ALT));
+        assert_eq!(app.tabs[app.cur].app, Some("settings"));
+        term.draw(|f| app.draw(f)).unwrap();
+        crate::testkit::save_html(term.backend().buffer(), "target/snap/app-settings.html");
+        let b = term.backend().buffer();
+        let s: String = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect::<String>() + "\n").collect();
+        assert!(s.contains("settings") && s.contains("alt ,") && s.contains("prefix key") && s.contains("providers & keys"), "{s}");
+        // the palette: one row per setting, opening on it
+        app.goto_app("files");
+        app.open_palette();
+        let item = app.palette.as_ref().unwrap().items.iter().find(|i| i.0.contains("setting: permissions · edits")).cloned().expect("a palette row per setting");
+        app.palette = None;
+        app.run_cmd(item.1);
+        assert_eq!(app.tabs[app.cur].app, Some("settings"));
+        term.draw(|f| app.draw(f)).unwrap();
+        let settings = app.focused();
+        assert!(app.panes[&settings].title().contains("AI chat"));
+        // a change from settings applies at once, and only it is saved
+        app.apply(settings, vec![Action::Config(Box::new(|c| c.prefix = "ctrl+b".into())), Action::Config(Box::new(|c| c.sidebar = false))]);
+        assert!(!app.sidebar, "the sidebar follows at once");
+        assert!(app.is_prefix(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)), "so does the prefix");
+        assert!(!app.is_prefix(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        assert_eq!(config::load_from(&p).unwrap().prefix, "ctrl+b");
+        // alt s is remembered
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(app.sidebar && config::load_from(&p).unwrap().sidebar);
+        // a preview shows a theme without saving it
+        app.apply(settings, vec![Action::PreviewTheme("ocean".into())]);
+        assert_eq!(app.theme.name, "ocean");
+        assert_eq!(config::load_from(&p).unwrap().theme, "oriel");
+        // a bare-key prefix from a hand edit can't eat every b typed: ctrl+space then
+        app.config.prefix = "b".into();
+        assert!(!app.is_prefix(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)));
+        assert!(app.is_prefix(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
     }
 
     /// Focus changes reach the app (they used to fall into the catch-all input arm), so desktop notifications know

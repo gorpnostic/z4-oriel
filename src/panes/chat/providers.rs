@@ -284,7 +284,7 @@ fn openai(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Str
 
 fn anthropic(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), String> {
     let Some(k) = key(&req.cfg.anthropic_key, "ANTHROPIC_API_KEY") else {
-        return Err("no Anthropic key: set ANTHROPIC_API_KEY or ai.anthropic_key in the config (oriel --config)".into());
+        return Err("no Anthropic key: add one in settings (alt ,) › providers & keys, or set ANTHROPIC_API_KEY".into());
     };
     let model = req.model.clone().unwrap_or_else(|| req.cfg.anthropic_model.clone());
     send(Ev::Status(format!("anthropic · {model}")));

@@ -207,7 +207,7 @@ pub struct Onboard {
 }
 
 /// Quick count of audio files under a folder (bounded: at most 20k entries, 4 levels down). None = no such folder.
-fn count_audio(dir: &str) -> Option<usize> {
+pub(crate) fn count_audio(dir: &str) -> Option<usize> {
     let root = std::path::Path::new(dir.trim());
     if !root.is_dir() {
         return None;
@@ -239,7 +239,7 @@ fn count_audio(dir: &str) -> Option<usize> {
 }
 
 /// Tab-complete a folder path: extend to the longest common prefix of matching sub-folders.
-fn complete_dir(input: &str) -> String {
+pub(crate) fn complete_dir(input: &str) -> String {
     let path = std::path::Path::new(input);
     let (parent, stem) = if input.ends_with(['/', '\\']) {
         (path.to_path_buf(), String::new())

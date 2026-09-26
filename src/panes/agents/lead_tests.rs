@@ -831,7 +831,19 @@ fn agents_config_goes_through_the_app() {
     let mut cfg = k.config.clone();
     cfg.roster = roster();
     cfg.lead.stagger_s = 0;
+    cfg.lead.hung_after_s = 120;
     p.config_changed(&cfg);
-    assert_eq!((p.roster().len(), p.stagger), (3, Duration::ZERO));
+    assert_eq!((p.roster().len(), p.stagger, p.hung_after), (3, Duration::ZERO, Duration::from_secs(120)));
+    // a budget that doesn't read is said in the form, not quietly saved as $1.50
+    k.config = cfg;
+    k.key(&mut p, KeyCode::Enter);
+    for _ in 0..6 {
+        k.key(&mut p, KeyCode::Tab);
+    }
+    k.typ(&mut p, ".5");
+    k.key_mod(&mut p, KeyCode::Char('s'), crossterm::event::KeyModifiers::CONTROL);
+    assert_eq!(k.apply_config(&mut p), 0, "nothing saved");
+    let s = k.render(&mut p, 150, 44);
+    assert!(s.contains("isn't an amount like 1.50"), "{s}");
     let _ = std::fs::remove_dir_all(&dir);
 }

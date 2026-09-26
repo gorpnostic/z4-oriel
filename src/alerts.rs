@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -35,9 +37,46 @@ impl Kind {
             Kind::Update => ("↑", "update"),
         }
     }
-    /// Worth a desktop notification when you're in another window.
-    pub fn loud(self) -> bool {
-        !matches!(self, Kind::Update)
+    /// Its name in the config (`[alerts] desktop = ["needs_you", …]`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Kind::AgentDone => "agent_done",
+            Kind::NeedsYou => "needs_you",
+            Kind::Approval => "approval",
+            Kind::BuildFailed => "build_failed",
+            Kind::Calendar => "calendar",
+            Kind::Download => "download",
+            Kind::Memory => "memory",
+            Kind::Usage => "usage",
+            Kind::Update => "update",
+        }
+    }
+    /// Worth a desktop notification when you're in another window: desktop notifications are on and this kind
+    /// is one you picked (settings › alerts).
+    pub fn loud(self, cfg: &crate::config::Config) -> bool {
+        cfg.desktop_notifications && cfg.alerts.desktop.iter().any(|k| k == self.id())
+    }
+}
+
+pub const KINDS: &[Kind] = &[Kind::AgentDone, Kind::NeedsYou, Kind::Approval, Kind::BuildFailed, Kind::Calendar, Kind::Download, Kind::Memory, Kind::Usage, Kind::Update];
+
+/// The watcher's thresholds, shared with the app so a change in settings applies without a restart.
+pub struct Thresholds {
+    pub memory_pct: AtomicU32,
+    pub usage_pct: AtomicU32,
+    pub weekly_pct: AtomicU32,
+}
+
+impl Thresholds {
+    pub fn new(c: &crate::config::AlertsConfig) -> Arc<Thresholds> {
+        let t = Arc::new(Thresholds { memory_pct: AtomicU32::new(0), usage_pct: AtomicU32::new(0), weekly_pct: AtomicU32::new(0) });
+        t.set(c);
+        t
+    }
+    pub fn set(&self, c: &crate::config::AlertsConfig) {
+        self.memory_pct.store(c.memory_pct.clamp(10, 100), Ordering::Relaxed);
+        self.usage_pct.store(c.usage_pct.clamp(1, 100), Ordering::Relaxed);
+        self.weekly_pct.store(c.weekly_usage_pct.clamp(1, 100), Ordering::Relaxed);
     }
 }
 
@@ -143,8 +182,8 @@ pub fn desktop(title: &str, body: &str) {
 
 // ------------------------------------------------------------------ watchers that run in the background
 /// Memory running out, and AI usage near its limit: checked every half minute / five minutes, each said once
-/// until it clears (or the usage window resets).
-pub fn watch(send: impl Fn(Kind, String) + Send + 'static) {
+/// until it clears (or the usage window resets). The thresholds are read on every check (settings › alerts).
+pub fn watch(th: Arc<Thresholds>, send: impl Fn(Kind, String) + Send + 'static) {
     if cfg!(test) {
         return;
     }
@@ -157,17 +196,18 @@ pub fn watch(send: impl Fn(Kind, String) + Send + 'static) {
         loop {
             sys.refresh_memory();
             let (used, total) = (sys.used_memory(), sys.total_memory().max(1));
-            let pct = used as f64 / total as f64;
-            if pct > 0.92 && !mem_warned {
+            let pct = used as f64 / total as f64 * 100.0;
+            let warn_at = th.memory_pct.load(Ordering::Relaxed) as f64;
+            if pct > warn_at && !mem_warned {
                 mem_warned = true;
-                send(Kind::Memory, format!("memory is {:.0}% full ({} of {}): the system app shows what's using it", pct * 100.0, crate::ui::human_bytes(used), crate::ui::human_bytes(total)));
-            } else if pct < 0.85 {
+                send(Kind::Memory, format!("memory is {pct:.0}% full ({} of {}): the system app shows what's using it", crate::ui::human_bytes(used), crate::ui::human_bytes(total)));
+            } else if pct < warn_at - 7.0 {
                 mem_warned = false;
             }
             if tick % 10 == 0 {
                 let limits = crate::panes::agents::usage_limits();
                 for (agent, w) in limits {
-                    let warn = if w.label == "weekly" { 90.0 } else { 85.0 };
+                    let warn = if w.label == "weekly" { th.weekly_pct.load(Ordering::Relaxed) } else { th.usage_pct.load(Ordering::Relaxed) } as f64;
                     let key = (agent.clone(), w.label.clone(), w.resets_at.unwrap_or(0));
                     if w.pct >= warn && usage_warned.insert(key) {
                         let when = w.resets_at.map(|r| format!(", resets in {}", crate::panes::agents::until(r))).unwrap_or_default();
@@ -179,4 +219,30 @@ pub fn watch(send: impl Fn(Kind, String) + Send + 'static) {
             std::thread::sleep(std::time::Duration::from_secs(30));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Which kinds make a desktop notification is a setting ("needs you" but not "finished", by default), and
+    /// the master switch still wins; the thresholds reach the watcher through shared atomics.
+    #[test]
+    fn alerts_desktop_kinds_and_thresholds() {
+        let mut c = crate::config::Config::default();
+        assert!(Kind::NeedsYou.loud(&c) && Kind::BuildFailed.loud(&c));
+        assert!(!Kind::AgentDone.loud(&c) && !Kind::Update.loud(&c));
+        c.alerts.desktop.push("agent_done".into());
+        assert!(Kind::AgentDone.loud(&c));
+        c.desktop_notifications = false;
+        assert!(!Kind::NeedsYou.loud(&c), "off is off");
+        assert_eq!(KINDS.len(), 9);
+        assert!(KINDS.iter().all(|k| serde_json::to_string(k).unwrap() == format!("\"{}\"", k.id())), "the config names match the saved ones");
+        let th = Thresholds::new(&c.alerts);
+        assert_eq!(th.memory_pct.load(Ordering::Relaxed), 92);
+        c.alerts.memory_pct = 80;
+        c.alerts.weekly_usage_pct = 95;
+        th.set(&c.alerts);
+        assert_eq!((th.memory_pct.load(Ordering::Relaxed), th.weekly_pct.load(Ordering::Relaxed)), (80, 95));
+    }
 }

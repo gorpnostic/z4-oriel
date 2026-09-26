@@ -1401,7 +1401,8 @@ impl Agents {
                 tm.last = format!("merging into {}…", run.branch);
             }
             let lock = self.merge_lock.clone();
-            let gate_cmd = self.lead_cfg.gate.trim().to_string();
+            // the repo's own gate ([lead.gates]) when it has one, else the global one
+            let gate_cmd = crate::config::gate_for(&self.lead_cfg, Path::new(&t.repo)).trim().to_string();
             let timeout = Duration::from_secs(self.lead_cfg.gate_timeout_s.max(30) as u64);
             let gate_wt = PathBuf::from(format!("{}-gate", run.worktree.trim_end_matches(['/', '\\'])));
             self.spawn(cx, move |send| {

@@ -218,11 +218,13 @@ impl Pane for Calendar {
             }
             self.today = today;
         }
+        // settings › alerts: how long before (0 = only when it starts)
+        let before = cx.config.calendar.remind_before_min.min(24 * 60);
         for p in &self.plans {
             if let (true, Some(at)) = (p.day == today, p.at) {
-                // ten minutes before, and when it starts
+                // a while before, and when it starts
                 let soon = (p.day, at + 10_000, p.text.clone());
-                if mins + 10 >= at && mins < at && !self.reminded.contains(&soon) {
+                if before > 0 && mins + before >= at && mins < at && !self.reminded.contains(&soon) {
                     cx.alert(crate::alerts::Kind::Calendar, format!("in {} min: {} {}", at - mins, hhmm(at), p.text));
                     self.reminded.insert(soon);
                 }
@@ -540,5 +542,33 @@ mod tests {
         // months roll over
         k.key(&mut c, KeyCode::Char(']'));
         assert_eq!(civil_from_days(c.sel).1, 10);
+    }
+
+    /// The early reminder follows settings › alerts (calendar.remind_before_min), 0 = only when it starts.
+    #[test]
+    fn calendar_reminder_lead_time_is_a_setting() {
+        let (today, mins) = now();
+        if mins > 23 * 60 {
+            return; // a plan 20 minutes out would be tomorrow
+        }
+        let path = std::path::absolute("target/test-scratch/calendar-remind.json").unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut k = Kit::new();
+        let fresh = |k: &mut Kit| {
+            let mut c = Calendar::open_at(path.clone());
+            c.plans = vec![Plan { day: today, at: Some(mins + 20), text: "standup".into() }];
+            k.actions.clear();
+            c
+        };
+        let mut c = fresh(&mut k);
+        k.poll(&mut c);
+        assert!(k.notices().is_empty(), "10 minutes before, by default: not yet");
+        k.config.calendar.remind_before_min = 30;
+        k.poll(&mut c);
+        assert!(k.notices().iter().any(|n| n.contains("in 20 min") && n.contains("standup")), "{:?}", k.notices());
+        k.config.calendar.remind_before_min = 0;
+        let mut c = fresh(&mut k);
+        k.poll(&mut c);
+        assert!(k.notices().is_empty());
     }
 }

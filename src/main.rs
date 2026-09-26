@@ -22,7 +22,7 @@ use std::sync::mpsc;
 
 fn help(prefix: &str) -> String {
     format!(
-        "oriel {} — a terminal workspace\n\n  oriel              open (starts in the ai app)\n  oriel <app>        open straight into an app, this time only: ai agents ais terminal claude codex music system files notes calendar storage themes help\n  oriel --config     print the config file path\n  oriel update       update to the latest release (keeps this one for rollback)\n  oriel rollback     go back to the version before the last update\n  oriel changelog    what's new in recent releases\n  oriel --tour       replay the tour\n  oriel --version\n\nInside: F1-F9 apps, F10 help (every key and how-to), alt p palette, alt n terminal split, {prefix} = tmux-style prefix.",
+        "oriel {} — a terminal workspace\n\n  oriel              open (starts in the ai app)\n  oriel <app>        open straight into an app, this time only: ai agents ais terminal claude codex music system files notes calendar storage settings themes help\n  oriel --config     print the config file path (the settings app, alt , inside, changes all of it)\n  oriel update       update to the latest release (keeps this one for rollback)\n  oriel rollback     go back to the version before the last update\n  oriel changelog    what's new in recent releases\n  oriel --tour       replay the tour\n  oriel --version\n\nInside: F1-F9 apps, F10 help (every key and how-to), alt p palette, alt n terminal split, {prefix} = tmux-style prefix.",
         env!("CARGO_PKG_VERSION")
     )
 }

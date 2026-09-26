@@ -34,7 +34,7 @@ use It::*;
 struct Topic {
     icon: &'static str,
     title: &'static str,
-    /// the app this topic belongs to (help opens here when you come from that app)
+    /// the app(s) this topic belongs to, space-separated (help opens here when you come from one)
     app: &'static str,
     items: Vec<It>,
 }
@@ -72,7 +72,8 @@ fn topics() -> Vec<Topic> {
             K("alt 1–9", "go to one of your tabs"),
             K("double-click a tab", "rename it (also right-click → rename, or ctrl+space then ,)"),
             K("× on a tab / middle-click", "close that tab"),
-            K("alt s", "hide or show the sidebar"),
+            K("alt s", "hide or show the sidebar (remembered)"),
+            K("alt ,", "settings: every setting in one place"),
             Gap,
             H("panes (splits)"),
             K("alt n", "open a terminal beside the current pane (alt enter works too outside Windows Terminal)"),
@@ -122,9 +123,10 @@ fn topics() -> Vec<Topic> {
             K("/perms plan", "read-only"),
             K("/perms auto", "auto mode: Claude decides what's safe and asks you about the rest"),
             K("/perms bypass", "anything, never asks — only in folders you trust"),
-            K("shift+tab", "cycle through the modes; the current one shows on the input box"),
+            K("shift+tab", "cycle through the modes for this chat; the current one shows on the input box"),
+            K("/perms default <mode>", "where every new chat starts (also settings › AI chat)"),
             K("/effort", "how hard it thinks: low · medium · high · xhigh · max · ultracode (max plus Claude Code's multi-agent mode)"),
-            P("The choice is saved for every chat. If a reply says actions were blocked, pick a looser mode."),
+            P("shift+tab and /perms change only the chat you're in, so a bypass for one throwaway chat doesn't become every chat's. /effort, /model and /provider are remembered. If a reply says actions were blocked, pick a looser mode."),
             Gap,
             H("when Claude asks you something"),
             P("Claude Code can stop and ask you to pick (and run quizzes this way): the question shows above the box with its choices."),
@@ -177,7 +179,7 @@ fn topics() -> Vec<Topic> {
             P("Frugal / Balanced / Max presets for Claude Code and Codex. Shows exactly what changes and asks first; only its own settings are touched, with a backup."),
         ]},
         Topic { icon: "music", title: "music", app: "music", items: vec![
-            P("Plays your music folder (set in setup, or [music] folders in the config): cover art, a spectrum, synced lyrics, playlists."),
+            P("Plays your music folders (settings › folders: add several, and pick whether the audio-player library comes first): cover art, a spectrum, synced lyrics, playlists."),
             K("enter", "play the selected song"),
             K("space", "play / pause (F12 from any app)"),
             K("← →  ·  n / p", "seek · next / previous"),
@@ -203,7 +205,7 @@ fn topics() -> Vec<Topic> {
             P("The sidebar lists home, desktop, downloads, documents and your drives."),
         ]},
         Topic { icon: "notes", title: "notes", app: "notes", items: vec![
-            P("Markdown notes that save as you type (the folder is set in setup). /note in chat saves a reply here; notes added to the folder from outside show up by themselves."),
+            P("Markdown notes that save as you type (the folder is in settings › folders). /note in chat saves a reply here; notes added to the folder from outside show up by themselves."),
             K("ctrl+n", "new note"),
             K("ctrl+e", "switch between editing and the rendered preview"),
             K("ctrl+d", "delete the note (asks first)"),
@@ -211,7 +213,7 @@ fn topics() -> Vec<Topic> {
         ]},
         Topic { icon: "bell", title: "alerts", app: "alerts", items: vec![
             P("Everything worth knowing that happened while you were busy: an agent finished or needs you, an approval or question is waiting, a build or merge check failed, a plan starts soon, an install finished, memory is nearly full, an AI's usage is near its limit, a new oriel is out."),
-            P("Each is a toast, a line here (the bell at the bottom of the sidebar shows how many are new) and, when the terminal isn't the window you're in, a desktop notification (desktop_notifications = false in the config turns those off)."),
+            P("Each is a toast, a line here (the bell at the bottom of the sidebar shows how many are new) and, when the terminal isn't the window you're in, a desktop notification for the kinds you pick: settings › alerts turns them off, picks the kinds (\"needs you\" but not \"finished\", say), sets the memory and usage warnings and the calendar's early reminder, and sends a test notification."),
             K("enter", "go to where it happened"),
             K("x  ·  c", "dismiss one · clear them all"),
         ]},
@@ -238,7 +240,26 @@ fn topics() -> Vec<Topic> {
             K("wheel", "scroll back"),
             K("drag", "copy text"),
         ]},
-        Topic { icon: "theme", title: "themes & config", app: "themes", items: vec![
+        Topic { icon: "cog", title: "settings & themes", app: "settings themes", items: vec![
+            H("settings"),
+            P("Every setting in one place, by section (the sidebar): general, AI chat, providers & keys, lead mode, roster, alerts, folders, tools. A change is saved at once and applies where it can right away; the panel on the right says the setting's name in config.toml, its default, and when it takes effect."),
+            Gap,
+            K("alt ,  ·  /settings", "open it (/settings perms opens on that setting; so does palette → \"setting: …\")"),
+            K("↑ ↓  ·  tab", "a setting · the next section"),
+            K("← →  ·  space", "change a choice or a number · switch on/off"),
+            K("enter", "type a value, capture a key, or go where a link points"),
+            K("r", "back to the default (● marks the ones you changed)"),
+            K("/", "find a setting in any section"),
+            K("o", "open config.toml"),
+            Gap,
+            H("a few that need a word"),
+            K("theme", "← → previews it live; enter keeps it, esc goes back"),
+            K("prefix key", "enter, then press the new one: ctrl+<letter> or ctrl+space. Keys apps need (ctrl+s, ctrl+x, ctrl+o…) are refused, saying which"),
+            K("keys", "API keys are typed out of sight and shown as sk-…a1b2; x clears one. An environment variable (OPENAI_API_KEY, ANTHROPIC_API_KEY) keeps a key out of the file"),
+            K("merge gate", "the check every merged task passes: detect, none, or a command; a repo can have its own"),
+            K("music folders", "a adds · x removes · J/K reorder, each with its song count"),
+            Gap,
+            H("themes"),
             K("alt p → theme", "pick a theme with live preview"),
             P("ultra is the default. terminal uses your terminal's own colours; omarchy follows your Omarchy theme live."),
             Gap,
@@ -252,7 +273,7 @@ fn topics() -> Vec<Topic> {
             P("A theme is one small file in the themes folder next to config.toml: base = \"ultra\" plus the colours you changed. Send it to a friend and it works for them too."),
             Gap,
             H("the config file"),
-            P("`oriel --config` prints where it is. Everything is optional: theme, shell, prefix key, startup app, icons, notes folder, music folders, the AI providers and keys, permissions, per-AI models, the lead and the roster."),
+            P("Every setting is in the settings app (alt ,), so you never need to open it. `oriel --config` prints where it is, and settings' o opens it. Everything in it is optional."),
             P("What you change inside oriel is saved there straight away, and only that one setting. Edit the file by hand and a running oriel picks it up; if it has a typo, oriel says which line and won't write over it until it's fixed."),
             K("oriel update", "update to the latest release (the updates screen does it too: alt p → updates)"),
             K("oriel rollback", "back to the version before the last update, if the new one misbehaves"),
@@ -265,7 +286,8 @@ fn topics() -> Vec<Topic> {
             K("alt enter goes fullscreen", "Windows Terminal takes it — use alt n for a terminal"),
             K("ctrl+v won't paste images", "Windows Terminal only pastes text — use alt v"),
             K("no AI found", "your AIs (F3) → install: Claude Code, Codex and others with one key"),
-            K("agents refuse actions", "/perms in chat (ask · edits · plan · bypass)"),
+            K("agents refuse actions", "/perms in chat (ask · edits · plan · bypass), or settings › AI chat for every new chat"),
+            K("the prefix key does nothing", "settings › general › prefix key: it must be ctrl+<letter> or ctrl+space"),
             K("update didn't stick", "close oriel and run the install line again"),
         ]},
     ]
@@ -306,7 +328,7 @@ impl Help {
     /// Jump to the topic for the app help was asked from (once per ask).
     fn pick_context(&mut self) {
         let ctx = CONTEXT.with(|c| c.borrow_mut().take());
-        if let Some(i) = ctx.and_then(|c| self.topics.iter().position(|t| t.app == c)) {
+        if let Some(i) = ctx.and_then(|c| self.topics.iter().position(|t| t.app.split(' ').any(|a| a == c))) {
             self.sel = i;
             self.scroll = 0;
             self.query.clear();
@@ -319,7 +341,7 @@ impl Pane for Help {
     fn title(&self) -> String {
         // the frame is drawn before render() picks up a new context, so look ahead here
         let ctx = CONTEXT.with(|c| c.borrow().clone());
-        let sel = ctx.and_then(|c| self.topics.iter().position(|t| t.app == c)).unwrap_or(self.sel);
+        let sel = ctx.and_then(|c| self.topics.iter().position(|t| t.app.split(' ').any(|a| a == c))).unwrap_or(self.sel);
         format!("help · {}", self.topics[sel].title)
     }
     fn icon(&self) -> &'static str {

@@ -452,14 +452,28 @@ impl Agents {
                     e.err = format!("{name} is already on the roster");
                     return false;
                 }
+                // an empty field is its placeholder; a number that doesn't read is said, not quietly swapped for one
+                let d = RosterEntry::default();
+                let turns = e.turns.text.trim();
+                let Ok(max_turns) = (if turns.is_empty() { Ok(d.max_turns) } else { turns.parse::<u32>() }) else {
+                    e.err = format!("max turns: '{turns}' isn't a whole number (0 = no cap)");
+                    e.field = 5;
+                    return false;
+                };
+                let budget = e.budget.text.trim().trim_start_matches('$');
+                let Some(budget_usd) = (if budget.is_empty() { Some(d.budget_usd) } else { budget.parse::<f64>().ok().filter(|b| b.is_finite() && *b >= 0.0) }) else {
+                    e.err = format!("budget: '{budget}' isn't an amount like 1.50 (0 = none)");
+                    e.field = 6;
+                    return false;
+                };
                 let w = RosterEntry {
                     name,
                     agent: KINDS[e.agent].0.into(),
                     model: e.model.text.trim().into(),
                     tier: TIERS[e.tier].into(),
                     good_at: e.good_at.text.trim().into(),
-                    max_turns: e.turns.text.trim().parse().unwrap_or(40),
-                    budget_usd: e.budget.text.trim().trim_start_matches('$').parse().unwrap_or(1.5),
+                    max_turns,
+                    budget_usd,
                     enabled: e.enabled,
                 };
                 match e.idx {
@@ -558,7 +572,11 @@ impl Agents {
         let inner = ui::popup(f, area, 110, h, "⚑ roster · the workers a lead can use", t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let w = inner.width as usize;
-        let src = if self.roster.is_empty() { "defaults from what's installed — any edit saves them to the config".to_string() } else { "saved in oriel's config.toml under [[roster]] (oriel --config prints where)".to_string() };
+        let src = if self.roster.is_empty() {
+            "using defaults from what's installed — any edit saves them as your roster".to_string()
+        } else {
+            "your roster, saved as you edit · settings (alt ,) › roster resets it to the defaults from what's installed".to_string()
+        };
         f.render_widget(Paragraph::new(Span::styled(ui::fit(&src, w), ui::muted(t))), Rect { height: 1, ..inner });
         let mut y = inner.y + 2;
         if roster.is_empty() {

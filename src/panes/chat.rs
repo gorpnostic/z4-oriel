@@ -41,7 +41,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/provider", "<ai>", "switch AI: claude, codex, ollama, openai, anthropic — remembered"),
     ("/model", "<model>", "switch model for the current AI — remembered per AI"),
     ("/cwd", "<folder>", "folder Claude Code / Codex work in for this chat"),
-    ("/perms", "<ask|edits|auto|plan|bypass>", "what coding agents may do — remembered for every chat (shift+tab cycles)"),
+    ("/perms", "<ask|edits|auto|plan|bypass>", "what coding agents may do in this chat (shift+tab cycles) · /perms default <mode> for new chats"),
     ("/effort", "<low|medium|high|xhigh|max|ultracode>", "how hard coding agents think — remembered for every chat"),
     ("/key", "<openai|anthropic> <key>", "save an API key"),
     ("/note", "", "save the last reply to notes"),
@@ -53,6 +53,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/music", "", "go to the music app"),
     ("/sidebar", "", "hide / show the sidebar"),
     ("/icons", "", "nerd font icons on / off — remembered"),
+    ("/settings", "[setting]", "every setting in one place (alt ,) · /settings perms opens that one"),
     ("/info", "", "what's running: AI, model, folder"),
     ("/delete", "", "delete this chat"),
     ("/help", "", "keys and commands (F10: the full guide)"),
@@ -69,8 +70,9 @@ struct MenuItem {
     run: bool,
 }
 
-/// The permission modes for coding agents in chat (Claude Code's own modes). Remembered in the config.
-const PERMS: &[(&str, &str)] = &[
+/// The permission modes for coding agents in chat (Claude Code's own modes). The default for new chats is in the
+/// config (settings, /perms default); shift+tab and /perms change one chat.
+pub(crate) const PERMS: &[(&str, &str)] = &[
     ("ask", "asks you before each edit or command (y allow · n deny · a always allow that tool)"),
     ("edits", "edits files in the chat's folder; anything else is refused (default)"),
     ("auto", "auto mode: Claude decides what's safe and asks you about the rest"),
@@ -79,7 +81,7 @@ const PERMS: &[(&str, &str)] = &[
 ];
 
 /// Canonical permission name; the old "full" / "read" still work.
-fn norm_perms(s: &str) -> Option<&'static str> {
+pub(crate) fn norm_perms(s: &str) -> Option<&'static str> {
     match s.trim().to_lowercase().as_str() {
         "ask" | "default" => Some("ask"),
         "edits" | "acceptedits" | "accept" => Some("edits"),
@@ -104,7 +106,7 @@ fn free_md_path(dir: &std::path::Path, title: &str) -> PathBuf {
 }
 
 /// /effort levels, like Claude Code's. ultracode = max plus its multi-agent mode.
-const EFFORTS: &[(&str, &str)] = &[
+pub(crate) const EFFORTS: &[(&str, &str)] = &[
     ("low", "quick answers, fewest tokens"),
     ("medium", "a balance"),
     ("high", "thinks it through"),
@@ -116,6 +118,38 @@ const EFFORTS: &[(&str, &str)] = &[
 
 /// shift+tab walks through these, like Claude Code.
 const PERM_CYCLE: &[&str] = &["ask", "edits", "auto", "plan", "bypass"];
+
+/// The models oriel knows for an AI, with a word on each (the /model menu and settings suggest them). Ollama's
+/// come from what's installed there, so they aren't here.
+pub(crate) fn known_models(p: &str) -> &'static [(&'static str, &'static str)] {
+    match p {
+        "claude" => &[
+            ("default", "Claude Code's default"),
+            ("opus", "most capable (always the newest Opus)"),
+            ("sonnet", "balanced speed and smarts"),
+            ("haiku", "fastest and cheapest"),
+            ("claude-opus-5-5", "Opus 5.5"),
+            ("claude-sonnet-5", "Sonnet 5"),
+            ("claude-haiku-4-5", "Haiku 4.5"),
+            ("claude-fable-5-1", "Fable 5.1"),
+        ],
+        "codex" => &[
+            ("default", "Codex's default"),
+            ("gpt-5.6-sol", "most capable"),
+            ("gpt-5.6-terra", "balanced"),
+            ("gpt-5.6-luna", "fast and cheap"),
+            ("gpt-5.3-codex", "older coding model"),
+        ],
+        "anthropic" => &[
+            ("claude-sonnet-5", "Sonnet 5 — balanced"),
+            ("claude-opus-5-5", "Opus 5.5 — most capable"),
+            ("claude-haiku-4-5", "Haiku 4.5 — fastest"),
+            ("claude-fable-5-1", "Fable 5.1"),
+        ],
+        "openai" => &[("gpt-5.6-terra", "balanced"), ("gpt-5.6-sol", "most capable"), ("gpt-5.6-luna", "fast and cheap")],
+        _ => &[],
+    }
+}
 
 /// The mode line on the input box, Claude Code style: glyph, words, colour.
 fn perm_badge(p: &str, t: &crate::theme::Theme) -> (&'static str, &'static str, ratatui::style::Color) {
@@ -178,7 +212,9 @@ pub struct Chat {
     menu_sel: usize,
     cache: HashMap<usize, (u64, Vec<Line<'static>>, Vec<(usize, String)>)>,
     provider: String,
+    /// This chat's permission mode (shift+tab, /perms); new chats start from `default_perms` (the config's).
     perms: String,
+    default_perms: String,
     /// /effort ("" = the agent's default)
     effort: String,
     keys: HashMap<String, String>,
@@ -252,6 +288,7 @@ impl Chat {
             cache: HashMap::new(),
             provider,
             perms: norm_perms(&cfg.ai.perms).unwrap_or("edits").to_string(),
+            default_perms: norm_perms(&cfg.ai.perms).unwrap_or("edits").to_string(),
             effort: cfg.ai.effort.clone(),
             keys: HashMap::new(),
             expanded: false,
@@ -313,6 +350,7 @@ impl Chat {
         let p = self.provider_of();
         self.chat = store::Chat::new(&p);
         self.chat.model = self.models.get(&p).cloned().filter(|m| !m.is_empty());
+        self.perms = self.default_perms.clone(); // a mode picked for the last chat stays with it
         self.cache.clear();
         self.scroll = 0;
         self.info.clear();
@@ -328,6 +366,7 @@ impl Chat {
         self.persist_if_changed();
         let Some(c) = self.chats.iter().find(|c| c.id == id).cloned() else { return };
         self.chat = c;
+        self.perms = self.default_perms.clone();
         self.cache.clear();
         self.scroll = 0;
         self.info.clear();
@@ -606,7 +645,7 @@ impl Chat {
                             "claude" => "  install Claude Code: npm i -g @anthropic-ai/claude-code, then run `claude` once to sign in".into(),
                             "codex" => "  install Codex: npm i -g @openai/codex, then `codex login`".into(),
                             "ollama" => "  install Ollama from ollama.com and pull a model (ollama pull llama3.2)".into(),
-                            _ => format!("  add a key: /key {id} <key>"),
+                            _ => format!("  add a key in settings (alt ,) › providers & keys, or /key {id} <key>"),
                         });
                     } else if providers::PROVIDERS.iter().any(|p| p.0 == id) {
                         // an explicit model, else the one remembered for this AI
@@ -654,15 +693,25 @@ impl Chat {
                     }
                 }
             }
+            // /perms default <mode>: where every new chat starts (saved); /perms <mode>: just this chat
+            "/perms" if arg.to_lowercase().starts_with("default ") => match norm_perms(&arg[8..]) {
+                Some(p) => {
+                    self.default_perms = p.to_string();
+                    if self.chat.messages.is_empty() {
+                        self.perms = p.to_string();
+                    }
+                    cx.edit_config(move |c| c.ai.perms = p.to_string());
+                    cx.notify(format!("new chats start in {p} · saved (settings › AI chat has it too)"));
+                }
+                None => self.info.push(format!("no mode called {} — ask · edits · auto · plan · bypass", arg[8..].trim())),
+            },
             "/perms" => match norm_perms(&arg) {
                 Some(p) => {
                     self.perms = p.to_string();
-                    // remembered: every new chat (and the next time oriel starts) uses it
-                    cx.edit_config(move |c| c.ai.perms = p.to_string());
-                    cx.notify(format!("agent permissions: {p} · saved for every chat"));
+                    cx.notify(format!("agent permissions: {p} · this chat (/perms default {p} for every new one)"));
                 }
                 None => {
-                    self.info.push(format!("permissions now: {} (saved for every chat). Choose one:", self.perms));
+                    self.info.push(format!("permissions in this chat: {} · new chats start in {} (/perms default <mode>). Choose one:", self.perms, self.default_perms));
                     for (k, what) in PERMS {
                         self.info.push(format!("  /perms {k:<7} {what}"));
                     }
@@ -710,7 +759,7 @@ impl Chat {
                         }
                         cx.notify(format!("{p} key saved"));
                     }
-                    _ => self.info.push("/key openai <key> · /key anthropic <key>  (saved in oriel's config file)".into()),
+                    _ => self.info.push("/key openai <key> · /key anthropic <key>  (saved in oriel's config file; settings › providers & keys types it out of sight)".into()),
                 }
             }
             "/note" => match self.chat.messages.iter().rev().find(|m| m.role == "assistant" && !m.content.is_empty()) {
@@ -751,6 +800,10 @@ impl Chat {
             "/music" => cx.act(Action::GotoApp("music")),
             "/sidebar" => cx.act(Action::ToggleSidebar),
             "/icons" => cx.act(Action::ToggleIcons),
+            "/settings" => {
+                crate::panes::settings::jump(&arg);
+                cx.act(Action::GotoApp("settings"));
+            }
             "/quit" => cx.act(Action::Quit),
             "/info" => {
                 let p = self.provider_of();
@@ -783,30 +836,7 @@ impl Chat {
     fn models_for(&self, p: &str) -> Vec<(String, String)> {
         let s = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
         let mut v = match p {
-            "claude" => s(&[
-                ("default", "Claude Code's default"),
-                ("opus", "most capable (always the newest Opus)"),
-                ("sonnet", "balanced speed and smarts"),
-                ("haiku", "fastest and cheapest"),
-                ("claude-opus-5-5", "Opus 5.5"),
-                ("claude-sonnet-5", "Sonnet 5"),
-                ("claude-haiku-4-5", "Haiku 4.5"),
-                ("claude-fable-5-1", "Fable 5.1"),
-            ]),
-            "codex" => s(&[
-                ("default", "Codex's default"),
-                ("gpt-5.6-sol", "most capable"),
-                ("gpt-5.6-terra", "balanced"),
-                ("gpt-5.6-luna", "fast and cheap"),
-                ("gpt-5.3-codex", "older coding model"),
-            ]),
-            "anthropic" => s(&[
-                ("claude-sonnet-5", "Sonnet 5 — balanced"),
-                ("claude-opus-5-5", "Opus 5.5 — most capable"),
-                ("claude-haiku-4-5", "Haiku 4.5 — fastest"),
-                ("claude-fable-5-1", "Fable 5.1"),
-            ]),
-            "openai" => s(&[("gpt-5.6-terra", "balanced"), ("gpt-5.6-sol", "most capable"), ("gpt-5.6-luna", "fast and cheap")]),
+            "claude" | "codex" | "anthropic" | "openai" => s(known_models(p)),
             "ollama" => {
                 let got = self.ollama_models.lock().unwrap().clone();
                 if got.is_empty() {
@@ -840,6 +870,7 @@ impl Chat {
             "/perms" => PERMS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
             "/effort" => EFFORTS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
             "/key" => pairs(&[("openai", "OpenAI-compatible key"), ("anthropic", "Anthropic API key")]),
+            "/settings" => crate::panes::settings::topics(),
             "/theme" => {
                 let mut v: Vec<(String, String)> = vec![("edit".into(), "open the theme editor".into()), ("new ".into(), "make your own theme from this one".into())];
                 v.extend(crate::theme::names().into_iter().map(|n| {
@@ -1310,8 +1341,13 @@ impl Pane for Chat {
     fn config_changed(&mut self, cfg: &crate::config::Config) {
         self.models = cfg.ai.models.clone();
         self.effort = cfg.ai.effort.clone();
+        // the default mode for new chats; the open one follows only while it's empty (a mode picked for a
+        // conversation with shift+tab stays)
         if let Some(p) = norm_perms(&cfg.ai.perms) {
-            self.perms = p.to_string();
+            if p != self.default_perms && self.chat.messages.is_empty() && self.stream.is_none() {
+                self.perms = p.to_string();
+            }
+            self.default_perms = p.to_string();
         }
         // a key saved with /key makes that AI usable here too
         for (id, key) in [("openai", &cfg.ai.openai_key), ("anthropic", &cfg.ai.anthropic_key)] {
@@ -1685,12 +1721,11 @@ impl Pane for Chat {
         let items = self.menu();
         match k.code {
             KeyCode::Char('x') if ctrl => self.chord_x = true,
-            // shift+tab: the next permission mode, remembered like /perms
+            // shift+tab: the next permission mode, for this chat only (a bypass for one throwaway chat mustn't
+            // become every chat's; the default is in settings, or /perms default <mode>)
             KeyCode::BackTab => {
                 let i = PERM_CYCLE.iter().position(|p| *p == self.perms).map(|i| (i + 1) % PERM_CYCLE.len()).unwrap_or(0);
                 self.perms = PERM_CYCLE[i].to_string();
-                let p = self.perms.clone();
-                cx.edit_config(move |c| c.ai.perms = p);
             }
             KeyCode::Up if self.input.is_empty() && self.queue.iter().any(|q| !q.sent) => {
                 let i = self.queue.iter().rposition(|q| !q.sent).unwrap_or(0);
@@ -2057,15 +2092,21 @@ mod tests {
         c.avail = vec!["claude", "codex"];
         c.provider = "claude".into();
         c.chat.provider = Some("claude".into());
-        for cmd in ["/perms bypass", "/effort high", "/model opus", "/key anthropic sk-test", "/provider codex"] {
+        for cmd in ["/perms default bypass", "/effort high", "/model opus", "/key anthropic sk-test", "/provider codex"] {
             assert_eq!(run_cmd(&mut k, &mut c, cmd), 1, "{cmd} asks the app to save it");
         }
         let a = &k.config.ai;
         assert_eq!((a.perms.as_str(), a.effort.as_str(), a.anthropic_key.as_str(), a.provider.as_str()), ("bypass", "high", "sk-test", "codex"));
         assert_eq!(a.models.get("claude").map(String::as_str), Some("opus"));
-        // shift+tab: the next mode, remembered the same way
+        // shift+tab and /perms <mode> change this chat only: a bypass for one chat isn't every chat's
         k.key_mod(&mut c, KeyCode::BackTab, KeyModifiers::SHIFT);
-        assert_eq!(k.apply_config(&mut c), 1);
+        assert_eq!(k.apply_config(&mut c), 0);
+        assert_eq!(c.perms, "ask");
+        assert_eq!(run_cmd(&mut k, &mut c, "/perms plan"), 0);
+        assert_eq!((c.perms.as_str(), k.config.ai.perms.as_str()), ("plan", "bypass"));
+        c.new_chat();
+        assert_eq!(c.perms, "bypass", "a new chat starts from the default");
+        assert_eq!(run_cmd(&mut k, &mut c, "/perms default ask"), 1);
         assert_eq!(k.config.ai.perms, "ask");
         // a chat that was open all along follows (its empty chat switches AI too) ...
         let mut before = Chat::new(&crate::config::Config::default());
@@ -2082,8 +2123,15 @@ mod tests {
         busy.chat.messages.push(store::Msg { role: "user".into(), content: "hi".into(), ..Default::default() });
         busy.config_changed(&k.config);
         assert_eq!(busy.chat.provider.as_deref(), Some("claude"));
+        // ... and its own mode: an unrelated setting changing doesn't touch it, a new default does not either
+        busy.perms = "bypass".into();
+        k.config.theme = "ocean".into();
+        busy.config_changed(&k.config);
+        k.config.ai.perms = "plan".into();
+        busy.config_changed(&k.config);
+        assert_eq!((busy.perms.as_str(), busy.default_perms.as_str()), ("bypass", "plan"));
         // and a chat opened now starts from it
-        assert_eq!(Chat::new(&k.config).perms, "ask");
+        assert_eq!(Chat::new(&k.config).perms, "plan");
     }
 
     /// /note saves where the notes app looks (notes_folder), and neither /note nor /save overwrites a file.
