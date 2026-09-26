@@ -12,6 +12,11 @@ mod store;
 /// A diff line's background for a theme (line tint, changed-word tint): the themes app previews with it.
 pub(crate) use activity::band as diff_band;
 
+/// Markdown drawn the way the chat draws replies (the updates screen shows release notes with it).
+pub(crate) fn render_markdown(text: &str, width: usize, t: &crate::theme::Theme) -> Vec<Line<'static>> {
+    md::render(text, width, "", t)
+}
+
 use crate::pane::{Action, Cx, Pane};
 use crate::ui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};

@@ -46,6 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # the release notes are the tag's message (tools/release.ps1 writes them); checkout keeps tags light
+      - run: git fetch --force --tags origin
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -56,5 +58,7 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           if [ "${GITHUB_REF_TYPE}" != "tag" ]; then tag="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"; fi
-          gh release create "$tag" dist/* install.sh install.ps1 --title "oriel $tag" --generate-notes \
+          git tag -l --format='%(contents)' "$tag" | sed '/^-----BEGIN PGP/,$d' > notes.md
+          if [ -s notes.md ] && ! grep -qx "release $tag" notes.md; then notes=(--notes-file notes.md); else notes=(--generate-notes); fi
+          gh release create "$tag" dist/* install.sh install.ps1 --title "oriel $tag" "${notes[@]}" \
             || gh release upload "$tag" dist/* install.sh install.ps1 --clobber

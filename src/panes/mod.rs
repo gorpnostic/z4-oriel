@@ -14,6 +14,7 @@ mod stub;
 pub mod system;
 pub mod term;
 pub mod themes;
+pub mod updates;
 
 use crate::config::{Config, which};
 use crate::pane::Pane;
@@ -56,6 +57,7 @@ pub fn open(name: &str, cfg: &Config) -> Option<Box<dyn Pane>> {
         "home" => Box::new(home::Home::new()),
         "help" => Box::new(help::Help::new()),
         "themes" => Box::new(themes::Themes::new()),
+        "updates" => Box::new(updates::Updates::new()),
         _ => {
             let (_, prog, title) = AGENTS.iter().find(|a| a.0 == name)?;
             let path = which(prog)?;

@@ -25,7 +25,16 @@ $toml = [regex]::Replace($toml, '(?m)^version\s*=\s*"[^"]+"', "version = `"$Vers
 cargo update --workspace --offline   # just refreshes Cargo.lock with the new version (the workflow builds with --locked)
 git add Cargo.toml Cargo.lock docs
 git commit -m "release v$Version"
-git tag "v$Version"
+# release notes: what changed since the last version, from the commit subjects (the workflow publishes them,
+# and oriel shows them under "what's new")
+$prev = git describe --tags --abbrev=0 "HEAD^" 2>$null
+$range = if ($prev) { "$prev..HEAD" } else { "HEAD" }
+$lines = git log $range --no-merges --pretty=format:%s | Where-Object { $_ -and $_ -notmatch '^release v' -and $_ -notmatch '^Screenshots' }
+$notes = if ($lines) { ($lines | ForEach-Object { "- $_" }) -join "`n" } else { "- small fixes" }
+$notesFile = Join-Path ([IO.Path]::GetTempPath()) "oriel-notes-$Version.md"
+[IO.File]::WriteAllText($notesFile, $notes)
+git tag -a "v$Version" -F $notesFile
+Remove-Item $notesFile
 git push
 git push origin "v$Version"
 "v$Version pushed. GitHub is building it: https://github.com/gorpnostic/z4-oriel/actions"

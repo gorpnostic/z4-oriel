@@ -11,6 +11,7 @@ mod panes;
 mod testkit;
 mod theme;
 mod ui;
+mod update;
 
 use crossterm::{
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
@@ -24,7 +25,7 @@ fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("-h" | "--help") => {
             println!(
-                "oriel {} — a terminal workspace\n\n  oriel              open (starts in the ai app)\n  oriel <app>        open straight into an app: ai agents ais terminal claude codex music system files notes calendar storage themes help\n  oriel --config     print the config file path\n  oriel update       update to the latest release\n  oriel --tour       replay the first-run setup and tour\n  oriel --version\n\nInside: F1-F9 apps, F10 help (every key and how-to), alt p palette, alt n terminal split, {} = tmux-style prefix.",
+                "oriel {} — a terminal workspace\n\n  oriel              open (starts in the ai app)\n  oriel <app>        open straight into an app: ai agents ais terminal claude codex music system files notes calendar storage themes help\n  oriel --config     print the config file path\n  oriel update       update to the latest release (keeps this one for rollback)\n  oriel rollback     go back to the version before the last update\n  oriel changelog    what's new in recent releases\n  oriel --tour       replay the first-run setup and tour\n  oriel --version\n\nInside: F1-F9 apps, F10 help (every key and how-to), alt p palette, alt n terminal split, {} = tmux-style prefix.",
                 env!("CARGO_PKG_VERSION"),
                 cfg.prefix
             );
@@ -35,17 +36,33 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("update" | "--update") => {
-            // re-run the installer: it fetches the latest release and swaps the binary (even this running one)
-            const RAW: &str = "https://raw.githubusercontent.com/gorpnostic/z4-oriel/master";
-            println!("oriel {} — updating to the latest release…", env!("CARGO_PKG_VERSION"));
-            let status = if cfg!(windows) {
-                std::process::Command::new("powershell.exe")
-                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &format!("irm {RAW}/install.ps1 | iex")])
-                    .status()
-            } else {
-                std::process::Command::new("sh").args(["-c", &format!("curl -fsSL {RAW}/install.sh | sh")]).status()
-            };
-            std::process::exit(status.map(|s| s.code().unwrap_or(1)).unwrap_or(1));
+            // oriel updates itself (keeping this version for `oriel rollback`); the install script is the fallback
+            let code = update::cli_update();
+            if code != 0 && args.get(1).map(String::as_str) != Some("--no-fallback") {
+                const RAW: &str = "https://raw.githubusercontent.com/gorpnostic/z4-oriel/master";
+                println!(":: trying the install script instead");
+                let status = if cfg!(windows) {
+                    std::process::Command::new("powershell.exe")
+                        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &format!("irm {RAW}/install.ps1 | iex")])
+                        .status()
+                } else {
+                    std::process::Command::new("sh").args(["-c", &format!("curl -fsSL {RAW}/install.sh | sh")]).status()
+                };
+                std::process::exit(status.map(|s| s.code().unwrap_or(1)).unwrap_or(1));
+            }
+            std::process::exit(code);
+        }
+        Some("rollback" | "--rollback") => std::process::exit(update::cli_rollback()),
+        Some("changelog" | "--changelog" | "whats-new") => {
+            match update::check(true) {
+                Ok(rs) => {
+                    for r in rs.iter().take(5) {
+                        println!("## {}\n\n{}\n", r.version, r.notes.lines().filter(|l| !l.contains("**Full Changelog**")).collect::<Vec<_>>().join("\n").trim());
+                    }
+                }
+                Err(e) => eprintln!("{e}"),
+            }
+            return Ok(());
         }
         Some("--mcp-approve") => {
             // the approval bridge Claude Code starts for /perms ask (see panes/chat/approve.rs)

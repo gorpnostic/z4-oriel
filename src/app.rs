@@ -174,6 +174,8 @@ pub struct App {
     done: std::collections::HashSet<PaneId>,
     _watcher: Option<notify::RecommendedWatcher>,
     _theme_watcher: Option<notify::RecommendedWatcher>,
+    /// A newer version is out: shown at the bottom of the sidebar.
+    update_ready: Option<String>,
 }
 
 impl App {
@@ -207,6 +209,7 @@ impl App {
             hover: Position { x: u16::MAX, y: u16::MAX },
             _watcher: None,
             _theme_watcher: None,
+            update_ready: None,
             renaming: None,
             ctx: None,
             onboard: None,
@@ -218,7 +221,18 @@ impl App {
             done: Default::default(),
         };
         app._watcher = watch_omarchy(tx.clone());
-        app._theme_watcher = watch_themes(tx);
+        app._theme_watcher = watch_themes(tx.clone());
+        if !cfg!(test) {
+            // once a day: is there a newer oriel? (in the background; quiet if offline)
+            std::thread::spawn(move || {
+                if let Some(r) = crate::update::check(false).ok().and_then(|rs| crate::update::available(&rs)) {
+                    let _ = tx.send(Event::UpdateAvailable(r.version));
+                }
+            });
+            if let Some((from, to)) = crate::update::just_updated() {
+                app.notify(format!("{}updated {from} → {to} · alt p → updates for what's new", ui::lead("package")));
+            }
+        }
         if !cfg!(test) && !crate::onboard::done_before() {
             app.onboard = Some(crate::onboard::Onboard::new(&app.theme.name, &app.config));
         }
@@ -693,6 +707,10 @@ impl App {
                     self.with_pane(id, |p, cx| p.key(key, cx));
                 }
             },
+            Event::UpdateAvailable(v) => {
+                self.notify(format!("{}oriel {v} is out · click it at the bottom of the sidebar, or alt p → updates", ui::lead("package")));
+                self.update_ready = Some(v);
+            }
             Event::ThemeFilesChanged => {
                 if self.theme.name == "omarchy" {
                     std::thread::sleep(Duration::from_millis(150)); // let omarchy finish swapping files
@@ -1005,6 +1023,11 @@ impl App {
         items.push((format!("{}rename this tab", ui::lead("tab")), Cmd::Rename));
         items.push((format!("{}close this tab", ui::lead("close")), Cmd::CloseTab(self.cur)));
         items.push((format!("{}theme editor: make your own", ui::lead("theme")), Cmd::App("themes")));
+        let upd = match &self.update_ready {
+            Some(v) => format!("{}update oriel to {v}: what's new", ui::lead("package")),
+            None => format!("{}updates: what's new, check, roll back", ui::lead("package")),
+        };
+        items.push((upd, Cmd::App("updates")));
         for t in theme::names() {
             let yours = if theme::is_custom(&t) { "  · yours" } else { "" };
             items.push((format!("{}theme {t}{yours}", ui::lead("theme")), Cmd::Theme(t)));
@@ -1383,10 +1406,17 @@ impl App {
         }
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), y: inner.y + 1, height: inner.height.saturating_sub(1) };
         // ---- the footer: themes and help, pinned to the bottom
-        let foot_n = (SIDEBAR.len() - FOOTER) as u16;
+        let extra = self.update_ready.is_some() as u16;
+        let foot_n = (SIDEBAR.len() - FOOTER) as u16 + extra;
         let inner = if inner.height > foot_n + 12 {
             let fy = inner.bottom() - foot_n;
             ui::rule(f, Rect { y: fy - 1, height: 1, ..inner }, t);
+            if let Some(v) = &self.update_ready {
+                let r = Rect { y: fy, height: 1, ..inner };
+                f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("{}update to {v}", ui::lead("package")), Style::default().fg(t.good).add_modifier(Modifier::BOLD))])), r);
+                self.side_hits.push((r, SideHit::App("updates")));
+            }
+            let fy = fy + extra;
             for (k, &(name, icon, label, key)) in SIDEBAR[FOOTER..].iter().enumerate() {
                 let r = Rect { y: fy + k as u16, height: 1, ..inner };
                 ui::side_row(f, r, icon, label, key, cur_app == Some(name), t);
