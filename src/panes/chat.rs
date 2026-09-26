@@ -97,6 +97,17 @@ struct Stream {
     steer: Option<std::sync::mpsc::Sender<String>>,
 }
 
+/// Answering a set of Claude's questions: which one, the highlighted choice, ticks (several allowed), your own
+/// words (Other), and the answers so far.
+#[derive(Default)]
+struct QState {
+    idx: usize,
+    sel: usize,
+    ticked: Vec<bool>,
+    other: Option<String>,
+    answers: serde_json::Map<String, serde_json::Value>,
+}
+
 /// A message typed while a reply was running.
 struct Queued {
     text: String,
@@ -132,6 +143,9 @@ pub struct Chat {
     asks: VecDeque<approve::Ask>,
     /// Tools the user said "always" to, for this session.
     always: HashSet<String>,
+    /// Claude's questions waiting for you (AskUserQuestion), oldest first, and where you are in the first one.
+    questions: VecDeque<approve::Question>,
+    qs: QState,
     info: Vec<String>,
     avail: Vec<&'static str>,
     /// the model picked per AI (/model), remembered in the config
@@ -195,6 +209,8 @@ impl Chat {
             tool_hits: vec![],
             asks: VecDeque::new(),
             always: HashSet::new(),
+            questions: VecDeque::new(),
+            qs: QState::default(),
             info: vec![],
             avail,
             confirm_delete: false,
@@ -291,6 +307,7 @@ impl Chat {
         if let Some(s) = self.stream.take() {
             s.stop.store(true, Ordering::SeqCst);
             self.asks.clear(); // unanswered approvals become a no
+            self.questions.clear(); // and unanswered questions a skip
             if let Some(m) = self.chat.messages.last_mut() {
                 if m.role == "assistant" {
                     activity::settle(&mut m.parts, "stopped");
@@ -324,6 +341,89 @@ impl Chat {
         let sent = self.stream.as_ref().and_then(|s| s.steer.as_ref()).is_some_and(|tx| tx.send(text.clone()).is_ok());
         self.queue.push(Queued { text, sent });
         self.scroll = 0;
+    }
+
+    /// Keys while Claude is asking you something: ↑↓ or a number to choose, space to tick (when several are
+    /// allowed), enter to answer, typing (or Other) for your own words, esc to skip.
+    fn question_key(&mut self, k: KeyEvent) {
+        let Some(q) = self.questions.front() else { return };
+        let Some(cur) = q.qs.get(self.qs.idx).cloned() else { return };
+        let n = cur.options.len() + 1; // the choices, then Other
+        if self.qs.ticked.len() != cur.options.len() {
+            self.qs.ticked = vec![false; cur.options.len()];
+        }
+        if let Some(text) = &mut self.qs.other {
+            match k.code {
+                KeyCode::Esc => self.qs.other = None,
+                KeyCode::Backspace => {
+                    text.pop();
+                }
+                KeyCode::Enter => {
+                    let a = text.trim().to_string();
+                    if !a.is_empty() {
+                        self.answer_question(&cur.question, a);
+                    }
+                }
+                KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => text.push(c),
+                _ => {}
+            }
+            return;
+        }
+        match k.code {
+            KeyCode::Up => self.qs.sel = (self.qs.sel + n - 1) % n,
+            KeyCode::Down | KeyCode::Tab => self.qs.sel = (self.qs.sel + 1) % n,
+            KeyCode::Char(c @ '1'..='9') if (c as usize - '0' as usize) <= n => {
+                self.qs.sel = c as usize - '1' as usize;
+                if self.qs.sel == n - 1 {
+                    self.qs.other = Some(String::new());
+                } else if cur.multi {
+                    self.qs.ticked[self.qs.sel] = !self.qs.ticked[self.qs.sel];
+                } else {
+                    self.answer_question(&cur.question, cur.options[self.qs.sel].0.clone());
+                }
+            }
+            KeyCode::Char(' ') if cur.multi && self.qs.sel < cur.options.len() => self.qs.ticked[self.qs.sel] = !self.qs.ticked[self.qs.sel],
+            KeyCode::Enter => {
+                if self.qs.sel == n - 1 {
+                    self.qs.other = Some(String::new());
+                } else if cur.multi {
+                    let mut picked: Vec<String> = cur.options.iter().zip(&self.qs.ticked).filter(|(_, t)| **t).map(|(o, _)| o.0.clone()).collect();
+                    if picked.is_empty() {
+                        picked.push(cur.options[self.qs.sel].0.clone());
+                    }
+                    self.answer_question(&cur.question, picked.join(", "));
+                } else {
+                    self.answer_question(&cur.question, cur.options[self.qs.sel].0.clone());
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(q) = self.questions.pop_front() {
+                    let _ = q.reply.send(None);
+                }
+                self.qs = QState::default();
+            }
+            // just start typing to answer in your own words
+            KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                self.qs.sel = n - 1;
+                self.qs.other = Some(c.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn answer_question(&mut self, question: &str, answer: String) {
+        self.qs.answers.insert(question.to_string(), serde_json::Value::String(answer));
+        self.qs.idx += 1;
+        self.qs.sel = 0;
+        self.qs.ticked.clear();
+        self.qs.other = None;
+        let done = self.questions.front().is_some_and(|q| self.qs.idx >= q.qs.len());
+        if done {
+            if let Some(q) = self.questions.pop_front() {
+                let _ = q.reply.send(Some(std::mem::take(&mut self.qs.answers)));
+            }
+            self.qs = QState::default();
+        }
     }
 
     /// ctrl+x s: stop the reply and send everything queued (and whatever is in the box) right away.
@@ -887,6 +987,52 @@ impl Chat {
         let m = self.chat.messages.last();
         let parts: &[store::Part] = m.map(|m| m.parts.as_slice()).unwrap_or(&[]);
         out.push(Line::raw(""));
+        // ---- a question for you
+        if let Some(q) = self.questions.front() {
+            if let Some(cur) = q.qs.get(self.qs.idx) {
+                let bar = Span::styled("  ▌ ", Style::default().fg(t.shine));
+                let mut head = vec![bar.clone()];
+                if !cur.header.is_empty() {
+                    head.push(Span::styled(format!("{}  ", cur.header), Style::default().fg(t.shine).add_modifier(Modifier::BOLD)));
+                }
+                if q.qs.len() > 1 {
+                    head.push(Span::styled(format!("{} of {}", self.qs.idx + 1, q.qs.len()), muted));
+                }
+                out.push(Line::from(head));
+                for l in md::wrap(vec![Span::styled(cur.question.clone(), Style::default().add_modifier(Modifier::BOLD))], width.saturating_sub(6), "", "") {
+                    let mut sp = vec![bar.clone()];
+                    sp.extend(l.spans);
+                    out.push(Line::from(sp));
+                }
+                let lw = cur.options.iter().map(|o| o.0.width()).max().unwrap_or(0).max(7).min(28);
+                let n = cur.options.len();
+                for (i, (label, what)) in cur.options.iter().chain(std::iter::once(&("Other…".to_string(), "type your own answer".to_string()))).enumerate() {
+                    let on = i == self.qs.sel;
+                    let tick = if cur.multi && i < n { if self.qs.ticked.get(i).copied().unwrap_or(false) { "[x] " } else { "[ ] " } } else { "" };
+                    let st = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default() };
+                    let lab = format!("{tick}{label}");
+                    out.push(Line::from(vec![
+                        bar.clone(),
+                        Span::styled(if on { " ❯ " } else { "   " }, st),
+                        Span::styled(format!("{}. ", i + 1), muted),
+                        Span::styled(format!("{lab:<w$}", w = lw + tick.len()), st),
+                        Span::styled(format!("  {}", ui::fit(what, width.saturating_sub(lw + 16))), muted),
+                    ]));
+                }
+                if let Some(text) = &self.qs.other {
+                    out.push(Line::from(vec![bar.clone(), Span::styled("your answer › ", ui::bold_accent(t)), Span::raw(text.clone()), Span::styled("▏", ui::accent(t))]));
+                    out.push(Line::from(vec![bar, Span::styled("enter", ui::bold_accent(t)), Span::styled(" send it  ", muted), Span::styled("esc", ui::bold_accent(t)), Span::styled(" back to the choices", muted)]));
+                } else {
+                    let mut keys = vec![bar, Span::styled("↑↓", ui::bold_accent(t)), Span::styled(" or ", muted), Span::styled("1-9", ui::bold_accent(t)), Span::styled(" choose  ", muted)];
+                    if cur.multi {
+                        keys.extend([Span::styled("space", ui::bold_accent(t)), Span::styled(" tick  ", muted)]);
+                    }
+                    keys.extend([Span::styled("enter", ui::bold_accent(t)), Span::styled(" answer  ", muted), Span::styled("type", ui::bold_accent(t)), Span::styled(" your own  ", muted), Span::styled("esc", ui::bold_accent(t)), Span::styled(" skip", muted)]);
+                    out.push(Line::from(keys));
+                }
+                out.push(Line::raw(""));
+            }
+        }
         // ---- an approval prompt
         if let Some(a) = self.asks.front() {
             let bar = Span::styled("  ▌ ", Style::default().fg(t.shine));
@@ -938,7 +1084,9 @@ impl Chat {
         // not ✳: Windows draws that one as a colour emoji two cells wide
         const STAR: &[&str] = &["·", "✢", "✶", "✻", "✽", "✻", "✶", "✢"];
         let spin = STAR[(e.as_millis() / 120) as usize % STAR.len()];
-        let action = if !self.asks.is_empty() {
+        let action = if !self.questions.is_empty() {
+            "asking you".to_string()
+        } else if !self.asks.is_empty() {
             "waiting for you".to_string()
         } else if s.status.starts_with("compacting") || s.status.starts_with("API hiccup") {
             s.status.clone()
@@ -1115,6 +1263,13 @@ impl Pane for Chat {
                 }
                 Ev::Mark(text) => activity::push_mark(m, &text),
                 Ev::Status(st) => s.status = st,
+                Ev::Question(q) => {
+                    if self.questions.is_empty() {
+                        self.qs = QState::default();
+                    }
+                    self.questions.push_back(q);
+                    self.scroll = 0;
+                }
                 Ev::Ask(a) => {
                     if self.always.contains(&a.tool) {
                         let _ = a.reply.send(approve::Decision::Allow);
@@ -1162,6 +1317,7 @@ impl Pane for Chat {
         if finished {
             self.stream = None;
             self.asks.clear();
+            self.questions.clear();
             self.persist();
             // anything queued that the agent didn't take mid-reply is the next message
             if failed {
@@ -1292,7 +1448,9 @@ impl Pane for Chat {
         let skip = bw.saturating_sub(room.saturating_sub(1));
         let (text, style) = if self.input.is_empty() {
             let name = providers::label(&self.provider_of()).to_lowercase();
-            if self.stream.is_some() && self.stream.as_ref().is_some_and(|s| s.steer.is_some()) {
+            if !self.questions.is_empty() {
+                (format!("{name} is asking you something above: choose, or just type your own answer"), ui::muted(t))
+            } else if self.stream.is_some() && self.stream.as_ref().is_some_and(|s| s.steer.is_some()) {
                 (format!("type to queue a message: {name} reads it after its current step"), ui::muted(t))
             } else if self.stream.is_some() {
                 ("type to queue a message: it sends when this reply ends".to_string(), ui::muted(t))
@@ -1333,6 +1491,11 @@ impl Pane for Chat {
                 self.cache.clear();
                 cx.notify("chat deleted");
             }
+            return true;
+        }
+        // a question Claude is waiting on takes the keys first
+        if !self.questions.is_empty() {
+            self.question_key(k);
             return true;
         }
         // an approval Claude Code is waiting on takes y / n / a first
@@ -1939,6 +2102,44 @@ mod tests {
         c.chat.title = store::title_from(&msgs[0].content);
         c.chat.messages = msgs;
         k.render_html(&mut c, 130, 140, &base.join("oriel2.html").to_string_lossy());
+    }
+
+    /// Claude asking: the picker shows, numbers and arrows choose, several can be ticked, Other takes your words,
+    /// and the answers go back as question -> answer.
+    #[test]
+    fn chat_questions() {
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "quiz me on rust");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let qs = vec![
+            approve::Q { question: "What does `&mut` give you?".into(), header: "Quiz 1".into(), multi: false, options: vec![("A copy".into(), "".into()), ("A unique borrow".into(), "one writer at a time".into()), ("Ownership".into(), "".into())] },
+            approve::Q { question: "Which are Copy?".into(), header: "Quiz 2".into(), multi: true, options: vec![("i32".into(), "".into()), ("String".into(), "".into()), ("bool".into(), "".into())] },
+            approve::Q { question: "Your favourite crate?".into(), header: "Quiz 3".into(), multi: false, options: vec![("serde".into(), "".into()), ("tokio".into(), "".into())] },
+        ];
+        deliver(&mut k, &mut c, [Ev::Question(approve::Question { qs, reply: tx })]);
+        let s = k.render_html(&mut c, 120, 36, "target/snap/chat-question.html");
+        assert!(s.contains("Quiz 1") && s.contains("1 of 3") && s.contains("A unique borrow") && s.contains("Other…") && s.contains("Asking you"), "{s}");
+        k.key(&mut c, KeyCode::Char('2')); // a number answers a single choice
+        k.key(&mut c, KeyCode::Char(' ')); // tick i32
+        k.key(&mut c, KeyCode::Down);
+        k.key(&mut c, KeyCode::Down);
+        k.key(&mut c, KeyCode::Char(' ')); // tick bool
+        let s = k.render(&mut c, 120, 36);
+        assert!(s.contains("[x] i32") && s.contains("[x] bool") && s.contains("space tick"), "{s}");
+        k.key(&mut c, KeyCode::Enter);
+        k.typ(&mut c, "anyhow"); // typing answers in your own words
+        k.key(&mut c, KeyCode::Enter);
+        let ans = rx.try_recv().unwrap().unwrap();
+        assert_eq!(ans["What does `&mut` give you?"], "A unique borrow");
+        assert_eq!(ans["Which are Copy?"], "i32, bool");
+        assert_eq!(ans["Your favourite crate?"], "anyhow");
+        assert!(c.questions.is_empty());
+        // esc skips
+        let (tx, rx) = std::sync::mpsc::channel();
+        deliver(&mut k, &mut c, [Ev::Question(approve::Question { qs: vec![approve::Q { question: "Proceed?".into(), header: String::new(), multi: false, options: vec![("Yes".into(), "".into())] }], reply: tx })]);
+        k.key(&mut c, KeyCode::Esc);
+        assert_eq!(rx.try_recv().unwrap(), None);
+        assert!(c.stream.is_some(), "esc skipped the question, it didn't stop the reply");
     }
 
     #[test]

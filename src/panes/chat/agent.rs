@@ -283,6 +283,7 @@ pub fn label(name: &str) -> String {
         "WebSearch" | "web_search" => "Web search".into(),
         "NotebookEdit" => "Notebook".into(),
         "LS" => "List".into(),
+        "AskUserQuestion" => "Asked you".into(),
         "command_execution" => "Run".into(),
         "file_change" => "Update".into(),
         n if n.starts_with("mcp__") => {
@@ -320,6 +321,11 @@ pub fn target(name: &str, input: &Value, cwd: &Path) -> String {
         "WebFetch" => s("url"),
         "WebSearch" => s("query"),
         "Task" | "Agent" => s("description"),
+        "AskUserQuestion" => {
+            let qs = input["questions"].as_array().map(|a| a.len()).unwrap_or(0);
+            let first = input["questions"][0]["header"].as_str().filter(|h| !h.is_empty()).or(input["questions"][0]["question"].as_str()).unwrap_or("");
+            if qs > 1 { format!("{first} +{}", qs - 1) } else { first.to_string() }
+        }
         _ => {
             // first short string argument
             for k in ["file_path", "path", "command", "url", "query", "pattern", "description", "name"] {
@@ -467,6 +473,11 @@ fn finish(t: &mut Tool, text: &str, r: &Value, is_error: bool) {
                 None => crate::ui::human_bytes(bytes),
             };
             t.body = output(r["result"].as_str().unwrap_or(text), '#');
+        }
+        "AskUserQuestion" => {
+            let answers = r["answers"].as_object().cloned().unwrap_or_default();
+            t.summary = if answers.is_empty() { "no answer".into() } else { "you answered".into() };
+            t.body = answers.iter().map(|(q, a)| line('>', None, &format!("· {q} → {}", a.as_str().unwrap_or("")))).collect();
         }
         "Task" | "Agent" => {
             if r["isAsync"].as_bool() == Some(true) || r["status"] == "async_launched" {

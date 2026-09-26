@@ -86,6 +86,8 @@ pub enum Ev {
     State(String, String),
     /// Claude Code wants permission for a tool call (/perms ask).
     Ask(approve::Ask),
+    /// Claude Code is asking you to pick (AskUserQuestion: choices, quizzes).
+    Question(approve::Question),
     /// Claude Code just read a message you queued mid-reply (shown inline where it landed).
     Steered(String),
     /// A marker in the transcript: "conversation compacted", "usage limit reached".
@@ -471,20 +473,19 @@ fn claude(req: &Request, stop: &AtomicBool, send: Arc<dyn Fn(Ev) + Send + Sync>,
         .iter()
         .map(|s| s.to_string())
         .collect();
-    // /perms ask: every call that needs permission comes back to the chat through oriel's own MCP server
+    // oriel's own MCP bridge: Claude's questions come to the chat as a picker (it only offers that tool with a
+    // permission-prompt tool attached), and under /perms ask so does every call that needs permission
     let mut broker = None;
     let mut cfg_file = None;
-    if req.perms == "ask" {
-        if let Ok(b) = approve::Broker::start(req.cwd.clone(), send.clone()) {
-            if let Some((a, path)) = approve::claude_args(&b) {
-                args.extend(a);
-                cfg_file = Some(path);
-                broker = Some(b);
-            }
+    if let Ok(b) = approve::Broker::start(req.cwd.clone(), req.perms.clone(), send.clone()) {
+        if let Some((a, path)) = approve::claude_args(&b) {
+            args.extend(a);
+            cfg_file = Some(path);
+            broker = Some(b);
         }
-        if broker.is_none() {
-            send(Ev::Status("couldn't set up approvals: anything that needs permission will be refused".into()));
-        }
+    }
+    if broker.is_none() && req.perms == "ask" {
+        send(Ev::Status("couldn't set up approvals: anything that needs permission will be refused".into()));
     }
     if let Some(s) = &sid {
         args.push("--resume".into());
@@ -600,6 +601,61 @@ mod tests {
         let r = run_cli(exe, &args, |_| {}, &std::env::temp_dir(), &stop, |_| Ok(()));
         assert!(r.is_ok(), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
+    }
+
+    /// Claude's questions come to the chat and the answer gets back to it, through the real `oriel --mcp-approve`.
+    /// `cargo build; cargo test chat_claude_live_question -- --ignored --nocapture` (a cent or two)
+    #[test]
+    #[ignore]
+    fn chat_claude_live_question() {
+        LIVE.store(true, Ordering::SeqCst);
+        let dir = std::path::absolute("target/test-scratch/question").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let req = Request {
+            provider: "claude".into(),
+            model: Some("haiku".into()),
+            messages: vec![("user".into(), "Use your AskUserQuestion tool to ask me one multiple-choice question: tabs or spaces? Then tell me in one sentence what I picked.".into())],
+            cwd: dir,
+            perms: "edits".into(),
+            state: Default::default(),
+            cfg: AiConfig::default(),
+            steer: None,
+        };
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let (l2, done) = (log.clone(), Arc::new(AtomicBool::new(false)));
+        let d2 = done.clone();
+        start(req, Arc::default(), move |e| {
+            let s = match e {
+                Ev::Question(q) => {
+                    let mut m = serde_json::Map::new();
+                    let pick = q.qs[0].options.iter().find(|o| o.0.to_lowercase().contains("space")).map(|o| o.0.clone()).unwrap_or("Spaces".into());
+                    m.insert(q.qs[0].question.clone(), serde_json::Value::String(pick));
+                    let _ = q.reply.send(Some(m));
+                    format!("QUESTION {}", q.qs[0].question)
+                }
+                Ev::Token(t) => format!("text {t}"),
+                Ev::Tool(t) => format!("tool {} {} {} {:?}", t.label, t.target, t.status, t.body),
+                Ev::Done { .. } => "DONE".into(),
+                Ev::Error(x) => format!("ERROR {x}"),
+                _ => return,
+            };
+            if s == "DONE" || s.starts_with("ERROR") {
+                d2.store(true, Ordering::SeqCst);
+            }
+            l2.lock().unwrap().push(s);
+        });
+        let t0 = Instant::now();
+        while !done.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(120) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let all = log.lock().unwrap().clone();
+        for l in &all {
+            println!("{l}");
+        }
+        assert!(all.iter().any(|l| l.starts_with("QUESTION")), "the question never reached the chat");
+        assert!(all.iter().any(|l| l.starts_with("tool Asked you") && l.contains("done") && l.contains("→")), "the transcript shows the answer");
+        let text: String = all.iter().filter_map(|l| l.strip_prefix("text ")).collect();
+        assert!(text.to_lowercase().contains("space"), "{text}");
     }
 
     /// Queued messages reach Claude Code mid-reply. Costs a couple of cents: `cargo test chat_claude_live_steer -- --ignored --nocapture`

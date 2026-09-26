@@ -1,4 +1,7 @@
-//! `/perms ask` for Claude Code: approve each tool call from the chat.
+//! Claude Code asking the person in oriel: `/perms ask` approvals, and its questions (AskUserQuestion, which is
+//! how it asks you to pick something and runs quizzes). Claude Code only offers that tool when a permission-prompt
+//! tool is attached, so every Claude run gets this bridge; outside `/perms ask` it refuses what the mode doesn't
+//! allow, exactly as before.
 //!
 //! Claude Code runs with `--permission-prompt-tool mcp__oriel__approve` and an MCP server that is oriel itself
 //! (`oriel --mcp-approve <port> <token>`, JSON-RPC over stdio). That server forwards every approval request over
@@ -31,6 +34,37 @@ pub struct Ask {
     pub reply: mpsc::Sender<Decision>,
 }
 
+/// One question Claude asked: what it asks, a short header, the choices (label, description), and whether several
+/// can be picked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Q {
+    pub question: String,
+    pub header: String,
+    pub multi: bool,
+    pub options: Vec<(String, String)>,
+}
+
+/// Up to a few questions at once; the reply is question -> answer, or None when you skip.
+pub struct Question {
+    pub qs: Vec<Q>,
+    pub reply: mpsc::Sender<Option<serde_json::Map<String, Value>>>,
+}
+
+pub fn parse_questions(input: &Value) -> Vec<Q> {
+    input["questions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|q| Q {
+            question: q["question"].as_str().unwrap_or("").to_string(),
+            header: q["header"].as_str().unwrap_or("").to_string(),
+            multi: q["multiSelect"].as_bool().unwrap_or(false),
+            options: q["options"].as_array().into_iter().flatten().map(|o| (o["label"].as_str().unwrap_or("").to_string(), o["description"].as_str().unwrap_or("").to_string())).collect(),
+        })
+        .filter(|q| !q.question.is_empty())
+        .collect()
+}
+
 /// The loopback end in oriel. Dropping it stops accepting.
 pub struct Broker {
     pub port: u16,
@@ -57,7 +91,8 @@ fn token() -> String {
 }
 
 impl Broker {
-    pub fn start(cwd: std::path::PathBuf, send: Arc<dyn Fn(Ev) + Send + Sync>) -> std::io::Result<Broker> {
+    /// `mode` is the chat's /perms: only "ask" brings approvals to the chat; questions always do.
+    pub fn start(cwd: std::path::PathBuf, mode: String, send: Arc<dyn Fn(Ev) + Send + Sync>) -> std::io::Result<Broker> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
@@ -68,9 +103,9 @@ impl Broker {
             while !st.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let (send, tk, cwd) = (send.clone(), tk.clone(), cwd.clone());
+                        let (send, tk, cwd, mode) = (send.clone(), tk.clone(), cwd.clone(), mode.clone());
                         std::thread::spawn(move || {
-                            let _ = handle(stream, &tk, &cwd, &*send);
+                            let _ = handle(stream, &tk, &cwd, &mode, &*send);
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(40)),
@@ -82,8 +117,8 @@ impl Broker {
     }
 }
 
-/// One request from the MCP server: `{"token", "tool_name", "input"}` -> `{"behavior": "allow"|"deny"}`.
-fn handle(stream: TcpStream, tok: &str, cwd: &std::path::Path, send: &dyn Fn(Ev)) -> std::io::Result<()> {
+/// One request from the MCP server: `{"token", "tool_name", "input"}` -> `{"behavior": "allow"|"deny", ...}`.
+fn handle(stream: TcpStream, tok: &str, cwd: &std::path::Path, mode: &str, send: &dyn Fn(Ev)) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut line = String::new();
@@ -94,6 +129,31 @@ fn handle(stream: TcpStream, tok: &str, cwd: &std::path::Path, send: &dyn Fn(Ev)
         return writeln!(out, "{}", json!({"behavior": "deny", "message": "bad token"}));
     }
     let tool = v["tool_name"].as_str().unwrap_or("tool").to_string();
+    // a question for you: shown as a picker, your answers go back in the tool's input
+    if tool == "AskUserQuestion" {
+        let qs = parse_questions(&v["input"]);
+        if qs.is_empty() {
+            return writeln!(out, "{}", json!({"behavior": "deny", "message": "No questions came through."}));
+        }
+        let (tx, rx) = mpsc::channel();
+        send(Ev::Question(Question { qs, reply: tx }));
+        let ans = match rx.recv().ok().flatten() {
+            Some(answers) => {
+                let mut input = v["input"].clone();
+                if let Some(o) = input.as_object_mut() {
+                    o.insert("answers".into(), Value::Object(answers));
+                }
+                json!({"behavior": "allow", "updatedInput": input})
+            }
+            None => json!({"behavior": "deny", "message": "The user skipped the question. Carry on with your best judgement, or ask in plain text."}),
+        };
+        return writeln!(out, "{ans}");
+    }
+    // outside /perms ask, the mode decides, as it did before oriel was asked at all
+    if mode != "ask" {
+        let msg = format!("Not allowed in oriel's current permission mode ({mode}). The user can change it with /perms in oriel.");
+        return writeln!(out, "{}", json!({"behavior": "deny", "message": msg}));
+    }
     let t = super::agent::describe("", &tool, &v["input"], cwd);
     let mut body = t.body;
     if body.is_empty() {
@@ -113,14 +173,14 @@ fn handle(stream: TcpStream, tok: &str, cwd: &std::path::Path, send: &dyn Fn(Ev)
     writeln!(out, "{ans}")
 }
 
-/// Ask the running oriel. Anything going wrong is a deny.
-fn forward(port: u16, tok: &str, tool: &str, input: &Value) -> Result<Decision, String> {
+/// Ask the running oriel; its answer comes back as is (behavior, and a message or new input). Anything going
+/// wrong is an error, which the caller turns into a deny.
+fn forward(port: u16, tok: &str, tool: &str, input: &Value) -> Result<Value, String> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("oriel isn't answering: {e}"))?;
     writeln!(s, "{}", json!({"token": tok, "tool_name": tool, "input": input})).map_err(|e| e.to_string())?;
     let mut line = String::new();
     BufReader::new(&s).read_line(&mut line).map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(line.trim()).map_err(|e| e.to_string())?;
-    Ok(if v["behavior"] == "allow" { Decision::Allow } else { Decision::Deny })
+    serde_json::from_str(line.trim()).map_err(|e| e.to_string())
 }
 
 /// The MCP server side: `oriel --mcp-approve <port> <token>`, newline-delimited JSON-RPC on stdin/stdout.
@@ -131,7 +191,7 @@ pub fn serve_stdio(port: &str, tok: &str) {
     serve(stdin.lock(), stdout.lock(), |tool, input| forward(port, tok, tool, input));
 }
 
-pub fn serve(input: impl BufRead, mut out: impl Write, ask: impl Fn(&str, &Value) -> Result<Decision, String>) {
+pub fn serve(input: impl BufRead, mut out: impl Write, ask: impl Fn(&str, &Value) -> Result<Value, String>) {
     for line in input.lines() {
         let Ok(line) = line else { break };
         let Ok(req) = serde_json::from_str::<Value>(line.trim()) else { continue };
@@ -161,8 +221,8 @@ pub fn serve(input: impl BufRead, mut out: impl Write, ask: impl Fn(&str, &Value
                 let a = &req["params"]["arguments"];
                 let input = if a["input"].is_object() { a["input"].clone() } else { json!({}) };
                 let answer = match ask(a["tool_name"].as_str().unwrap_or("tool"), &input) {
-                    Ok(Decision::Allow) => json!({"behavior": "allow", "updatedInput": input}),
-                    Ok(Decision::Deny) => json!({"behavior": "deny", "message": "The user said no in oriel."}),
+                    Ok(v) if v["behavior"] == "allow" => json!({"behavior": "allow", "updatedInput": if v["updatedInput"].is_object() { v["updatedInput"].clone() } else { input }}),
+                    Ok(v) => json!({"behavior": "deny", "message": v["message"].as_str().unwrap_or("The user said no in oriel.")}),
                     Err(e) => json!({"behavior": "deny", "message": format!("Couldn't ask the user: {e}")}),
                 };
                 json!({"content": [{"type": "text", "text": answer.to_string()}]})
@@ -185,6 +245,9 @@ pub fn serve(input: impl BufRead, mut out: impl Write, ask: impl Fn(&str, &Value
 /// Claude Code's arguments for asking through oriel, and the config file they point at (delete it afterwards).
 pub fn claude_args(b: &Broker) -> Option<(Vec<String>, std::path::PathBuf)> {
     let exe = std::env::current_exe().ok()?;
+    // under `cargo test` this binary is the test runner: point at the real one next to it (cargo build first)
+    #[cfg(test)]
+    let exe = exe.parent()?.parent()?.join(if cfg!(windows) { "oriel.exe" } else { "oriel" });
     let cfg = json!({"mcpServers": {"oriel": {"command": exe.to_string_lossy(), "args": ["--mcp-approve", b.port.to_string(), b.token.clone()]}}});
     let path = std::env::temp_dir().join(format!("oriel-approve-{}-{}.json", std::process::id(), b.port));
     std::fs::write(&path, cfg.to_string()).ok()?;
@@ -207,7 +270,7 @@ mod tests {
                 let _ = a.reply.send(if a.tool == "Bash" { Decision::Allow } else { Decision::Deny });
             }
         });
-        let b = Broker::start(std::path::PathBuf::from("/w"), send).unwrap();
+        let b = Broker::start(std::path::PathBuf::from("/w"), "ask".into(), send).unwrap();
         let rpc = [
             json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
             json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
@@ -230,7 +293,38 @@ mod tests {
         assert_eq!(ans(3)["behavior"], "deny");
         assert_eq!(*asks.lock().unwrap(), vec!["Bash cargo test".to_string(), "Write a.txt".to_string()]);
         // a wrong token is refused without asking
-        assert_eq!(forward(b.port, "nope", "Bash", &json!({})).unwrap(), Decision::Deny);
+        assert_eq!(forward(b.port, "nope", "Bash", &json!({})).unwrap()["behavior"], "deny");
         assert_eq!(asks.lock().unwrap().len(), 2);
+    }
+
+    /// Claude's questions reach the chat in every mode and the answers go back in its input; other calls outside
+    /// /perms ask are refused without asking.
+    #[test]
+    fn chat_approve_questions() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let s2 = seen.clone();
+        let send: Arc<dyn Fn(Ev) + Send + Sync> = Arc::new(move |ev| match ev {
+            Ev::Question(q) => {
+                s2.lock().unwrap().push(format!("{} [{}]", q.qs[0].question, q.qs[0].options.len()));
+                let mut m = serde_json::Map::new();
+                m.insert(q.qs[0].question.clone(), json!("Spaces"));
+                let _ = q.reply.send(Some(m));
+            }
+            Ev::Ask(a) => {
+                s2.lock().unwrap().push(format!("ASKED {}", a.tool));
+                let _ = a.reply.send(Decision::Allow);
+            }
+            _ => {}
+        });
+        let b = Broker::start(std::path::PathBuf::from("/w"), "edits".into(), send).unwrap();
+        let q = json!({"questions": [{"question": "Tabs or spaces?", "header": "Indentation", "multiSelect": false, "options": [{"label": "Tabs", "description": "t"}, {"label": "Spaces", "description": "s"}]}]});
+        let v = forward(b.port, &b.token, "AskUserQuestion", &q).unwrap();
+        assert_eq!(v["behavior"], "allow");
+        assert_eq!(v["updatedInput"]["answers"]["Tabs or spaces?"], "Spaces");
+        assert_eq!(v["updatedInput"]["questions"][0]["header"], "Indentation", "the questions stay in the input");
+        let v = forward(b.port, &b.token, "Bash", &json!({"command": "rm -rf x"})).unwrap();
+        assert_eq!(v["behavior"], "deny");
+        assert!(v["message"].as_str().unwrap().contains("/perms"));
+        assert_eq!(*seen.lock().unwrap(), vec!["Tabs or spaces? [2]".to_string()], "edits mode never asks about Bash");
     }
 }

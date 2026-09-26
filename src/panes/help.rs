@@ -122,6 +122,13 @@ fn topics() -> Vec<Topic> {
             K("/perms plan", "read-only"),
             K("/perms bypass", "anything, never asks — only in folders you trust"),
             P("The choice is saved for every chat. If a reply says actions were blocked, pick a looser mode."),
+            Gap,
+            H("when Claude asks you something"),
+            P("Claude Code can stop and ask you to pick (and run quizzes this way): the question shows above the box with its choices."),
+            K("↑ ↓  ·  1-9", "choose (a number answers right away)"),
+            K("space", "tick one, when you can pick several"),
+            K("enter  ·  type", "answer · or just type your own"),
+            K("esc", "skip the question (esc again stops the reply)"),
         ]},
         Topic { icon: "ai", title: "chat commands", app: "", items: chat_cmds },
         Topic { icon: "robot", title: "agents & lead mode", app: "agents", items: vec![
