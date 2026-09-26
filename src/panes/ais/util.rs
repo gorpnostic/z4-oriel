@@ -313,9 +313,18 @@ pub fn fresh_path() -> std::ffi::OsString {
     }
     let ps = Path::new("powershell.exe");
     let script = "[Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')";
-    let Some(reg) = run_timeout(ps, &["-NoProfile", "-NonInteractive", "-Command", script], Duration::from_secs(5)) else { return mine };
+    match run_timeout(ps, &["-NoProfile", "-NonInteractive", "-Command", script], Duration::from_secs(5)) {
+        Some(out) => add_dirs(mine, &out),
+        None => mine,
+    }
+}
+
+/// `mine` plus the folders in `out`, PowerShell's answer: the registry's PATH on its first line (stdout), then
+/// whatever it printed on stderr (Windows PowerShell started from pwsh 7 can complain about modules).
+fn add_dirs(mine: std::ffi::OsString, out: &str) -> std::ffi::OsString {
+    let reg = out.lines().next().unwrap_or("");
     let mut dirs: Vec<PathBuf> = std::env::split_paths(&mine).collect();
-    for d in reg.trim().split(';').map(str::trim).filter(|d| !d.is_empty()) {
+    for d in reg.split(';').map(str::trim).filter(|d| !d.is_empty()) {
         let d = PathBuf::from(d);
         if !dirs.contains(&d) {
             dirs.push(d);
@@ -345,5 +354,13 @@ mod tests {
         assert_eq!(tok(1_234_567), "1.2M");
         assert_eq!(find_version("2.1.282 (Claude Code)").as_deref(), Some("2.1.282"));
         assert_eq!(find_version("codex-cli 0.147.0").as_deref(), Some("0.147.0"));
+    }
+
+    #[test]
+    fn ais_fresh_path_adds_new_folders_only() {
+        let mine = std::env::join_paths(["/a", "/b"]).unwrap();
+        let got: Vec<PathBuf> = std::env::split_paths(&add_dirs(mine.clone(), "/b;/c; ;\r\n\nType data error;/d\n")).collect();
+        assert_eq!(got, ["/a", "/b", "/c"].map(PathBuf::from), "stderr after the first line is never a folder");
+        assert_eq!(add_dirs(mine.clone(), "\nsome error"), mine);
     }
 }

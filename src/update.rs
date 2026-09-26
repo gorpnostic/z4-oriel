@@ -504,6 +504,11 @@ pub fn cli_script_fallback() -> i32 {
     };
     let Some(dir) = exe.parent() else { return 1 };
     println!(":: trying the install script instead, into {}", dir.display());
+    // the script keeps no copy of the version it replaces: keep one here, so `oriel rollback` still works after it
+    if let Err(e) = keep_current(&exe, VERSION, &|s| println!(":: {s}")) {
+        eprintln!("update failed: {e}");
+        return exit_code(&e);
+    }
     let raw = format!("https://raw.githubusercontent.com/{REPO}/master");
     let mut c = if cfg!(windows) {
         let mut c = std::process::Command::new("powershell.exe");

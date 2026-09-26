@@ -2072,6 +2072,9 @@ mod tests {
         let mut cfg = Config::default();
         cfg.theme = "oriel".into();
         let mut app = App::new(cfg, tx);
+        // the F4 tab, with a stand-in pane: a real music player would scan the music folder on this machine
+        let id = app.add(Box::new(crate::panes::themes::Themes::new()));
+        app.tabs.push(Tab { app: Some("music"), name: None, root: Node::Leaf(id), focus: id, zoom: false });
         let music_tabs = |app: &App| app.tabs.iter().filter(|t| t.app == Some("music")).count();
         // m on a new tab's launcher, twice: the F4 tab both times, and the launcher steps aside
         for _ in 0..2 {

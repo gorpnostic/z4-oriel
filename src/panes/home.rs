@@ -75,7 +75,9 @@ impl Pane for Home {
         self.sel = self.sel.min(apps.len().saturating_sub(1));
         let cols = if area.width >= 90 { 3 } else if area.width >= 60 { 2 } else { 1 };
         let rows = apps.len().div_ceil(cols) as u16;
-        let block_h = 10 + 2 + rows * 2 + 2 + 4;
+        // a blank line between rows when there's room, else none: every app still fits in one narrow column
+        let gap: u16 = if 10 + 2 + rows * 2 + 2 + 4 <= area.height { 2 } else { 1 };
+        let block_h = 10 + 2 + rows * gap + 2 + 4;
         let top = area.y + area.height.saturating_sub(block_h) / 2;
         let mut y = top;
         let lh = ui::logo(f, Rect { y, height: area.height.saturating_sub(y - area.y), ..area }, t, cx.time);
@@ -92,7 +94,7 @@ impl Pane for Home {
             let (name, key, icon, label) = APPS[i];
             let fkey = crate::app::SIDEBAR.iter().find(|a| a.0 == name).map(|a| a.3).unwrap_or("");
             let (r, c) = (n / cols, n % cols);
-            let rect = Rect { x: x0 + c as u16 * cell_w, y: y + r as u16 * 2, width: cell_w, height: 1 };
+            let rect = Rect { x: x0 + c as u16 * cell_w, y: y + r as u16 * gap, width: cell_w, height: 1 };
             if rect.bottom() > area.bottom() {
                 break;
             }
@@ -108,7 +110,7 @@ impl Pane for Home {
             f.render_widget(Paragraph::new(line), rect);
             self.hits.push((rect, n));
         }
-        y += rows * 2 + 1;
+        y += rows * gap + 1;
         // bindings
         let pre = cx.config.prefix.replace("ctrl+", "ctrl-");
         let lines = vec![
@@ -197,6 +199,9 @@ mod tests {
             assert!(s.contains(want), "{want}: {s}");
         }
         assert!(s.lines().any(|l| l.contains(" m ") && l.contains("music") && l.contains("F4")), "{s}");
+        // one narrow column still has room for all of them (rows close up instead of the last ones falling off)
+        let s = k.render(&mut h, 50, 34);
+        assert!(s.contains("themes") && s.contains("help") && s.contains("new tab"), "{s}");
         // music is the F4 tab, not a second player; the launcher steps aside
         k.key(&mut h, KeyCode::Char('m'));
         assert_eq!(goto(&k), ["goto music", "close"]);
