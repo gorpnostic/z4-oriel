@@ -36,20 +36,32 @@ struct Step {
 const STEPS: &[Step] = &[
     Step {
         title: "switch apps",
-        body: "Everything lives in the sidebar. Open music: press F4, or click it.",
+        body: "Everything lives in the sidebar: the ai apps on top, the tools below. Open music: press F4, or click it.",
         keys: "F4",
         done: Some(|now, _| now.app == Some("music")),
     },
     Step {
-        title: "back to chat",
-        body: "F1 is chat, F2 runs several coding agents at once, F3 shows your AIs and their limits. Go back to chat.",
+        title: "chat with any AI",
+        body: "F1 is chat. /provider picks the AI (Claude Code, Codex, Ollama\u{2026}), /model its model, /perms what coding agents may do \u{2014} all remembered. Go back to chat.",
         keys: "F1",
         done: Some(|now, _| now.app == Some("ai")),
     },
     Step {
+        title: "your AIs",
+        body: "F3 installs and signs in to AI tools with one key each, and shows your plan limits and usage. Have a look.",
+        keys: "F3",
+        done: Some(|now, _| now.app == Some("ais")),
+    },
+    Step {
+        title: "a team of agents",
+        body: "F2 is agents. Press L there, give one goal and pick a lead AI: it splits the work between worker AIs, each in its own copy of the repo, and merges it safely. Open it.",
+        keys: "F2",
+        done: Some(|now, _| now.app == Some("agents")),
+    },
+    Step {
         title: "the palette",
         body: "alt p opens a search over every app, action and theme. Open it, have a look, then esc.",
-        keys: "alt p  ·  esc",
+        keys: "alt p  \u{b7}  esc",
         done: Some(|now, start| now.palette_seen > start.palette_seen && !now.palette_open),
     },
     Step {
@@ -67,7 +79,7 @@ const STEPS: &[Step] = &[
     Step {
         title: "move between panes",
         body: "alt + arrow keys move between panes; alt shift + arrows resize them. Or just click, and drag the divider.",
-        keys: "alt ←  alt →",
+        keys: "alt \u{2190}  alt \u{2192}",
         done: Some(|now, start| now.focus != start.focus),
     },
     Step {
@@ -83,18 +95,33 @@ const STEPS: &[Step] = &[
         done: Some(|now, start| now.ctx_seen > start.ctx_seen),
     },
     Step {
+        title: "copy, paste, close",
+        body: "Drag over any text to copy it (shift+drag in programs that use the mouse). alt v pastes a screenshot into Claude Code, Codex or chat. The \u{d7} on a pane or tab closes it, and so does alt w.",
+        keys: "",
+        done: None,
+    },
+    Step {
         title: "agents look after themselves",
         body: "Run Claude Code or Codex in a terminal (or start tasks in agents, F2) and their tabs get status dots: \u{25d0} working, red \u{25cf} needs you, green \u{25cf} done. You get a toast when one finishes while you're elsewhere.",
         keys: "",
         done: None,
     },
     Step {
+        title: "the help screen",
+        body: "F10 (or ? in most apps) opens the guide: every key and command, by topic, starting on the app you're in. Open it.",
+        keys: "F10",
+        done: Some(|now, _| now.app == Some("help")),
+    },
+    Step {
         title: "you're set",
-        body: "? shows every key, alt p finds everything else. Replay this tour from the palette (\u{201c}take the tour\u{201d}).",
+        body: "alt p finds everything and F10 explains it. Replay this tour from the palette (\u{201c}take the tour\u{201d}) or with oriel --tour.",
         keys: "",
         done: None,
     },
 ];
+
+/// The step whose key is the app's own F10, so the tour lets it through instead of skipping.
+const HELP_STEP: &str = "the help screen";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Btn {
@@ -387,6 +414,7 @@ impl Onboard {
                 _ => {}
             },
             Stage::Tour { step, start } => match k.code {
+                KeyCode::F(10) if STEPS[*step].title == HELP_STEP => return (false, Out::None),
                 KeyCode::F(10) => {
                     return (true, self.advance(probe));
                 }
@@ -639,7 +667,7 @@ impl Onboard {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), Rect { height: inner.height.saturating_sub(1), ..inner });
         // buttons on the bottom row
         let by = inner.bottom().saturating_sub(1);
-        let next = if s.done.is_none() { if step + 1 == STEPS.len() { " enter  finish " } else { " enter  next › " } } else { " F10  skip step › " };
+        let next = if s.done.is_none() { if step + 1 == STEPS.len() { " enter  finish " } else { " enter  next › " } } else if s.title == HELP_STEP { " skip step › " } else { " F10  skip step › " };
         let end = " F11  end tour ";
         let rn = Rect { x: inner.x, y: by, width: next.chars().count() as u16, height: 1 };
         let re = Rect { x: inner.x + rn.width + 2, y: by, width: end.chars().count() as u16, height: 1 };

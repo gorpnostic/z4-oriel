@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::Paragraph,
 };
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -42,6 +42,7 @@ pub const SIDEBAR: &[(&str, &str, &str, &str)] = &[
     ("notes", "notes", "notes", "F7"),
     ("storage", "storage", "storage", "F8"),
     ("terminal", "term", "terminal", "F9"),
+    ("help", "search", "help", "F10"),
 ];
 /// Where each sidebar section starts: (index into SIDEBAR, heading).
 const SECTIONS: &[(usize, &str)] = &[(0, "ai"), (3, "tools")];
@@ -134,7 +135,6 @@ pub struct App {
     notice: Option<(String, Instant)>,
     prefix_armed: bool,
     palette: Option<Palette>,
-    help: bool,
     quit: bool,
     start: Instant,
     last_tick: HashMap<PaneId, Instant>,
@@ -185,7 +185,6 @@ impl App {
             notice: None,
             prefix_armed: false,
             palette: None,
-            help: false,
             quit: false,
             start: Instant::now(),
             last_tick: HashMap::new(),
@@ -240,6 +239,16 @@ impl App {
 
     /// Show an app's tab, creating it the first time (like nest's F1-F6).
     fn goto_app(&mut self, name: &'static str) {
+        if let (true, Some(t)) = (name == "help", self.tabs.get(self.cur)) {
+            let ctx = match t.app {
+                Some(a) => a,
+                None if self.panes.get(&t.focus).map(|p| p.is_terminal()).unwrap_or(false) => "terminal",
+                None => "home",
+            };
+            if ctx != "help" {
+                panes::help::set_context(ctx);
+            }
+        }
         if let Some(i) = self.tabs.iter().position(|t| t.app == Some(name)) {
             self.cur = i;
             return;
@@ -255,6 +264,11 @@ impl App {
         let at = self.tabs.iter().position(|t| order(t.app) > me).unwrap_or(self.tabs.len());
         self.tabs.insert(at, Tab { app: Some(name), name: None, root: Node::Leaf(id), focus: id, zoom: false });
         self.cur = at;
+    }
+
+    /// The help app, opened on the topic for whatever you're looking at (F10, ?, the sidebar, the palette).
+    fn open_help(&mut self) {
+        self.goto_app("help");
     }
 
     /// Tabs you made (not the pinned apps), with their index in self.tabs.
@@ -768,10 +782,6 @@ impl App {
             }
             return;
         }
-        if self.help {
-            self.help = false;
-            return;
-        }
         if self.palette.is_some() {
             self.palette_key(k);
             return;
@@ -812,7 +822,7 @@ impl App {
         if !used && !self.panes.get(&id).map(|p| p.is_terminal()).unwrap_or(false) {
             // unused keys in app panes
             if let KeyCode::Char('?') = k.code {
-                self.help = true;
+                self.open_help();
             }
         }
     }
@@ -884,7 +894,7 @@ impl App {
                 }
             }
             KeyCode::Char(':') | KeyCode::Char(' ') => self.open_palette(),
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?') => self.open_help(),
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char(c) => {
                 if let Some(a) = APPS.iter().find(|a| a.1 == c && a.0 != "terminal") {
@@ -940,7 +950,7 @@ impl App {
                 ui::NERD.store(n, std::sync::atomic::Ordering::Relaxed);
                 self.notify(if n { "nerd font icons" } else { "plain icons (no nerd font)" });
             }
-            Cmd::Help => self.help = true,
+            Cmd::Help => self.open_help(),
             Cmd::Tour => self.start_tour(),
             Cmd::Quit => self.quit = true,
         }
@@ -973,7 +983,7 @@ impl App {
             items.push((format!("{}theme {t}", ui::lead("theme")), Cmd::Theme(t)));
         }
         items.push(("toggle nerd font icons".into(), Cmd::Icons));
-        items.push(("key bindings".into(), Cmd::Help));
+        items.push((format!("{}help: every key, command and how-to  F10", ui::lead("search")), Cmd::Help));
         items.push((format!("{}take the tour", ui::lead("window")), Cmd::Tour));
         items.push((format!("{}quit oriel", ui::lead("quit")), Cmd::Quit));
         self.palette = Some(Palette { query: String::new(), sel: 0, items, theme_before: self.theme.name.clone() });
@@ -1319,15 +1329,12 @@ impl App {
         if let Some(p) = &self.palette {
             self.draw_palette(f, area, p, &t);
         }
-        if self.help {
-            draw_help(f, area, &t, &self.config);
-        }
         if let Some(ob) = &mut self.onboard {
             ob.draw(f, area, &t, self.start.elapsed().as_secs_f64());
         }
     }
 
-    /// The sidebar: the apps in sections (F1-F9), your own tabs, then the current app's own section.
+    /// The sidebar: the apps in sections (F1-F10), your own tabs, then the current app's own section.
     fn draw_sidebar(&mut self, f: &mut Frame, area: Rect, t: &Theme) {
         let time = self.start.elapsed().as_secs_f64();
         let cur_app = self.tabs[self.cur].app;
@@ -1484,43 +1491,6 @@ impl App {
     }
 }
 
-fn draw_help(f: &mut Frame, area: Rect, t: &Theme, c: &Config) {
-    let inner = ui::popup(f, area, 70, 24, "key bindings", t);
-    let pre = c.prefix.clone();
-    let rows: Vec<(String, &str)> = vec![
-        ("alt ←↑↓→".into(), "move between panes"),
-        ("alt shift ←↑↓→".into(), "resize the pane"),
-        ("alt n · alt enter".into(), "new terminal (splits the pane)"),
-        ("alt p".into(), "palette: open apps, themes, everything"),
-        ("F1-F3".into(), "ai: chat · agents · your AIs"),
-        ("F4-F9".into(), "tools: music · system · files · notes · storage · terminal"),
-        ("F12".into(), "play / pause music from anywhere"),
-        ("alt 1-9 · alt t".into(), "go to one of your tabs · new tab"),
-        ("alt s".into(), "hide / show the sidebar"),
-        ("alt z · alt w".into(), "zoom pane · close pane"),
-        ("right-click".into(), "menu: split, zoom, rename, close"),
-        ("drag".into(), "select text in any pane: it's copied when you let go (shift+drag in apps that use the mouse)"),
-        ("alt v".into(), "paste a clipboard image (or copied files) into Claude Code, Codex or the chat, as a path"),
-        ("click ×".into(), "close a pane (top-right of its frame) or a tab (in the sidebar); middle-click a tab too"),
-        ("double-click a tab".into(), "rename it (or prefix then ,)"),
-        (format!("{pre} then"), ""),
-        ("  | or v  ·  - ".into(), "split right · split down"),
-        ("  , · &".into(), "rename tab · close tab"),
-        ("  h j k l".into(), "move  (H J K L resize)"),
-        ("  x · z · c · n/p".into(), "close · zoom · new tab · next/prev tab"),
-        ("  a m s f e g".into(), "open ai · music · system · files · notes · storage"),
-        ("  t · space · q".into(), "themes · palette · quit"),
-        (format!("  {pre} again"), "send the prefix key to the program"),
-        ("mouse".into(), "click to focus · drag a divider to resize · wheel scrolls"),
-    ];
-    let lines: Vec<Line> = rows
-        .into_iter()
-        .map(|(k, v)| Line::from(vec![Span::styled(format!("{k:<22}"), ui::bold_accent(t)), Span::raw(v.to_string())]))
-        .chain([Line::raw(""), Line::styled("any key closes this", ui::muted(t))])
-        .collect();
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-}
-
 fn clock() -> String {
     // local time without a date crate: good enough via the OS
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -1641,6 +1611,40 @@ mod tests {
         crate::testkit::save_html(term.backend().buffer(), "docs/screenshot-apps.html");
     }
     #[test]
+    fn app_help_screen() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "ultra".into();
+        let mut app = App::new(cfg, tx);
+        let mut term = Terminal::new(TestBackend::new(150, 42)).unwrap();
+        let mut shot = |app: &mut App, name: &str| {
+            term.draw(|f| app.draw(f)).unwrap();
+            crate::testkit::save_html(term.backend().buffer(), &format!("target/snap/app-help-{name}.html"));
+            let b = term.backend().buffer();
+            (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol().to_string()).collect::<String>() + "
+").collect::<String>()
+        };
+        // F10 from chat opens help on the chat topic; the sidebar lists the topics
+        let s = shot(&mut app, "chat0");
+        assert!(s.contains("help") && s.contains("F10"), "{s}");
+        app.key(KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE));
+        let s = shot(&mut app, "chat");
+        assert!(s.contains("/perms bypass") && s.contains("getting started") && s.contains("troubleshooting"), "{s}");
+        // ? on the home launcher (a tab of your own) opens getting started
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        app.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        let s = shot(&mut app, "start");
+        assert!(s.contains("oriel in one minute"), "{s}");
+        // and the palette has it
+        app.goto_app("files");
+        app.open_palette();
+        if let Some(p) = &mut app.palette {
+            p.query = "help".into();
+        }
+        assert!(shot(&mut app, "palette").contains("every key, command and how-to"));
+    }
+
+    #[test]
     fn app_rename_menu_agents() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut cfg = Config::default();
@@ -1726,12 +1730,23 @@ mod tests {
         let p = app.probe();
         let out = app.onboard.as_mut().unwrap().check(&p);
         app.onboard_out(out);
-        assert!(shot(&mut app, "tour2").contains("back to chat"));
+        assert!(shot(&mut app, "tour2").contains("chat with any AI"));
         key(&mut app, KeyCode::F(1));
         let p = app.probe();
         let out = app.onboard.as_mut().unwrap().check(&p);
         app.onboard_out(out);
-        assert!(shot(&mut app, "tour3").contains("the palette"));
+        assert!(shot(&mut app, "tour3").contains("installs and signs in"));
+        // skip ahead to the help step: F10 there opens help (the app's key) and that finishes the step
+        for _ in 0..10 {
+            key(&mut app, KeyCode::F(10));
+        }
+        assert!(shot(&mut app, "tour-help").contains("the help screen"));
+        key(&mut app, KeyCode::F(10));
+        let p = app.probe();
+        let out = app.onboard.as_mut().unwrap().check(&p);
+        app.onboard_out(out);
+        let s = shot(&mut app, "tour-last");
+        assert!(s.contains("you're set") && s.contains("help ·"), "{s}");
         // end it
         key(&mut app, KeyCode::F(11));
         assert!(app.onboard.is_none());

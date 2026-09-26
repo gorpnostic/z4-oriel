@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
-const COMMANDS: &[(&str, &str, &str)] = &[
+pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/new", "", "start a new chat"),
     ("/retry", "", "regenerate the last reply"),
     ("/provider", "<ai>", "switch AI: claude, codex, ollama, openai, anthropic — remembered"),
@@ -46,7 +46,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/icons", "", "nerd font icons on / off"),
     ("/info", "", "what's running: AI, model, folder"),
     ("/delete", "", "delete this chat"),
-    ("/help", "", "keys and commands"),
+    ("/help", "", "keys and commands (F10: the full guide)"),
     ("/quit", "", "quit oriel"),
 ];
 
@@ -523,6 +523,7 @@ impl Chat {
                         "ctrl+o shows every tool call in full (diffs, output) · click a tool line to open just that one",
                         "/perms ask: Claude Code asks first · y allow · n deny · a always allow that tool",
                         "F1-F9 apps · F12 play/pause · alt p palette · alt n terminal beside this",
+                        "F10 opens the full guide: every app, lead mode, troubleshooting",
                     ]
                     .map(String::from),
                 );
@@ -1016,14 +1017,14 @@ impl Pane for Chat {
             if has_activity {
                 v.push(("ctrl+o", expand_hint));
             }
-            v.extend([("F1-F9", "apps"), ("alt p", "palette")]);
+            v.extend([("F10", "help"), ("alt p", "palette")]);
             v
         } else {
             let mut v = vec![("enter", "send"), ("ctrl+r", "regenerate"), ("ctrl+n", "new chat"), ("/", "commands")];
             if has_activity {
                 v.push(("ctrl+o", expand_hint));
             }
-            v.extend([("F1-F9", "apps"), ("alt p", "palette")]);
+            v.extend([("F10", "help"), ("alt p", "palette")]);
             v
         };
         let area = ui::hint_line(f, area, &hints, t);

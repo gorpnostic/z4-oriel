@@ -4,6 +4,7 @@ pub mod agents;
 pub mod ais;
 pub mod chat;
 pub mod files;
+pub mod help;
 pub mod home;
 pub mod music;
 pub mod notes;
@@ -50,6 +51,7 @@ pub fn open(name: &str, cfg: &Config) -> Option<Box<dyn Pane>> {
         "agents" => Box::new(agents::Agents::new(cfg)),
         "ais" => Box::new(ais::Ais::new(cfg)),
         "home" => Box::new(home::Home::new()),
+        "help" => Box::new(help::Help::new()),
         _ => {
             let (_, prog, title) = AGENTS.iter().find(|a| a.0 == name)?;
             let path = which(prog)?;

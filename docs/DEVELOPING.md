@@ -6,7 +6,9 @@
 |---|---|
 | `src/app.rs` | the workspace: sidebar, tabs, split tree, focus, keys, palette, mouse, themes |
 | `src/pane.rs` | the `Pane` trait every app implements |
-| `src/panes/` | the apps: `chat` (+ `providers`, `store`, `md`), `music`, `system`, `files`, `notes`, `storage`, `term` (the terminal), `home` |
+| `src/panes/` | the apps: `chat` (+ `providers`, `store`, `md`), `agents` (board + lead mode), `ais` (your AIs), `music`, `system`, `files`, `notes`, `storage`, `term` (the terminal), `home`, `help` (F10: the in-app guide; update it when keys or commands change) |
+| `src/onboard.rs` | first-run setup pages and the interactive tour (`STEPS`) |
+| `src/clip.rs` | copy to the clipboard, and the alt+v image grab |
 | `src/theme.rs` | palettes, the ANSI `terminal` theme, the live Omarchy reader |
 | `src/ui.rs`, `src/font.rs` | shared drawing helpers, icons, the block-letter logo font |
 | `src/testkit.rs` | headless rendering for tests |

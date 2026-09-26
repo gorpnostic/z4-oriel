@@ -66,7 +66,12 @@ impl Notes {
         {
             {
                 let custom = crate::config::load().notes_folder;
-                let dir = if custom.trim().is_empty() { crate::config::data_dir().join("notes") } else { std::path::PathBuf::from(custom.trim()) };
+                let custom = custom.trim();
+                let dir = match custom.strip_prefix('~') {
+                    _ if custom.is_empty() => crate::config::data_dir().join("notes"),
+                    Some(rest) => dirs::home_dir().unwrap_or_default().join(rest.trim_start_matches(['/', '\\'])),
+                    None => std::path::PathBuf::from(custom),
+                };
                 Self::open_in(dir, None)
             }
         }

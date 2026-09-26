@@ -17,10 +17,13 @@ Copy-Item target\snap\agents-lead-watch.html docs\screenshot-lead.html -Force
 cargo test app_onboarding_flow
 if ($LASTEXITCODE) { throw "onboarding snapshot test failed" }
 Copy-Item target\snap\onboard-welcome.html docs\screenshot-welcome.html -Force
+cargo test app_help_screen
+if ($LASTEXITCODE) { throw "help snapshot test failed" }
+Copy-Item target\snap\app-help-start.html docs\screenshot-help.html -Force
 Copy-Item target\snap\agents-board.html docs\screenshot-agents.html -Force
 Copy-Item target\snap\ais-overview.html docs\screenshot-ais.html -Force
 
-foreach ($n in 'hero', 'agent', 'agents', 'lead', 'ais', 'system', 'apps', 'welcome') {
+foreach ($n in 'hero', 'agent', 'agents', 'lead', 'ais', 'system', 'apps', 'welcome', 'help') {
     pwsh -NoProfile -File tools\snap.ps1 "docs\screenshot-$n.html" -Width 1380 -Height 860 | Out-Null
     if (-not (Test-Path "docs\screenshot-$n.png")) { throw "screenshot-$n.png wasn't made" }
 }

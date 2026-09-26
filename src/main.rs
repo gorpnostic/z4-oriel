@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("-h" | "--help") => {
             println!(
-                "oriel {} — a terminal workspace\n\n  oriel              open (starts in the ai app)\n  oriel <app>        open straight into an app: ai agents ais terminal claude codex music system files notes storage\n  oriel --config     print the config file path\n  oriel update       update to the latest release\n  oriel --version\n\nInside: F1-F9 apps, alt p palette, alt n terminal split, {} then ? = all keys.",
+                "oriel {} — a terminal workspace\n\n  oriel              open (starts in the ai app)\n  oriel <app>        open straight into an app: ai agents ais terminal claude codex music system files notes storage help\n  oriel --config     print the config file path\n  oriel update       update to the latest release\n  oriel --tour       replay the first-run setup and tour\n  oriel --version\n\nInside: F1-F9 apps, F10 help (every key and how-to), alt p palette, alt n terminal split, {} = tmux-style prefix.",
                 env!("CARGO_PKG_VERSION"),
                 cfg.prefix
             );
