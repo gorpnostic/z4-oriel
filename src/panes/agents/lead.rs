@@ -527,8 +527,10 @@ impl Agents {
 
     // ---------------------------------------------------------------- starting a run
 
-    /// L → a new lead run: the integration branch + the lead's checkout (background), then the lead.
-    pub(super) fn start_run(&mut self, goal: &str, agent: &str, model: &str, max_parallel: u32, budget: f64, cx: &mut Cx) -> Result<String, String> {
+    /// L → a new lead run: the integration branch + the lead's checkout (background), then the lead. `gate` = the
+    /// command every merge must pass ("" = none).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start_run(&mut self, goal: &str, agent: &str, model: &str, max_parallel: u32, budget: f64, gate: &str, cx: &mut Cx) -> Result<String, String> {
         let goal = goal.trim().to_string();
         if goal.is_empty() {
             return Err("what's the goal?".into());
@@ -558,6 +560,7 @@ impl Agents {
             budget_usd: budget,
             max_parallel: max_parallel.clamp(1, 5),
             created: store::now(),
+            gate: Some(gate.trim().to_string()),
             ..Default::default()
         });
         self.runs_live.insert(id.clone(), RunLive::new());
@@ -567,14 +570,89 @@ impl Agents {
         self.lead_cfg.max_parallel = max_parallel.clamp(1, 5);
         self.lead_cfg.run_budget_usd = budget;
         self.save_config();
+        self.remember_gate(gate);
         self.lead_focus = true;
         self.save();
-        let (root, id2) = (repo.root.clone(), id.clone());
-        self.spawn(cx, move |send| send(Msg::RunStarted(id2, git::start_run(&root, &wt, &slug))));
+        self.starting.insert(id.clone(), (repo.root.clone(), wt, slug));
+        let seen = self.dirty_seen.get(&repo.root.display().to_string()).cloned().unwrap_or_default();
+        self.spawn_run_start(&id, git::Dirty::Ask(seen), cx);
         Ok(id)
     }
 
+    /// Make a run's integration branch (background); `dirty` says what happens to uncommitted changes in your
+    /// checkout (see git::Dirty). Its arguments wait in `starting` until it's made.
+    pub(super) fn spawn_run_start(&mut self, id: &str, dirty: git::Dirty, cx: &Cx) {
+        let Some((root, wt, slug)) = self.starting.get(id).cloned() else { return };
+        let id2 = id.to_string();
+        self.spawn(cx, move |send| send(Msg::RunStarted(id2, git::start_run(&root, &wt, &slug, &dirty))));
+    }
+
+    /// Esc on the uncommitted-changes question for a run: it never started, so it goes; your goal waits in the lead
+    /// form (L), or your tasks are marked again.
+    pub(super) fn cancel_dirty_run(&mut self, id: &str) {
+        self.starting.remove(id);
+        let Some(r) = self.run_ref(id).cloned() else { return };
+        if r.manual {
+            self.marked = r.batch.iter().filter(|t| self.task(t).is_some_and(|x| x.status == Status::Todo && x.run.is_empty())).cloned().collect();
+        } else {
+            self.drafts.lead = Some(self.lead_form_from(&r));
+        }
+        self.store.runs.retain(|x| x.id != id);
+        self.runs_live.remove(id);
+        self.lead_focus = false;
+        self.save();
+    }
+
+    /// The lead form filled in from a run (retrying one that never started, or bringing a cancelled goal back).
+    pub(super) fn lead_form_from(&self, r: &Run) -> super::LeadForm {
+        let mut f = self.new_lead_form();
+        f.goal = super::Input::new(&r.goal, true);
+        if let Some(i) = super::KINDS.iter().position(|k| k.0 == r.agent) {
+            f.agent = i;
+        }
+        f.model = super::Input::new(&r.model, false);
+        f.parallel = super::Input::new(&r.max_parallel.clamp(1, 5).to_string(), false);
+        f.budget = super::Input::new(&format!("{:.2}", r.budget_usd), false);
+        if let Some(g) = &r.gate {
+            f.gate = super::Input::new(g, false);
+        }
+        f
+    }
+
+    /// r on a run that never started (its integration branch couldn't be made: a detached HEAD, a branch in the
+    /// way): the lead form again with everything it had, or for your own tasks the run popup with them marked.
+    /// The failed run goes once the new one starts.
+    pub(super) fn retry_run(&mut self, id: &str, cx: &mut Cx) {
+        let Some(r) = self.run_ref(id).cloned() else { return };
+        if r.manual {
+            let marked: Vec<String> = r.batch.iter().filter(|t| self.task(t).is_some_and(|x| x.status == Status::Todo && x.run.is_empty())).cloned().collect();
+            if marked.is_empty() {
+                cx.notify("its tasks aren't waiting in TODO any more");
+                return;
+            }
+            self.marked = marked;
+            if let Some(x) = self.run_mut(id) {
+                x.state = RunState::Discarded;
+            }
+            self.lead_focus = false;
+            self.save();
+            self.open_batch();
+            return;
+        }
+        let mut f = self.lead_form_from(&r);
+        f.retry = Some(id.to_string());
+        self.mode = super::Mode::LeadForm(f);
+        self.restored = false;
+    }
+
     pub(super) fn on_run_started(&mut self, id: &str, r: Result<git::RunStarted, String>, cx: &mut Cx) {
+        // your checkout has uncommitted changes the branch wouldn't have: ask, then make it (spawn_run_start)
+        if let Err(e) = &r {
+            if let Some(st) = e.strip_prefix(git::DIRTY) {
+                return self.ask_dirty(super::DirtyThen::Run(id.to_string()), st.to_string(), cx);
+            }
+        }
+        self.starting.remove(id);
         let Some(run) = self.run_mut(id) else { return };
         match r {
             Err(e) => {
@@ -646,7 +724,8 @@ impl Agents {
             }
         }
         let roster = self.roster();
-        let brief = mcp::Brief { integration: &r.branch, base: &r.base_branch, max_parallel: r.max_parallel, budget: r.budget_usd, roster: &roster::roster_brief(&roster), shell: git::gate_shell().2 };
+        let gate = self.run_gate(&r).unwrap_or_default();
+        let brief = mcp::Brief { integration: &r.branch, base: &r.base_branch, max_parallel: r.max_parallel, budget: r.budget_usd, roster: &roster::roster_brief(&roster), shell: git::gate_shell().2, gate: &gate };
         let d = Driver {
             run: id.to_string(),
             agent: r.agent.clone(),
@@ -670,20 +749,109 @@ impl Agents {
         self.spawn(cx, move |send| drive(d, stop, send));
     }
 
+    /// The gate command a run's merges pass (None = none): what its form said, or for older runs the config's,
+    /// else what the repo was detected to build with.
+    pub(super) fn run_gate(&self, r: &Run) -> Option<String> {
+        let g = match &r.gate {
+            Some(g) => g.trim().to_string(),
+            None => match self.lead_cfg.gate.trim() {
+                "none" | "off" => String::new(),
+                "" => self.gate_detect.get(&r.repo).and_then(|d| d.0.clone()).unwrap_or_default(),
+                c => c.to_string(),
+            },
+        };
+        (!g.is_empty()).then_some(g)
+    }
+
+    /// Why the lead can't take feedback on this run (c) right now, or None: only a lead run that's finished or
+    /// stopped, with its branch and checkout still there.
+    pub(super) fn feedback_block(&self, r: &Run) -> Option<&'static str> {
+        if r.manual {
+            return Some("a run of your own tasks has no lead to tell — add a task (n) and run it");
+        }
+        match r.state {
+            RunState::Starting | RunState::Running => return Some("the lead is still at it — c works once the run is in review (or stopped)"),
+            RunState::Merged | RunState::Discarded => return Some("that run is over"),
+            _ => {}
+        }
+        if r.branch.is_empty() {
+            return Some("that run never started — r retries it");
+        }
+        if r.worktree.is_empty() || !Path::new(&r.worktree).is_dir() {
+            return Some("the run's checkout is gone");
+        }
+        None
+    }
+
+    /// c on a finished (or stopped) lead run: the lead picks it up again in its own session with your feedback, on
+    /// the same integration branch and budget, and the run goes back to review when it's done again.
+    pub(super) fn run_feedback(&mut self, id: &str, text: &str, cx: &mut Cx) {
+        let Some(r) = self.run_ref(id).cloned() else { return };
+        if let Some(why) = self.feedback_block(&r) {
+            cx.notify(why);
+            return;
+        }
+        if r.budget_usd > 0.0 && self.spend(id) >= r.budget_usd {
+            cx.notify(format!("the run's budget is spent (${:.2}): the lead can answer and merge, but start no workers — ctrl+b in the box adds $2", r.budget_usd));
+        }
+        if r.state == RunState::Stopped {
+            return self.resume_run_with(id, Some(text), cx);
+        }
+        if let Some(x) = self.run_mut(id) {
+            x.state = RunState::Running;
+            x.finished = 0;
+            x.finishing = false;
+            x.error.clear();
+            x.summary.clear();
+            // a new round for the lead needs a little of its own budget
+            if x.lead_budget_usd > 0.0 && x.cost_usd + 0.25 > x.lead_budget_usd {
+                x.lead_budget_usd = x.cost_usd + 1.0;
+                x.log("the lead's own budget +$1 for your feedback");
+            }
+            x.log(&format!("› {text}"));
+        }
+        if let Some(l) = self.runs_live.get_mut(id) {
+            l.budget_warned = false;
+        }
+        let state = json!({"board": self.board_json(id), "tasks": self.run_tasks(id).iter().map(|t| self.card(t)).collect::<Vec<_>>()});
+        let first = format!(
+            "The user reviewed the result and asks: {text}\n\nGoal (as before): {}\n\nCurrent state:\n{state}\n\nKeep working on the same integration branch ({}): plan what this needs, merge it, then call done again.",
+            r.goal, r.branch
+        );
+        self.launch_lead(id, first, r.session_id.clone(), cx);
+        self.save();
+    }
+
     /// After a stop or a restart: pick a stopped run back up — the lead resumes its session with the current
     /// state, the workers that were cut off continue theirs, queued tasks start again and finished work that never
     /// got merged goes back through the check and the merge queue (neither survives a stop or a restart).
     pub(super) fn resume_run(&mut self, id: &str, cx: &mut Cx) {
+        self.resume_run_with(id, None, cx)
+    }
+
+    /// `resume_run`, with something from you for the lead (c on a stopped run): it wakes up even if it was done.
+    pub(super) fn resume_run_with(&mut self, id: &str, note: Option<&str>, cx: &mut Cx) {
         let Some(r) = self.run_ref(id).cloned() else { return };
         if r.state != RunState::Stopped || r.branch.is_empty() || !Path::new(&r.worktree).is_dir() {
             cx.notify("that run can't be resumed (its branch or checkout is gone)");
             return;
         }
+        let wake = note.is_some() && !r.manual;
         if let Some(run) = self.run_mut(id) {
             run.state = RunState::Running;
             run.error.clear();
             run.finished = 0;
             run.log("resumed");
+            if let Some(n) = note {
+                run.log(&format!("› {n}"));
+            }
+            if wake {
+                run.finishing = false;
+                run.summary.clear();
+                if run.lead_budget_usd > 0.0 && run.cost_usd + 0.25 > run.lead_budget_usd {
+                    run.lead_budget_usd = run.cost_usd + 1.0;
+                }
+            }
         }
         if let Some(l) = self.runs_live.get_mut(id) {
             l.budget_warned = false;
@@ -716,13 +884,14 @@ impl Agents {
                 _ => {}
             }
         }
-        if r.manual || r.finishing {
+        if r.manual || (r.finishing && !wake) {
             // no lead to wake: just carry on
             self.schedule(cx);
             return;
         }
         let state = json!({"board": self.board_json(id), "tasks": self.run_tasks(id).iter().map(|t| self.card(t)).collect::<Vec<_>>()});
-        let first = format!("oriel restarted and resumed this run. Goal (unchanged): {}\n\nCurrent state:\n{state}\n\nCarry on: wait for events, merge what's ready, finish with done.", r.goal);
+        let ask = note.map(|n| format!("The user paused this run, looked at it, and asks: {n}\n\n")).unwrap_or_default();
+        let first = format!("{ask}oriel restarted and resumed this run. Goal (unchanged): {}\n\nCurrent state:\n{state}\n\nCarry on: wait for events, merge what's ready, finish with done.", r.goal);
         self.launch_lead(id, first, r.session_id.clone(), cx);
         self.schedule(cx);
     }
@@ -1683,8 +1852,15 @@ impl Agents {
             if let Some(tm) = self.task_mut(&id) {
                 tm.last = format!("merging into {}…", run.branch);
             }
+            // its worktree goes once it's merged: a `T` terminal in it would keep Windows from removing it
+            cx.act(crate::pane::Action::CloseTag(super::try_tag(&id)));
             let lock = self.merge_lock.clone();
-            let gate_cmd = self.lead_cfg.gate.trim().to_string();
+            // the run's own gate (from its form); an older run without one detects it in the checkout, as before
+            let gate_cmd = match &run.gate {
+                Some(g) if g.trim().is_empty() => "none".to_string(),
+                Some(g) => g.trim().to_string(),
+                None => self.lead_cfg.gate.trim().to_string(),
+            };
             let timeout = Duration::from_secs(self.lead_cfg.gate_timeout_s.max(30) as u64);
             let gate_wt = PathBuf::from(format!("{}-gate", run.worktree.trim_end_matches(['/', '\\'])));
             self.spawn(cx, move |send| {
@@ -1699,6 +1875,8 @@ impl Agents {
                     let mut cmds: Vec<String> = vec![];
                     if gate_cmd.is_empty() || base.is_some() || !t.acceptance.is_empty() {
                         git::gate_checkout(repo, &gate_wt, sha)?;
+                        // a JS project's gate needs its dependencies: borrow the main checkout's
+                        git::link_deps(repo, &gate_wt);
                         if let Some(c) = base.or_else(|| if gate_cmd.is_empty() { git::detect_gate(&gate_wt) } else { None }) {
                             cmds.push(c);
                         }
@@ -1902,6 +2080,7 @@ impl Agents {
             tm.last = format!("starting over with {}", next.name);
         }
         self.live(id).busy = true;
+        cx.act(crate::pane::Action::CloseTag(super::try_tag(id)));
         let id2 = id.to_string();
         let (repo, wt, branch) = (t.repo.clone(), t.worktree.clone(), t.branch.clone());
         let pick = next.clone();
@@ -2083,6 +2262,11 @@ impl Agents {
         }
         // what never made it in goes with the run: their worktrees and branches too (on_run_final marks them)
         let leftovers: Vec<Task> = self.run_tasks(id).into_iter().filter(|t| t.status != Status::Done && (!t.worktree.is_empty() || !t.branch.is_empty())).cloned().collect();
+        // T terminals in those checkouts would keep Windows from removing them
+        cx.act(crate::pane::Action::CloseTag(super::try_tag(id)));
+        for t in &leftovers {
+            cx.act(crate::pane::Action::CloseTag(super::try_tag(&t.id)));
+        }
         let id2 = id.to_string();
         self.spawn(cx, move |send| {
             let repo = Path::new(&r.repo);
@@ -2130,7 +2314,12 @@ impl Agents {
                 let Some(run) = self.run_mut(id) else { return };
                 run.error = e.clone();
                 run.log(&format!("merge failed: {e}"));
-                cx.notify(format!("merge failed: {e}"));
+                if e.contains(git::UNCOMMITTED) {
+                    // your own edits are in the way: offer to commit them and merge
+                    self.ask_dirty(super::DirtyThen::MergeRun(id.to_string()), String::new(), cx);
+                } else {
+                    cx.notify(format!("merge failed: {e}"));
+                }
             }
         }
     }
@@ -2138,8 +2327,13 @@ impl Agents {
     /// Throw the whole run away: its workers' worktrees, the lead's checkout and the integration branch.
     pub(super) fn discard_run(&mut self, id: &str, cx: &mut Cx) {
         self.stop_run(id, cx);
+        self.starting.remove(id);
         let Some(r) = self.run_ref(id).cloned() else { return };
         let tasks: Vec<Task> = self.run_tasks(id).into_iter().filter(|t| t.status != Status::Done).cloned().collect();
+        cx.act(crate::pane::Action::CloseTag(super::try_tag(id)));
+        for t in &tasks {
+            cx.act(crate::pane::Action::CloseTag(super::try_tag(&t.id)));
+        }
         let id2 = id.to_string();
         self.spawn(cx, move |send| {
             let repo = Path::new(&r.repo);

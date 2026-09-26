@@ -151,7 +151,7 @@ fn with_cx<R>(k: &mut Kit, f: impl FnOnce(&mut crate::pane::Cx) -> R) -> R {
 fn run_batch(k: &mut Kit, p: &mut Agents, ids: &[String], serial: bool) {
     p.marked = ids.to_vec();
     k.key(p, KeyCode::Enter);
-    assert!(matches!(p.mode, Mode::Batch));
+    assert!(matches!(p.mode, Mode::Batch(_)));
     k.key(p, KeyCode::Char(if serial { 's' } else { 'p' }));
     assert!(p.marked.is_empty(), "the run started: {:?}", k.notices());
 }
@@ -277,7 +277,7 @@ fn agents_batch_runs_without_a_lead() {
     let s = k.render_html(&mut p, 150, 44, "target/snap/agents-batch-marked.html");
     assert!(s.contains("[1]") && s.contains("[3]") && s.contains("run the marked together"), "{s}");
     k.key(&mut p, KeyCode::Enter);
-    assert!(matches!(p.mode, Mode::Batch));
+    assert!(matches!(p.mode, Mode::Batch(_)));
     let s = k.render_html(&mut p, 150, 44, "target/snap/agents-batch.html");
     assert!(s.contains("run 3 tasks together") && s.contains("one after another"), "{s}");
     k.key(&mut p, KeyCode::Char('p'));
@@ -1222,7 +1222,7 @@ fn agents_lead_live_claude_haiku() {
     until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some() && p.installed("claude").is_some());
     let id = {
         let mut cx = crate::pane::Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut vec![], focused: true, time: 1.0 };
-        p.start_run("Create a file hello.txt containing exactly the word hi. One task for the haiku worker (owns hello.txt, size S), merge it, then done.", "claude", "haiku", 1, 1.20, &mut cx).unwrap()
+        p.start_run("Create a file hello.txt containing exactly the word hi. One task for the haiku worker (owns hello.txt, size S), merge it, then done.", "claude", "haiku", 1, 1.20, "", &mut cx).unwrap()
     };
     until(&mut k, &mut p, 600_000, "the live lead finishes", |p| p.run_ref(&id).is_some_and(|r| !r.state.active()));
     let r = p.run_ref(&id).unwrap().clone();
@@ -1236,5 +1236,108 @@ fn agents_lead_live_claude_haiku() {
     let hello = sh(&repo, &["show", &format!("{}:hello.txt", r.branch)]);
     assert_eq!(hello.trim(), "hi");
     assert_eq!(r.protocol, "mcp");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// c on a finished lead run: the lead picks it up again in its own session with your feedback, on the same
+/// branch; the run works, then goes back to review. The run diff and the lead's transcript take c too.
+#[test]
+fn agents_lead_takes_feedback_after_review() {
+    let dir = scratch("lead-feedback");
+    let repo = temp_repo(&dir);
+    let prompts: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let p2 = prompts.clone();
+    // plans one task first; asked for more, plans a second; done each time everything is merged
+    let lead: run::Fake = Arc::new(move |spec: &run::Spec, _stop: &AtomicBool, on: &mut dyn FnMut(Ev)| -> run::Outcome {
+        p2.lock().unwrap().push((spec.prompt.clone(), spec.resume.clone()));
+        on(Ev::Session("lead-f".into()));
+        let p = &spec.prompt;
+        let actions = if p.contains("Start with roster") {
+            json!([{"tool": "plan", "args": {"tasks": [{"id": "a", "title": "Add a", "goal": "write a.txt: first", "worker": "w1", "owns": ["a.txt"], "size": "S"}]}}, {"tool": "wait", "args": {"timeout_s": 20}}])
+        } else if p.contains("The user reviewed the result and asks") {
+            json!([{"tool": "plan", "args": {"tasks": [{"id": "b", "title": "Add b", "goal": "write b.txt: second", "worker": "w1", "owns": ["b.txt"], "size": "S"}]}}, {"tool": "wait", "args": {"timeout_s": 20}}])
+        } else if p.contains("\"event\":\"finished\"") {
+            let key = if p.contains("\"key\":\"b\"") { "b" } else { "a" };
+            json!([{"tool": "merge", "args": {"id": key}}, {"tool": "wait", "args": {"timeout_s": 20}}])
+        } else {
+            json!([{"tool": "done", "args": {"summary": "merged"}}])
+        };
+        run::Outcome { session: "lead-f".into(), text: format!("```json\n{}\n```", json!({"actions": actions})), ..Default::default() }
+    });
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(Arc::default()), lead);
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    start(&mut k, &mut p, "Two files");
+    assert_eq!(run0(&p).gate, Some(String::new()), "the form's gate row (nothing detected here) went with the run");
+    until(&mut k, &mut p, 60_000, "first pass in review", |p| p.store.runs[0].state == store::RunState::Review);
+    let branch = run0(&p).branch.clone();
+    assert_eq!(sh(&repo, &["show", &format!("{branch}:a.txt")]), "first");
+    // the lead panel offers c; the feedback box says where it goes
+    k.key(&mut p, KeyCode::Up);
+    assert!(p.lead_focus);
+    assert!(p.board_hints().contains(&("c", "feedback to the lead")), "{:?}", p.board_hints());
+    k.key(&mut p, KeyCode::Char('c'));
+    assert!(matches!(&p.mode, Mode::Comment(id, _) if *id == run0(&p).id));
+    let s = k.render(&mut p, 150, 44);
+    assert!(s.contains("feedback to the lead") && s.contains(&branch), "{s}");
+    k.typ(&mut p, "also add b");
+    k.key(&mut p, KeyCode::Enter);
+    assert_eq!(run0(&p).state, store::RunState::Running, "back to work");
+    assert!(run0(&p).log.iter().any(|l| l == "› also add b"), "{:?}", run0(&p).log);
+    until(&mut k, &mut p, 60_000, "second pass in review", |p| p.store.runs[0].state == store::RunState::Review && p.store.tasks.len() == 2);
+    let asked = prompts.lock().unwrap().iter().find(|(pr, _)| pr.contains("The user reviewed the result and asks: also add b")).cloned().expect("the lead heard it");
+    assert_eq!(asked.1, "lead-f", "in its own session");
+    assert!(asked.0.contains("Two files") && asked.0.contains(&branch));
+    assert_eq!(run0(&p).branch, branch, "the same integration branch");
+    assert_eq!(sh(&repo, &["show", &format!("{branch}:b.txt")]), "second");
+    assert_eq!(sh(&repo, &["show", &format!("{branch}:a.txt")]), "first", "the first pass is still there");
+    // the run diff and the lead's transcript take c as well; a run of your own tasks doesn't offer it
+    let rid = run0(&p).id.clone();
+    p.mode = Mode::Diff(DiffView { id: rid.clone(), data: None, file: 0, scroll: 0 });
+    k.key(&mut p, KeyCode::Char('c'));
+    assert!(matches!(&p.mode, Mode::Comment(id, _) if *id == rid));
+    k.key(&mut p, KeyCode::Esc);
+    p.mode = Mode::Log(LogView { target: LogTarget::Lead(rid.clone()), scroll: 0, back: None });
+    assert!(k.render(&mut p, 150, 44).contains("feedback to the lead"));
+    k.key(&mut p, KeyCode::Char('c'));
+    assert!(matches!(&p.mode, Mode::Comment(id, _) if *id == rid));
+    k.key(&mut p, KeyCode::Esc);
+    if let Some(r) = p.run_mut(&rid) {
+        r.manual = true;
+    }
+    p.mode = Mode::Diff(DiffView { id: rid.clone(), data: None, file: 0, scroll: 0 });
+    assert!(!k.render(&mut p, 150, 44).contains("feedback to the lead"), "no c where it can't work");
+    k.key(&mut p, KeyCode::Char('c'));
+    assert!(matches!(p.mode, Mode::Diff(_)));
+    assert!(k.notices().last().is_some_and(|n| n.contains("no lead to tell")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A run whose branch couldn't be made (a detached HEAD) offers r: the form again with the same goal, and the
+/// failed run goes once the new one starts.
+#[test]
+fn agents_lead_retry_a_run_that_never_started() {
+    let dir = scratch("lead-retry");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let mut p = lead_pane(&dir, &repo, fake_worker(Arc::default()), fake_text_lead(json!([{"tool": "done", "args": {"summary": "nothing to do"}}]), 0, Arc::default()));
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    sh(&repo, &["checkout", "-q", "--detach"]);
+    start(&mut k, &mut p, "A goal worth keeping");
+    until(&mut k, &mut p, 10_000, "failed to start", |p| p.store.runs[0].state == store::RunState::Stopped);
+    assert!(run0(&p).error.contains("detached HEAD") && run0(&p).branch.is_empty(), "{:?}", run0(&p));
+    p.lead_focus = true;
+    let s = k.render(&mut p, 150, 44);
+    assert!(s.contains("r retry with the same goal"), "{s}");
+    k.key(&mut p, KeyCode::Char('r'));
+    assert!(matches!(&p.mode, Mode::LeadForm(f) if f.goal.text == "A goal worth keeping" && f.retry.is_some()));
+    sh(&repo, &["checkout", "-q", "master"]);
+    k.key_mod(&mut p, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    assert_eq!(p.store.runs.len(), 2);
+    assert_eq!(p.store.runs[0].state, store::RunState::Discarded, "the failed one goes");
+    until(&mut k, &mut p, 30_000, "the new one ran", |p| p.store.runs[1].state == store::RunState::Review);
+    assert_eq!(p.current_run().map(|r| r.goal.clone()).as_deref(), Some("A goal worth keeping"));
     let _ = std::fs::remove_dir_all(&dir);
 }

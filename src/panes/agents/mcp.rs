@@ -243,6 +243,8 @@ pub struct Brief<'a> {
     pub roster: &'a str,
     /// The shell acceptance commands and the gate run in ("bash", "PowerShell", "cmd", "sh").
     pub shell: &'a str,
+    /// The run's merge gate ("" = none: only acceptance commands check a merge).
+    pub gate: &'a str,
 }
 
 /// oriel's instructions for the lead (Claude gets them as an appended system prompt, the others at the top of
@@ -266,7 +268,7 @@ pub fn lead_system(b: &Brief, mcp: bool) -> String {
          - Spread concurrent tasks across vendors (separate usage limits). Skip a worker at 5h >= 85% or weekly >= 90%; below 25% weekly left, give it only S tasks.\n\n",
     );
     s.push_str(&format!(
-        "THIS RUN\n- Integration branch: {} (made from the user's {}).\n- At most {} workers at once; the rest queue.\n- Budget for the whole run (you + workers): ${:.2}. New work is refused once it's spent.\n- Acceptance commands and the gate run in {} from the repo root: write them for {}{}.\n- Workers:\n{}\n",
+        "THIS RUN\n- Integration branch: {} (made from the user's {}).\n- At most {} workers at once; the rest queue.\n- Budget for the whole run (you + workers): ${:.2}. New work is refused once it's spent.\n- Acceptance commands and the gate run in {} from the repo root: write them for {}{}.\n{}- Workers:\n{}\n",
         b.integration,
         b.base,
         b.max_parallel.clamp(1, 5),
@@ -277,6 +279,10 @@ pub fn lead_system(b: &Brief, mcp: bool) -> String {
             "bash" | "sh" => " (e.g. `test -f notes.md && grep -q Usage notes.md`, `cargo test cli`)",
             "PowerShell" => " (e.g. `if (-not (Select-String -Quiet Usage notes.md)) { exit 1 }`)",
             _ => " (e.g. `findstr /c:Usage notes.md`)",
+        },
+        match b.gate.trim() {
+            "" => "- This repo has no build/test gate: a merge is checked only for conflicts and by the task's acceptance command, so give every task one.\n".to_string(),
+            g => format!("- The merge gate is `{g}`: it runs on every merged result, before the task's acceptance command.\n"),
         },
         b.roster
     ));
@@ -399,12 +405,14 @@ mod tests {
         assert_eq!(a[1], ("wait".to_string(), json!({})));
         assert_eq!(parse_actions("{\"actions\":[{\"tool\":\"done\",\"args\":{\"summary\":\"ok\"}}]}").unwrap()[0].0, "done");
         assert!(parse_actions("no json here").is_none());
-        let sys = lead_system(&Brief { integration: "oriel/lead-x", base: "master", max_parallel: 3, budget: 5.0, roster: "- codex", shell: "bash" }, false);
+        let sys = lead_system(&Brief { integration: "oriel/lead-x", base: "master", max_parallel: 3, budget: 5.0, roster: "- codex", shell: "bash", gate: "" }, false);
         assert!(sys.contains("END EVERY REPLY") && sys.contains("resolve_conflicts") && sys.contains("oriel/lead-x"));
-        let a = lead_system(&Brief { integration: "i", base: "b", max_parallel: 3, budget: 5.0, roster: "", shell: "bash" }, true);
+        assert!(sys.contains("no build/test gate") && sys.contains("give every task one"), "a run without a gate says so");
+        let a = lead_system(&Brief { integration: "i", base: "b", max_parallel: 3, budget: 5.0, roster: "", shell: "bash", gate: "cargo check" }, true);
         assert!(a.contains("mcp__oriel__") && a.contains("ROUTING"));
+        assert!(a.contains("The merge gate is `cargo check`"));
         // byte-stable: the shared part comes first and doesn't depend on the run
-        let b = lead_system(&Brief { integration: "j", base: "c", max_parallel: 2, budget: 1.0, roster: "- kimi", shell: "bash" }, true);
+        let b = lead_system(&Brief { integration: "j", base: "c", max_parallel: 2, budget: 1.0, roster: "- kimi", shell: "bash", gate: "" }, true);
         let cut = a.find("THIS RUN").unwrap();
         assert_eq!(a[..cut], b[..cut]);
     }

@@ -5,13 +5,13 @@
 
 use super::lead::{self, RunLive};
 use super::store::{self, Run, RunState, Status};
-use super::{Agents, Msg, git};
+use super::{Agents, git};
 use crate::pane::Cx;
 
 impl Agents {
     /// Start a run of these hand-made TODO tasks (this repo's). `serial` = one after another, in the order given
-    /// as far as their own "after" links allow.
-    pub(super) fn start_batch(&mut self, ids: &[String], serial: bool, cx: &mut Cx) -> Result<String, String> {
+    /// as far as their own "after" links allow. `gate` = the command every merge must pass ("" = none).
+    pub(super) fn start_batch(&mut self, ids: &[String], serial: bool, gate: &str, cx: &mut Cx) -> Result<String, String> {
         let Some(repo) = self.repo.clone() else { return Err("open a repo first".into()) };
         let key = repo.root.display().to_string();
         let tasks: Vec<_> = ids.iter().filter_map(|id| self.task(id).cloned()).filter(|t| t.status == Status::Todo && t.run.is_empty() && t.repo == key).collect();
@@ -52,13 +52,16 @@ impl Agents {
             manual: true,
             serial,
             batch: tasks.iter().map(|t| t.id.clone()).collect(),
+            gate: Some(gate.trim().to_string()),
             ..Default::default()
         });
         self.runs_live.insert(id.clone(), RunLive::new());
+        self.remember_gate(gate);
         self.lead_focus = true;
         self.save();
-        let (root, id2) = (repo.root.clone(), id.clone());
-        self.spawn(cx, move |send| send(Msg::RunStarted(id2, git::start_run(&root, &wt, &format!("batch-{slug}")))));
+        self.starting.insert(id.clone(), (repo.root.clone(), wt, format!("batch-{slug}")));
+        let seen = self.dirty_seen.get(&key).cloned().unwrap_or_default();
+        self.spawn_run_start(&id, git::Dirty::Ask(seen), cx);
         Ok(id)
     }
 

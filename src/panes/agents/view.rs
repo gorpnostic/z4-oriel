@@ -126,16 +126,120 @@ impl Agents {
             Mode::Repo(_) => self.draw_picker(f, area, cx),
             Mode::LeadForm(_) => self.draw_lead_form(f, area, cx),
             Mode::Roster(_) => self.draw_roster(f, area, cx),
-            Mode::Batch => self.draw_batch(f, area, cx),
+            Mode::Batch(_) => self.draw_batch(f, area, cx),
+            Mode::Dirty(_) => self.draw_dirty(f, area, cx),
+            Mode::Try(_) => self.draw_try(f, area, cx),
             _ => {}
         }
+        if self.prompt_pick.is_some() {
+            self.draw_prompt_pick(f, area, cx);
+        }
+    }
+
+    /// Uncommitted changes in your checkout: commit them, take them along, or go without.
+    fn draw_dirty(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
+        let t = cx.theme;
+        let Mode::Dirty(d) = &self.mode else { return };
+        let repo = self.repo.as_ref().map(|r| r.name.clone()).unwrap_or_else(|| "the repo".into());
+        let files = super::git::porcelain_files(&d.status);
+        let shown: Vec<String> = files.iter().take(4).cloned().collect();
+        let more = if files.len() > 4 { format!(" and {} more", files.len() - 4) } else { String::new() };
+        let what_files = if files.is_empty() { String::new() } else { format!("{}{more}", shown.join(", ")) };
+        let key = |k: &str, c: Color| Span::styled(format!(" {k} "), Style::default().fg(Color::Black).bg(c).add_modifier(Modifier::BOLD));
+        let (title, body, keys): (&str, Vec<String>, Vec<Line>) = match &d.then {
+            super::DirtyThen::Merge(_) | super::DirtyThen::MergeRun(_) => (
+                "uncommitted changes",
+                vec![format!("{repo} has changes that aren't committed, so nothing was merged."), "Commit them (git add -A) and the merge goes ahead right after.".into()],
+                vec![Line::from(vec![key("c", t.accent), Span::styled("  commit your changes and merge", Style::default().fg(t.fg))])],
+            ),
+            then => {
+                let what = match then {
+                    super::DirtyThen::Task(id) => format!("\"{}\"", self.task(id).map(|x| x.title.clone()).unwrap_or_default()),
+                    _ => "the run".into(),
+                };
+                (
+                    "uncommitted changes",
+                    vec![
+                        format!("{} file{} in {repo} {} committed{}", files.len(), if files.len() == 1 { "" } else { "s" }, if files.len() == 1 { "isn't" } else { "aren't" }, if what_files.is_empty() { String::new() } else { format!(": {what_files}") }),
+                        "A chat's edits? A new branch starts from your last commit, so".to_string(),
+                        format!("{what} wouldn't see them."),
+                    ],
+                    vec![
+                        Line::from(vec![key("c", t.accent), Span::styled("  commit them first (git add -A), then start", Style::default().fg(t.fg))]),
+                        Line::from(vec![key("i", t.shine), Span::styled("  take them along: start from a snapshot (your checkout isn't touched)", Style::default().fg(t.fg))]),
+                        Line::from(vec![key("enter", t.frame), Span::styled("  start without them", Style::default().fg(t.fg))]),
+                    ],
+                )
+            }
+        };
+        let h = (body.len() + keys.len()) as u16 + 7;
+        let inner = ui::popup(f, area, 80, h, title, t);
+        let inner = Rect { x: inner.x + 2, width: inner.width.saturating_sub(4), y: inner.y + 1, height: inner.height.saturating_sub(1) };
+        let mut lines: Vec<Line> = body.iter().enumerate().map(|(i, s)| Line::styled(ui::fit(s, inner.width as usize), if i == 0 { bold(t.fg) } else { ui::muted(t) })).collect();
+        lines.push(Line::raw(""));
+        lines.extend(keys);
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![Span::styled("esc", bold(t.fg)), Span::styled(" cancel", ui::muted(t))]));
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// T: which checkout, and what to start in it.
+    fn draw_try(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
+        let t = cx.theme;
+        let Mode::Try(v) = &self.mode else { return };
+        let inner = ui::popup(f, area, 80, 11, &format!("{}try it", ui::lead("term")), t);
+        let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+        let w = inner.width as usize;
+        f.render_widget(Paragraph::new(vec![Line::styled(ui::fit(&v.title, w), bold(t.fg)), Line::styled(ui::fit(&format!("a terminal in {}", v.dir.display()), w), ui::muted(t))]), Rect { height: 2, ..inner });
+        let r = Rect { y: inner.y + 3, height: 3, ..inner };
+        let ri = ui::frame(f, r, "run there first (remembered for this repo)", None, true, t);
+        draw_input(f, ri, &v.input, "nothing — just a shell · or e.g. pnpm dev, cargo run", true, t);
+        let hr = Rect { y: inner.bottom().saturating_sub(1), height: 1, ..inner };
+        f.render_widget(Paragraph::new(Line::from(vec![Span::styled("enter", bold(t.fg)), Span::styled(" open", ui::muted(t)), Span::styled(" · ", ui::muted(t)), Span::styled("esc", bold(t.fg)), Span::styled(" cancel", ui::muted(t))])).centered(), hr);
+    }
+
+    /// ctrl+t: your saved prompts.
+    fn draw_prompt_pick(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
+        let t = cx.theme;
+        let Some(p) = &self.prompt_pick else { return };
+        let rows = p.rows();
+        let h = (rows.len() as u16 + 9).clamp(11, 24);
+        let inner = ui::popup(f, area, 76, h, &format!("{}saved prompts", ui::lead("new")), t);
+        let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+        let w = inner.width as usize;
+        let r = Rect { height: 3, ..inner };
+        let ri = ui::frame(f, r, "", None, true, t);
+        draw_input(f, ri, &p.filter, "type to filter · or a name to save the field under", true, t);
+        let mut y = inner.y + 4;
+        if p.items.is_empty() {
+            f.render_widget(Paragraph::new(Span::styled(ui::fit(&format!("none yet — they live in {}", super::prompts::path().display()), w), ui::muted(t))), Rect { y, height: 1, ..inner });
+            y += 2;
+        }
+        let room = inner.bottom().saturating_sub(1).saturating_sub(y) as usize;
+        let start = p.sel.saturating_sub(room.saturating_sub(1));
+        for (i, row) in rows.iter().enumerate().skip(start).take(room) {
+            let on = i == p.sel;
+            let bg = if on { Style::default().bg(tint(t.accent, 0.18)) } else { Style::default() };
+            let line = match row {
+                super::PickRow::Prompt(k) => {
+                    let pr = &p.items[*k];
+                    spread(vec![Span::styled(format!("{} {}", if on { "›" } else { " " }, pr.name), if on { bold(t.accent) } else { bold(t.fg) }), Span::styled(format!("  {}", pr.text.replace('\n', " ")), ui::muted(t))], vec![], w)
+                }
+                super::PickRow::Save(name) => spread(vec![Span::styled(format!("{} + save what's in the field as \"{name}\"", if on { "›" } else { " " }), if on { bold(t.shine) } else { Style::default().fg(t.shine) })], vec![], w),
+            };
+            f.render_widget(Paragraph::new(line.style(bg)), Rect { y, height: 1, ..inner });
+            y += 1;
+        }
+        let hr = Rect { y: inner.bottom().saturating_sub(1), height: 1, ..inner };
+        f.render_widget(Paragraph::new(Span::styled("enter insert · ↑↓ choose · del delete · esc close · chat: /p <name>", ui::muted(t))).centered(), hr);
     }
 
     /// Run the marked tasks together: which, how, and where their work ends up.
     fn draw_batch(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
         let n = self.marked.len();
-        let inner = ui::popup(f, area, 76, (n as u16 + 12).min(26), &format!("{}run {n} task{} together", ui::lead("robot"), if n == 1 { "" } else { "s" }), t);
+        let Mode::Batch(v) = &self.mode else { return };
+        let inner = ui::popup(f, area, 80, (n as u16 + 16).min(30), &format!("{}run {n} task{} together", ui::lead("robot"), if n == 1 { "" } else { "s" }), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let mut lines = vec![];
         for (i, id) in self.marked.iter().enumerate() {
@@ -158,20 +262,34 @@ impl Agents {
         lines.push(Line::from(vec![Span::styled(" p ", Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD)), Span::styled(format!("  all at once: up to {par} at a time, highest priority first"), Style::default().fg(t.fg))]));
         lines.push(Line::from(vec![Span::styled(" s ", Style::default().fg(Color::Black).bg(t.shine).add_modifier(Modifier::BOLD)), Span::styled("  one after another, in the order you marked them (after-links first)", Style::default().fg(t.fg))]));
         lines.push(Line::raw(""));
+        let top = (inner.y + lines.len() as u16).min(inner.bottom());
+        f.render_widget(Paragraph::new(lines), Rect { height: top - inner.y, ..inner });
+        // the gate row: what every merged result must pass (g edits it)
+        let (prefill, why) = self.gate_prefill();
+        let gate_r = Rect { y: top, height: 3.min(inner.bottom().saturating_sub(top)), ..inner };
+        let note = (!v.gate.text.is_empty() && v.gate.text == prefill).then_some(why.as_str());
+        let ri = ui::frame(f, gate_r, if v.editing { "gate · enter done" } else { "gate · g edits" }, note, v.editing, t);
+        let ph = if prefill.is_empty() { why.clone() } else { "none — merges get only a conflict check".to_string() };
+        draw_input(f, ri, &v.gate, &ph, v.editing, t);
+        // what happens, with what actually runs
         let budget = self.lead_cfg.run_budget_usd;
-        for l in [
-            "Each runs in its own worktree with its own AI and model. Finished work".to_string(),
-            "is merged one at a time into a new branch: a conflict check and your".to_string(),
-            format!("build/tests first (a failure goes back to it, then one fresh try)."),
+        let gate = v.gate.text.trim();
+        let w = inner.width as usize;
+        let mut tail: Vec<Line> = [
+            "Each runs in its own worktree with its own AI and model. Finished work is".to_string(),
+            if gate.is_empty() { "merged one at a time into a new branch after a conflict check only:".to_string() } else { "merged one at a time into a new branch after a conflict check and".to_string() },
+            if gate.is_empty() { "no gate, so nothing builds or tests it (g sets one).".to_string() } else { format!("`{}` on the merged result (a failure goes back to it).", ui::fit(gate, w.saturating_sub(40))) },
             format!("Budget ${budget:.2} for the run. When they're all in: d reviews, m merges."),
-        ] {
-            lines.push(Line::from(Span::styled(l, ui::muted(t))));
-        }
-        lines.push(Line::from(Span::styled("esc cancels", ui::muted(t))));
-        f.render_widget(Paragraph::new(lines), inner);
+        ]
+        .into_iter()
+        .map(|l| Line::from(Span::styled(ui::fit(&l, w), ui::muted(t))))
+        .collect();
+        tail.push(Line::from(Span::styled("esc cancels", ui::muted(t))));
+        let ty = (top + 4).min(inner.bottom());
+        f.render_widget(Paragraph::new(tail), Rect { y: ty, height: inner.bottom() - ty, ..inner });
     }
 
-    fn board_hints(&self) -> Vec<(&'static str, &'static str)> {
+    pub(super) fn board_hints(&self) -> Vec<(&'static str, &'static str)> {
         if self.repo.is_none() {
             return vec![("o", "open a repo")];
         }
@@ -180,14 +298,21 @@ impl Agents {
         }
         if self.lead_focus {
             if let Some(r) = self.current_run() {
+                if r.state == super::store::RunState::Stopped && r.branch.is_empty() {
+                    // it never started
+                    return vec![("r", "retry with the same goal"), ("x", "discard"), ("↓", "cards")];
+                }
                 let mut h = vec![("enter", "lead transcript"), ("w", "watch")];
                 if r.state.active() {
                     h.extend([("s", "stop run"), ("d", "diff so far")]);
                 } else {
-                    h.extend([("d", "review"), ("m", "merge into your branch"), ("x", "discard run")]);
                     if r.state == super::store::RunState::Stopped {
                         h.push(("r", "resume"));
                     }
+                    if self.feedback_block(r).is_none() {
+                        h.push(("c", "feedback to the lead"));
+                    }
+                    h.extend([("d", "review"), ("T", "try it"), ("m", "merge into your branch"), ("x", "discard run")]);
                 }
                 h.extend([("↓", "cards"), ("R", "roster")]);
                 return h;
@@ -198,17 +323,22 @@ impl Agents {
         let headless = sel.as_ref().is_some_and(|t| t.headless());
         match sel.as_ref().map(|t| t.status) {
             Some(Status::Todo) if headless => h.extend([("enter", "transcript"), ("x", "discard")]),
-            Some(Status::Todo) => h.extend([("enter", "start"), ("e", "edit"), ("x", "delete")]),
+            Some(Status::Todo) => h.extend([("enter", "start"), ("space", "mark"), ("e", "edit"), ("x", "delete")]),
             Some(Status::Running | Status::Blocked) if headless => h.extend([("enter", "live transcript"), ("t", "take over"), ("d", "diff"), ("x", "discard")]),
             Some(Status::Running | Status::Blocked) => h.extend([("enter", "open agent"), ("d", "diff"), ("c", "comment"), ("m", "merge"), ("x", "discard")]),
-            Some(Status::Review) if headless => h.extend([("enter", "transcript"), ("d", "diff"), ("m", "merge"), ("c", "follow-up"), ("t", "take over"), ("x", "discard")]),
-            Some(Status::Review) => h.extend([("d", "diff"), ("m", "merge"), ("c", "comment"), ("x", "discard"), ("r", "retry")]),
+            Some(Status::Review) if headless => h.extend([("enter", "transcript"), ("d", "diff"), ("T", "try it"), ("m", "merge"), ("c", "follow-up"), ("t", "take over"), ("x", "discard")]),
+            Some(Status::Review) => h.extend([("d", "diff"), ("T", "try it"), ("m", "merge"), ("c", "comment"), ("x", "discard"), ("r", "retry")]),
             Some(Status::Done) if sel.as_ref().map(|t| t.outcome != "merged" && t.run.is_empty()).unwrap_or(false) => h.push(("r", "retry")),
             _ => {}
         }
+        if self.deleted.as_ref().is_some_and(|(_, at)| at.elapsed() < super::UNDO_FOR) {
+            h.insert(0, ("u", "undo delete"));
+        }
         if self.current_run().is_some() {
             h.push(("w", "watch run"));
-        } else if self.installed("claude").is_some() {
+        }
+        // planning only reads the repo: fine next to a run
+        if self.installed("claude").is_some() {
             h.push(("P", "plan"));
         }
         h.extend([("R", "roster"), ("o", "repo"), ("←→↑↓", "move")]);
@@ -496,7 +626,14 @@ impl Agents {
             self.store.runs.iter().find(|r| r.id == id).map(|r| Task { id: r.id.clone(), title: format!("⚑ {}", r.goal.lines().next().unwrap_or("")), branch: r.branch.clone(), base_branch: r.base_branch.clone(), error: r.error.clone(), ..Default::default() })
         });
         let task = task.unwrap_or_default();
-        let hints = [("↑↓", "file"), ("pgup/pgdn", "scroll"), ("m", "merge"), ("c", "comment"), ("x", "discard"), ("R", "reload"), ("esc", "board")];
+        // c only where it works (a run: back to its lead; a task: a follow-up in its session)
+        let is_run = self.run_ref(&id).is_some();
+        let mut hints = vec![("↑↓", "file"), ("pgup/pgdn", "scroll"), ("m", "merge")];
+        if self.comment_block(&id).is_none() {
+            hints.push(("c", if is_run { "feedback to the lead" } else { "comment" }));
+        }
+        hints.extend([("T", "try it"), ("x", "discard"), ("R", "reload"), ("esc", "board")]);
+        let Mode::Diff(v) = &mut self.mode else { return };
         let body = ui::hint_line(f, area, &fit_hints(&hints, area.width as usize), t);
         let body = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };
         // header: title, branch → target, totals, merge check
@@ -615,7 +752,7 @@ impl Agents {
         let t = cx.theme;
         let Mode::Form(form) = &self.mode else { return };
         let title = if form.editing.is_some() { "edit task" } else { "new task" };
-        let inner = ui::popup(f, area, 86, 37, &format!("{}{title}", ui::lead("new")), t);
+        let inner = ui::popup(f, area, 90, 37, &format!("{}{title}", ui::lead("new")), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let repo = self.repo.as_ref().map(|r| format!("{} · a new branch off {}", r.name, r.branch)).unwrap_or_default();
         f.render_widget(Paragraph::new(Span::styled(repo, ui::muted(t))), Rect { height: 1, ..inner });
@@ -632,7 +769,7 @@ impl Agents {
         // prompt
         let ph = (bottom.saturating_sub(y + 21)).clamp(3, 12);
         let r = field(f, "prompt", ph + 2, 1, &mut y);
-        draw_input(f, r, &form.prompt, "what should the agent do? (enter = new line, paste works)", form.field == 1, t);
+        draw_input(f, r, &form.prompt, "what should the agent do? (enter = new line · ↑ earlier prompts · ctrl+t saved prompts)", form.field == 1, t);
         // agent chooser
         let r = field(f, "agent", 3, 2, &mut y);
         let mut spans = vec![];
@@ -704,7 +841,11 @@ impl Agents {
         }
         if bottom > inner.y + 1 {
             let hr = Rect { y: bottom - 1, height: 1, ..inner };
-            let hints = [("tab", "next field"), ("ctrl+s", "add to todo"), ("enter", "on the buttons"), ("esc", "cancel")];
+            if self.restored {
+                f.render_widget(Paragraph::new(Span::styled("restored your draft · ctrl+u clears", bold(t.accent))).centered(), hr);
+                return;
+            }
+            let hints = [("tab", "next field"), ("ctrl+s", "add to todo"), ("enter", "on the buttons"), ("esc", "cancel (kept)")];
             let mut spans = vec![];
             for (i, (k, w)) in hints.iter().enumerate() {
                 if i > 0 {
@@ -802,7 +943,20 @@ impl Agents {
 
     fn draw_prompt_box(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
+        let mut extra: Option<(String, Style)> = None;
         let (title, head, inp, ph) = match &self.mode {
+            // feedback for a lead run: the lead picks it up again
+            Mode::Comment(id, i) if self.run_ref(id).is_some() => {
+                let r = self.run_ref(id).cloned().unwrap_or_default();
+                let goal = ui::fit(r.goal.lines().next().unwrap_or(""), 30);
+                let spend = self.spend(id);
+                if r.budget_usd > 0.0 && spend >= r.budget_usd {
+                    extra = Some((format!("the run's budget is spent (${spend:.2} of ${:.2}) — ctrl+b adds $2, or the lead can only merge and answer", r.budget_usd), Style::default().fg(t.danger)));
+                } else if r.budget_usd > 0.0 {
+                    extra = Some((format!("${spend:.2} of ${:.2} spent · ctrl+b adds $2", r.budget_usd), ui::muted(t)));
+                }
+                ("feedback to the lead", format!("\"{goal}\" · the lead picks it up again on {}", r.branch), i, "what should change or come next? (\"also add tests\", \"the toggle icon is wrong\")")
+            }
             Mode::Comment(id, i) => {
                 let task = self.task(id);
                 let name = task.map(|x| x.title.clone()).unwrap_or_default();
@@ -813,18 +967,38 @@ impl Agents {
                 };
                 ("comment", format!("feedback for \"{name}\" · continues its session ({how})"), i, "what should change?")
             }
-            Mode::Plan(i) => ("plan", "claude reads the repo (read-only) and splits the goal into TODO cards".to_string(), i, "what's the goal?"),
+            Mode::Plan(i) => ("plan", "claude reads the repo (read-only) and splits the goal into TODO cards".to_string(), i, "what's the goal? (↑ earlier goals)"),
             _ => return,
         };
-        let inner = ui::popup(f, area, 80, 12, &format!("{}{title}", ui::lead(if title == "plan" { "claude" } else { "new" })), t);
+        let inner = ui::popup(f, area, 84, if extra.is_some() { 13 } else { 12 }, &format!("{}{title}", ui::lead(if title == "plan" { "claude" } else { "new" })), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
-        f.render_widget(Paragraph::new(Span::styled(ui::fit(&head, inner.width as usize), ui::muted(t))), Rect { height: 1, ..inner });
-        let r = Rect { y: inner.y + 2, height: inner.height.saturating_sub(4), ..inner };
+        let w = inner.width as usize;
+        let mut head_lines = vec![Line::styled(ui::fit(&head, w), ui::muted(t))];
+        if let Some((s, st)) = &extra {
+            head_lines.push(Line::styled(ui::fit(s, w), *st));
+        }
+        let hh = head_lines.len() as u16;
+        f.render_widget(Paragraph::new(head_lines), Rect { height: hh, ..inner });
+        let r = Rect { y: inner.y + hh + 1, height: inner.height.saturating_sub(hh + 3), ..inner };
         let ri = ui::frame(f, r, "", None, true, t);
         draw_input(f, ri, inp, ph, true, t);
         let hr = Rect { y: inner.bottom().saturating_sub(1), height: 1, ..inner };
+        if self.restored {
+            f.render_widget(Paragraph::new(Span::styled("restored your draft · ctrl+u clears", bold(t.accent))).centered(), hr);
+            return;
+        }
         f.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled("enter", bold(t.fg)), Span::styled(if title == "plan" { " plan" } else { " send" }, ui::muted(t)), Span::styled(" · ", ui::muted(t)), Span::styled("esc", bold(t.fg)), Span::styled(" cancel", ui::muted(t))])).centered(),
+            Paragraph::new(Line::from(vec![
+                Span::styled("enter", bold(t.fg)),
+                Span::styled(if title == "plan" { " plan" } else { " send" }, ui::muted(t)),
+                Span::styled(" · ", ui::muted(t)),
+                Span::styled("ctrl+t", bold(t.fg)),
+                Span::styled(" saved prompts", ui::muted(t)),
+                Span::styled(" · ", ui::muted(t)),
+                Span::styled("esc", bold(t.fg)),
+                Span::styled(" cancel (kept)", ui::muted(t)),
+            ]))
+            .centered(),
             hr,
         );
     }
@@ -832,7 +1006,9 @@ impl Agents {
     fn draw_picker(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
         let Mode::Repo(p) = &self.mode else { return };
-        let h = (self.store.repos.len() as u16 + 11).min(22);
+        let rows = self.picker_rows();
+        let chats = rows.iter().filter(|r| r.1).count();
+        let h = (rows.len() as u16 + 11 + if chats > 0 { 2 } else { 0 }).min(26);
         let inner = ui::popup(f, area, 78, h, &format!("{}open a repo", ui::lead("files")), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         f.render_widget(Paragraph::new(Span::styled("agents work in git worktrees of a repo — which one?", ui::muted(t))), Rect { height: 1, ..inner });
@@ -844,9 +1020,21 @@ impl Agents {
             f.render_widget(Paragraph::new(Span::styled("recent", bold(t.muted))), Rect { y, height: 1, ..inner });
             y += 1;
         }
-        for (i, path) in self.store.repos.iter().enumerate() {
+        for (i, (path, from_chat)) in rows.iter().enumerate() {
             if y + 1 >= inner.bottom() {
                 break;
+            }
+            if *from_chat && (i == 0 || !rows[i - 1].1) {
+                // the folders your chats work in
+                y += if i > 0 { 1 } else { 0 };
+                if y + 1 >= inner.bottom() {
+                    break;
+                }
+                f.render_widget(Paragraph::new(Span::styled("from your chats", bold(t.muted))), Rect { y, height: 1, ..inner });
+                y += 1;
+                if y + 1 >= inner.bottom() {
+                    break;
+                }
             }
             let on = p.sel == i + 1;
             let name = std::path::Path::new(path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();

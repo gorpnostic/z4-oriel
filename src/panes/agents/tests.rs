@@ -37,7 +37,7 @@ pub(super) fn noop_agent() -> (String, Vec<String>) {
     if cfg!(windows) { ("cmd.exe".into(), vec!["/c".into(), "exit".into()]) } else { ("true".into(), vec![]) }
 }
 
-fn pane(dir: &Path, repo: &Path) -> Agents {
+pub(super) fn pane(dir: &Path, repo: &Path) -> Agents {
     let mut a = Agents::with_paths(Paths { agents: dir.join("agents"), wt: dir.join("wt") });
     a.start_dir = Some(repo.to_path_buf());
     a.fake_agent = Some(noop_agent());
@@ -407,7 +407,7 @@ fn agents_snapshots_board_form_diff() {
 
 /// The demo board on a repo path that doesn't exist (in the scratch folder): any git work a test sets off in the
 /// background fails at once instead of reaching a real folder.
-fn offline(dir: &Path) -> Agents {
+pub(super) fn offline(dir: &Path) -> Agents {
     let mut p = demo(dir);
     let root = dir.join("no-repo");
     let key = root.display().to_string();
@@ -418,12 +418,12 @@ fn offline(dir: &Path) -> Agents {
     p
 }
 
-fn with_cx<R>(k: &mut Kit, f: impl FnOnce(&mut Cx) -> R) -> R {
+pub(super) fn with_cx<R>(k: &mut Kit, f: impl FnOnce(&mut Cx) -> R) -> R {
     let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut k.actions, focused: true, time: 1.0 };
     f(&mut cx)
 }
 
-fn id_of(p: &Agents, title: &str) -> String {
+pub(super) fn id_of(p: &Agents, title: &str) -> String {
     p.store.tasks.iter().find(|t| t.title == title).map(|t| t.id.clone()).unwrap_or_else(|| panic!("no task {title}"))
 }
 
@@ -439,21 +439,21 @@ fn agents_batch_order_follows_links_and_refuses_loops() {
     let ui = p.add_task("Add the UI", "ui", 0, "");
     p.task_mut(&ui).unwrap().depends_on = vec![api.clone()];
     // UI marked first, then the API it waits for: one after another still means API first
-    let run = with_cx(&mut k, |cx| p.start_batch(&[ui.clone(), api.clone()], true, cx)).unwrap();
+    let run = with_cx(&mut k, |cx| p.start_batch(&[ui.clone(), api.clone()], true, "", cx)).unwrap();
     assert_eq!(p.run_ref(&run).unwrap().batch, vec![api.clone(), ui.clone()]);
     // a loop
     let x = p.add_task("Task x", "x", 0, "");
     let y = p.add_task("Task y", "y", 0, "");
     p.task_mut(&x).unwrap().depends_on = vec![y.clone()];
     p.task_mut(&y).unwrap().depends_on = vec![x.clone()];
-    let e = with_cx(&mut k, |cx| p.start_batch(&[x.clone(), y.clone()], false, cx)).unwrap_err();
+    let e = with_cx(&mut k, |cx| p.start_batch(&[x.clone(), y.clone()], false, "", cx)).unwrap_err();
     assert!(e.contains("wait for each other") && e.contains("Task x") && e.contains("Task y"), "{e}");
     // a link to an open task that isn't marked
-    let e = with_cx(&mut k, |cx| p.start_batch(&[x.clone()], false, cx)).unwrap_err();
+    let e = with_cx(&mut k, |cx| p.start_batch(&[x.clone()], false, "", cx)).unwrap_err();
     assert!(e.contains("isn't marked") && e.contains("Task y"), "{e}");
     // an agent that isn't installed (kimi, in the demo)
     let z = p.add_task("Task z", "z", 2, "");
-    let e = with_cx(&mut k, |cx| p.start_batch(&[z.clone()], false, cx)).unwrap_err();
+    let e = with_cx(&mut k, |cx| p.start_batch(&[z.clone()], false, "", cx)).unwrap_err();
     assert!(e.contains("kimi") && e.contains("isn't installed"), "{e}");
     // the form: y already waits for x, so x can't wait for y
     p.task_mut(&x).unwrap().depends_on.clear();

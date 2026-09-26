@@ -231,6 +231,9 @@ pub struct Run {
     /// The lead is done but some of its work isn't: the run carries on without it (like a run of yours) and goes
     /// to review once nothing is left.
     pub finishing: bool,
+    /// The merge gate chosen when it started ("" = none). None = a run from before the form had a gate row: the
+    /// config's `[lead] gate`, else what's detected in the gate checkout.
+    pub gate: Option<String>,
 }
 
 impl Run {
@@ -255,6 +258,10 @@ pub struct Store {
     pub runs: Vec<Run>,
     /// Per roster worker name.
     pub records: std::collections::BTreeMap<String, Record>,
+    /// Per repo: the merge gate you typed in a run's form ("" = none), when it isn't the default.
+    pub gates: std::collections::BTreeMap<String, String>,
+    /// Per repo: what `T` starts in the checkout it opens ("pnpm dev"), "" = just a shell.
+    pub try_cmds: std::collections::BTreeMap<String, String>,
 }
 
 /// Where the orchestrator keeps things. `agents` = tasks.json + status/, `wt` = the worktrees.
