@@ -1416,12 +1416,12 @@ mod tests {
         });
         c.chat.title = "names".into();
         println!("{}", k.render_html(&mut c, 130, 40, "target/snap/chat-msgs.html"));
-        k.typ(&mut c, "/mo");
+        k.typ(&mut c, "/pro");
         println!("{}", k.render_html(&mut c, 130, 40, "target/snap/chat-menu.html"));
-        k.key(&mut c, KeyCode::Enter); // completes "/model " and lists the AIs
-        assert_eq!(c.input, "/model ");
+        k.key(&mut c, KeyCode::Enter); // completes "/provider " and lists the AIs
+        assert_eq!(c.input, "/provider ");
         let s = k.render_html(&mut c, 130, 40, "target/snap/chat-menu-model.html");
-        assert!(s.contains("claude") && s.contains("ollama"), "/model choices missing");
+        assert!(s.contains("claude") && s.contains("ollama"), "/provider choices missing");
         k.typ(&mut c, "cl");
         assert_eq!(c.menu().len(), 1);
         c.input = "/theme ".into();
