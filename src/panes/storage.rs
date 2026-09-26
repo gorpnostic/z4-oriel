@@ -14,6 +14,8 @@ mod scan;
 mod sys;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod qa_sizes;
 
 use crate::pane::{Action, Cx, Place, Waker};
 use ratatui::layout::Rect;

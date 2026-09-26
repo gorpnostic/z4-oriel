@@ -26,6 +26,8 @@ mod store;
 mod stream;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod qa_sizes;
 mod view;
 
 /// `oriel mcp-lead <port> <token>`: the MCP stdio server a lead's CLI starts (bridges to the running oriel).

@@ -19,6 +19,8 @@ mod ollama;
 mod saver;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod qa_sizes;
 mod usage;
 mod util;
 

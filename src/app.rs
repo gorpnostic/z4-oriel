@@ -2015,3 +2015,7 @@ mod tests {
         println!("{}", snap(&mut app, "home"));
     }
 }
+
+#[cfg(test)]
+#[path = "qa_sizes_app.rs"]
+mod qa_sizes_app;
