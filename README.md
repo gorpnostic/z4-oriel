@@ -183,8 +183,15 @@ every chat.
 
 - `ask`: approve each edit or command.
 - `edits` (the default): edit files in the chat's folder.
+- `auto`: Claude Code's auto mode. Claude decides what's safe and asks you about the rest.
 - `plan`: read-only.
 - `bypass`: Claude Code's *bypass permissions* mode, which allows everything. Use it only in folders you trust.
+
+`shift+tab` cycles through them, like in Claude Code, and the current mode shows on the input box.
+
+**Effort:** `/effort low`, `medium`, `high`, `xhigh` or `max` sets how hard Claude Code and Codex think, and it's
+remembered. `/effort ultracode` is max effort plus Claude Code's multi-agent mode, where it can run a whole team of
+agents on the task, so it uses a lot more.
 
 ## Themes
 

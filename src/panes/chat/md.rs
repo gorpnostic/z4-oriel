@@ -211,10 +211,10 @@ pub fn render(text: &str, width: usize, indent: &str, t: &Theme) -> Vec<Line<'st
             let mut spans = vec![];
             spans.extend(inline(rest, body, t));
             let mut l = wrap(spans, width, &first, &cont);
-            // colour the bullet
+            // a quiet bullet: the words are what matter
             if let Some(first_line) = l.first_mut() {
                 if let Some(sp) = first_line.spans.first_mut() {
-                    *sp = Span::styled(sp.content.to_string(), Style::default().fg(t.accent));
+                    *sp = Span::styled(sp.content.to_string(), Style::default().fg(t.muted));
                 }
             }
             out.extend(l);

@@ -78,6 +78,10 @@ pub struct AiConfig {
     /// What coding agents may do in chat: "ask", "edits" (default), "plan" (read-only) or "bypass" (anything).
     /// Set with /perms; applies to every new chat.
     pub perms: String,
+    /// How hard coding agents think (/effort): "low" … "max", or "ultracode" (max plus Claude Code's multi-agent
+    /// mode). Empty = the agent's own default.
+    #[serde(default)]
+    pub effort: String,
     /// The model picked for each AI with /model (e.g. claude = "opus"); new chats use it.
     #[serde(default)]
     pub models: std::collections::BTreeMap<String, String>,
@@ -133,6 +137,7 @@ impl Default for AiConfig {
         AiConfig {
             provider: String::new(),
             perms: "edits".into(),
+            effort: String::new(),
             models: Default::default(),
             ollama_url: "http://127.0.0.1:11434".into(),
             ollama_model: "llama3.2".into(),

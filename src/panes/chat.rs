@@ -36,7 +36,8 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/provider", "<ai>", "switch AI: claude, codex, ollama, openai, anthropic — remembered"),
     ("/model", "<model>", "switch model for the current AI — remembered per AI"),
     ("/cwd", "<folder>", "folder Claude Code / Codex work in for this chat"),
-    ("/perms", "<ask|edits|plan|bypass>", "what coding agents may do — remembered for every chat"),
+    ("/perms", "<ask|edits|auto|plan|bypass>", "what coding agents may do — remembered for every chat (shift+tab cycles)"),
+    ("/effort", "<low|medium|high|xhigh|max|ultracode>", "how hard coding agents think — remembered for every chat"),
     ("/key", "<openai|anthropic> <key>", "save an API key"),
     ("/note", "", "save the last reply to notes"),
     ("/save", "", "export this chat as a markdown file"),
@@ -67,6 +68,7 @@ struct MenuItem {
 const PERMS: &[(&str, &str)] = &[
     ("ask", "asks you before each edit or command (y allow · n deny · a always allow that tool)"),
     ("edits", "edits files in the chat's folder; anything else is refused (default)"),
+    ("auto", "auto mode: Claude decides what's safe and asks you about the rest"),
     ("plan", "read-only: looks and plans, changes nothing"),
     ("bypass", "bypass permissions: never asks, allows everything — only in folders you trust"),
 ];
@@ -77,8 +79,35 @@ fn norm_perms(s: &str) -> Option<&'static str> {
         "ask" | "default" => Some("ask"),
         "edits" | "acceptedits" | "accept" => Some("edits"),
         "plan" | "read" | "readonly" | "read-only" => Some("plan"),
+        "auto" => Some("auto"),
         "bypass" | "full" | "yolo" | "bypasspermissions" => Some("bypass"),
         _ => None,
+    }
+}
+
+/// /effort levels, like Claude Code's. ultracode = max plus its multi-agent mode.
+const EFFORTS: &[(&str, &str)] = &[
+    ("low", "quick answers, fewest tokens"),
+    ("medium", "a balance"),
+    ("high", "thinks it through"),
+    ("xhigh", "thinks harder"),
+    ("max", "thinks as hard as it can"),
+    ("ultracode", "max, plus Claude Code's multi-agent mode: it can run a whole team of agents (uses a lot)"),
+    ("default", "the agent's own default"),
+];
+
+/// shift+tab walks through these, like Claude Code.
+const PERM_CYCLE: &[&str] = &["ask", "edits", "auto", "plan", "bypass"];
+
+/// The mode line on the input box, Claude Code style: glyph, words, colour.
+fn perm_badge(p: &str, t: &crate::theme::Theme) -> (&'static str, &'static str, ratatui::style::Color) {
+    use ratatui::style::Color;
+    match p {
+        "edits" => ("⏵⏵", "accept edits on", t.accent),
+        "auto" => ("⏵⏵", "auto mode on", Color::Rgb(0xe6, 0xc4, 0x6a)),
+        "plan" => ("⏸", "plan mode on", t.shine),
+        "bypass" => ("⏵⏵", "bypass permissions on", t.danger),
+        _ => ("⏵", "asks before changes", t.muted),
     }
 }
 
@@ -132,6 +161,8 @@ pub struct Chat {
     cache: HashMap<usize, (u64, Vec<Line<'static>>, Vec<(usize, String)>)>,
     provider: String,
     perms: String,
+    /// /effort ("" = the agent's default)
+    effort: String,
     keys: HashMap<String, String>,
     /// ctrl+o: every call shows its full diff / output.
     expanded: bool,
@@ -203,6 +234,7 @@ impl Chat {
             cache: HashMap::new(),
             provider,
             perms: norm_perms(&cfg.ai.perms).unwrap_or("edits").to_string(),
+            effort: cfg.ai.effort.clone(),
             keys: HashMap::new(),
             expanded: false,
             open: HashSet::new(),
@@ -488,6 +520,7 @@ impl Chat {
             state: self.chat.state.clone(),
             cfg,
             steer: steer_rx,
+            effort: self.effort.clone(),
         };
         let (ib, waker) = (inbox.clone(), cx.waker());
         providers::start(req, stop.clone(), move |ev| {
@@ -583,6 +616,21 @@ impl Chat {
                     cx.notify(format!("agents work in {}", p.display()));
                 } else {
                     self.info.push(format!("not a folder: {arg}"));
+                }
+            }
+            "/effort" => {
+                let want = arg.trim().to_lowercase();
+                if let Some((level, what)) = EFFORTS.iter().find(|(l, _)| *l == want) {
+                    self.effort = if *level == "default" { String::new() } else { level.to_string() };
+                    let mut c = crate::config::load();
+                    c.ai.effort = self.effort.clone();
+                    crate::config::save(&c);
+                    cx.notify(format!("effort: {level} · {what}"));
+                } else {
+                    self.info.push(format!("effort now: {}. Choose one:", if self.effort.is_empty() { "default" } else { &self.effort }));
+                    for (l, what) in EFFORTS {
+                        self.info.push(format!("  /effort {l:<10} {what}"));
+                    }
                 }
             }
             "/perms" => match norm_perms(&arg) {
@@ -692,7 +740,7 @@ impl Chat {
             "/info" => {
                 let p = self.provider_of();
                 self.info.push(format!("oriel {} · {} ({})", env!("CARGO_PKG_VERSION"), providers::label(&p), self.chat.model.clone().unwrap_or("default model".into())));
-                self.info.push(format!("  works in {} · permissions {}", self.workdir().display(), self.perms));
+                self.info.push(format!("  works in {} · permissions {} · effort {}", self.workdir().display(), self.perms, if self.effort.is_empty() { "default" } else { &self.effort }));
                 self.info.push(format!("  {} saved chats · config: {}", self.chats.len(), crate::config::path().display()));
             }
             "/delete" => self.confirm_delete = true,
@@ -775,6 +823,7 @@ impl Chat {
                 .collect(),
             "/model" => self.models_for(&self.provider_of()),
             "/perms" => PERMS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
+            "/effort" => EFFORTS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
             "/key" => pairs(&[("openai", "OpenAI-compatible key"), ("anthropic", "Anthropic API key")]),
             "/theme" => {
                 let mut v: Vec<(String, String)> = vec![("edit".into(), "open the theme editor".into()), ("new ".into(), "make your own theme from this one".into())];
@@ -874,11 +923,11 @@ impl Chat {
         let agent_chat = matches!(self.provider_of().as_str(), "claude" | "codex");
         if m.role == "user" && agent_chat {
             // like the Claude Code TUI: the prompt on a full-width grey band, "❯ " in front
-            let band = match (t.bg, t.fg) {
-                (ratatui::style::Color::Rgb(..), ratatui::style::Color::Rgb(..)) => crate::theme::mix(t.bg, t.fg, 0.14),
-                (_, ratatui::style::Color::Rgb(..)) => crate::theme::mix(ratatui::style::Color::Rgb(14, 14, 16), t.fg, 0.14),
-                _ => t.frame,
+            let base = match t.bg {
+                ratatui::style::Color::Rgb(..) => t.bg,
+                _ => ratatui::style::Color::Rgb(14, 14, 17),
             };
+            let band = crate::theme::mix(base, ratatui::style::Color::Rgb(205, 205, 212), 0.13);
             let body = md::wrap(vec![Span::raw(m.content.clone())], width.saturating_sub(3), "", "");
             for (n, l) in body.into_iter().enumerate() {
                 let w = l.width();
@@ -1229,7 +1278,7 @@ impl Pane for Chat {
         let p = self.provider_of();
         let mut s = providers::label(&p).to_lowercase();
         match p.as_str() {
-            "claude" | "codex" => s.push_str(&format!(" · {} · {} · {}", self.chat.model.clone().unwrap_or("default".into()), ui::fit(&self.workdir().to_string_lossy(), 40), self.perms)),
+            "claude" | "codex" => s.push_str(&format!(" · {} · {}", self.chat.model.clone().unwrap_or("default".into()), ui::fit(&self.workdir().to_string_lossy(), 40))),
             _ => s.push_str(&format!(" · {}", self.chat.model.clone().unwrap_or("default".into()))),
         }
         Some(s)
@@ -1434,13 +1483,52 @@ impl Pane for Chat {
         }
 
         // ---- composer
-        let border = if cx.focused { t.accent } else { t.frame };
+        let border = if cx.focused { crate::theme::mix(t.accent, ratatui::style::Color::Rgb(96, 96, 104), 0.3) } else { t.frame };
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(Style::default().fg(border));
         let inner = block.inner(comp);
         f.render_widget(block, comp);
+        if t.animated && cx.focused {
+            // ultra: a rainbow drifting round the input box
+            let (w, h) = (comp.width as usize, comp.height as usize);
+            let per = (2 * (w + h)).max(1) as f64;
+            let mut ring: Vec<(u16, u16)> = (0..comp.width).map(|x| (comp.x + x, comp.y)).collect();
+            ring.extend((1..comp.height).map(|y| (comp.right() - 1, comp.y + y)));
+            ring.extend((0..comp.width.saturating_sub(1)).rev().map(|x| (comp.x + x, comp.bottom() - 1)));
+            ring.extend((1..comp.height.saturating_sub(1)).rev().map(|y| (comp.x, comp.y + y)));
+            let buf = f.buffer_mut();
+            for (i, (x, y)) in ring.into_iter().enumerate() {
+                if let Some(c) = buf.cell_mut(Position { x, y }) {
+                    c.set_fg(crate::theme::rainbow_at(i as f64 / per - cx.time * 0.12, 0.55));
+                }
+            }
+        }
+        if matches!(self.provider_of().as_str(), "claude" | "codex") && comp.width > 70 && !self.effort.is_empty() {
+            // the effort, bottom-left
+            let color = match self.effort.as_str() {
+                "ultracode" => t.shine,
+                "max" | "xhigh" => t.accent,
+                _ => t.muted,
+            };
+            let label = Line::from(vec![Span::raw(" "), Span::styled(format!("◆ {} effort", self.effort), Style::default().fg(color).add_modifier(Modifier::BOLD)), Span::styled(" /effort ", Style::default().fg(t.muted))]);
+            let lw = label.width() as u16;
+            f.render_widget(Paragraph::new(label), Rect { x: comp.x + 2, y: comp.bottom() - 1, width: lw, height: 1 });
+        }
+        if matches!(self.provider_of().as_str(), "claude" | "codex") && comp.width > 40 {
+            // the permission mode, on the box's bottom edge
+            let (glyph, words, color) = perm_badge(&self.perms, t);
+            let label = Line::from(vec![
+                Span::raw(" "),
+                Span::styled(format!("{glyph} {words}"), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(" (shift+tab to cycle) ", Style::default().fg(t.muted)),
+            ]);
+            let lw = label.width() as u16;
+            if lw + 4 < comp.width {
+                f.render_widget(Paragraph::new(label), Rect { x: comp.right() - lw - 2, y: comp.bottom() - 1, width: lw, height: 1 });
+            }
+        }
         let room = inner.width.saturating_sub(3) as usize;
         let shown: String = self.input.replace('\n', "⏎");
         let before: String = shown.chars().take(self.cursor).collect();
@@ -1543,6 +1631,14 @@ impl Pane for Chat {
         let items = self.menu();
         match k.code {
             KeyCode::Char('x') if ctrl => self.chord_x = true,
+            // shift+tab: the next permission mode, remembered like /perms
+            KeyCode::BackTab => {
+                let i = PERM_CYCLE.iter().position(|p| *p == self.perms).map(|i| (i + 1) % PERM_CYCLE.len()).unwrap_or(0);
+                self.perms = PERM_CYCLE[i].to_string();
+                let mut c = crate::config::load();
+                c.ai.perms = self.perms.clone();
+                crate::config::save(&c);
+            }
             KeyCode::Up if self.input.is_empty() && self.queue.iter().any(|q| !q.sent) => {
                 let i = self.queue.iter().rposition(|q| !q.sent).unwrap_or(0);
                 self.input = self.queue.remove(i).text;
@@ -2140,6 +2236,30 @@ mod tests {
         k.key(&mut c, KeyCode::Esc);
         assert_eq!(rx.try_recv().unwrap(), None);
         assert!(c.stream.is_some(), "esc skipped the question, it didn't stop the reply");
+    }
+
+    /// The input box shows the permission mode (shift+tab cycles it) and the effort.
+    #[test]
+    fn chat_mode_and_effort() {
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "make it faster");
+        c.stream = None;
+        c.chat.messages.push(store::Msg { role: "assistant".into(), model: Some("claude".into()), content: "- **Where:** here
+- **Mode:** bypass".into(), ..Default::default() });
+        c.perms = "edits".into();
+        k.key_mod(&mut c, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(c.perms, "auto");
+        k.key_mod(&mut c, KeyCode::BackTab, KeyModifiers::SHIFT);
+        k.key_mod(&mut c, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(c.perms, "bypass");
+        k.typ(&mut c, "/effort high");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.effort, "high");
+        for name in ["matrix", "ultra"] {
+            k.theme = crate::theme::get(name);
+            let s = k.render_html(&mut c, 120, 24, &format!("target/snap/chat-badges-{name}.html"));
+            assert!(s.contains("bypass permissions on") && s.contains("shift+tab") && s.contains("high effort"), "{s}");
+        }
     }
 
     #[test]

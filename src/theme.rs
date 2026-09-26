@@ -99,15 +99,18 @@ fn builtin(name: &str) -> Theme {
         _ => {
             let p = PALETTES.iter().find(|p| p.0 == name).unwrap_or(&PALETTES[0]);
             let c = |s| hex(s).unwrap_or(Color::Reset);
+            // borders, hints and secondary text lean grey, so the theme's colour is saved for what matters
+            // (the focused pane, selections, code) instead of tinting the whole screen
+            let calm = |s, grey: Color, a: f32| mix(c(s), grey, a);
             Theme {
                 name: p.0.into(),
                 bg: Color::Reset,
                 fg: Color::Reset,
                 accent: c(p.1),
                 shine: c(p.2),
-                frame: c(p.3),
-                muted: c(p.4),
-                user: c(p.5),
+                frame: calm(p.3, Color::Rgb(58, 58, 62), 0.55),
+                muted: calm(p.4, Color::Rgb(128, 128, 134), 0.5),
+                user: calm(p.5, Color::Rgb(92, 92, 98), 0.45),
                 inline: c(p.6),
                 good: c(p.7),
                 danger: c(p.8),

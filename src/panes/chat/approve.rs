@@ -149,8 +149,9 @@ fn handle(stream: TcpStream, tok: &str, cwd: &std::path::Path, mode: &str, send:
         };
         return writeln!(out, "{ans}");
     }
-    // outside /perms ask, the mode decides, as it did before oriel was asked at all
-    if mode != "ask" {
+    // outside /perms ask (and auto, which only sends what it thinks is risky), the mode decides, as it did
+    // before oriel was asked at all
+    if mode != "ask" && mode != "auto" {
         let msg = format!("Not allowed in oriel's current permission mode ({mode}). The user can change it with /perms in oriel.");
         return writeln!(out, "{}", json!({"behavior": "deny", "message": msg}));
     }

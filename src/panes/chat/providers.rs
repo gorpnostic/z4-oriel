@@ -112,6 +112,8 @@ pub struct Request {
     pub cfg: AiConfig,
     /// Messages queued while the reply runs (steerable AIs only).
     pub steer: Option<std::sync::mpsc::Receiver<String>>,
+    /// /effort: "" (the agent's default), low, medium, high, xhigh, max, ultracode.
+    pub effort: String,
 }
 
 /// Tests never start a real AI unless they ask for it (the #[ignore]d live ones set this).
@@ -465,6 +467,7 @@ fn claude(req: &Request, stop: &AtomicBool, send: Arc<dyn Fn(Ev) + Send + Sync>,
         "bypass" | "full" => "bypassPermissions",
         "plan" | "read" => "plan",
         "ask" => "default",
+        "auto" => "auto",
         _ => "acceptEdits",
     };
     // stdin stays open as a stream of messages, so ones you queue mid-reply reach Claude at its next step;
@@ -495,7 +498,15 @@ fn claude(req: &Request, stop: &AtomicBool, send: Arc<dyn Fn(Ev) + Send + Sync>,
         args.push("--model".into());
         args.push(m.clone());
     }
-    let prompt = if sid.is_some() { req.messages.last().map(|m| m.1.clone()).unwrap_or_default() } else { transcript(req) };
+    // /effort; ultracode is max effort plus the keyword that turns on Claude Code's multi-agent mode
+    if !req.effort.is_empty() {
+        args.push("--effort".into());
+        args.push(if req.effort == "ultracode" { "max".into() } else { req.effort.clone() });
+    }
+    let mut prompt = if sid.is_some() { req.messages.last().map(|m| m.1.clone()).unwrap_or_default() } else { transcript(req) };
+    if req.effort == "ultracode" {
+        prompt.push_str("\n\n(ultracode)");
+    }
     send(Ev::Status("claude code is starting".into()));
     let t0 = Instant::now();
     let mut p = agent::Claude::new(&req.cwd);
@@ -567,6 +578,15 @@ fn codex(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Stri
         args.push("-m".into());
         args.push(m.clone());
     }
+    // /effort as Codex's reasoning effort (it tops out at xhigh)
+    if !req.effort.is_empty() {
+        let e = match req.effort.as_str() {
+            "max" | "ultracode" => "xhigh",
+            e => e,
+        };
+        args.push("-c".into());
+        args.push(format!("model_reasoning_effort=\"{e}\""));
+    }
     args.push("-".into());
     let prompt = if tid.is_some() { req.messages.last().map(|m| m.1.clone()).unwrap_or_default() } else { transcript(req) };
     send(Ev::Status("codex is starting".into()));
@@ -620,6 +640,7 @@ mod tests {
             state: Default::default(),
             cfg: AiConfig::default(),
             steer: None,
+            effort: String::new(),
         };
         let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let (l2, done) = (log.clone(), Arc::new(AtomicBool::new(false)));
@@ -675,6 +696,7 @@ mod tests {
             state: Default::default(),
             cfg: AiConfig::default(),
             steer: Some(rx),
+            effort: String::new(),
         };
         let evs: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let (e2, done) = (evs.clone(), Arc::new(AtomicBool::new(false)));
