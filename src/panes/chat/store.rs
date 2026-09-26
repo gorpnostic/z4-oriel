@@ -40,6 +40,14 @@ pub enum Part {
     Todos {
         items: Vec<Todo>,
     },
+    /// A message you queued while the agent worked, at the point it read it.
+    User {
+        text: String,
+    },
+    /// Something that happened to the run itself: the conversation was compacted, a usage limit was hit.
+    Mark {
+        text: String,
+    },
 }
 
 /// One tool call: "Update src/app.rs · +3 -1", its diff or output, and (for subagents) the calls it made.
@@ -70,6 +78,19 @@ pub struct Tool {
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<Tool>,
+    /// When it started running (live only: drives the "· 12s" on a long command).
+    #[serde(skip)]
+    pub since: Since,
+}
+
+/// A running call's start time. Live only, so it never makes a saved transcript differ from the live one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Since(pub Option<std::time::Instant>);
+
+impl PartialEq for Since {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 fn is_zero(n: &u64) -> bool {

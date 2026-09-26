@@ -83,8 +83,12 @@ pub fn upsert_tool(m: &mut Msg, mut t: Tool) {
     ensure_parts(m);
     if let Some(old) = find_part(&mut m.parts, &t.id) {
         t.children = std::mem::take(&mut old.children);
+        t.since = old.since;
         *old = t;
         return;
+    }
+    if t.status == "running" {
+        t.since = super::store::Since(Some(std::time::Instant::now()));
     }
     if let Some(p) = t.parent.clone() {
         if let Some(parent) = find_part(&mut m.parts, &p) {
@@ -93,6 +97,17 @@ pub fn upsert_tool(m: &mut Msg, mut t: Tool) {
         }
     }
     m.parts.push(Part::Tool(t));
+}
+
+/// A queued message the agent just read: it goes in the transcript where it landed.
+pub fn push_user(m: &mut Msg, text: &str) {
+    ensure_parts(m);
+    m.parts.push(Part::User { text: text.to_string() });
+}
+
+pub fn push_mark(m: &mut Msg, text: &str) {
+    ensure_parts(m);
+    m.parts.push(Part::Mark { text: text.to_string() });
 }
 
 /// The todo list lives where it first appeared and updates there.
@@ -222,6 +237,12 @@ fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out:
     }
     if tool.ms >= 1000 || (tool.ms >= 100 && tool.status != "running") {
         meta.push(Span::styled(format!(" · {}", human_ms(tool.ms)), muted));
+    } else if let (true, Some(since)) = (tool.status == "running" && v.live, tool.since.0) {
+        // a long command: count up while it runs
+        let s = since.elapsed().as_secs();
+        if s >= 2 {
+            meta.push(Span::styled(format!(" · {}", human_ms(s * 1000)), muted));
+        }
     }
     let meta_w: usize = meta.iter().map(|s| s.content.width()).sum();
     let label_w = tool.label.width();
@@ -356,6 +377,11 @@ pub fn render(parts: &[Part], width: usize, t: &Theme, v: &View, out: &mut Vec<L
                 out.push(Line::from(vec![Span::styled("  ◇ ", Style::default().fg(t.shine)), Span::styled(word, style), Span::styled(toks, muted)]));
                 if v.expanded && !text.trim().is_empty() {
                     out.extend(md::wrap(vec![Span::styled(text.trim().to_string(), muted.add_modifier(Modifier::ITALIC))], width.saturating_sub(1), "    ", "    "));
+                } else if live_last && !text.trim().is_empty() {
+                    // what it's thinking right now: the last few lines, like watching it think
+                    let lines = md::wrap(vec![Span::styled(text.trim().to_string(), muted.add_modifier(Modifier::ITALIC))], width.saturating_sub(1), "    ", "    ");
+                    let skip = lines.len().saturating_sub(3);
+                    out.extend(lines.into_iter().skip(skip));
                 }
                 prev = Some("thinking");
             }
@@ -371,6 +397,33 @@ pub fn render(parts: &[Part], width: usize, t: &Theme, v: &View, out: &mut Vec<L
                 gap(out, prev, "todos");
                 todo_lines(items, width, t, v.time, out);
                 prev = Some("todos");
+            }
+            Part::User { text } => {
+                // "❯ you  also fix the tests": what you sent while it worked, where it read it
+                gap(out, prev, "user");
+                let head = vec![Span::styled("  ❯ ", Style::default().fg(t.user).add_modifier(Modifier::BOLD)), Span::styled("you  ", muted)];
+                let mut lines = md::wrap(vec![Span::styled(text.trim().to_string(), Style::default().fg(t.fg))], width.saturating_sub(10), "", "");
+                if let Some(first) = lines.first_mut() {
+                    let mut spans = head;
+                    spans.append(&mut first.spans);
+                    *first = Line::from(spans);
+                }
+                for (n, l) in lines.into_iter().enumerate() {
+                    if n == 0 {
+                        out.push(l);
+                    } else {
+                        let mut spans = vec![Span::raw("       ")];
+                        spans.extend(l.spans);
+                        out.push(Line::from(spans));
+                    }
+                }
+                prev = Some("user");
+            }
+            Part::Mark { text } => {
+                gap(out, prev, "mark");
+                let side = "─".repeat(3);
+                out.push(Line::from(Span::styled(format!("  {side} {text} {side}"), muted)));
+                prev = Some("mark");
             }
         }
     }

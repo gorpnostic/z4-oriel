@@ -90,6 +90,15 @@ struct Stream {
     status: String,
     started: Instant,
     tokens: u64,
+    /// Straight to the running agent (Claude Code reads it at its next step); None = queue until the reply ends.
+    steer: Option<std::sync::mpsc::Sender<String>>,
+}
+
+/// A message typed while a reply was running.
+struct Queued {
+    text: String,
+    /// already handed to the agent mid-reply (it can't be taken back, only waited for)
+    sent: bool,
 }
 
 #[derive(Clone)]
@@ -133,6 +142,10 @@ pub struct Chat {
     launch_dir: PathBuf,
     history_pos: Option<usize>,
     offset: i64,
+    /// Messages typed while the AI was replying, oldest first (enter queues, ctrl+x s sends now).
+    queue: Vec<Queued>,
+    /// ctrl+x was pressed: s sends now.
+    chord_x: bool,
 }
 
 impl Chat {
@@ -188,6 +201,8 @@ impl Chat {
             launch_dir: std::env::current_dir().unwrap_or_default(),
             history_pos: None,
             offset: crate::app::local_offset_secs(),
+            queue: vec![],
+            chord_x: false,
         }
     }
 
@@ -284,10 +299,49 @@ impl Chat {
             }
             self.persist();
         }
+        self.unqueue_to_box("stopped");
+    }
+
+    /// Queued messages that never got sent go back into the composer, so nothing you typed is lost.
+    fn unqueue_to_box(&mut self, why: &str) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let mut parts: Vec<String> = self.queue.drain(..).map(|q| q.text).collect();
+        if !self.input.trim().is_empty() {
+            parts.push(self.input.trim().to_string());
+        }
+        self.input = parts.join("\n\n");
+        self.cursor = self.input.chars().count();
+        self.info.push(format!("{why} · your queued message is back in the box: enter sends it"));
+    }
+
+    /// Typed while a reply runs: hand it to the agent now if it can take it mid-reply, else hold it.
+    fn enqueue(&mut self, text: String) {
+        let sent = self.stream.as_ref().and_then(|s| s.steer.as_ref()).is_some_and(|tx| tx.send(text.clone()).is_ok());
+        self.queue.push(Queued { text, sent });
+        self.scroll = 0;
+    }
+
+    /// ctrl+x s: stop the reply and send everything queued (and whatever is in the box) right away.
+    fn send_now(&mut self, cx: &mut Cx) {
+        let mut parts: Vec<String> = self.queue.drain(..).map(|q| q.text).collect();
+        let typed = self.input.trim().to_string();
+        if !typed.is_empty() {
+            parts.push(typed);
+        }
+        if parts.is_empty() {
+            return;
+        }
+        self.input.clear();
+        self.cursor = 0;
+        self.stop();
+        self.send(parts.join("\n\n"), cx);
     }
 
     fn send(&mut self, text: String, cx: &mut Cx) {
         if self.stream.is_some() {
+            self.enqueue(text);
             return;
         }
         if self.chat.messages.is_empty() {
@@ -316,6 +370,12 @@ impl Chat {
         if let Some(k) = self.keys.get("anthropic") {
             cfg.anthropic_key = k.clone();
         }
+        let (steer, steer_rx) = if providers::steerable(&provider) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let req = providers::Request {
             provider: provider.clone(),
             model: self.chat.model.clone(),
@@ -324,13 +384,14 @@ impl Chat {
             perms: self.perms.clone(),
             state: self.chat.state.clone(),
             cfg,
+            steer: steer_rx,
         };
         let (ib, waker) = (inbox.clone(), cx.waker());
         providers::start(req, stop.clone(), move |ev| {
             ib.lock().unwrap().push(ev);
             waker.wake();
         });
-        self.stream = Some(Stream { stop, inbox, status: String::new(), started: Instant::now(), tokens: 0 });
+        self.stream = Some(Stream { stop, inbox, status: String::new(), started: Instant::now(), tokens: 0, steer });
     }
 
     fn retry(&mut self, cx: &mut Cx) {
@@ -809,6 +870,8 @@ impl Chat {
         let spin = SPIN[(e.as_millis() / 100) as usize % SPIN.len()];
         let action = if !self.asks.is_empty() {
             "waiting for you".to_string()
+        } else if s.status.starts_with("compacting") || s.status.starts_with("API hiccup") {
+            s.status.clone()
         } else if let Some(a) = activity::current_action(parts) {
             a
         } else if m.map(|m| !m.content.is_empty()).unwrap_or(false) {
@@ -847,6 +910,27 @@ impl Chat {
             for it in &items[first..first + keep] {
                 out.push(activity::todo_row(it, "       ", width, t));
             }
+        }
+        // ---- what you queued
+        if !self.queue.is_empty() {
+            out.push(Line::raw(""));
+            let who = providers::label(&self.provider_of()).to_lowercase();
+            for q in &self.queue {
+                let tag = if q.sent { format!("  queued · {who} reads it after its current step") } else { "  queued · sends when this reply ends".to_string() };
+                let first = q.text.lines().next().unwrap_or("").to_string();
+                let more = if q.text.lines().count() > 1 { " …" } else { "" };
+                out.push(Line::from(vec![
+                    Span::styled("  ❯ ", Style::default().fg(t.user).add_modifier(Modifier::BOLD)),
+                    Span::styled(ui::fit(&format!("{first}{more}"), width.saturating_sub(tag.width() + 6).max(12)), Style::default().fg(t.fg)),
+                    Span::styled(tag, muted),
+                ]));
+            }
+            let mut keys = vec![Span::raw("    "), Span::styled("ctrl+x s", ui::bold_accent(t)), Span::styled(" send now (stops this reply)", muted)];
+            if self.queue.iter().any(|q| !q.sent) {
+                keys.extend([Span::styled("  ↑", ui::bold_accent(t)), Span::styled(" edit", muted)]);
+            }
+            keys.extend([Span::styled("  esc", ui::bold_accent(t)), Span::styled(" stop (keeps what you typed)", muted)]);
+            out.push(Line::from(keys));
         }
         out
     }
@@ -943,6 +1027,7 @@ impl Pane for Chat {
         let Some(s) = &mut self.stream else { return };
         let evs: Vec<Ev> = std::mem::take(&mut *s.inbox.lock().unwrap());
         let mut finished = false;
+        let mut failed = false;
         let mut denied_hint: Option<u32> = None;
         for ev in evs {
             let Some(m) = self.chat.messages.last_mut() else { break };
@@ -952,6 +1037,13 @@ impl Pane for Chat {
                 Ev::Tool(tool) => activity::upsert_tool(m, tool),
                 Ev::Todos(items) => activity::set_todos(m, items),
                 Ev::Usage(n) => s.tokens = n,
+                Ev::Steered(text) => {
+                    if let Some(i) = self.queue.iter().position(|q| q.text.trim() == text.trim()) {
+                        self.queue.remove(i);
+                    }
+                    activity::push_user(m, &text);
+                }
+                Ev::Mark(text) => activity::push_mark(m, &text),
                 Ev::Status(st) => s.status = st,
                 Ev::Ask(a) => {
                     if self.always.contains(&a.tool) {
@@ -979,6 +1071,7 @@ impl Pane for Chat {
                     finished = true;
                 }
                 Ev::Error(e) => {
+                    failed = true;
                     activity::settle(&mut m.parts, "stopped");
                     if m.content.trim().is_empty() && m.parts.is_empty() {
                         m.content = format!("⚠ {e}");
@@ -1000,7 +1093,13 @@ impl Pane for Chat {
             self.stream = None;
             self.asks.clear();
             self.persist();
-            let _ = cx;
+            // anything queued that the agent didn't take mid-reply is the next message
+            if failed {
+                self.unqueue_to_box("the reply failed");
+            } else if !self.queue.is_empty() {
+                let text = self.queue.drain(..).map(|q| q.text).collect::<Vec<_>>().join("\n\n");
+                self.send(text, cx);
+            }
         }
     }
 
@@ -1012,8 +1111,10 @@ impl Pane for Chat {
             vec![("y", "delete this chat"), ("esc", "keep it")]
         } else if !self.asks.is_empty() {
             vec![("y", "allow"), ("n", "deny"), ("a", "always allow"), ("esc", "stop")]
+        } else if self.chord_x {
+            vec![("s", "send now: stop this reply and send what you queued"), ("any other key", "cancel")]
         } else if self.stream.is_some() {
-            let mut v = vec![("esc", "stop")];
+            let mut v = vec![("esc", "stop"), ("enter", "queue"), ("ctrl+x s", "send now")];
             if has_activity {
                 v.push(("ctrl+o", expand_hint));
             }
@@ -1121,7 +1222,13 @@ impl Pane for Chat {
         let skip = bw.saturating_sub(room.saturating_sub(1));
         let (text, style) = if self.input.is_empty() {
             let name = providers::label(&self.provider_of()).to_lowercase();
-            (format!("message {name}…   (/ for commands · /model to switch)"), ui::muted(t))
+            if self.stream.is_some() && self.stream.as_ref().is_some_and(|s| s.steer.is_some()) {
+                (format!("type to queue a message: {name} reads it after its current step"), ui::muted(t))
+            } else if self.stream.is_some() {
+                ("type to queue a message: it sends when this reply ends".to_string(), ui::muted(t))
+            } else {
+                (format!("message {name}…   (/ for commands · /model to switch)"), ui::muted(t))
+            }
         } else {
             let mut s = String::new();
             let mut w = 0;
@@ -1187,8 +1294,27 @@ impl Pane for Chat {
                 return true;
             }
         }
+        if std::mem::take(&mut self.chord_x) && matches!(k.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+            if self.stream.is_some() {
+                self.send_now(cx);
+            } else {
+                let text = self.input.trim().to_string();
+                self.input.clear();
+                self.cursor = 0;
+                if !text.is_empty() {
+                    self.send(text, cx);
+                }
+            }
+            return true;
+        }
         let items = self.menu();
         match k.code {
+            KeyCode::Char('x') if ctrl => self.chord_x = true,
+            KeyCode::Up if self.input.is_empty() && self.queue.iter().any(|q| !q.sent) => {
+                let i = self.queue.iter().rposition(|q| !q.sent).unwrap_or(0);
+                self.input = self.queue.remove(i).text;
+                self.cursor = self.input.chars().count();
+            }
             KeyCode::Char('o') if ctrl => {
                 self.expanded = !self.expanded;
                 self.open.clear();
@@ -1484,7 +1610,7 @@ mod tests {
         c.perms = "edits".into();
         c.chat.messages.push(store::Msg { role: "user".into(), content: "look".into(), ..Default::default() });
         c.chat.messages.push(store::Msg { role: "assistant".into(), model: Some("claude".into()), ..Default::default() });
-        c.stream = Some(Stream { stop: Arc::new(AtomicBool::new(false)), inbox: Arc::new(Mutex::new(vec![Ev::Done { note: Some("20s · 880 tokens · 5 turns · 4 denied · claude code".into()) }])), status: String::new(), started: Instant::now(), tokens: 0 });
+        c.stream = Some(Stream { stop: Arc::new(AtomicBool::new(false)), inbox: Arc::new(Mutex::new(vec![Ev::Done { note: Some("20s · 880 tokens · 5 turns · 4 denied · claude code".into()) }])), status: String::new(), started: Instant::now(), tokens: 0, steer: None });
         k.poll(&mut c);
         assert!(c.info.iter().any(|l| l.contains("4 actions were blocked") && l.contains("/perms bypass")), "{:?}", c.info);
         store::delete(&c.chat.id);
@@ -1529,6 +1655,79 @@ mod tests {
         assert_eq!((c.provider_of().as_str(), c.chat.model.as_deref()), ("codex", Some("gpt-5.6-luna")));
     }
 
+    /// enter while a reply runs queues the message; Claude Code gets it mid-reply and it lands inline, others get
+    /// it when the reply ends; esc gives it back; ctrl+x s sends it now.
+    #[test]
+    fn chat_queue_messages() {
+        let mut k = Kit::new();
+        // ---- an AI that can't take messages mid-reply: held, sent as the next message
+        let mut c = agent_chat(&k, "codex", "refactor the parser");
+        let _forget = Forget(c.chat.id.clone());
+        k.typ(&mut c, "also update the docs");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.queue.len(), 1);
+        assert!(!c.queue[0].sent);
+        assert!(c.input.is_empty());
+        let s = k.render_html(&mut c, 130, 36, "target/snap/chat-queue-held.html");
+        assert!(s.contains("also update the docs") && s.contains("sends when this reply ends") && s.contains("ctrl+x s"), "{s}");
+        // up takes it back to edit, enter queues it again
+        k.key(&mut c, KeyCode::Up);
+        assert_eq!(c.input, "also update the docs");
+        assert!(c.queue.is_empty());
+        k.typ(&mut c, " and the README");
+        k.key(&mut c, KeyCode::Enter);
+        deliver(&mut k, &mut c, [Ev::Token("Done.".into()), Ev::Done { note: None }]);
+        let n = c.chat.messages.len();
+        assert_eq!(c.chat.messages[n - 2].content, "also update the docs and the README", "the queue became the next message");
+        assert!(c.queue.is_empty());
+        // (the provider refuses to run in tests: the new reply fails, which is fine here)
+        c.stop();
+
+        // ---- Claude Code: straight to the running agent, shown inline once it's read
+        let mut c = agent_chat(&k, "claude", "fix the flaky test");
+        let _forget2 = Forget(c.chat.id.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        c.stream.as_mut().unwrap().steer = Some(tx);
+        deliver(&mut k, &mut c, [Ev::Tool(store::Tool { id: "t1".into(), name: "Bash".into(), label: "Bash".into(), target: "cargo test".into(), status: "running".into(), ..Default::default() })]);
+        k.typ(&mut c, "use nextest instead");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(rx.try_recv().ok().as_deref(), Some("use nextest instead"), "handed to the agent right away");
+        assert!(c.queue[0].sent);
+        let s = k.render(&mut c, 130, 36);
+        assert!(s.contains("claude code reads it after its current step"), "{s}");
+        k.key(&mut c, KeyCode::Up); // can't take back what the agent already has: ↑ recalls history as usual
+        assert!(c.input == "fix the flaky test" && c.queue.len() == 1, "{:?}", c.input);
+        k.key_mod(&mut c, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        deliver(&mut k, &mut c, [Ev::Steered("use nextest instead".into()), Ev::Token("Switching to nextest.".into())]);
+        assert!(c.queue.is_empty());
+        let s = k.render_html(&mut c, 130, 36, "target/snap/chat-queue-steered.html");
+        assert!(s.contains("❯ you  use nextest instead") && s.contains("Switching to nextest"), "{s}");
+        let before = c.chat.messages.len();
+        deliver(&mut k, &mut c, [Ev::Done { note: None }]);
+        assert_eq!(c.chat.messages.len(), before, "nothing left to send");
+
+        // ---- esc stops and gives the queue back; ctrl+x s sends now
+        let mut c = agent_chat(&k, "codex", "write a parser");
+        let _forget3 = Forget(c.chat.id.clone());
+        k.typ(&mut c, "in rust please");
+        k.key(&mut c, KeyCode::Enter);
+        k.key(&mut c, KeyCode::Esc);
+        assert!(c.stream.is_none());
+        assert_eq!(c.input, "in rust please");
+        let mut c = agent_chat(&k, "codex", "write a parser");
+        let _forget4 = Forget(c.chat.id.clone());
+        k.typ(&mut c, "in rust please");
+        k.key(&mut c, KeyCode::Enter);
+        k.key_mod(&mut c, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(k.render(&mut c, 130, 36).contains("send now: stop this reply"));
+        k.key(&mut c, KeyCode::Char('s'));
+        let n = c.chat.messages.len();
+        assert_eq!(c.chat.messages[n - 2].content, "in rust please");
+        assert!(c.chat.messages[n - 3].note.as_deref().unwrap_or("").contains("stopped"), "the old reply was stopped");
+        assert!(c.input.is_empty() && c.queue.is_empty());
+        c.stop();
+    }
+
     #[test]
     fn chat_no_ai() {
         let mut k = Kit::new();
@@ -1570,7 +1769,7 @@ mod tests {
         c.chat.cwd = Some("C:\\work\\demo".into());
         c.chat.messages.push(store::Msg { role: "user".into(), content: prompt.into(), ..Default::default() });
         c.chat.messages.push(store::Msg { role: "assistant".into(), model: Some(provider.into()), ..Default::default() });
-        c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0 });
+        c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0, steer: None });
         c
     }
 
@@ -1662,7 +1861,7 @@ mod tests {
             store::Part::Text { .. } => 'T',
             store::Part::Tool(_) => 't',
             store::Part::Todos { .. } => 'L',
-            store::Part::Thinking { .. } => '.',
+            store::Part::Thinking { .. } | store::Part::User { .. } | store::Part::Mark { .. } => '.',
         }).filter(|k| *k != '.').collect();
         println!("{kinds}");
         assert!(kinds.starts_with("TTL") || kinds.starts_with("TL") || kinds.contains("TtttttT"), "{kinds}");

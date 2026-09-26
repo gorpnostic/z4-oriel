@@ -634,9 +634,21 @@ impl Claude {
                     self.usage(send);
                 }
                 Some("status") => {
-                    if let Some(s) = v["status"].as_str().filter(|s| *s != "requesting") {
-                        send(Ev::Status(s.to_string()));
+                    let s = v["status"].as_str().unwrap_or("");
+                    send(Ev::Status(if s == "compacting" { "compacting the conversation".into() } else if s == "requesting" { String::new() } else { s.to_string() }));
+                }
+                Some("compact_boundary") => {
+                    let before = v["compact_metadata"]["pre_tokens"].as_u64().unwrap_or(0);
+                    let auto = v["compact_metadata"]["trigger"] == "auto";
+                    let mut s = String::from(if auto { "context was full: conversation compacted" } else { "conversation compacted" });
+                    if before > 0 {
+                        s.push_str(&format!(" (from {} tokens)", human_tokens(before)));
                     }
+                    send(Ev::Mark(s));
+                }
+                Some("api_retry") => {
+                    let n = v["attempt"].as_u64().unwrap_or(1);
+                    send(Ev::Status(format!("API hiccup, retrying (attempt {n})")));
                 }
                 Some("task_started" | "task_progress" | "task_notification") => {
                     let Some(id) = v["tool_use_id"].as_str() else { return Ok(()) };
@@ -754,6 +766,29 @@ impl Claude {
                         }
                         _ => {}
                     }
+                }
+            }
+            // --replay-user-messages: a message we sent, at the moment Claude read it (subagents' prompts aside)
+            Some("user") if parent.is_none() && v["message"]["content"].is_string() => {
+                send(Ev::Steered(v["message"]["content"].as_str().unwrap_or("").to_string()));
+            }
+            Some("user")
+                if parent.is_none()
+                    && v["message"]["content"].as_array().is_some_and(|a| !a.is_empty() && a.iter().all(|c| c["type"] == "text")) =>
+            {
+                let text: Vec<&str> = v["message"]["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect();
+                send(Ev::Steered(text.join("\n")));
+            }
+            Some("rate_limit_event") => {
+                let info = &v["rate_limit_info"];
+                let resets = info["resetsAt"].as_i64().map(|s| {
+                    let l = crate::panes::files::clock::local(s);
+                    format!(" · resets {:02}:{:02}", l.hour, l.min)
+                });
+                match info["status"].as_str() {
+                    Some("rejected") => send(Ev::Mark(format!("usage limit reached{}", resets.unwrap_or_default()))),
+                    Some("allowed_warning") => send(Ev::Status(format!("close to your usage limit{}", resets.unwrap_or_default()))),
+                    _ => {}
                 }
             }
             Some("user") => {
@@ -910,6 +945,9 @@ impl Codex {
                         let code = it["exit_code"].as_i64();
                         let ok = it["status"] != "failed" && code.unwrap_or(0) == 0;
                         let mut t = Tool { id, name: "command_execution".into(), label: label("command_execution"), target: first_line(&cmd), status: status(ok), ..Default::default() };
+                        if !done {
+                            t.body = output(it["aggregated_output"].as_str().unwrap_or(""), '>');
+                        }
                         if done {
                             t.ms = t_ms.saturating_sub(start);
                             t.body = output(it["aggregated_output"].as_str().unwrap_or(""), if ok { '>' } else { '!' });

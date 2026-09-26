@@ -86,8 +86,18 @@ pub enum Ev {
     State(String, String),
     /// Claude Code wants permission for a tool call (/perms ask).
     Ask(approve::Ask),
+    /// Claude Code just read a message you queued mid-reply (shown inline where it landed).
+    Steered(String),
+    /// A marker in the transcript: "conversation compacted", "usage limit reached".
+    Mark(String),
     Done { note: Option<String> },
     Error(String),
+}
+
+/// AIs that can take a message in the middle of a reply (at their next step). The rest get queued messages
+/// once the reply ends.
+pub fn steerable(provider: &str) -> bool {
+    provider == "claude"
 }
 
 pub struct Request {
@@ -98,13 +108,26 @@ pub struct Request {
     pub perms: String,
     pub state: serde_json::Map<String, Value>,
     pub cfg: AiConfig,
+    /// Messages queued while the reply runs (steerable AIs only).
+    pub steer: Option<std::sync::mpsc::Receiver<String>>,
 }
+
+/// Tests never start a real AI unless they ask for it (the #[ignore]d live ones set this).
+#[cfg(test)]
+pub static LIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn start(req: Request, stop: Arc<AtomicBool>, send: impl Fn(Ev) + Send + Sync + 'static) {
     let send: Arc<dyn Fn(Ev) + Send + Sync> = Arc::new(send);
+    #[cfg(test)]
+    if !LIVE.load(Ordering::SeqCst) {
+        send(Ev::Error("AIs don't run in tests".into()));
+        return;
+    }
     std::thread::spawn(move || {
+        let mut req = req;
+        let steer = req.steer.take();
         let r = match req.provider.as_str() {
-            "claude" => claude(&req, &stop, send.clone()),
+            "claude" => claude(&req, &stop, send.clone(), steer),
             "codex" => codex(&req, &stop, &*send),
             "ollama" => ollama(&req, &stop, &*send),
             "openai" => openai(&req, &stop, &*send),
@@ -304,11 +327,26 @@ fn transcript(req: &Request) -> String {
     format!("(Conversation so far, for context:)\n\n{t}\n\n(New message:)\n{last}")
 }
 
-/// Spawn a CLI with the prompt on stdin; call parse(json line) per stdout line.
+/// Kill a CLI and everything it started: npm installs run through a cmd.exe shim, and killing just that leaves
+/// the real agent running (and editing files).
+fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).creation_flags(0x08000000).output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+    }
+}
+
+/// Spawn a CLI, hand its stdin to `feed_stdin` (write the prompt and drop it to close, or keep it open);
+/// call parse(json line) per stdout line.
 fn run_cli(
     exe: &str,
     args: &[String],
-    prompt: &str,
+    feed_stdin: impl FnOnce(std::process::ChildStdin),
     cwd: &std::path::Path,
     stop: &AtomicBool,
     mut parse: impl FnMut(&Value) -> Result<(), String>,
@@ -330,8 +368,8 @@ fn run_cli(
         cmd.creation_flags(0x08000000); // no console window flashing up
     }
     let mut child = cmd.spawn().map_err(|e| format!("couldn't start {exe}: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes());
+    if let Some(stdin) = child.stdin.take() {
+        feed_stdin(stdin);
     }
     let stderr = child.stderr.take().unwrap();
     let err_buf = Arc::new(std::sync::Mutex::new(String::new()));
@@ -344,17 +382,35 @@ fn run_cli(
     let out = BufReader::new(child.stdout.take().unwrap());
     let mut got = false;
     let mut result = Ok(());
-    for line in out.lines() {
-        if stop.load(Ordering::SeqCst) {
-            break;
+    let pid = child.id();
+    let over = AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        // esc stops it now, even in the middle of a long silent command (the read below is blocked then)
+        sc.spawn(|| {
+            while !over.load(Ordering::SeqCst) {
+                if stop.load(Ordering::SeqCst) {
+                    kill_tree(pid);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        for line in out.lines() {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let Ok(line) = line else { break };
+            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+            got = true;
+            if let Err(e) = parse(&v) {
+                result = Err(e);
+                break;
+            }
         }
-        let Ok(line) = line else { break };
-        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        got = true;
-        if let Err(e) = parse(&v) {
-            result = Err(e);
-            break;
-        }
+        over.store(true, Ordering::SeqCst);
+    });
+    if matches!(child.try_wait(), Ok(None)) {
+        kill_tree(pid);
     }
     let _ = child.kill();
     let status = child.wait().ok();
@@ -367,7 +423,33 @@ fn run_cli(
     result
 }
 
-fn claude(req: &Request, stop: &AtomicBool, send: Arc<dyn Fn(Ev) + Send + Sync>) -> Result<(), String> {
+/// Claude Code's stdin while a reply runs: user messages as stream-json lines, and the ones not read back yet.
+#[derive(Default)]
+struct Pipe {
+    stdin: Option<std::process::ChildStdin>,
+    /// written, not yet replayed: (text, show it in the chat when it lands)
+    pending: Vec<(String, bool)>,
+    /// seen at least one replay (an old CLI without --replay-user-messages never sends any: close after a turn)
+    replays: bool,
+}
+
+impl Pipe {
+    fn write(&mut self, text: &str, show: bool) {
+        let Some(stdin) = &mut self.stdin else { return }; // the run is over: the chat sends it as the next message
+        let line = serde_json::json!({"type": "user", "message": {"role": "user", "content": text}}).to_string();
+        if stdin.write_all(format!("{line}\n").as_bytes()).and_then(|_| stdin.flush()).is_ok() {
+            self.pending.push((text.to_string(), show));
+        }
+    }
+    /// A user message came back: Some(show) if it was one of ours.
+    fn read_back(&mut self, text: &str) -> Option<bool> {
+        self.replays = true;
+        let i = self.pending.iter().position(|(p, _)| p.trim() == text.trim())?;
+        Some(self.pending.remove(i).1)
+    }
+}
+
+fn claude(req: &Request, stop: &AtomicBool, send: Arc<dyn Fn(Ev) + Send + Sync>, steer: Option<std::sync::mpsc::Receiver<String>>) -> Result<(), String> {
     let sid = req.state.get("claude").and_then(|s| s.get("session")).and_then(|v| v.as_str()).map(String::from);
     let mode = match req.perms.as_str() {
         "bypass" | "full" => "bypassPermissions",
@@ -375,7 +457,9 @@ fn claude(req: &Request, stop: &AtomicBool, send: Arc<dyn Fn(Ev) + Send + Sync>)
         "ask" => "default",
         _ => "acceptEdits",
     };
-    let mut args: Vec<String> = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-mode", mode]
+    // stdin stays open as a stream of messages, so ones you queue mid-reply reach Claude at its next step;
+    // --replay-user-messages echoes each one back at the moment Claude reads it
+    let mut args: Vec<String> = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--replay-user-messages", "--permission-mode", mode]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -406,7 +490,46 @@ fn claude(req: &Request, stop: &AtomicBool, send: Arc<dyn Fn(Ev) + Send + Sync>)
     send(Ev::Status("claude code is starting".into()));
     let t0 = Instant::now();
     let mut p = agent::Claude::new(&req.cwd);
-    let r = run_cli("claude", &args, &prompt, &req.cwd, stop, |ev| p.feed(ev, t0.elapsed().as_millis() as u64, &mut |e| send(e)));
+    let pipe: Arc<std::sync::Mutex<Pipe>> = Arc::default();
+    let feed_stdin = {
+        let pipe = pipe.clone();
+        move |stdin: std::process::ChildStdin| {
+            let mut g = pipe.lock().unwrap();
+            g.stdin = Some(stdin);
+            g.write(&prompt, false);
+            drop(g);
+            if let Some(rx) = steer {
+                // runs until the chat drops its end (the reply is over)
+                std::thread::spawn(move || {
+                    while let Ok(text) = rx.recv() {
+                        pipe.lock().unwrap().write(&text, true);
+                    }
+                });
+            }
+        }
+    };
+    let r = run_cli("claude", &args, feed_stdin, &req.cwd, stop, |ev| {
+        let res = p.feed(ev, t0.elapsed().as_millis() as u64, &mut |e| match e {
+            // a replay of something we wrote: only queued messages show up in the chat
+            Ev::Steered(text) => {
+                if let Some(show) = pipe.lock().unwrap().read_back(&text) {
+                    if show {
+                        send(Ev::Steered(text));
+                    }
+                }
+            }
+            e => send(e),
+        });
+        if ev["type"] == "result" {
+            // the turn is over: close stdin (Claude exits) unless a queued message is still waiting to be read,
+            // which starts another turn in this same run
+            let mut g = pipe.lock().unwrap();
+            if g.pending.is_empty() || !g.replays {
+                g.stdin = None;
+            }
+        }
+        res
+    });
     drop(broker);
     if let Some(f) = cfg_file {
         let _ = std::fs::remove_file(f);
@@ -440,8 +563,86 @@ fn codex(req: &Request, stop: &AtomicBool, send: &dyn Fn(Ev)) -> Result<(), Stri
     send(Ev::Status("codex is starting".into()));
     let t0 = Instant::now();
     let mut p = agent::Codex::new(&req.cwd);
-    run_cli("codex", &args, &prompt, &req.cwd, stop, |ev| p.feed(ev, t0.elapsed().as_millis() as u64, &mut |e| send(e)))
+    let feed_stdin = move |mut stdin: std::process::ChildStdin| {
+        let _ = stdin.write_all(prompt.as_bytes());
+    };
+    run_cli("codex", &args, feed_stdin, &req.cwd, stop, |ev| p.feed(ev, t0.elapsed().as_millis() as u64, &mut |e| send(e)))
         .map_err(|e| format!("{e} (run `codex login` in a terminal)"))?;
     send(Ev::Done { note: Some(p.note(t0.elapsed())) });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// esc has to stop a CLI at once, even mid-way through a long command that prints nothing, and take the
+    /// processes it started with it.
+    #[test]
+    fn chat_cli_stops_mid_command() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            s2.store(true, Ordering::SeqCst);
+        });
+        let (exe, args): (&str, Vec<String>) =
+            if cfg!(windows) { ("cmd", vec!["/c".into(), "ping -n 30 127.0.0.1 >nul".into()]) } else { ("sh", vec!["-c".into(), "sleep 30".into()]) };
+        let t0 = Instant::now();
+        let r = run_cli(exe, &args, |_| {}, &std::env::temp_dir(), &stop, |_| Ok(()));
+        assert!(r.is_ok(), "{r:?}");
+        assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
+    }
+
+    /// Queued messages reach Claude Code mid-reply. Costs a couple of cents: `cargo test chat_claude_live_steer -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn chat_claude_live_steer() {
+        LIVE.store(true, Ordering::SeqCst);
+        let dir = std::path::absolute("target/test-scratch/steer").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let req = Request {
+            provider: "claude".into(),
+            model: Some("haiku".into()),
+            messages: vec![("user".into(), "Use the Bash tool to run `sleep 6 && echo one`, then `sleep 6 && echo two`, then reply in one sentence.".into())],
+            cwd: dir,
+            perms: "bypass".into(),
+            state: Default::default(),
+            cfg: AiConfig::default(),
+            steer: Some(rx),
+        };
+        let evs: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let (e2, done) = (evs.clone(), Arc::new(AtomicBool::new(false)));
+        let d2 = done.clone();
+        start(req, Arc::default(), move |e| {
+            let s = match &e {
+                Ev::Token(t) => format!("text {t}"),
+                Ev::Steered(t) => format!("STEERED {t}"),
+                Ev::Tool(t) => format!("tool {} {} {}", t.label, t.target, t.status),
+                Ev::Done { note } => format!("DONE {note:?}"),
+                Ev::Error(x) => format!("ERROR {x}"),
+                _ => return,
+            };
+            if s.starts_with("DONE") || s.starts_with("ERROR") {
+                d2.store(true, Ordering::SeqCst);
+            }
+            e2.lock().unwrap().push(s);
+        });
+        std::thread::sleep(Duration::from_secs(9));
+        tx.send("Also: what is 17+25? Put the answer in your reply.".into()).unwrap();
+        let t0 = Instant::now();
+        while !done.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(120) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let all = evs.lock().unwrap().clone();
+        for l in &all {
+            println!("{l}");
+        }
+        assert!(all.iter().any(|l| l.starts_with("STEERED Also")), "the queued message never landed");
+        assert!(all.iter().any(|l| l.starts_with("DONE")), "the run didn't finish (stdin left open?)");
+        let text: String = all.iter().filter_map(|l| l.strip_prefix("text ")).collect();
+        assert!(text.contains("42"), "{text}");
+        assert!(!all.iter().any(|l| l.starts_with("STEERED Use the Bash")), "the first prompt isn't a queued message");
+    }
 }
