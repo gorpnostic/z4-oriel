@@ -6,7 +6,7 @@
 //!   * "review" rows (your data) never delete: enter opens them in the files app
 //!   * uninstall/install and anything needing root run in a terminal pane, so you see and answer every prompt
 //!   * sizes are measured on background threads and never follow links/junctions (see storage/scan.rs)
-//!   * under `cargo test` the delete/run paths only record what they would have done
+//!   * under `cargo test` the delete/run/search paths only record what they would have done
 
 mod catalog;
 mod draw;
@@ -73,8 +73,9 @@ struct FRow {
 
 enum Pending {
     Clean(&'static str),
-    Uninstall(usize),
-    Install(usize),
+    /// the app / package itself, not a list index: the list can be replaced while the question is open
+    Uninstall(App),
+    Install(Found),
     /// a catalog entry (index into catalog::CATALOG)
     Get(usize),
 }
@@ -365,8 +366,14 @@ impl Storage {
         self.sgen += 1;
         self.searching = true;
         self.found_q = q.clone();
-        let (g, out) = (self.sgen, self.out.clone());
-        std::thread::spawn(move || out.send(Msg::Found { g, res: sys::search(&q) }, true));
+        self.found = None; // the old results are hidden while it runs: nothing to select or install from them
+        #[cfg(test)]
+        self.launched.push(format!("search: {q}")); // tests never hit the package manager
+        #[cfg(not(test))]
+        {
+            let (g, out) = (self.sgen, self.out.clone());
+            std::thread::spawn(move || out.send(Msg::Found { g, res: sys::search(&q) }, true));
+        }
     }
 
     fn drain(&mut self, cx: &mut Cx) {
@@ -636,24 +643,25 @@ impl Storage {
 
     fn ask_uninstall(&mut self) {
         let Some(i) = self.selected() else { return };
-        let Some(Ok(apps)) = &self.apps else { return };
-        let a = &apps[i];
+        let Some(a) = self.apps.as_ref().and_then(|a| a.as_ref().ok()).and_then(|a| a.get(i)).cloned() else { return };
         let size = if a.size > 0 { human(a.size) } else { "size unknown".into() };
         self.confirm = Some(Confirm {
             question: format!("uninstall {} {} ({size})?", a.name, a.version),
             lines: vec![format!("runs `{}` in a terminal", a.uninstall.text())],
-            what: Pending::Uninstall(i),
+            what: Pending::Uninstall(a),
         });
     }
 
     fn ask_install(&mut self) {
+        if self.searching {
+            return; // the rows on screen are about to be replaced
+        }
         let Some(i) = self.selected() else { return };
-        let Some(Ok(found)) = &self.found else { return };
-        let f = &found[i];
+        let Some(f) = self.found.as_ref().and_then(|f| f.as_ref().ok()).and_then(|f| f.get(i)).cloned() else { return };
         self.confirm = Some(Confirm {
             question: format!("install {} {}?", f.name, f.version),
             lines: vec![format!("runs `{}` in a terminal", f.install.text())],
-            what: Pending::Install(i),
+            what: Pending::Install(f),
         });
     }
 
@@ -687,15 +695,12 @@ impl Storage {
                     self.start_clean(tg, cx);
                 }
             }
-            Pending::Uninstall(i) => {
-                let Some(Ok(apps)) = &self.apps else { return };
-                let a = apps[i].clone();
+            // exactly what the question named, even if the list changed underneath it
+            Pending::Uninstall(a) => {
                 self.run_in_terminal(&format!("uninstall {}", a.name), "trash", &a.uninstall, cx);
                 cx.notify(format!("started {}'s uninstaller — press r when done", a.name));
             }
-            Pending::Install(i) => {
-                let Some(Ok(found)) = &self.found else { return };
-                let f = found[i].clone();
+            Pending::Install(f) => {
                 self.run_in_terminal(&format!("install {}", f.name), "package", &f.install, cx);
             }
             Pending::Get(i) => {

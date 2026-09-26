@@ -845,9 +845,10 @@ impl App {
                 }
                 Action::GotoApp(a) => self.goto_app(a),
                 Action::AppKey(a, c) => {
-                    let here = self.cur;
+                    // stay where we are: an app tab opened now sorts in ahead of your own tabs, so find ours again
+                    let here = self.tabs[self.cur].focus;
                     self.goto_app(a); // opens it if it isn't yet
-                    self.cur = here;
+                    self.cur = self.tabs.iter().position(|t| t.root.contains(here)).unwrap_or(self.cur);
                     if let Some(id) = self.tabs.iter().find(|t| t.app == Some(a)).map(|t| t.focus) {
                         self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), cx));
                     }
@@ -976,14 +977,16 @@ impl App {
         }
         match (key.as_str(), k.code) {
             ("space", KeyCode::Char(' ')) => true,
-            // some terminals report ctrl+space as ctrl+@ / NUL
-            ("space", KeyCode::Char('@')) => true,
+            // some terminals report ctrl+space as ctrl+@ / NUL (but ctrl+alt+@ is AltGr typing '@')
+            ("space", KeyCode::Char('@')) => !k.modifiers.contains(KeyModifiers::ALT),
             (s, KeyCode::Char(c)) if s.chars().count() == 1 => s.starts_with(c.to_ascii_lowercase()),
             _ => false,
         }
     }
 
     fn key(&mut self, k: KeyEvent) {
+        // AltGr arrives as ctrl+alt+char on Windows: make it the plain char before any binding sees it
+        let k = ui::strip_altgr(k);
         self.sel = None;
         if self.onboard.is_none() && self.palette.is_none() && self.renaming.is_none() && self.ctx.is_none() && !self.prefix_armed {
             let v = matches!(k.code, KeyCode::Char('v') | KeyCode::Char('V'));
@@ -1074,10 +1077,9 @@ impl App {
                 return;
             }
             if n == 12 {
-                // play/pause from anywhere, if the music app is open
-                if let Some(id) = self.tabs.iter().find(|t| t.app == Some("music")).map(|t| t.focus) {
-                    self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), cx));
-                }
+                // play/pause from anywhere: opens the music app in the background if it isn't yet (like /play)
+                let from = self.focused();
+                self.apply(from, vec![Action::AppKey("music", ' ')]);
                 return;
             }
         }
@@ -2403,6 +2405,32 @@ mod tests {
         }
         let s = snap(&mut app, "palette");
         assert!(s.contains("theme ocean"), "theme list missing");
+    }
+
+    /// F12 works before music has been opened: it opens it in the background (and doesn't switch to it, even from
+    /// a tab of your own that the new app tab sorts in ahead of).
+    #[test]
+    fn app_f12_opens_music_in_the_background() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config::default(), tx);
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        let mine = app.focused();
+        assert!(!app.tabs.iter().any(|t| t.app == Some("music")));
+        // (never drawn after this, so the library never loads and nothing can start playing)
+        app.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        assert!(app.tabs.iter().any(|t| t.app == Some("music")), "F12 opened music");
+        assert_eq!(app.focused(), mine, "and left you where you were");
+    }
+
+    #[test]
+    fn app_altgr_at_is_not_the_prefix() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config::default(), tx);
+        let altgr = KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        assert!(!app.is_prefix(&altgr), "AltGr+2 types '@' on a German layout");
+        assert!(app.is_prefix(&KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL)), "ctrl+@ is still ctrl+space");
+        app.key(altgr);
+        assert!(!app.prefix_armed);
     }
 
     #[test]

@@ -446,6 +446,7 @@ impl System {
     fn set_view(&mut self, v: View, cx: &Cx) {
         self.view = v;
         self.filtering = false;
+        self.pending_kill = None; // a question from the old view would swallow the next key unseen
         self.want(cx);
     }
 
@@ -1033,9 +1034,9 @@ impl Pane for System {
                     if self.tree {
                         hints.push(("←→", "fold"));
                     }
-                    hints.extend([("k", "kill"), ("/", "filter")]);
+                    hints.extend([("x", "kill"), ("/", "filter")]);
                 }
-                View::Connections => hints.extend([("/", "filter"), ("k", "kill process")]),
+                View::Connections => hints.extend([("/", "filter"), ("x", "kill process")]),
                 View::Startup | View::Services => hints.push(("/", "filter")),
                 View::Performance | View::Info => {}
             }
@@ -1053,7 +1054,7 @@ impl Pane for System {
     }
 
     fn key(&mut self, key: KeyEvent, cx: &mut Cx) -> bool {
-        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && ui::typed_char(&key).is_none() {
             return false;
         }
         if self.pending_kill.is_some() {
@@ -1121,10 +1122,11 @@ impl Pane for System {
             KeyCode::Left if procs && self.tree => return self.fold(Some(true)),
             KeyCode::Right if procs && self.tree => return self.fold(Some(false)),
             KeyCode::Enter if procs && self.tree => return self.fold(None),
-            KeyCode::Char('k') | KeyCode::Delete if procs || self.view == View::Connections => self.ask_kill(),
+            // x kills, like x deletes elsewhere (j/k move, as in every other app)
+            KeyCode::Char('x') | KeyCode::Delete if procs || self.view == View::Connections => self.ask_kill(),
             KeyCode::Char('/') if self.filterable() => self.filtering = true,
             KeyCode::Down | KeyCode::Char('j') if moves => self.move_sel(1),
-            KeyCode::Up if moves => self.move_sel(-1),
+            KeyCode::Up | KeyCode::Char('k') if moves => self.move_sel(-1),
             KeyCode::PageDown if moves => self.move_sel(page),
             KeyCode::PageUp if moves => self.move_sel(-page),
             KeyCode::Home | KeyCode::Char('g') if moves => self.move_sel(-len),

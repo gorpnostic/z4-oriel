@@ -541,8 +541,8 @@ impl Pane for Storage {
 
     fn key(&mut self, key: KeyEvent, cx: &mut Cx) -> bool {
         self.ensure(cx);
-        if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) {
-            return false;
+        if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) && ui::typed_char(&key).is_none() {
+            return false; // (AltGr chars type into the boxes below)
         }
         if self.confirm.is_some() {
             match key.code {

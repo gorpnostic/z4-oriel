@@ -4,8 +4,9 @@
 //!   lyrics\). That app owns the file and rewrites it, so oriel only ever *reads* it — exactly like nest did.
 //! * Anywhere else: scan `[music] folders` from the config, or the OS music folder, for audio files.
 //!
-//! oriel's own play counts, volume, shuffle and repeat live in `data_dir()/music.json`; lyrics it fetches from
-//! lrclib.net are cached in `data_dir()/lyrics/`.
+//! oriel's own play counts, volume, shuffle and repeat live in `data_dir()/music.json`; tags read from scanned
+//! files are cached in `data_dir()/music-tags.json`; lyrics it fetches from lrclib.net are cached in
+//! `data_dir()/lyrics/`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -165,6 +166,13 @@ pub fn is_audio(p: &Path) -> bool {
     p.extension().map(|e| AUDIO_EXT.contains(&e.to_string_lossy().to_lowercase().as_str())).unwrap_or(false)
 }
 
+/// Why oriel can't play a file it lists, if it can't: symphonia 0.5 has no Opus decoder, and .opus is yt-dlp's
+/// default audio format, so those songs are shown (muted) but never queued.
+pub fn unplayable(p: &Path) -> Option<&'static str> {
+    let ext = p.extension()?.to_string_lossy().to_lowercase();
+    (ext == "opus").then_some("no opus decoder")
+}
+
 pub fn stem(p: &Path) -> String {
     p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
 }
@@ -224,6 +232,92 @@ pub fn probe(path: &Path) -> Option<symphonia::core::probe::ProbeResult> {
     }
     let probed = symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default()).ok()?;
     Some(probed)
+}
+
+// ---------------------------------------------------------------- tag cache
+/// Tags already read from scanned files, so a launch (or R) doesn't probe every file again: keyed by path, and
+/// trusted only while the file's size and modified time are unchanged. Lives in `data_dir()/music-tags.json`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct TagCache {
+    pub files: HashMap<String, Tags>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct Tags {
+    pub size: u64,
+    /// modified time, ms since 1970
+    pub mtime: u64,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration: f64,
+}
+
+/// (size, modified ms) of a file, the cache's check that it hasn't changed.
+fn stamp(p: &Path) -> Option<(u64, u64)> {
+    let m = std::fs::metadata(p).ok()?;
+    let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((m.len(), t.as_millis() as u64))
+}
+
+impl TagCache {
+    /// Fill in the tags of every track the cache knows (and whose file hasn't changed); returns the indices of
+    /// the ones that still have to be read.
+    pub fn apply(&self, tracks: &mut [Track]) -> Vec<usize> {
+        let mut todo = vec![];
+        for (i, t) in tracks.iter_mut().enumerate() {
+            let hit = self.files.get(&t.id).filter(|c| stamp(&t.path) == Some((c.size, c.mtime)));
+            match hit {
+                Some(c) => {
+                    t.title = if c.title.is_empty() { stem(&t.path) } else { c.title.clone() };
+                    t.artist = c.artist.clone();
+                    t.album = c.album.clone();
+                    t.duration = c.duration;
+                }
+                None => todo.push(i),
+            }
+        }
+        todo
+    }
+
+    /// Remember a track's tags (just read with `read_tags`).
+    pub fn put(&mut self, t: &Track) {
+        let Some((size, mtime)) = stamp(&t.path) else { return };
+        let title = if t.title == stem(&t.path) { String::new() } else { t.title.clone() };
+        self.files.insert(t.id.clone(), Tags { size, mtime, title, artist: t.artist.clone(), album: t.album.clone(), duration: t.duration });
+    }
+
+    /// Forget files that are gone from the scan.
+    pub fn keep_only(&mut self, tracks: &[Track]) {
+        let ids: std::collections::HashSet<&str> = tracks.iter().map(|t| t.id.as_str()).collect();
+        self.files.retain(|k, _| ids.contains(k.as_str()));
+    }
+}
+
+pub fn tags_path() -> PathBuf {
+    if cfg!(test) {
+        return std::path::absolute("target/test-scratch/music-tags.json").unwrap_or_default();
+    }
+    crate::config::data_dir().join("music-tags.json")
+}
+
+pub fn load_tags(p: &Path) -> TagCache {
+    std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+/// Atomic write, like save_state.
+pub fn save_tags(p: &Path, c: &TagCache) {
+    let tmp = p.with_extension("json.tmp");
+    if let Ok(text) = serde_json::to_string(c) {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, p);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- oriel's own state
@@ -422,5 +516,37 @@ mod tests {
         assert_eq!(clean_title(&t), ("Loser".into(), "Tame Impala".into()));
         assert_eq!(file_key("0708663e-da06"), "0708663e-da06");
         assert_eq!(file_key("C:\\x\\y.mp3").len(), 16);
+    }
+
+    #[test]
+    fn music_tag_cache_skips_unchanged_files() {
+        let dir = crate::panes::files::tests::scratch("music-tags");
+        let (a, b) = (dir.join("one.mp3"), dir.join("two.mp3"));
+        std::fs::write(&a, b"not really audio").unwrap();
+        std::fs::write(&b, b"not really audio either").unwrap();
+        let mut tracks = vec![bare_track(&a), bare_track(&b)];
+        let mut cache = TagCache::default();
+        assert_eq!(cache.apply(&mut tracks), [0, 1], "nothing known yet: read both");
+        // pretend read_tags found these
+        tracks[0].title = "Song One".into();
+        tracks[0].artist = "Someone".into();
+        tracks[0].duration = 187.5;
+        cache.put(&tracks[0]);
+        cache.put(&tracks[1]);
+        let file = dir.join("music-tags.json");
+        save_tags(&file, &cache);
+        // next launch: the cache fills them in, nothing to read
+        let cache = load_tags(&file);
+        let mut again = vec![bare_track(&a), bare_track(&b)];
+        assert!(cache.apply(&mut again).is_empty());
+        assert_eq!((again[0].title.as_str(), again[0].artist.as_str(), again[0].duration), ("Song One", "Someone", 187.5));
+        assert_eq!(again[1].title, "two", "no title tag: the file name");
+        // a file that changed is read again; one that's gone is forgotten
+        std::fs::write(&b, b"a different, longer file now").unwrap();
+        let mut again = vec![bare_track(&a), bare_track(&b)];
+        assert_eq!(cache.apply(&mut again), [1]);
+        let mut cache = cache;
+        cache.keep_only(&again[..1]);
+        assert_eq!(cache.files.len(), 1);
     }
 }

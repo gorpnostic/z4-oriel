@@ -270,6 +270,56 @@ fn storage_install_confirm_then_terminal() {
     assert_eq!(p.launched, vec!["term: winget install --id BurntSushi.ripgrep.MSVC -e".to_string()]);
 }
 
+#[test]
+fn storage_install_confirm_runs_what_it_named() {
+    let mut k = Kit::new();
+    let mut p = Storage::new();
+    quiet(&mut p, &k);
+    fake(&mut p);
+    k.key(&mut p, KeyCode::Char('5'));
+    let vlc = "Name             Id                      Version Match        Source\n\
+               --------------------------------------------------------------------\n\
+               VLC media player VideoLAN.VLC            3.0.21  Tag: vlc     winget\n";
+    let rg = "Name             Id                      Version Match        Source\n\
+              --------------------------------------------------------------------\n\
+              RipGrep GNU      BurntSushi.ripgrep.GNU  15.2.0  Tag: ripgrep winget\n\
+              RipGrep MSVC     BurntSushi.ripgrep.MSVC 15.2.0  Tag: ripgrep winget\n";
+    p.input = false;
+    p.found_q = "vlc".into();
+    p.found = Some(Ok(sys::parse_winget(vlc)));
+    // a new search: the old rows go away while it runs, so enter can't ask about the VLC you can't see
+    p.input = true;
+    p.query.clear();
+    k.typ(&mut p, "ripgrep");
+    k.key(&mut p, KeyCode::Enter);
+    assert_eq!(p.launched, vec!["search: ripgrep".to_string()]);
+    assert!(p.searching && p.found.is_none());
+    k.key(&mut p, KeyCode::Enter);
+    assert!(p.confirm.is_none(), "nothing to install while searching");
+    // the results land
+    p.out.tx.send(Msg::Found { g: p.sgen, res: Ok(sys::parse_winget(rg)) }).unwrap();
+    k.poll(&mut p);
+    assert!(!p.searching);
+    k.key(&mut p, KeyCode::Char('j'));
+    k.key(&mut p, KeyCode::Enter);
+    assert!(p.confirm.as_ref().is_some_and(|c| c.question == "install RipGrep MSVC 15.2.0?"));
+    // the list changes underneath the question (even to nothing): y still runs exactly what it named
+    p.found = Some(Ok(vec![]));
+    k.key(&mut p, KeyCode::Char('y'));
+    assert_eq!(p.launched.last().map(String::as_str), Some("term: winget install --id BurntSushi.ripgrep.MSVC -e"));
+
+    // uninstall: the same, with the installed-apps list reloading under it
+    let app = |name: &str, prog: &str| sys::App { name: name.into(), version: "1.0".into(), publisher: String::new(), size: 0, date: String::new(), uninstall: Cmd::new(prog, &["/uninstall"]) };
+    p.apps = Some(Ok(vec![app("Alpha", "alpha-uninstall"), app("Beta", "beta-uninstall")]));
+    k.key(&mut p, KeyCode::Char('3'));
+    k.key(&mut p, KeyCode::Char('j'));
+    k.key(&mut p, KeyCode::Char('u'));
+    assert!(p.confirm.as_ref().is_some_and(|c| c.question.starts_with("uninstall Beta 1.0")));
+    p.apps = Some(Ok(vec![app("Gamma", "gamma-uninstall")]));
+    k.key(&mut p, KeyCode::Char('y'));
+    assert_eq!(p.launched.last().map(String::as_str), Some("term: beta-uninstall /uninstall"));
+}
+
 /// Hits the network: `cargo test storage_live_search -- --ignored --nocapture`.
 #[test]
 #[ignore]

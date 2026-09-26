@@ -88,18 +88,22 @@ pub fn open(name: &str, cfg: &Config) -> Option<Box<dyn Pane>> {
         "alerts" => Box::new(alerts::Alerts::new()),
         "updates" => Box::new(updates::Updates::new()),
         "settings" => Box::new(settings::Settings::new(cfg)),
-        _ => {
-            let (_, prog, title) = AGENTS.iter().find(|a| a.0 == name)?;
-            let path = which(prog)?;
-            let icon = APPS.iter().find(|a| a.0 == name).map(|a| a.2).unwrap_or("term");
-            let icon: &'static str = crate::ui::ICON_NAMES.iter().find(|n| **n == icon).copied().unwrap_or("term");
-            // .cmd shims (npm installs on Windows) need cmd.exe to run them
-            let p = path.to_string_lossy().to_string();
-            if cfg!(windows) && (p.ends_with(".cmd") || p.ends_with(".bat")) {
-                Box::new(term::Term::new(title, icon, "cmd.exe", vec!["/c".into(), p], None))
-            } else {
-                Box::new(term::Term::new(title, icon, &p, vec![], None))
-            }
-        }
+        _ => return open_agent(name, None),
+    })
+}
+
+/// A CLI agent (claude, codex) in a terminal pane, working in `cwd` (None = the folder oriel runs in). None if
+/// it isn't one or isn't installed.
+pub fn open_agent(name: &str, cwd: Option<std::path::PathBuf>) -> Option<Box<dyn Pane>> {
+    let (_, prog, title) = AGENTS.iter().find(|a| a.0 == name)?;
+    let path = which(prog)?;
+    let icon = APPS.iter().find(|a| a.0 == name).map(|a| a.2).unwrap_or("term");
+    let icon: &'static str = crate::ui::ICON_NAMES.iter().find(|n| **n == icon).copied().unwrap_or("term");
+    // .cmd shims (npm installs on Windows) need cmd.exe to run them
+    let p = path.to_string_lossy().to_string();
+    Some(if cfg!(windows) && (p.ends_with(".cmd") || p.ends_with(".bat")) {
+        Box::new(term::Term::new(title, icon, "cmd.exe", vec!["/c".into(), p], cwd))
+    } else {
+        Box::new(term::Term::new(title, icon, &p, vec![], cwd))
     })
 }

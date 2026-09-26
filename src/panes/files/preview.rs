@@ -594,6 +594,109 @@ pub fn open_external(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What the OS calls the place deleted files go.
+pub fn bin_name() -> &'static str {
+    if cfg!(windows) { "the recycle bin" } else { "the trash" }
+}
+
+/// Move a file or folder to the recycle bin (Windows) or the trash (freedesktop / macOS), never delete it
+/// outright. Blocking: call it from a background thread.
+pub fn to_trash(path: &Path) -> Result<(), String> {
+    let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Err(format!("{} isn't there any more", path.display()));
+    }
+    trash_os(&path)
+}
+
+#[cfg(all(windows, target_pointer_width = "64"))]
+fn trash_os(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    // SHFileOperationW with FOF_ALLOWUNDO is the recycle bin; no crate needed for one call
+    #[repr(C)]
+    struct FileOp {
+        hwnd: *mut std::ffi::c_void,
+        func: u32,
+        from: *const u16,
+        to: *const u16,
+        flags: u16,
+        aborted: i32,
+        mappings: *mut std::ffi::c_void,
+        title: *const u16,
+    }
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHFileOperationW(op: *mut FileOp) -> i32;
+    }
+    const FO_DELETE: u32 = 3;
+    const FOF_SILENT: u16 = 0x4;
+    const FOF_NOCONFIRMATION: u16 = 0x10;
+    const FOF_ALLOWUNDO: u16 = 0x40;
+    const FOF_NOERRORUI: u16 = 0x400;
+    const FOF_WANTNUKEWARNING: u16 = 0x4000;
+    // a list of paths, each NUL-terminated, the list ending in another NUL
+    let from: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
+    let mut op = FileOp {
+        hwnd: std::ptr::null_mut(),
+        func: FO_DELETE,
+        from: from.as_ptr(),
+        to: std::ptr::null(),
+        // no questions, except one: an item the bin can't take (too big, a drive without a bin) would otherwise be
+        // deleted for good without a word, and oriel promised the recycle bin; WANTNUKEWARNING makes Windows ask
+        flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING,
+        aborted: 0,
+        mappings: std::ptr::null_mut(),
+        title: std::ptr::null(),
+    };
+    // SAFETY: one Win32 call on a stack struct laid out as the API expects; `from` outlives it
+    let r = unsafe { SHFileOperationW(&mut op) };
+    if op.aborted != 0 {
+        return Err("cancelled: it stays where it is".into());
+    }
+    if r != 0 {
+        return Err(format!("windows said no (code {r:#x}): is it open in another program?"));
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, not(target_pointer_width = "64")))]
+fn trash_os(_path: &Path) -> Result<(), String> {
+    Err("the recycle bin isn't supported in this build".into())
+}
+
+#[cfg(not(windows))]
+fn trash_os(path: &Path) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let run = |prog: &str, args: &[&std::ffi::OsStr]| -> bool {
+        crate::config::which(prog).is_some() && Command::new(prog).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    };
+    if cfg!(target_os = "macos") {
+        let script = format!("tell application \"Finder\" to delete POSIX file \"{}\"", path.display().to_string().replace('\\', "\\\\").replace('"', "\\\""));
+        return if run("osascript", &["-e".as_ref(), script.as_ref()]) { Ok(()) } else { Err("Finder wouldn't move it to the trash".into()) };
+    }
+    if run("gio", &["trash".as_ref(), path.as_os_str()]) || run("trash-put", &[path.as_os_str()]) {
+        return Ok(());
+    }
+    // the freedesktop trash by hand: the file into Trash/files, a note of where it came from into Trash/info
+    let trash = dirs::data_dir().ok_or("no data folder for the trash")?.join("Trash");
+    let (files, info) = (trash.join("files"), trash.join("info"));
+    std::fs::create_dir_all(&files).and_then(|_| std::fs::create_dir_all(&info)).map_err(|e| e.to_string())?;
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+    let mut dest = name.clone();
+    let mut n = 1;
+    while files.join(&dest).exists() || info.join(format!("{dest}.trashinfo")).exists() {
+        n += 1;
+        dest = format!("{name}.{n}");
+    }
+    let l = clock::local(clock::now_secs());
+    let when = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", l.year, l.month, l.day, l.hour, l.min, l.sec);
+    std::fs::write(info.join(format!("{dest}.trashinfo")), format!("[Trash Info]\nPath={}\nDeletionDate={when}\n", path.display())).map_err(|e| e.to_string())?;
+    std::fs::rename(path, files.join(&dest)).map_err(|e| {
+        let _ = std::fs::remove_file(info.join(format!("{dest}.trashinfo")));
+        format!("couldn't move it to the trash ({e})")
+    })
+}
+
 /// Put text on the clipboard: clip.exe on Windows (fed UTF-16 so any path survives), wl-copy / xclip / xsel on Linux.
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     use std::io::Write;
