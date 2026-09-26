@@ -20,6 +20,53 @@ pub struct Config {
     pub notes_folder: String,
     pub ai: AiConfig,
     pub music: MusicConfig,
+    /// The agents app's lead mode: which agent orchestrates, and its caps.
+    pub lead: LeadConfig,
+    /// Workers a lead can hand tasks to. Empty = one per installed agent (claude, codex, kimi).
+    pub roster: Vec<RosterEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct LeadConfig {
+    /// Who orchestrates: "claude", "codex", "kimi"… Empty = the last one used, else the first installed.
+    pub agent: String,
+    /// Empty = the agent's default model.
+    pub model: String,
+    /// The lead's own spend cap per run in USD (claude --max-budget-usd).
+    pub budget_usd: f64,
+    /// Cap for a whole run: lead + every worker. The lead can't spawn more work once it's reached.
+    pub run_budget_usd: f64,
+    /// Headless workers running at once (1-5); more tasks wait in TODO.
+    pub max_parallel: u32,
+    /// How the lead calls oriel: "" = MCP tools when its CLI can load them, else JSON actions; "mcp"; "text".
+    pub protocol: String,
+    /// The merge gate, run on every merged candidate before the integration branch moves: a shell command
+    /// ("cargo test", "npm run build"…). "" = detect (Cargo → cargo check, go.mod → go build ./...), "none" = off.
+    pub gate: String,
+    pub gate_timeout_s: u32,
+    /// Seconds between starting two workers on the same model, so the later one reuses the first one's cache.
+    pub stagger_s: u32,
+}
+
+/// One worker in the roster, e.g. `[[roster]] name = "codex" agent = "codex" tier = "mid" good_at = "refactors"`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct RosterEntry {
+    pub name: String,
+    /// "claude", "codex" or "kimi"
+    pub agent: String,
+    /// Empty = the agent's default.
+    pub model: String,
+    /// "cheap", "mid" or "premium": the lead prefers cheap tiers for simple work.
+    pub tier: String,
+    /// What to hand it, in a few words (the lead reads this).
+    pub good_at: String,
+    /// claude --max-turns (0 = no cap).
+    pub max_turns: u32,
+    /// Spend cap per task in USD (claude --max-budget-usd; others are stopped when their cost passes it). 0 = none.
+    pub budget_usd: f64,
+    pub enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -60,7 +107,21 @@ impl Default for Config {
             notes_folder: String::new(),
             ai: AiConfig::default(),
             music: MusicConfig::default(),
+            lead: LeadConfig::default(),
+            roster: vec![],
         }
+    }
+}
+
+impl Default for LeadConfig {
+    fn default() -> Self {
+        LeadConfig { agent: String::new(), model: String::new(), budget_usd: 2.0, run_budget_usd: 8.0, max_parallel: 3, protocol: String::new(), gate: String::new(), gate_timeout_s: 900, stagger_s: 5 }
+    }
+}
+
+impl Default for RosterEntry {
+    fn default() -> Self {
+        RosterEntry { name: String::new(), agent: "claude".into(), model: String::new(), tier: "mid".into(), good_at: String::new(), max_turns: 40, budget_usd: 1.5, enabled: true }
     }
 }
 

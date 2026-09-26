@@ -98,15 +98,25 @@ impl Agents {
             f.render_widget(Paragraph::new(Span::styled("agents: make the pane bigger", ui::muted(t))), area);
             return;
         }
-        if let Mode::Diff(_) = self.mode {
-            self.draw_diff(f, area, cx);
-        } else {
-            let hints = self.board_hints();
-            let body = ui::hint_line(f, area, &fit_hints(&hints, area.width as usize), t);
-            let body = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };
-            self.draw_header(f, Rect { height: 1, ..body }, cx);
-            let cols = Rect { y: body.y + 2, height: body.height.saturating_sub(2), ..body };
-            self.draw_board(f, cols, cx);
+        match self.mode {
+            Mode::Diff(_) => self.draw_diff(f, area, cx),
+            Mode::Watch(_) => self.draw_watch(f, area, cx),
+            Mode::Log(_) => self.draw_log(f, area, cx),
+            _ => {
+                let hints = self.board_hints();
+                let body = ui::hint_line(f, area, &fit_hints(&hints, area.width as usize), t);
+                let body = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };
+                self.draw_header(f, Rect { height: 1, ..body }, cx);
+                let mut cols = Rect { y: body.y + 2, height: body.height.saturating_sub(2), ..body };
+                // the lead run sits above the columns
+                if self.current_run().is_some() && cols.height > super::lead_view::LEAD_H + 8 {
+                    self.draw_lead_panel(f, Rect { height: super::lead_view::LEAD_H, ..cols }, cx);
+                    cols = Rect { y: cols.y + super::lead_view::LEAD_H + 1, height: cols.height - super::lead_view::LEAD_H - 1, ..cols };
+                } else if self.current_run().is_none() {
+                    self.lead_focus = false;
+                }
+                self.draw_board(f, cols, cx);
+            }
         }
         // popups on top
         match &self.mode {
@@ -114,6 +124,8 @@ impl Agents {
             Mode::Confirm(_) => self.draw_confirm(f, area, cx),
             Mode::Comment(..) | Mode::Plan(_) => self.draw_prompt_box(f, area, cx),
             Mode::Repo(_) => self.draw_picker(f, area, cx),
+            Mode::LeadForm(_) => self.draw_lead_form(f, area, cx),
+            Mode::Roster(_) => self.draw_roster(f, area, cx),
             _ => {}
         }
     }
@@ -122,19 +134,40 @@ impl Agents {
         if self.repo.is_none() {
             return vec![("o", "open a repo")];
         }
+        if self.lead_focus {
+            if let Some(r) = self.current_run() {
+                let mut h = vec![("enter", "lead transcript"), ("w", "watch")];
+                if r.state.active() {
+                    h.extend([("s", "stop run"), ("d", "diff so far")]);
+                } else {
+                    h.extend([("d", "review"), ("m", "merge into your branch"), ("x", "discard run")]);
+                    if r.state == super::store::RunState::Stopped {
+                        h.push(("r", "resume"));
+                    }
+                }
+                h.extend([("↓", "cards"), ("R", "roster")]);
+                return h;
+            }
+        }
         let sel = self.selected().and_then(|id| self.task(&id).cloned());
-        let mut h = vec![("n", "new task")];
+        let mut h = vec![("n", "new task"), ("L", "lead run")];
+        let headless = sel.as_ref().is_some_and(|t| t.headless());
         match sel.as_ref().map(|t| t.status) {
+            Some(Status::Todo) if headless => h.extend([("enter", "transcript"), ("x", "discard")]),
             Some(Status::Todo) => h.extend([("enter", "start"), ("e", "edit"), ("x", "delete")]),
+            Some(Status::Running | Status::Blocked) if headless => h.extend([("enter", "live transcript"), ("t", "take over"), ("d", "diff"), ("x", "discard")]),
             Some(Status::Running | Status::Blocked) => h.extend([("enter", "open agent"), ("d", "diff"), ("c", "comment"), ("m", "merge"), ("x", "discard")]),
+            Some(Status::Review) if headless => h.extend([("enter", "transcript"), ("d", "diff"), ("m", "merge"), ("c", "follow-up"), ("t", "take over"), ("x", "discard")]),
             Some(Status::Review) => h.extend([("d", "diff"), ("m", "merge"), ("c", "comment"), ("x", "discard"), ("r", "retry")]),
-            Some(Status::Done) if sel.as_ref().map(|t| t.outcome != "merged").unwrap_or(false) => h.push(("r", "retry")),
+            Some(Status::Done) if sel.as_ref().map(|t| t.outcome != "merged" && t.run.is_empty()).unwrap_or(false) => h.push(("r", "retry")),
             _ => {}
         }
-        if self.installed("claude").is_some() {
+        if self.current_run().is_some() {
+            h.push(("w", "watch run"));
+        } else if self.installed("claude").is_some() {
             h.push(("P", "plan"));
         }
-        h.extend([("o", "repo"), ("←→↑↓", "move")]);
+        h.extend([("R", "roster"), ("o", "repo"), ("←→↑↓", "move")]);
         h
     }
 
@@ -292,14 +325,17 @@ impl Agents {
             _ if sel => bold(t.fg),
             _ => Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
         };
+        let (glyph, gstyle) = if task.headless() && task.status == Status::Review && (task.blocked || !task.error.is_empty()) { ("▲", bold(t.danger)) } else { (glyph, gstyle) };
         let mut lines = vec![Line::from(vec![Span::styled(format!("{glyph} "), gstyle), Span::styled(ui::fit(&task.title, w.saturating_sub(2)), title_style)])];
-        // 2: agent · model, and time on the right
+        // 2: agent · model (a lead run's worker: ⚑ worker · tier), and time on the right
         let model = if task.model.is_empty() { "default" } else { &task.model };
         let icon = KINDS.iter().find(|k| k.0 == task.agent).map(|k| k.1).unwrap_or("robot");
         let when = match task.status {
+            Status::Todo if task.queued => Span::styled("queued", ui::muted(t)),
             Status::Todo => Span::styled(format!("added {}", dur(now - task.created)), ui::muted(t)),
             Status::Running => Span::styled(dur(now - task.started), ui::accent(t)),
             Status::Blocked => Span::styled("BLOCKED", bold(t.danger)),
+            Status::Review if task.want_merge => Span::styled("merging", bold(t.shine)),
             Status::Review => Span::styled(format!("took {}", dur(task.finished - task.started)), ui::muted(t)),
             Status::Done => Span::styled(format!("{} {}", task.outcome, crate::panes::files::clock::stamp(task.finished).get(0..6).unwrap_or("")), ui::muted(t)),
         };
@@ -307,7 +343,21 @@ impl Agents {
         if task.followups > 0 {
             right.insert(0, Span::styled(format!("↻{} ", task.followups), ui::muted(t)));
         }
-        lines.push(spread(vec![Span::styled(format!("{}{} · {model}", ui::lead(icon), task.agent), ui::muted(t))], right, w));
+        let who = if task.run.is_empty() {
+            vec![Span::styled(format!("{}{} · {model}", ui::lead(icon), task.agent), ui::muted(t))]
+        } else {
+            let tier_c = match task.tier.as_str() {
+                "cheap" => t.good,
+                "premium" => t.shine,
+                _ => t.accent,
+            };
+            let mut v = vec![Span::styled("⚑ ", Style::default().fg(t.shine)), Span::styled(format!("{}{}", ui::lead(icon), task.worker), Style::default().fg(t.fg)), Span::styled(format!(" · {}", task.tier), Style::default().fg(tier_c))];
+            if !task.headless() {
+                v.push(Span::styled(" · tab", ui::accent(t)));
+            }
+            v
+        };
+        lines.push(spread(who, right, w));
         // 3-4: what it's doing / asking / the error, and the numbers
         let stat_spans = |t: &Theme| -> Vec<Span<'static>> {
             let mut v = vec![];
@@ -328,6 +378,11 @@ impl Agents {
             lines.push(Line::styled(b, Style::default().fg(t.danger)));
         } else {
             match task.status {
+                Status::Todo if task.queued && !task.depends_on.is_empty() => {
+                    let (a, _) = two_lines(&task.prompt.replace('\n', " "), w);
+                    lines.push(Line::styled(a, ui::muted(t)));
+                    lines.push(Line::styled(ui::fit(&format!("after {}", task.depends_on.join(", ")), w), Style::default().fg(t.frame)));
+                }
                 Status::Todo => {
                     let (a, b) = two_lines(&task.prompt.replace('\n', " "), w);
                     lines.push(Line::styled(a, ui::muted(t)));
@@ -348,9 +403,15 @@ impl Agents {
                     }
                     lines.push(spread(left, cost(t), w));
                 }
+                Status::Review if task.blocked => {
+                    let q = task.questions.first().cloned().unwrap_or_else(|| "blocked — needs a decision".into());
+                    lines.push(Line::styled(ui::fit(&format!("? {q}"), w), Style::default().fg(t.danger)));
+                    lines.push(spread(stat_spans(t), cost(t), w));
+                }
                 Status::Review | Status::Done => {
                     let st = if task.status == Status::Review && !busy { Style::default().fg(t.shine) } else { ui::muted(t) };
-                    lines.push(Line::styled(ui::fit(&task.last, w), st));
+                    let last = if task.status == Status::Review && !task.summary.is_empty() && !task.want_merge && !busy { task.summary.clone() } else { task.last.clone() };
+                    lines.push(Line::styled(ui::fit(&last, w), st));
                     lines.push(spread(stat_spans(t), cost(t), w));
                 }
             }
@@ -364,7 +425,11 @@ impl Agents {
         let t = cx.theme;
         let Mode::Diff(v) = &mut self.mode else { return };
         let id = v.id.clone();
-        let task = self.store.tasks.iter().find(|x| x.id == id).cloned().unwrap_or_default();
+        // a lead run's review diff shows as a task: its goal, integration branch → the user's branch
+        let task = self.store.tasks.iter().find(|x| x.id == id).cloned().or_else(|| {
+            self.store.runs.iter().find(|r| r.id == id).map(|r| Task { id: r.id.clone(), title: format!("⚑ {}", r.goal.lines().next().unwrap_or("")), branch: r.branch.clone(), base_branch: r.base_branch.clone(), error: r.error.clone(), ..Default::default() })
+        });
+        let task = task.unwrap_or_default();
         let hints = [("↑↓", "file"), ("pgup/pgdn", "scroll"), ("m", "merge"), ("c", "comment"), ("x", "discard"), ("R", "reload"), ("esc", "board")];
         let body = ui::hint_line(f, area, &fit_hints(&hints, area.width as usize), t);
         let body = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };
@@ -570,8 +635,41 @@ impl Agents {
     fn draw_confirm(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
         let Mode::Confirm(c) = &self.mode else { return };
+        if let Some(run) = self.run_ref(&c.id) {
+            let goal: String = run.goal.lines().next().unwrap_or("").chars().take(50).collect();
+            let workers = self.run_tasks(&run.id).iter().filter(|x| matches!(x.status, Status::Running | Status::Blocked)).count();
+            let (title, body, yes, danger): (&str, Vec<String>, &str, bool) = match c.what {
+                Pending::StopRun => ("stop the lead run", vec![format!("Stop \"{goal}\"?"), format!("The lead and {workers} running worker(s) stop now. What's merged stays on"), format!("{} for you to review or merge.", run.branch)], "stop", true),
+                Pending::MergeRun => ("merge the lead run", vec![format!("Squash-merge {} into {}?", run.branch, run.base_branch), format!("Everything the run merged ({} task(s)) becomes one commit on {}.", run.merged, run.base_branch), "Then the integration branch and the lead's checkout are removed.".into()], "merge", false),
+                _ => ("discard the lead run", vec![format!("Throw away \"{goal}\"?"), format!("Stops everything and deletes {} and every worker's worktree.", run.branch), "Nothing reaches your branch.".into()], "discard", true),
+            };
+            let h = body.len() as u16 + 6;
+            let inner = ui::popup(f, area, 76, h, title, t);
+            let inner = Rect { x: inner.x + 2, width: inner.width.saturating_sub(4), y: inner.y + 1, height: inner.height.saturating_sub(1) };
+            let mut lines: Vec<Line> = body.iter().enumerate().map(|(i, s)| Line::styled(s.clone(), if i == 0 { bold(t.fg) } else { ui::muted(t) })).collect();
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled(format!(" y {yes} "), Style::default().fg(Color::Black).bg(if danger { t.danger } else { t.accent }).add_modifier(Modifier::BOLD)),
+                Span::raw("   "),
+                Span::styled("esc", bold(t.fg)),
+                Span::styled(" cancel", ui::muted(t)),
+            ]));
+            f.render_widget(Paragraph::new(lines), inner);
+            return;
+        }
         let Some(task) = self.task(&c.id) else { return };
         let (title, body, yes, danger): (&str, Vec<String>, &str, bool) = match c.what {
+            Pending::Merge if !task.run.is_empty() => (
+                "merge into the run",
+                vec![
+                    format!("Queue \"{}\" for the run's integration branch?", task.title),
+                    "It's conflict-checked and gated (build/tests) on the merged result".into(),
+                    format!("first; nothing reaches {} until you merge the run.", self.run_ref(&task.run).map(|r| r.base_branch.clone()).unwrap_or_default()),
+                ],
+                "queue merge",
+                false,
+            ),
+            Pending::StopRun | Pending::MergeRun | Pending::DiscardRun => return,
             Pending::Merge => (
                 "merge",
                 vec![
@@ -717,6 +815,16 @@ impl Agents {
             f.render_widget(Paragraph::new(line), r);
             self.side_hits.push((r, Hit::Column(c)));
         }
+        if let Some(run) = self.current_run().cloned() {
+            y += 1;
+            if let Some(r) = row(f, &mut y, area) {
+                let spin = SPIN[(cx.time * 10.0) as usize % 10];
+                let (g, st) = if run.state.active() { (spin, bold(t.accent)) } else { ("⚑", bold(t.shine)) };
+                let spend = self.spend(&run.id);
+                f.render_widget(Paragraph::new(spread(vec![Span::styled(format!("{g} "), st), Span::styled("lead run", if self.lead_focus { bold(t.accent) } else { Style::default().fg(t.fg) })], vec![Span::styled(format!("${spend:.2}"), ui::muted(t))], r.width as usize)), r);
+                self.side_hits.push((r, Hit::LeadPanel));
+            }
+        }
         let today = self.today();
         if today > 0.0 {
             y += 1;
@@ -763,7 +871,7 @@ fn fit_hints<'a>(hints: &[(&'a str, &'a str)], w: usize) -> Vec<(&'a str, &'a st
 }
 
 /// A text field inside `r`: wrapped text (or a muted placeholder) and the cursor when focused.
-fn draw_input(f: &mut Frame, r: Rect, inp: &super::input::Input, placeholder: &str, focused: bool, t: &Theme) {
+pub(super) fn draw_input(f: &mut Frame, r: Rect, inp: &super::input::Input, placeholder: &str, focused: bool, t: &Theme) {
     if r.width < 2 || r.height == 0 {
         return;
     }

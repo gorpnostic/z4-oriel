@@ -52,6 +52,11 @@ fn main() -> anyhow::Result<()> {
             panes::chat::approve::serve_stdio(args.get(1).map(String::as_str).unwrap_or(""), args.get(2).map(String::as_str).unwrap_or(""));
             return Ok(());
         }
+        Some("mcp-lead") => {
+            // the MCP server a lead agent's CLI starts in lead mode (see panes/agents/mcp.rs)
+            panes::agents::mcp_lead(args.get(1).map(String::as_str).unwrap_or(""), args.get(2).map(String::as_str).unwrap_or(""));
+            return Ok(());
+        }
         // helpers other programs call (hooks, status lines) — they print and exit, no UI
         Some("report") => std::process::exit(panes::agents::cli(&args[1..])),
         Some("usage-sink") => std::process::exit(panes::ais::cli(&args[1..])),
