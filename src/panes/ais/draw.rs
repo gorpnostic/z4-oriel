@@ -713,6 +713,14 @@ impl Ais {
                     None => s("not set (c on overview)", ui::muted(t)),
                 };
                 put(f, ri, y, vec![lab("status line"), sl]);
+                y += 1;
+                // Claude deletes old transcripts; oriel's search keeps a copy, h keeps the originals for a year
+                let hist = match r.history_days {
+                    Some(d) if d >= saver::KEEP_DAYS => s(format!("{d} days ✓"), Style::default().fg(t.good)),
+                    Some(d) => s(format!("{d} days · h: a year"), Style::default().fg(AMBER)),
+                    None => s("30 days (default) · h: a year", ui::muted(t)),
+                };
+                put(f, ri, y, vec![lab("history kept"), hist]);
             }
         }
         let ti = card(f, Rect { y: right.y + nh + 1, height: th, ..right }, "tips", None, true, false, t);
@@ -832,7 +840,7 @@ impl Ais {
             View::Overview => vec![("c", "connect Claude limits"), ("r", "refresh")],
             View::Install => vec![("enter", "install"), ("l", "sign in"), ("o", "docs"), ("r", "recheck")],
             View::Usage => vec![("←/→", "which AI"), ("↑/↓", "scroll days"), ("r", "refresh")],
-            View::Saver => vec![("↑/↓", "preset"), ("enter", "apply to Claude"), ("x", "add Codex profile"), ("r", "reload")],
+            View::Saver => vec![("↑/↓", "preset"), ("enter", "apply to Claude"), ("x", "add Codex profile"), ("h", "keep a year of history"), ("r", "reload")],
         };
         v.push(("1-4 / tab", "views"));
         v
@@ -979,6 +987,7 @@ impl Pane for Ais {
             }
             KeyCode::Enter | KeyCode::Char('a') if self.view == View::Saver => self.plan("claude", cx),
             KeyCode::Char('x') if self.view == View::Saver => self.plan("codex", cx),
+            KeyCode::Char('h') if self.view == View::Saver => self.plan("history", cx),
             _ => return false,
         }
         true

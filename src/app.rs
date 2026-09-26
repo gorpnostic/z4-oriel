@@ -232,6 +232,8 @@ impl App {
             crate::alerts::watch(move |k, s| {
                 let _ = t2.send(Event::Alert(k, s));
             });
+            // keep the search index (and so the archive of every AI session) current in the background
+            crate::recall::start_background();
             // once a day: is there a newer oriel? (in the background; quiet if offline)
             std::thread::spawn(move || {
                 if let Some(r) = crate::update::check(false).ok().and_then(|rs| crate::update::available(&rs)) {
@@ -251,6 +253,8 @@ impl App {
         let startup = app.config.startup.clone();
         if SIDEBAR.iter().any(|a| a.0 == startup) {
             app.goto_app(SIDEBAR.iter().find(|a| a.0 == startup).unwrap().0);
+        } else if startup == "search" {
+            app.goto_app("search"); // `oriel search`: the same tab alt r goes to, not a second one
         } else {
             let first = panes::open(&startup, &app.config).unwrap_or_else(|| Box::new(panes::home::Home::new()));
             app.new_tab(first);
@@ -680,6 +684,12 @@ impl App {
                         self.with_pane(id, |p, cx| p.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), cx));
                     }
                 }
+                Action::AppPaste(a, text) => {
+                    self.goto_app(a); // opens it if it isn't yet
+                    if let Some(id) = self.tabs.iter().find(|t| t.app == Some(a)).map(|t| t.focus) {
+                        self.with_pane(id, |p, cx| p.paste(&text, cx));
+                    }
+                }
                 Action::OpenTagged { pane, tag, name, focus } => {
                     let here = self.cur;
                     self.new_tab(pane);
@@ -937,6 +947,8 @@ impl App {
                 }
                 's' => self.sidebar = !self.sidebar,
                 'p' => self.open_palette(),
+                // search every AI session (a shell's own history search stays on ctrl+r)
+                'r' => self.goto_app("search"),
                 'z' => self.run_cmd(Cmd::Zoom),
                 'w' => self.run_cmd(Cmd::Close),
                 't' => self.run_cmd(Cmd::NewTab),
@@ -1048,6 +1060,8 @@ impl App {
         for &(name, icon, label, key) in SIDEBAR {
             items.push((format!("{}go to {label}  {key}", ui::lead(icon)), Cmd::App(name)));
         }
+        // not in the sidebar: it comes up over whatever you're doing (alt r)
+        items.push((format!("{}search chats: every AI session on this computer  alt r", ui::lead("history")), Cmd::App("search")));
         for &(name, _, icon, label) in APPS {
             if available(name) {
                 items.push((format!("{}split: open {label} beside this", ui::lead(icon)), Cmd::Open(name, Place::Split)));
@@ -1997,6 +2011,45 @@ mod tests {
         }
         let s = snap(&mut app, "palette");
         assert!(s.contains("theme ocean"), "theme list missing");
+    }
+
+    /// alt r opens the search app from anywhere (the palette has it too), and AppPaste lands text in an app's box and
+    /// switches to it.
+    #[test]
+    fn app_search_alt_r_and_app_paste() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "oriel".into();
+        let mut app = App::new(cfg, tx);
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert_eq!(app.tabs[app.cur].app, Some("search"));
+        let s = snap(&mut app, "search");
+        assert!(s.contains("search every AI session") && s.contains("what did we decide about"), "{s}");
+        assert!(!app.user_tabs().contains(&app.cur), "it isn't one of your tabs");
+        app.goto_app("files");
+        app.open_palette();
+        if let Some(p) = &mut app.palette {
+            p.query = "search chats".into();
+        }
+        assert!(snap(&mut app, "search-palette").contains("search chats: every AI session"));
+        app.palette_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.tabs[app.cur].app, Some("search"), "the palette goes back to the same search");
+        assert_eq!(app.tabs.iter().filter(|t| t.app == Some("search")).count(), 1);
+        // AppPaste: into the chat's composer, and the chat is where you land
+        let from = app.focused();
+        app.apply(from, vec![Action::AppPaste("ai", "(from a codex session) use a token bucket".into())]);
+        assert_eq!(app.tabs[app.cur].app, Some("ai"));
+        assert!(snap(&mut app, "search-paste").contains("use a token bucket"));
+
+        // `oriel search` starts on that same app tab, so alt r doesn't make a second one
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.startup = "search".into();
+        let mut app = App::new(cfg, tx);
+        assert_eq!((app.tabs[app.cur].app, app.tabs.len()), (Some("search"), 1));
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert_eq!(app.tabs.len(), 1);
     }
 
     #[test]

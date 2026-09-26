@@ -10,6 +10,7 @@ pub mod help;
 pub mod home;
 pub mod music;
 pub mod notes;
+pub mod search;
 pub mod storage;
 mod stub;
 pub mod system;
@@ -55,6 +56,7 @@ pub fn open(name: &str, cfg: &Config) -> Option<Box<dyn Pane>> {
         "storage" => Box::new(storage::Storage::new()),
         "agents" => Box::new(agents::Agents::new(cfg)),
         "ais" => Box::new(ais::Ais::new(cfg)),
+        "search" => Box::new(search::Search::new(cfg)),
         "home" => Box::new(home::Home::new()),
         "help" => Box::new(help::Help::new()),
         "themes" => Box::new(themes::Themes::new()),

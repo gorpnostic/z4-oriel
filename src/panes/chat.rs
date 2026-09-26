@@ -7,7 +7,7 @@ mod agent;
 pub mod approve;
 mod md;
 pub mod providers;
-mod store;
+pub(crate) mod store;
 
 /// A diff line's background for a theme (line tint, changed-word tint): the themes app previews with it.
 pub(crate) use activity::band as diff_band;
@@ -15,6 +15,49 @@ pub(crate) use activity::band as diff_band;
 /// Markdown drawn the way the chat draws replies (the updates screen shows release notes with it).
 pub(crate) fn render_markdown(text: &str, width: usize, t: &crate::theme::Theme) -> Vec<Line<'static>> {
     md::render(text, width, "", t)
+}
+
+/// A tool call as the transcript names it ("Update", "src/app.rs"), or None for the todo-list plumbing. The
+/// search index keeps one such line per call.
+pub(crate) fn tool_brief(name: &str, input: &serde_json::Value, cwd: &std::path::Path) -> Option<(String, String)> {
+    (!agent::hidden(name)).then(|| (agent::label(name), agent::target(name, input, cwd)))
+}
+
+/// What the chat app should show next time it draws (the search app's `r`): a saved chat by id, or a session from
+/// elsewhere to carry on, with the line that says what happened.
+pub(crate) enum Open {
+    Chat(String),
+    Resume(store::Chat, String),
+}
+
+thread_local! {
+    /// Set just before switching to the chat app (the UI is single-threaded; thread-local keeps tests apart).
+    static OPEN: std::cell::RefCell<Option<Open>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn request_open(o: Open) {
+    OPEN.with(|c| *c.borrow_mut() = Some(o));
+}
+
+/// ctrl+r: searching your past prompts (from every chat), newest first.
+#[derive(Default)]
+struct PromptSearch {
+    query: String,
+    sel: usize,
+}
+
+/// The chat sidebar's "this folder only" switch, kept in a small file of its own.
+fn folder_pref_path() -> PathBuf {
+    crate::config::data_dir().join("chat-sidebar.json")
+}
+
+/// Same folder? (Windows paths compare without case and with either slash.)
+fn same_dir(a: &str, b: &str) -> bool {
+    let n = |s: &str| {
+        let s = s.trim_end_matches(['/', '\\']);
+        if cfg!(windows) { s.replace('\\', "/").to_lowercase() } else { s.to_string() }
+    };
+    n(a) == n(b)
 }
 
 use crate::pane::{Action, Cx, Pane};
@@ -46,6 +89,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/key", "<openai|anthropic> <key>", "save an API key"),
     ("/note", "", "save the last reply to notes"),
     ("/save", "", "export this chat as a markdown file"),
+    ("/recall", "<words>", "search every AI chat and session on this computer (alt r)"),
     ("/theme", "<name|edit|new>", "switch theme · edit opens the theme editor · new <name> makes your own"),
     ("/play", "", "music: play / pause"),
     ("/next", "", "music: next song"),
@@ -152,6 +196,8 @@ struct Queued {
 #[derive(Clone)]
 enum SideItem {
     New,
+    /// the "all folders / this folder only" switch
+    Folder,
     Chat(usize),
 }
 
@@ -199,18 +245,21 @@ pub struct Chat {
     queue: Vec<Queued>,
     /// ctrl+x was pressed: s sends now.
     chord_x: bool,
+    /// A transcript to read, not a chat to type in (the search app shows sessions with it).
+    readonly: bool,
+    /// Scroll so this message is at the top, on the next draw.
+    focus_msg: Option<usize>,
+    /// A session carried on from elsewhere (search's `r`): only saved once you send something in it.
+    draft: bool,
+    prompt_search: Option<PromptSearch>,
+    /// The sidebar lists only chats from the current chat's folder (ctrl+f).
+    this_folder: bool,
 }
 
 impl Chat {
     pub fn new(cfg: &crate::config::Config) -> Self {
         let chats = store::load_all();
         let avail = providers::available(&cfg.ai);
-        // the configured AI if this machine has it, else the first one it does have
-        let provider = if !cfg.ai.provider.is_empty() && avail.contains(&cfg.ai.provider.as_str()) {
-            cfg.ai.provider.clone()
-        } else {
-            avail.first().map(|s| s.to_string()).unwrap_or_else(|| "none".into())
-        };
         let ollama_models: Arc<Mutex<Vec<String>>> = Arc::default();
         if avail.contains(&"ollama") && !cfg!(test) {
             let (url, into) = (cfg.ai.ollama_url.clone(), ollama_models.clone());
@@ -224,6 +273,31 @@ impl Chat {
                 }
             });
         }
+        let mut c = Self::make(cfg, chats, avail, ollama_models);
+        if !cfg!(test) {
+            c.this_folder = std::fs::read_to_string(folder_pref_path()).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).is_some_and(|v| v["this_folder"] == true);
+        }
+        c
+    }
+
+    /// A read-only view of a transcript (a session from the search app), scrolled to message `focus`. No saved chats
+    /// are loaded and no AI is asked about: it only draws.
+    pub(crate) fn viewer(cfg: &crate::config::Config, chat: store::Chat, focus: usize) -> Self {
+        let mut c = Self::make(cfg, vec![], vec![], Arc::default());
+        c.provider = chat.provider.clone().filter(|p| providers::is_known(p)).unwrap_or_else(|| "claude".into());
+        c.chat = chat;
+        c.readonly = true;
+        c.focus_msg = Some(focus);
+        c
+    }
+
+    fn make(cfg: &crate::config::Config, chats: Vec<store::Chat>, avail: Vec<&'static str>, ollama_models: Arc<Mutex<Vec<String>>>) -> Self {
+        // the configured AI if this machine has it, else the first one it does have
+        let provider = if !cfg.ai.provider.is_empty() && avail.contains(&cfg.ai.provider.as_str()) {
+            cfg.ai.provider.clone()
+        } else {
+            avail.first().map(|s| s.to_string()).unwrap_or_else(|| "none".into())
+        };
         let mut first = store::Chat::new(&provider);
         first.model = cfg.ai.models.get(&provider).cloned().filter(|m| !m.is_empty());
         Chat {
@@ -259,7 +333,121 @@ impl Chat {
             offset: crate::app::local_offset_secs(),
             queue: vec![],
             chord_x: false,
+            readonly: false,
+            focus_msg: None,
+            draft: false,
+            prompt_search: None,
+            this_folder: false,
         }
+    }
+
+    /// The search app asked for a chat (or a session to carry on): show it.
+    fn take_open(&mut self) {
+        let Some(o) = OPEN.with(|c| c.borrow_mut().take()) else { return };
+        match o {
+            Open::Chat(id) => {
+                if !self.chats.iter().any(|c| c.id == id) {
+                    self.chats = store::load_all();
+                }
+                match self.chats.iter().position(|c| c.id == id) {
+                    Some(i) => self.open_chat(i),
+                    None => self.info = vec!["that chat isn't there any more".into()],
+                }
+            }
+            Open::Resume(c, note) => {
+                self.stop();
+                self.persist_if_changed();
+                self.chat = c;
+                self.draft = true;
+                self.cache.clear();
+                self.scroll = 0;
+                self.info = vec![note];
+            }
+        }
+    }
+
+    /// The folder the sidebar's "this folder" switch means: the current chat's.
+    fn folder(&self) -> String {
+        self.chat.cwd.clone().unwrap_or_else(|| self.launch_dir.to_string_lossy().to_string())
+    }
+
+    fn toggle_folder(&mut self) {
+        self.this_folder = !self.this_folder;
+        self.side_scroll = 0;
+        if !cfg!(test) {
+            let _ = std::fs::write(folder_pref_path(), serde_json::json!({ "this_folder": self.this_folder }).to_string());
+        }
+    }
+
+    /// Your past prompts matching `q` (every word), from this chat and then every saved one, newest first.
+    fn prompt_matches(&self, q: &str) -> Vec<String> {
+        let words: Vec<String> = q.to_lowercase().split_whitespace().map(String::from).collect();
+        let mut seen = HashSet::new();
+        let mut out = vec![];
+        for c in std::iter::once(&self.chat).chain(self.chats.iter().filter(|c| c.id != self.chat.id)) {
+            for m in c.messages.iter().rev().filter(|m| m.role == "user") {
+                let text = m.content.trim();
+                if text.is_empty() || text.starts_with('/') {
+                    continue;
+                }
+                let low = text.to_lowercase();
+                if words.iter().all(|w| low.contains(w.as_str())) && seen.insert(text.to_string()) {
+                    out.push(text.to_string());
+                    if out.len() >= 200 {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Keys while ctrl+r's prompt search is open.
+    fn prompt_search_key(&mut self, k: KeyEvent) {
+        let Some(ps) = &self.prompt_search else { return };
+        let (q, sel) = (ps.query.clone(), ps.sel);
+        let n = self.prompt_matches(&q).len();
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => self.prompt_search = None,
+            KeyCode::Enter | KeyCode::Tab => {
+                if let Some(p) = self.prompt_matches(&q).get(sel) {
+                    self.input = p.clone();
+                    self.cursor = self.input.chars().count();
+                    self.menu_sel = 0;
+                }
+                self.prompt_search = None;
+            }
+            // up (or ctrl+r again) goes further back, like a shell
+            KeyCode::Up => self.set_prompt_sel((sel + 1).min(n.saturating_sub(1))),
+            KeyCode::Char('r') if ctrl => self.set_prompt_sel((sel + 1).min(n.saturating_sub(1))),
+            KeyCode::Down => self.set_prompt_sel(sel.saturating_sub(1)),
+            KeyCode::Backspace => {
+                if let Some(ps) = &mut self.prompt_search {
+                    ps.query.pop();
+                    ps.sel = 0;
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(ps) = &mut self.prompt_search {
+                    ps.query.push(c);
+                    ps.sel = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn set_prompt_sel(&mut self, i: usize) {
+        if let Some(ps) = &mut self.prompt_search {
+            ps.sel = i;
+        }
+    }
+
+    /// For other panes' tests: the chat's CLI state (JSON), its info lines, and whether it's still a draft.
+    #[cfg(test)]
+    pub(crate) fn test_view(&self) -> (String, Vec<String>, bool) {
+        (serde_json::to_string(&self.chat.state).unwrap_or_default(), self.info.clone(), self.draft)
     }
 
     /// The chat's AI, or the current default when it used one oriel doesn't have (an old chat).
@@ -322,6 +510,9 @@ impl Chat {
 
     /// Save only if it differs from the saved copy — just looking at a chat mustn't bump it to the top.
     fn persist_if_changed(&mut self) {
+        if self.draft || self.readonly {
+            return; // a session carried on from elsewhere becomes a chat of yours once you say something in it
+        }
         if let Some(old) = self.chats.iter().find(|c| c.id == self.chat.id) {
             if serde_json::to_value(old).ok() == serde_json::to_value(&self.chat).ok() {
                 return;
@@ -484,6 +675,7 @@ impl Chat {
             self.enqueue(text);
             return;
         }
+        self.draft = false;
         if self.chat.messages.is_empty() {
             self.chat.title = store::title_from(&text);
             if self.chat.cwd.is_none() {
@@ -735,6 +927,10 @@ impl Chat {
                     }
                 }
             }
+            "/recall" => {
+                crate::panes::search::request_query(&arg);
+                cx.act(Action::GotoApp("search"));
+            }
             "/play" => cx.act(Action::AppKey("music", ' ')),
             "/next" => cx.act(Action::AppKey("music", 'n')),
             "/prev" => cx.act(Action::AppKey("music", 'p')),
@@ -752,8 +948,9 @@ impl Chat {
             "/help" => {
                 self.info.extend(
                     [
-                        "enter send · esc stop · ctrl+r regenerate · ctrl+n new chat · ctrl+d delete chat",
-                        "pgup/pgdn or the wheel scroll · ↑ in an empty box recalls your last message",
+                        "enter send · esc stop · ctrl+g regenerate · ctrl+n new chat · ctrl+d delete chat",
+                        "pgup/pgdn or the wheel scroll · ↑ in an empty box recalls your last message · ctrl+r searches every prompt you've sent",
+                        "ctrl+f: the sidebar lists only this folder's chats · /recall <words> or alt r searches every AI session",
                         "ctrl+o shows every tool call in full (diffs, output) · click a tool line to open just that one",
                         "/perms ask: Claude Code asks first · y allow · n deny · a always allow that tool",
                         "F1-F9 apps · F12 play/pause · alt p palette · alt n terminal beside this",
@@ -1399,10 +1596,17 @@ impl Pane for Chat {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
+        if !self.readonly {
+            self.take_open();
+        }
         let t = cx.theme;
         let has_activity = self.chat.messages.iter().any(|m| !m.parts.is_empty());
         let expand_hint = if self.expanded { "collapse" } else { "expand tools" };
-        let hints: Vec<(&str, &str)> = if self.confirm_delete {
+        let hints: Vec<(&str, &str)> = if self.readonly {
+            vec![("esc", "back"), ("r", "resume in chat"), ("a", "attach to chat"), ("ctrl+o", expand_hint), ("↑↓ pgup/pgdn", "scroll")]
+        } else if self.prompt_search.is_some() {
+            vec![("type", "search your prompts"), ("↑ / ctrl+r", "older"), ("↓", "newer"), ("enter", "use it"), ("esc", "cancel")]
+        } else if self.confirm_delete {
             vec![("y", "delete this chat"), ("esc", "keep it")]
         } else if !self.asks.is_empty() {
             vec![("y", "allow"), ("n", "deny"), ("a", "always allow"), ("esc", "stop")]
@@ -1416,7 +1620,7 @@ impl Pane for Chat {
             v.extend([("F10", "help"), ("alt p", "palette")]);
             v
         } else {
-            let mut v = vec![("enter", "send"), ("ctrl+r", "regenerate"), ("ctrl+n", "new chat"), ("/", "commands")];
+            let mut v = vec![("enter", "send"), ("ctrl+g", "regenerate"), ("ctrl+r", "past prompts"), ("ctrl+n", "new chat"), ("/", "commands")];
             if has_activity {
                 v.push(("ctrl+o", expand_hint));
             }
@@ -1427,8 +1631,10 @@ impl Pane for Chat {
         if area.height < 5 {
             return;
         }
-        let comp = Rect { y: area.bottom() - 3, height: 3, ..area };
-        let above = Rect { height: area.height - 3, ..area };
+        // a read-only transcript has no composer: all of it is the conversation
+        let comp_h = if self.readonly { 0 } else { 3 };
+        let comp = Rect { y: area.bottom() - comp_h, height: comp_h, ..area };
+        let above = Rect { height: area.height - comp_h, ..area };
         let above = Rect { x: above.x + 1, width: above.width.saturating_sub(2), ..above };
         // what's pinned above the composer while an agent works: an approval prompt, the status line, the todos
         let mut pinned = self.pinned_lines(above.width as usize, cx);
@@ -1447,9 +1653,11 @@ impl Pane for Chat {
             let width = body.width as usize;
             let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
             let mut hits: Vec<(usize, String)> = vec![];
+            let mut starts = vec![];
             for i in 0..self.chat.messages.len() {
                 let (l, h) = self.msg_lines(i, width, cx);
                 let off = lines.len();
+                starts.push(off);
                 hits.extend(h.into_iter().map(|(n, id)| (n + off, id)));
                 lines.extend(l);
             }
@@ -1458,6 +1666,11 @@ impl Pane for Chat {
             }
             let h = body.height as usize;
             let max_scroll = lines.len().saturating_sub(h);
+            if let Some(i) = self.focus_msg.take() {
+                // open at a given message (the one a search matched), a line of the one before showing
+                let at = starts.get(i).copied().unwrap_or(0).saturating_sub(1);
+                self.scroll = max_scroll - at.min(max_scroll);
+            }
             self.scroll = self.scroll.min(max_scroll);
             let start = max_scroll - self.scroll;
             self.tool_hits = hits.into_iter().filter(|(n, _)| *n >= start && *n < start + h).map(|(n, id)| (body.y + (n - start) as u16, id)).collect();
@@ -1473,8 +1686,34 @@ impl Pane for Chat {
             }
         }
 
+        if self.readonly {
+            return;
+        }
+
+        // ---- ctrl+r: your past prompts, above the composer
+        if let (Some(ps), true) = (&self.prompt_search, cx.focused) {
+            let found = self.prompt_matches(&ps.query);
+            let rows = found.len().clamp(1, 8) as u16;
+            let mr = Rect { x: comp.x, y: comp.y.saturating_sub(rows + 2), width: comp.width, height: rows + 2 };
+            f.render_widget(ratatui::widgets::Clear, mr);
+            let title = format!("your prompts: {}▏", ps.query);
+            let count = if found.is_empty() { "0".to_string() } else { format!("{}/{}", ps.sel.min(found.len() - 1) + 1, found.len()) };
+            let inner = ui::frame(f, mr, &title, Some(&count), false, t);
+            if found.is_empty() {
+                f.render_widget(Paragraph::new(Span::styled("  nothing you've sent matches", ui::muted(t))), Rect { height: 1, ..inner });
+            }
+            let start = ps.sel.saturating_sub(rows as usize - 1);
+            for (row, p) in found.iter().enumerate().skip(start).take(rows as usize) {
+                let on = row == ps.sel;
+                let st = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default() };
+                let text = p.split_whitespace().collect::<Vec<_>>().join(" ");
+                let line = Line::from(vec![Span::styled(if on { "▌" } else { " " }, ui::accent(t)), Span::styled(ui::fit(&text, inner.width.saturating_sub(1) as usize), st)]);
+                f.render_widget(Paragraph::new(line), Rect { y: inner.y + (row - start) as u16, height: 1, ..inner });
+            }
+        }
+
         // ---- the / command menu, above the composer
-        let items = self.menu();
+        let items = if self.prompt_search.is_some() { vec![] } else { self.menu() };
         if !items.is_empty() && cx.focused {
             let rows = items.len().min(10) as u16;
             let mh = rows + 2;
@@ -1589,6 +1828,28 @@ impl Pane for Chat {
         if k.modifiers.contains(KeyModifiers::ALT) {
             return false;
         }
+        if self.readonly {
+            // only scrolling and ctrl+o; the rest is for whoever shows the transcript (the search app)
+            match k.code {
+                KeyCode::Up | KeyCode::Char('k') => self.scroll += 1,
+                KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_sub(1),
+                KeyCode::PageUp => self.scroll += 10,
+                KeyCode::PageDown | KeyCode::Char(' ') => self.scroll = self.scroll.saturating_sub(10),
+                KeyCode::Home | KeyCode::Char('g') => self.scroll = usize::MAX / 2,
+                KeyCode::End | KeyCode::Char('G') => self.scroll = 0,
+                KeyCode::Char('o') if ctrl => {
+                    self.expanded = !self.expanded;
+                    self.open.clear();
+                    self.cache.clear();
+                }
+                _ => return false,
+            }
+            return true;
+        }
+        if self.prompt_search.is_some() {
+            self.prompt_search_key(k);
+            return true;
+        }
         if self.confirm_delete {
             self.confirm_delete = false;
             if k.code == KeyCode::Char('y') {
@@ -1670,7 +1931,10 @@ impl Pane for Chat {
                 self.cache.clear();
             }
             KeyCode::Char('n') if ctrl => self.new_chat(),
-            KeyCode::Char('r') if ctrl => self.retry(cx),
+            KeyCode::Char('g') if ctrl => self.retry(cx),
+            // like a shell's reverse search: every prompt you've sent, from any chat
+            KeyCode::Char('r') if ctrl => self.prompt_search = Some(PromptSearch::default()),
+            KeyCode::Char('f') if ctrl => self.toggle_folder(),
             KeyCode::Char('d') if ctrl => {
                 if !self.chat.messages.is_empty() {
                     self.confirm_delete = true;
@@ -1825,10 +2089,21 @@ impl Pane for Chat {
         let r = Rect { height: 1, ..area };
         ui::side_row(f, r, "new", "new chat", "ctrl+n", false, t);
         self.side_hits.push((r, SideItem::New));
+        // all folders, or only the chats that worked in this chat's folder
+        let folder = self.folder();
+        let r = Rect { y: area.y + 1, height: 1, ..area };
+        if r.bottom() <= area.bottom() {
+            let label = if self.this_folder { format!("{} only", crate::panes::ais::usage::project_name(&folder)) } else { "all folders".to_string() };
+            ui::side_row(f, r, "files", &label, "ctrl+f", self.this_folder, t);
+            self.side_hits.push((r, SideItem::Folder));
+        }
         let mut rows: Vec<(Option<&'static str>, usize)> = vec![];
         let now = store::now();
         let mut last = "";
         for (i, c) in self.chats.iter().enumerate() {
+            if self.this_folder && !c.cwd.as_deref().is_some_and(|d| same_dir(d, &folder)) {
+                continue;
+            }
             let b = store::bucket(c.updated, now, self.offset);
             if b != last {
                 rows.push((Some(b), 0));
@@ -1836,7 +2111,7 @@ impl Pane for Chat {
             }
             rows.push((None, i));
         }
-        let list = Rect { y: area.y + 2, height: area.height.saturating_sub(2), ..area };
+        let list = Rect { y: area.y + 3, height: area.height.saturating_sub(3), ..area };
         let h = list.height as usize;
         self.side_scroll = self.side_scroll.min(rows.len().saturating_sub(h));
         for (n, (group, i)) in rows.iter().skip(self.side_scroll).take(h).enumerate() {
@@ -1862,6 +2137,7 @@ impl Pane for Chat {
                 if let Some((_, item)) = self.side_hits.iter().find(|(r, _)| r.contains(pos)).cloned() {
                     match item {
                         SideItem::New => self.new_chat(),
+                        SideItem::Folder => self.toggle_folder(),
                         SideItem::Chat(i) => self.open_chat(i),
                     }
                 }
@@ -1930,6 +2206,80 @@ mod tests {
             assert_eq!(c.chat.id, format!("t{i}"), "clicking row {i} opens that chat");
             assert_eq!(order(&c), before, "just opening chats must not reorder the list");
         }
+    }
+
+    /// ctrl+r searches every prompt you've sent (any chat, newest first); ctrl+g regenerates now; ctrl+f narrows the
+    /// sidebar to this chat's folder.
+    #[test]
+    fn chat_prompt_search_and_folder_filter() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        let mk = |id: &str, title: &str, cwd: &str, prompts: &[&str], updated: f64| {
+            let mut ch = store::Chat::new("claude");
+            ch.id = id.into();
+            ch.title = title.into();
+            ch.cwd = Some(cwd.into());
+            ch.updated = updated;
+            for p in prompts {
+                ch.messages.push(store::Msg { role: "user".into(), content: p.to_string(), ..Default::default() });
+                ch.messages.push(store::Msg { role: "assistant".into(), content: "ok".into(), ..Default::default() });
+            }
+            ch
+        };
+        let (app, app2, site, here) =
+            if cfg!(windows) { ("C:\\work\\app", "C:\\work\\app\\", "C:\\work\\site", "c:/work/app") } else { ("/work/app", "/work/app/", "/work/site", "/work/app") };
+        c.chats = vec![
+            mk("pa", "login work", app, &["fix the flaky login test", "now the logout test"], 300.0),
+            mk("pb", "docs", site, &["write the flaky-test docs", "/model opus"], 200.0),
+            mk("pc", "older login", app2, &["fix the flaky login test"], 100.0),
+        ];
+        c.chat.cwd = Some(here.into());
+        k.key_mod(&mut c, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(c.prompt_search.is_some(), "ctrl+r searches prompts now, it doesn't regenerate");
+        k.typ(&mut c, "flaky");
+        let s = k.render_html(&mut c, 120, 30, "target/snap/chat-prompt-search.html");
+        assert!(s.contains("your prompts: flaky") && s.contains("fix the flaky login test") && s.contains("write the flaky-test docs"), "{s}");
+        assert_eq!(c.prompt_matches("flaky"), vec!["fix the flaky login test", "write the flaky-test docs"], "newest first, each once");
+        assert!(c.prompt_matches("model").is_empty(), "commands aren't prompts");
+        k.key(&mut c, KeyCode::Up); // older
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.input, "write the flaky-test docs");
+        assert!(c.prompt_search.is_none());
+        k.key_mod(&mut c, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        k.key_mod(&mut c, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        k.typ(&mut c, "zzz");
+        assert!(k.render(&mut c, 120, 30).contains("nothing you've sent matches"));
+        k.key(&mut c, KeyCode::Esc);
+        assert!(c.prompt_search.is_none() && c.input.is_empty(), "esc leaves the box as it was");
+
+        // the sidebar: every chat, or only this folder's (either slash, any case, a trailing one)
+        let side = k.render_side(&mut c, 34, 20);
+        assert!(side.contains("all folders") && side.contains("docs"), "{side}");
+        k.key_mod(&mut c, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        let side = k.render_side(&mut c, 34, 20);
+        assert!(side.contains("app only") && side.contains("login work") && side.contains("older login") && !side.contains("docs"), "{side}");
+        k.key_mod(&mut c, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(k.render_side(&mut c, 34, 20).contains("docs"));
+    }
+
+    /// The search app's reader: the chat's renderer with no composer, keys only scroll.
+    #[test]
+    fn chat_viewer_is_read_only() {
+        let mut k = Kit::new();
+        let mut ch = store::Chat::new("codex");
+        ch.title = "rate limits".into();
+        for i in 0..30 {
+            ch.messages.push(store::Msg { role: "user".into(), content: format!("question {i}"), ..Default::default() });
+            ch.messages.push(store::Msg { role: "assistant".into(), model: Some("codex".into()), content: format!("answer {i}"), ..Default::default() });
+        }
+        let mut v = Chat::viewer(&k.config, ch, 20);
+        let s = k.render_html(&mut v, 100, 24, "target/snap/chat-viewer.html");
+        assert!(s.contains("question 10") && !s.contains("question 3\n"), "opens at the message asked for\n{s}");
+        assert!(s.contains("resume in chat") && !s.contains("message codex"), "{s}");
+        assert!(!k.key(&mut v, KeyCode::Char('r')), "r is for whoever shows it");
+        assert!(k.key(&mut v, KeyCode::End));
+        assert!(k.render(&mut v, 100, 24).contains("answer 29"));
+        assert!(v.input.is_empty());
     }
 
     #[test]

@@ -37,6 +37,7 @@ const ICONS: &[(&str, &str, &str)] = &[
     ("repeat", "\u{F0456}", "rep"),
     ("volume", "\u{F057E}", "vol"),
     ("search", "\u{F0349}", "?"),
+    ("history", "\u{F02DA}", "~"), // md-history
     ("gauge", "\u{F029A}", "#"),
     ("chart", "\u{F0128}", "#"),
     ("clock", "\u{F0150}", ""),
