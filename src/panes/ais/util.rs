@@ -269,17 +269,65 @@ pub fn find_version(s: &str) -> Option<String> {
     None
 }
 
-/// The shell that hosts an install / sign-in command in a terminal pane, with a pause at the end so the output
-/// stays readable after the command exits (a finished terminal pane closes itself).
-pub fn host_command(cmdline: &str) -> (String, Vec<String>) {
+/// The shell that hosts an install / sign-in command in a terminal pane. When the command ends it writes the exit
+/// code to `marker` (the "your AIs" app watches for it: alert + recheck), says how it went, and pauses so the
+/// output stays readable (a finished terminal pane closes itself); then it exits with the command's own code, not
+/// the pause's.
+pub fn host_command(cmdline: &str, marker: &Path) -> (String, Vec<String>) {
+    let m = marker.to_string_lossy();
     if cfg!(windows) {
         let prog = crate::config::which("pwsh").map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "powershell.exe".into());
-        let script = format!("{cmdline}; Write-Host ''; Read-Host 'finished - press enter to close'");
+        let script = [
+            // what's been installed since oriel started (Node, say) is on the machine's PATH, not in the one we inherited
+            "$env:Path = (($env:Path -split ';') + ([Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';') + ([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') | Where-Object { $_ } | Select-Object -Unique) -join ';'".to_string(),
+            // (no ErrorActionPreference = Stop: an installer script that shrugs off an error of its own should still finish)
+            "$global:LASTEXITCODE = 0; $ok = $true; $c = $null".to_string(),
+            // `finally`, because an `irm … | iex` script may `exit` (or you press ctrl+c): its code is unknown then,
+            // so the marker says "ended" and the row's recheck tells how it went
+            format!(
+                "try {{ try {{ {cmdline}; $ok = $? }} catch {{ Write-Host $_ -ForegroundColor Red; $ok = $false }}; $c = if ($LASTEXITCODE) {{ $LASTEXITCODE }} elseif ($ok) {{ 0 }} else {{ 1 }} }} finally {{ \
+                 Set-Content -LiteralPath '{}' -Value $(if ($null -eq $c) {{ 'ended' }} else {{ $c }}) -ErrorAction SilentlyContinue; Write-Host ''; \
+                 if ($null -eq $c) {{ Write-Host 'ended' }} elseif ($c -eq 0) {{ Write-Host 'finished' -ForegroundColor Green }} else {{ Write-Host \"failed (exit $c)\" -ForegroundColor Red }}; \
+                 $null = Read-Host 'press enter to close' }}",
+                m.replace('\'', "''")
+            ),
+            "exit $c".to_string(),
+        ]
+        .join("; ");
         (prog, vec!["-NoProfile".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-Command".into(), script])
     } else {
-        let script = format!("{cmdline}; printf '\\nfinished - press enter to close '; read _");
+        let script = format!(
+            "{cmdline}; c=$?; printf '%s' \"$c\" > {}; if [ \"$c\" -eq 0 ]; then printf '\\nfinished'; else printf '\\nfailed (exit %s)' \"$c\"; fi; printf ' - press enter to close '; read _; exit $c",
+            super::saver::sh_quote(&m)
+        );
         ("sh".into(), vec!["-c".into(), script])
     }
+}
+
+/// PATH as a new terminal would see it now. On Windows that's this process's PATH plus the machine's and the
+/// user's from the registry (an install since oriel started changes those, not ours); elsewhere it's ours.
+pub fn fresh_path() -> std::ffi::OsString {
+    let mine = std::env::var_os("PATH").unwrap_or_default();
+    if !cfg!(windows) {
+        return mine;
+    }
+    let ps = Path::new("powershell.exe");
+    let script = "[Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')";
+    let Some(reg) = run_timeout(ps, &["-NoProfile", "-NonInteractive", "-Command", script], Duration::from_secs(5)) else { return mine };
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&mine).collect();
+    for d in reg.trim().split(';').map(str::trim).filter(|d| !d.is_empty()) {
+        let d = PathBuf::from(d);
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or(mine)
+}
+
+/// `config::which`, against a given PATH.
+pub fn which_in(prog: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    let exts: &[&str] = if cfg!(windows) && !prog.contains('.') { &[".exe", ".cmd", ".bat", ""] } else { &[""] };
+    std::env::split_paths(path).flat_map(|d| exts.iter().map(move |e| d.join(format!("{prog}{e}")))).find(|p| p.is_file())
 }
 
 #[cfg(test)]

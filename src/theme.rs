@@ -270,7 +270,20 @@ fn file_of(name: &str) -> PathBuf {
     themes_dir().join(format!("{name}.toml"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Theme-file reads on this thread (folder listings, files parsed for problems): the themes app must not
+    /// do them every frame.
+    pub static FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn count_read() {
+    #[cfg(test)]
+    FILE_READS.with(|c| c.set(c.get() + 1));
+}
+
 pub fn custom_names() -> Vec<String> {
+    count_read();
     let mut v: Vec<String> = std::fs::read_dir(themes_dir())
         .into_iter()
         .flatten()
@@ -504,6 +517,7 @@ pub fn base_of(name: &str) -> String {
 
 /// Anything wrong with a theme file, in words ("mine.toml: 'acent' isn't a setting").
 pub fn problems(name: &str) -> Vec<String> {
+    count_read();
     let Ok(text) = std::fs::read_to_string(file_of(name)) else { return vec![] };
     let file = format!("{name}.toml");
     match text.parse::<toml::Table>() {
@@ -537,6 +551,23 @@ pub fn free_name(want: &str) -> String {
     (2..).map(|i| format!("{clean}-{i}")).find(|n| !taken(n)).unwrap()
 }
 
+/// The theme files oriel wrote itself, as written: the file watcher then knows those changes are its own (the
+/// themes app applies them straight away) and doesn't reload for them.
+static OWN_WRITES: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Is theme `name`'s file just as oriel itself last wrote it? Once it isn't (you saved it in an editor), that's
+/// forgotten, so saving it back the same way still counts as yours.
+pub fn own_write(name: &str) -> bool {
+    let p = file_of(name);
+    let mut own = OWN_WRITES.lock().unwrap();
+    let Some(i) = own.iter().position(|(q, _)| *q == p) else { return false };
+    let same = std::fs::read_to_string(&p).is_ok_and(|t| t == own[i].1);
+    if !same {
+        own.remove(i);
+    }
+    same
+}
+
 /// Write `t` as the theme file `name` (every colour spelled out, `base` for anything added later).
 pub fn save_custom(name: &str, base: &str, t: &Theme) -> Result<PathBuf, String> {
     let dir = themes_dir();
@@ -552,6 +583,9 @@ pub fn save_custom(name: &str, base: &str, t: &Theme) -> Result<PathBuf, String>
     }
     s.push_str(&format!("{:<26}# the animated rainbow logo\n", format!("rainbow = {}", t.animated)));
     let path = file_of(name);
-    std::fs::write(&path, s).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &s).map_err(|e| e.to_string())?;
+    let mut own = OWN_WRITES.lock().unwrap();
+    own.retain(|(q, _)| *q != path);
+    own.push((path.clone(), s));
     Ok(path)
 }

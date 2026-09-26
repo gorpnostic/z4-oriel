@@ -212,6 +212,92 @@ fn ais_install_asks_then_opens_a_terminal() {
 }
 
 #[test]
+fn ais_install_reports_back() {
+    let r = std::path::absolute("target/test-scratch/newer/ais-report").unwrap();
+    let _ = std::fs::remove_dir_all(&r);
+    let mut k = Kit::new();
+    let mut a = Ais::with(fixture(&r), false);
+    fake_found(&mut a);
+    k.key(&mut a, KeyCode::Char('2'));
+    let gi = CLIS.iter().position(|c| c.id == "opencode").unwrap();
+    for _ in 0..gi {
+        k.key(&mut a, KeyCode::Down);
+    }
+    assert!(!a.ticks_hidden(), "nothing running, no ticking while hidden");
+    k.key(&mut a, KeyCode::Enter);
+    k.key(&mut a, KeyCode::Char('y'));
+    assert_eq!(a.running.len(), 1);
+    assert!(a.ticks_hidden() && a.tick_every() == Some(Duration::from_secs(1)), "watches for the result even from another tab");
+    // the host shell writes the command's exit code the moment it ends: an alert, and the row is rechecked
+    let m = a.running[0].marker.clone();
+    std::fs::write(&m, "0\n").unwrap();
+    k.poll(&mut a);
+    assert!(k.notices().iter().any(|n| n == "OpenCode install: done"), "{:?}", k.notices());
+    assert!(a.running.is_empty() && !m.exists());
+    k.key(&mut a, KeyCode::Enter);
+    k.key(&mut a, KeyCode::Char('y'));
+    std::fs::write(&a.running[0].marker, "ended").unwrap(); // the script exited by itself: code unknown
+    k.poll(&mut a);
+    assert!(k.notices().iter().any(|n| n.starts_with("OpenCode install: ended")), "{:?}", k.notices());
+    k.key(&mut a, KeyCode::Enter);
+    k.key(&mut a, KeyCode::Char('y'));
+    std::fs::write(&a.running[0].marker, "").unwrap(); // the shell is mid-write
+    k.poll(&mut a);
+    assert_eq!(a.running.len(), 1, "an empty marker isn't a result yet");
+    // a failure says so (the exit code isn't the pause's any more)
+    std::fs::write(&a.running[0].marker, "1").unwrap();
+    k.poll(&mut a);
+    assert!(k.notices().iter().any(|n| n.starts_with("OpenCode install: failed (exit 1)")), "{:?}", k.notices());
+    // a pane closed mid-way never writes one: after a while it stops watching, quietly
+    k.key(&mut a, KeyCode::Enter);
+    k.key(&mut a, KeyCode::Char('y'));
+    if let Some(long_ago) = std::time::Instant::now().checked_sub(super::RUNNING_MAX) {
+        a.running[0].started = long_ago;
+        let alerts = k.notices().len();
+        k.poll(&mut a);
+        assert!(a.running.is_empty() && !a.ticks_hidden() && k.notices().len() == alerts);
+    }
+    // r recomputes the installers (npm may have arrived since): the answer replaces the old picks
+    let before = a.picks.clone();
+    let _ = a.tx.send(Msg::Picks(vec![None; CLIS.len()]));
+    k.poll(&mut a);
+    assert!(before.iter().any(|p| p.is_some()) && a.picks.iter().all(|p| p.is_none()));
+    let _ = std::fs::remove_dir_all(&r);
+}
+
+/// The real host shell (pwsh on Windows, sh elsewhere), hidden and with no input: the marker gets the command's
+/// own exit code, and so does the shell's exit.
+#[test]
+fn ais_host_command_keeps_the_exit_code() {
+    let dir = std::path::absolute("target/test-scratch/newer/ais-host").unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |cmdline: &str, marker: &Path| -> Option<i32> {
+        let (prog, args) = util::host_command(cmdline, marker);
+        let mut c = std::process::Command::new(prog);
+        c.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000);
+        }
+        c.status().ok()?.code()
+    };
+    let (ok, bad) = (dir.join("it's ok"), dir.join("bad"));
+    assert_eq!(run(if cfg!(windows) { "cmd /c exit 0" } else { "true" }, &ok), Some(0));
+    assert_eq!(std::fs::read_to_string(&ok).unwrap().trim(), "0");
+    assert_eq!(run(if cfg!(windows) { "cmd /c exit 3" } else { "(exit 3)" }, &bad), Some(3));
+    assert_eq!(std::fs::read_to_string(&bad).unwrap().trim(), "3");
+    if cfg!(windows) {
+        // an `irm … | iex` script that exits by itself still leaves word that it ended (its code is the shell's)
+        let gone = dir.join("gone");
+        assert_eq!(run("iex 'exit 5'", &gone), Some(5));
+        assert_eq!(std::fs::read_to_string(&gone).unwrap().trim(), "ended");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ais_token_saver_edits_only_its_keys_with_backup() {
     let r = root("saver");
     let p = fixture(&r);

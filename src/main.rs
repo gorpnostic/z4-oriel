@@ -37,19 +37,11 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("update" | "--update") => {
-            // oriel updates itself (keeping this version for `oriel rollback`); the install script is the fallback
+            // oriel updates itself (keeping this version for `oriel rollback`); the install script is the fallback,
+            // only for failures it can get past (not offline, a bad download or a failed backup), into the same folder
             let code = update::cli_update();
-            if code != 0 && args.get(1).map(String::as_str) != Some("--no-fallback") {
-                const RAW: &str = "https://raw.githubusercontent.com/gorpnostic/z4-oriel/master";
-                println!(":: trying the install script instead");
-                let status = if cfg!(windows) {
-                    std::process::Command::new("powershell.exe")
-                        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &format!("irm {RAW}/install.ps1 | iex")])
-                        .status()
-                } else {
-                    std::process::Command::new("sh").args(["-c", &format!("curl -fsSL {RAW}/install.sh | sh")]).status()
-                };
-                std::process::exit(status.map(|s| s.code().unwrap_or(1)).unwrap_or(1));
+            if code == update::TRY_SCRIPT && args.get(1).map(String::as_str) != Some("--no-fallback") {
+                std::process::exit(update::cli_script_fallback());
             }
             std::process::exit(code);
         }

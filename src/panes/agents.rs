@@ -471,7 +471,7 @@ impl Agents {
             hits: vec![],
             side_hits: vec![],
             planning: false,
-            hook_exe: std::env::current_exe().ok(),
+            hook_exe: crate::update::exe_path().ok(),
             fake_agent: None,
             start_dir: None,
             lead_cfg: crate::config::LeadConfig::default(),

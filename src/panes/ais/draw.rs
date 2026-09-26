@@ -906,7 +906,13 @@ impl Pane for Ais {
     }
 
     fn tick_every(&self) -> Option<std::time::Duration> {
-        Some(std::time::Duration::from_secs(5))
+        // an install running beside it: look for its result every second
+        Some(std::time::Duration::from_secs(if self.running.is_empty() { 5 } else { 1 }))
+    }
+
+    /// Keep watching a running install while you're in another tab, so its alert comes when it finishes.
+    fn ticks_hidden(&self) -> bool {
+        !self.running.is_empty()
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
@@ -1006,6 +1012,7 @@ impl Pane for Ais {
     fn poll(&mut self, cx: &mut Cx) {
         self.ensure(cx);
         self.drain(cx);
+        self.check_running(cx);
         if !self.scanning && self.last_scan.is_none_or(|t| t.elapsed() >= super::REFRESH) {
             self.rescan_usage();
         }

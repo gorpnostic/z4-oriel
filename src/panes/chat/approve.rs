@@ -245,7 +245,7 @@ pub fn serve(input: impl BufRead, mut out: impl Write, ask: impl Fn(&str, &Value
 
 /// Claude Code's arguments for asking through oriel, and the config file they point at (delete it afterwards).
 pub fn claude_args(b: &Broker) -> Option<(Vec<String>, std::path::PathBuf)> {
-    let exe = std::env::current_exe().ok()?;
+    let exe = crate::update::exe_path().ok()?; // not Linux's "… (deleted)" after an update
     // under `cargo test` this binary is the test runner: point at the real one next to it (cargo build first)
     #[cfg(test)]
     let exe = exe.parent()?.parent()?.join(if cfg!(windows) { "oriel.exe" } else { "oriel" });

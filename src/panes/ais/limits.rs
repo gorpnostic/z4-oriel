@@ -5,6 +5,7 @@ use super::util::{Paths, now, write_atomic};
 use serde_json::{Value, json};
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Window {
@@ -149,17 +150,21 @@ pub fn sink(input: &str, file: &Path, at: i64) -> String {
     status_line(&v)
 }
 
+/// How long the user's own status line command gets before oriel prints its own line instead.
+const CHAIN_LIMIT: Duration = Duration::from_secs(2);
+
 /// `oriel usage-sink [--then <command…>]`. Always exits 0: a status line must never break Claude Code.
 pub fn cli(args: &[String]) -> i32 {
     let mut input = String::new();
     let _ = std::io::stdin().take(4 << 20).read_to_string(&mut input);
     let file = crate::config::data_dir().join("usage").join("claude.json");
     let line = sink(&input, &file, now());
-    // chaining: hand the same JSON to the user's own statusLine command and print its output instead
+    // chaining: hand the same JSON to the user's own statusLine command and print its output instead (the
+    // connect step quotes it as one shell word, so this is the command exactly as they wrote it)
     if let Some(i) = args.iter().position(|a| a == "--then") {
         let cmd = args[i + 1..].join(" ");
         if !cmd.trim().is_empty() {
-            if let Some(out) = run_chained(&cmd, &input) {
+            if let Some(out) = run_chained(&cmd, &input, CHAIN_LIMIT) {
                 print!("{out}");
                 return 0;
             }
@@ -169,15 +174,14 @@ pub fn cli(args: &[String]) -> i32 {
     0
 }
 
-fn run_chained(cmd: &str, input: &str) -> Option<String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+/// The shell for a chained command: (program, its "run this" flag).
+fn chain_shell() -> (std::path::PathBuf, &'static str) {
     // Claude Code runs statusLine commands through Git Bash on Windows, so use the same shell when it's there
-    // (not System32\bash.exe: that's the WSL launcher)
-    // (and not WindowsApps\bash.exe, the same launcher's alias) — find Git for Windows' own bash
+    // (not System32\bash.exe: that's the WSL launcher, and not WindowsApps\bash.exe, the same launcher's alias):
+    // the one Claude is told to use, then Git for Windows' own
     let bash = if cfg!(windows) {
         let from_git = crate::config::which("git").and_then(|g| Some(g.parent()?.parent()?.join("bin").join("bash.exe")));
-        [Some(std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")), from_git]
+        [std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH").map(std::path::PathBuf::from), Some(std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")), from_git]
             .into_iter()
             .flatten()
             .find(|p| p.is_file())
@@ -190,31 +194,56 @@ fn run_chained(cmd: &str, input: &str) -> Option<String> {
     } else {
         None
     };
-    let mut c = if let Some(b) = bash {
-        let mut c = Command::new(b);
-        c.args(["-c", cmd]);
-        c
-    } else if cfg!(windows) {
-        let mut c = Command::new("cmd.exe");
-        c.args(["/C", cmd]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", cmd]);
-        c
-    };
-    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    match bash {
+        Some(b) => (b, "-c"),
+        None if cfg!(windows) => ("cmd.exe".into(), "/C"),
+        None => ("sh".into(), "-c"),
+    }
+}
+
+/// Run the user's statusLine command with the same JSON on stdin. None — so oriel's own line shows instead —
+/// when it fails, prints nothing or takes longer than `limit`: a blank status line helps nobody.
+fn run_chained(cmd: &str, input: &str, limit: Duration) -> Option<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let (shell, flag) = chain_shell();
+    let mut c = Command::new(shell);
+    c.args([flag, cmd]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000);
     }
     let mut child = c.spawn().ok()?;
+    // feed and drain on their own threads, so a command that ignores its input or floods its output can't hang us
     if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(input.as_bytes());
+        let input = input.to_string();
+        std::thread::spawn(move || {
+            let _ = si.write_all(input.as_bytes());
+        });
     }
-    let out = child.wait_with_output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    let mut so = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut b = vec![];
+        let _ = so.read_to_end(&mut b);
+        let _ = tx.send(b);
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let out = rx.recv_timeout(limit).ok();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => break None,
+        }
+    };
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let text = String::from_utf8_lossy(&out?).into_owned();
+    (status?.success() && !text.trim().is_empty()).then_some(text)
 }
 
 #[cfg(test)]
@@ -239,6 +268,29 @@ mod tests {
         assert_eq!(l.updated, 1_900_000_000);
         assert_eq!(sink("not json", &file, 0), "oriel: no status");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ais_chained_status_line_never_blank() {
+        let json = r#"{"model":{"display_name":"Opus"}}"#;
+        let lim = Duration::from_secs(5);
+        assert_eq!(run_chained("echo hi", json, lim).map(|s| s.trim().to_string()), Some("hi".into()));
+        // failing or silent: None, so cli() prints oriel's own line instead of a blank status line
+        assert_eq!(run_chained("exit 3", json, lim), None);
+        assert_eq!(run_chained("exit 0", json, lim), None);
+        // too slow: given up on after the limit
+        let posix = chain_shell().1 == "-c";
+        let slow = if posix { "sleep 5; echo late" } else { "ping -n 6 127.0.0.1 >nul & echo late" };
+        let t0 = std::time::Instant::now();
+        assert_eq!(run_chained(slow, json, Duration::from_millis(300)), None);
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        if posix {
+            // it gets the same JSON, and a command the connect step quoted comes back exactly as written
+            assert_eq!(run_chained("cat", json, lim).as_deref(), Some(json));
+            let theirs = r#"printf '%s|' "a b" 'it'"'"'s' | tr -d x; echo"#;
+            let back = run_chained(&format!("printf %s {}", super::super::saver::sh_quote(theirs)), "", lim);
+            assert_eq!(back.as_deref(), Some(theirs));
+        }
     }
 
     #[test]
