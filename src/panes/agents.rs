@@ -20,6 +20,8 @@ mod lead_tests;
 mod lead_view;
 mod mcp;
 mod plan;
+#[cfg(test)]
+mod qa_data;
 mod roster;
 mod run;
 mod store;

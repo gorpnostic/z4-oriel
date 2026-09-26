@@ -9,6 +9,8 @@ mod layout;
 mod onboard;
 mod pane;
 mod panes;
+#[cfg(test)]
+mod qa_data;
 mod testkit;
 mod theme;
 mod ui;
