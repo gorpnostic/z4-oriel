@@ -151,6 +151,12 @@ pub(super) fn codex_price(model: &str) -> (f64, f64, f64) {
     }
 }
 
+/// $/MTok for Kimi: input, cached input, output (Moonshot's API list price for its K2-class models; Kimi Code
+/// streams report tokens, not money).
+pub(super) fn kimi_price(_model: &str) -> (f64, f64, f64) {
+    (0.60, 0.15, 2.50)
+}
+
 /// One Codex rollout file: (its cwd, its cost).
 pub fn codex_lines(r: impl BufRead) -> (String, Cost) {
     let mut cwd = String::new();

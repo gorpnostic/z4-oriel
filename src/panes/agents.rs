@@ -21,13 +21,22 @@ mod lead_tests;
 mod lead_view;
 mod mcp;
 mod plan;
+mod plan_view;
+mod project;
+pub mod prompts;
+#[cfg(test)]
+mod research_tests;
+mod review;
 mod roster;
 mod run;
 mod store;
 mod stream;
+mod templates;
 #[cfg(test)]
 mod tests;
 mod view;
+#[cfg(test)]
+mod workflow_tests;
 
 /// `oriel mcp-lead <port> <token>`: the MCP stdio server a lead's CLI starts (bridges to the running oriel).
 /// Every AI's plan windows from disk, flattened: (agent, window). The event center warns near a limit.
@@ -58,6 +67,111 @@ pub fn until(ts: i64) -> String {
 
 pub fn mcp_lead(port: &str, token: &str) {
     mcp::serve_stdio(port, token);
+}
+
+/// The folder the chat you used last works in, and when it said so.
+type ChatDir = Arc<Mutex<Option<(PathBuf, Instant)>>>;
+
+fn chat_dir_global() -> &'static ChatDir {
+    static G: std::sync::OnceLock<ChatDir> = std::sync::OnceLock::new();
+    G.get_or_init(ChatDir::default)
+}
+
+/// Chat calls this with its folder whenever you use a chat (/cwd, switching chats, sending, a /command). Agents
+/// opens there when it isn't started in a repo, and a /lead or /task straight from that chat runs on it.
+pub fn note_chat_dir(dir: &Path) {
+    *chat_dir_global().lock().unwrap() = Some((dir.to_path_buf(), Instant::now()));
+}
+
+/// Chat's /commit: `git add -A` and commit in `dir` ("committed 3 files as 1a2b3c4").
+pub fn commit_all(dir: &Path, msg: &str) -> Result<String, String> {
+    git::commit_all(dir, msg)
+}
+
+/// A key this soon after the chat noted its folder came from that chat (its /lead or /task).
+const FROM_CHAT: Duration = Duration::from_secs(2);
+/// How long u can bring back a deleted task.
+const UNDO_FOR: Duration = Duration::from_secs(20);
+
+/// The tag of a task's or run's `T` terminal (closed before its checkout goes).
+fn try_tag(id: &str) -> String {
+    format!("agent-try:{id}")
+}
+
+/// The shell `T` opens: ORIEL_PORT set when the checkout has one, then `setup` (only if it works) and `cmd` when
+/// there are any, and it stays open after them.
+fn try_shell(cfg: &crate::config::Config, setup: &str, cmd: &str, port: u16) -> (String, Vec<String>) {
+    let (prog, mut args) = crate::config::default_shell(cfg);
+    let (setup, cmd) = (setup.trim(), cmd.trim());
+    if cmd.is_empty() && setup.is_empty() && port == 0 {
+        return (prog, args);
+    }
+    let name = Path::new(&prog).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let join = |set: String, and: &dyn Fn(&str, &str) -> String| -> String {
+        let work = match (setup.is_empty(), cmd.is_empty()) {
+            (true, _) => cmd.to_string(),
+            (false, true) => setup.to_string(),
+            (false, false) => and(setup, cmd),
+        };
+        [set, work].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("; ")
+    };
+    let set = |s: String| if port > 0 { s } else { String::new() };
+    match name.as_str() {
+        // (PowerShell 5 has no &&)
+        "pwsh" | "powershell" => args.extend(["-NoExit".into(), "-Command".into(), join(set(format!("$env:ORIEL_PORT='{port}'")), &|a, b| format!("{a}; if ($?) {{ {b} }}"))]),
+        "cmd" => {
+            // `set X=1&& y`: a space before && would end up in the value
+            let work = join(String::new(), &|a, b| format!("{a} && {b}"));
+            let line = match (port > 0, work.is_empty()) {
+                (false, _) => work,
+                (true, true) => format!("set ORIEL_PORT={port}"),
+                (true, false) => format!("set ORIEL_PORT={port}&& {work}"),
+            };
+            args.extend(["/k".into(), line]);
+        }
+        "nu" => args.extend(["-e".into(), join(set(format!("$env.ORIEL_PORT = '{port}'")), &|a, b| format!("{a}; {b}"))]),
+        _ => args.extend(["-c".into(), format!("{}; exec {prog}", join(set(format!("export ORIEL_PORT={port}")), &|a, b| format!("{a} && {b}")))]),
+    }
+    (prog, args)
+}
+
+/// Look a folder's repo up (and the gate it would get, and its .oriel/project.toml), for `from`.
+fn probe_repo(dir: &Path, from: RepoFrom, send: &dyn Fn(Msg)) {
+    let r = git::repo_info(dir);
+    if let Ok(i) = &r {
+        send(Msg::Gate(i.root.display().to_string(), git::detect_gate_in(&i.root)));
+        send(Msg::Project(i.root.display().to_string(), project::load(&i.root)));
+    }
+    send(Msg::Repo(r, from));
+}
+
+/// The folders chat's saved chats work in (their "cwd"), newest chat first, those that still exist.
+fn chat_dirs(store: &Path) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        updated: f64,
+    }
+    let mut heads: Vec<Head> = std::fs::read_dir(store)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| serde_json::from_str::<Head>(&std::fs::read_to_string(e.path()).ok()?).ok())
+        .collect();
+    heads.sort_by(|a, b| b.updated.partial_cmp(&a.updated).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<String> = vec![];
+    for d in heads.into_iter().filter_map(|h| h.cwd) {
+        if !out.contains(&d) && Path::new(&d).is_dir() {
+            out.push(d);
+        }
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    out
 }
 
 use crate::pane::{Action, Activity, Cx, Pane, Waker};
@@ -97,7 +211,7 @@ fn find_agent(id: &str) -> Option<PathBuf> {
 
 /// Program + args for a terminal pane running `bin` with `args`. `.cmd` shims (npm installs on Windows) go
 /// through cmd.exe, whose quoting can't carry newlines or double quotes, so those get flattened.
-fn wrap_cmd(bin: &Path, args: Vec<String>, task_id: &str) -> (String, Vec<String>) {
+fn wrap_cmd(bin: &Path, args: Vec<String>, task_id: &str, port: u16) -> (String, Vec<String>) {
     let p = bin.to_string_lossy().to_string();
     let low = p.to_lowercase();
     if cfg!(windows) && (low.ends_with(".cmd") || low.ends_with(".bat")) {
@@ -105,13 +219,30 @@ fn wrap_cmd(bin: &Path, args: Vec<String>, task_id: &str) -> (String, Vec<String
         a.extend(args.into_iter().map(|s| s.replace(['\r', '\n'], " ").replace('"', "'")));
         ("cmd.exe".into(), a)
     } else if cfg!(unix) {
-        // no env API on terminal panes: `env` sets ORIEL_TASK_ID for the agent (and its hooks)
-        let mut a = vec![format!("ORIEL_TASK_ID={task_id}"), p];
+        // no env API on terminal panes: `env` sets ORIEL_TASK_ID for the agent (and its hooks), and its checkout's port
+        let mut a = vec![format!("ORIEL_TASK_ID={task_id}")];
+        if port > 0 {
+            a.push(format!("ORIEL_PORT={port}"));
+        }
+        a.push(p);
         a.extend(args);
         ("env".into(), a)
     } else {
         (p, args)
     }
+}
+
+/// A task's first prompt in its tab: its own, plus the files it may edit and how to check it when it has them
+/// (the planner's cards do).
+fn hand_prompt(t: &Task) -> String {
+    let mut p = t.prompt.clone();
+    if !t.owns.is_empty() {
+        p.push_str(&format!("\n\nOnly edit files matching: {}.", t.owns.join(", ")));
+    }
+    if !t.acceptance.is_empty() {
+        p.push_str(&format!("\nWhen you're done, check it works with: {}", t.acceptance));
+    }
+    p
 }
 
 /// The agent's arguments. `followup` = continue the task's last session with `prompt` as the next message.
@@ -151,9 +282,30 @@ pub fn agent_args(agent: &str, model: &str, prompt: &str, followup: bool) -> Vec
     a
 }
 
+/// Who asked for a repo to be looked up.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RepoFrom {
+    /// the pane starting up (the launch folder, else the chat's)
+    Start,
+    /// the repo picker
+    Picked,
+    /// a /lead or /task from a chat working in another folder (the form waits in `pending_form`)
+    Chat,
+}
+
 /// Results from background threads.
 enum Msg {
-    Repo(Result<git::RepoInfo, String>, bool),
+    Repo(Result<git::RepoInfo, String>, RepoFrom),
+    /// The gate a repo would get by itself: (command, why) — see git::detect_gate_in.
+    Gate(String, (Option<String>, String)),
+    /// A repo's .oriel/project.toml, freshly read (setup, copy, run, ports).
+    Project(String, Result<project::Project, String>),
+    /// Folders your chats work in, newest first (the repo picker lists them).
+    ChatDirs(Vec<String>),
+    /// Your changes were committed (or not) so that this can go ahead.
+    Committed(DirtyThen, Result<String, String>),
+    /// T: the checkout is ready to try (its files copied, its dependencies linked).
+    TryReady(TryLaunch),
     Agents(Vec<(&'static str, Option<PathBuf>)>),
     Status(String, StatusFile),
     Started(String, Result<git::Started, String>),
@@ -163,7 +315,12 @@ enum Msg {
     Progress(String, String),
     Merged(String, Result<String, String>),
     Removed(String, Result<(), String>, Then),
-    Plan(Result<(Vec<(String, String)>, f64), String>),
+    /// The planner's cards, for the repo it read (the board may have moved to another one meanwhile).
+    Plan(String, Result<PlanOut, String>),
+    /// A second opinion on a task's or run's diff (review.rs).
+    Reviewed(String, Result<review::Review, String>),
+    /// A second opinion the lead asked for is in: (run, what it cost, a line for the run's log).
+    ReviewSpent(String, f64, String),
     // ---- lead mode
     /// A headless worker's live event, and its end.
     Worker(String, stream::Ev),
@@ -276,6 +433,10 @@ struct DiffView {
     data: Option<Result<git::Diff, String>>,
     file: usize,
     scroll: usize,
+    /// The line under the cursor (an index into the file's lines; always a code line once it has moved).
+    cursor: usize,
+    /// c: the comment being typed for the cursor's line.
+    typing: Option<Input>,
 }
 
 struct Picker {
@@ -288,13 +449,104 @@ struct Picker {
 
 /// `L`: a new lead run.
 struct LeadForm {
-    field: usize, // 0 goal, 1 lead agent, 2 model, 3 max parallel, 4 run budget, 5 start
+    field: usize, // 0 goal, 1 lead agent, 2 model, 3 max parallel, 4 run budget, 5 gate, 6 approve, 7 start
     goal: Input,
     agent: usize,
     model: Input,
     parallel: Input,
     budget: Input,
+    /// the merge gate for this run ("" = none)
+    gate: Input,
+    /// show the lead's plan as cards to approve before any worker starts (plan_view.rs)
+    approve: bool,
+    /// r on a run that never started: this form replaces it (it goes once the new one starts)
+    retry: Option<String>,
     err: String,
+}
+
+/// Enter on marked tasks: run them together — how, and with which gate.
+struct BatchView {
+    gate: Input,
+    /// g: typing into the gate
+    editing: bool,
+}
+
+/// Esc on a form keeps what you typed: n / L / P / c bring it back (in memory, per kind).
+#[derive(Default)]
+struct Drafts {
+    task: Option<Form>,
+    lead: Option<LeadForm>,
+    plan: Option<Input>,
+    /// per task or run
+    comment: HashMap<String, Input>,
+}
+
+/// What's waiting on your uncommitted changes.
+#[derive(Clone, Debug, PartialEq)]
+enum DirtyThen {
+    /// starting this hand task
+    Task(String),
+    /// making this run's integration branch (its arguments wait in `starting`)
+    Run(String),
+    /// merging this task / this run into your branch
+    Merge(String),
+    MergeRun(String),
+}
+
+/// The checkout has uncommitted changes: commit them, take them along, or go without them.
+struct DirtyAsk {
+    then: DirtyThen,
+    /// `git status --porcelain` ("" = not known: a merge that refused)
+    status: String,
+}
+
+/// T: a terminal in a run's or task's checkout, to try it before merging.
+struct TryView {
+    id: String,
+    dir: PathBuf,
+    title: String,
+    /// run this there ("pnpm dev"), remembered per repo (project.toml's `run` until you change it); empty = a shell
+    input: Input,
+    /// the repo's setup, run first in a checkout that never had it (the lead's own)
+    setup: String,
+    /// the checkout's ORIEL_PORT
+    port: u16,
+}
+
+/// What a `T` terminal starts with, once its checkout is ready.
+struct TryLaunch {
+    id: String,
+    dir: PathBuf,
+    title: String,
+    setup: String,
+    cmd: String,
+    port: u16,
+}
+
+/// ctrl+t in a goal or prompt field: your saved prompts, filtered by what you type.
+struct PromptPick {
+    items: Vec<prompts::Prompt>,
+    filter: Input,
+    sel: usize,
+    /// the field's text when it opened: the last row saves it as a prompt
+    field: String,
+}
+
+enum PickRow {
+    Prompt(usize),
+    Save(String),
+}
+
+impl PromptPick {
+    fn rows(&self) -> Vec<PickRow> {
+        let q = self.filter.text.trim().to_lowercase();
+        let mut v: Vec<PickRow> = self.items.iter().enumerate().filter(|(_, p)| q.is_empty() || p.name.to_lowercase().contains(&q) || p.text.to_lowercase().contains(&q)).map(|(i, _)| PickRow::Prompt(i)).collect();
+        if !self.field.trim().is_empty() {
+            let name = if q.is_empty() { prompts::name_for(&self.field) } else { self.filter.text.trim().to_string() };
+            v.push(PickRow::Save(name));
+        }
+        v
+    }
 }
 
 /// `R`: the roster, editable.
@@ -352,7 +604,15 @@ enum Mode {
     Watch(WatchView),
     Log(LogView),
     /// Run the marked tasks together: all at once or one after another.
-    Batch,
+    Batch(BatchView),
+    /// Uncommitted changes in the way of starting or merging: what to do with them.
+    Dirty(DirtyAsk),
+    Try(TryView),
+    /// The lead's plan as cards, waiting for your approval (plan_view.rs).
+    PlanReview(plan_view::PlanView),
+    /// S: a run saved as a template; W: the repo's templates (templates.rs).
+    SaveTemplate(templates::SaveView),
+    Templates(templates::TplView),
 }
 
 #[derive(Clone)]
@@ -361,6 +621,8 @@ enum Hit {
     Column(usize),
     File(usize),
     DiffBody,
+    /// a line of the diff (its index in the file)
+    DiffLine(usize),
     Repo(String),
     NewTask,
     LeadPanel,
@@ -389,10 +651,15 @@ pub struct Agents {
     mode: Mode,
     col: usize,
     row: [usize; 4],
+    /// The task each column has selected: cards arriving or leaving above it move `row`, not the selection.
+    sel_id: [Option<String>; 4],
     scroll: [usize; 4],
     hits: Vec<(Rect, Hit)>,
     side_hits: Vec<(Rect, Hit)>,
     planning: bool,
+    /// n or L pressed before the repo is known (another app's /task or /lead opens this one and types into it at
+    /// once): that form, with whatever was pasted meanwhile, opens as soon as there's a repo.
+    pending_form: Option<(char, String)>,
     /// The oriel binary the hooks call.
     hook_exe: Option<PathBuf>,
     /// Tests: run this instead of the real agent.
@@ -427,6 +694,42 @@ pub struct Agents {
     fake_lead: Option<run::Fake>,
     /// The oriel binary lead CLIs start as their MCP server (tests point it at the built binary).
     mcp_exe: Option<PathBuf>,
+    // ---- forms
+    drafts: Drafts,
+    /// The open form came back from a draft ("restored your draft · ctrl+u clears" until the first key).
+    restored: bool,
+    /// When the open form opened: text arriving at once (another app's /task or /lead) isn't typed into a draft.
+    opened_at: Instant,
+    /// ↑ in an empty goal or prompt field: which earlier one it shows (see recall_list).
+    recall: Option<usize>,
+    prompt_pick: Option<PromptPick>,
+    /// The task x deleted last, and when (u puts it back for a little while).
+    deleted: Option<(Task, Instant)>,
+    // ---- review (review.rs)
+    /// Per task or run: your line comments and a second opinion's findings, until they're sent.
+    notes: HashMap<String, Vec<review::Note>>,
+    /// Second opinions being written: task or run -> who.
+    reviewing: HashMap<String, String>,
+    /// The comment box was opened from this diff (esc goes back to it).
+    comment_back: Option<String>,
+    /// Tests: run this instead of a real reviewer.
+    fake_reviewer: Option<run::Fake>,
+    // ---- where work starts
+    /// Per repo: the gate it would get by itself (git::detect_gate_in), found when the repo opens.
+    gate_detect: HashMap<String, (Option<String>, String)>,
+    /// Per repo: its .oriel/project.toml as last read (re-read whenever a checkout is made).
+    projects: HashMap<String, project::Project>,
+    /// Per repo: why its project.toml didn't read, as last said.
+    project_err: HashMap<String, String>,
+    /// Per repo: uncommitted changes you chose to start without (not asked again while they stay the same).
+    dirty_seen: HashMap<String, String>,
+    /// Runs whose integration branch is being made: (repo, lead checkout, slug), to try again after the dirty ask.
+    starting: HashMap<String, (PathBuf, PathBuf, String)>,
+    /// The folder of the chat you used last (see note_chat_dir); tests get their own.
+    chat_hint: ChatDir,
+    /// Chat's saved chats (None in tests): the picker lists the folders they work in.
+    chat_store: Option<PathBuf>,
+    chat_dirs: Vec<String>,
 }
 
 impl Agents {
@@ -437,6 +740,9 @@ impl Agents {
         a.stagger = Duration::from_secs(cfg.lead.stagger_s as u64);
         a.hung_after = Duration::from_secs(cfg.lead.hung_after_s.max(60) as u64);
         a.limit_paths = Some(roster::LimitPaths::real());
+        a.chat_hint = chat_dir_global().clone();
+        // (chat's store: one JSON file per chat, with the folder it works in as "cwd")
+        a.chat_store = Some(crate::config::data_dir().join("chats"));
         a
     }
 
@@ -482,10 +788,12 @@ impl Agents {
             mode: Mode::Board,
             col: 0,
             row: [0; 4],
+            sel_id: Default::default(),
             scroll: [0; 4],
             hits: vec![],
             side_hits: vec![],
             planning: false,
+            pending_form: None,
             hook_exe: crate::update::exe_path().ok(),
             fake_agent: None,
             start_dir: None,
@@ -508,6 +816,24 @@ impl Agents {
             fake_worker: None,
             fake_lead: None,
             mcp_exe: None,
+            drafts: Drafts::default(),
+            restored: false,
+            opened_at: Instant::now(),
+            recall: None,
+            prompt_pick: None,
+            deleted: None,
+            notes: HashMap::new(),
+            reviewing: HashMap::new(),
+            comment_back: None,
+            fake_reviewer: None,
+            gate_detect: HashMap::new(),
+            projects: HashMap::new(),
+            project_err: HashMap::new(),
+            dirty_seen: HashMap::new(),
+            starting: HashMap::new(),
+            chat_hint: ChatDir::default(),
+            chat_store: None,
+            chat_dirs: vec![],
         };
         a.settle_after_restart();
         a
@@ -542,11 +868,69 @@ impl Agents {
         }
         self.booted = true;
         let dir = self.start_dir.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+        let chat = self.chat_hint.lock().unwrap().as_ref().map(|c| c.0.clone());
+        let store = self.chat_store.clone();
         self.spawn(cx, move |send| {
             send(Msg::Agents(KINDS.iter().map(|k| (k.0, find_agent(k.0))).collect()));
-            send(Msg::Repo(git::repo_info(&dir), false));
+            // not started in a repo: the chat you were just in may work in one
+            let dir = match chat {
+                Some(c) if git::repo_info(&dir).is_err() && git::repo_info(&c).is_ok() => c,
+                _ => dir,
+            };
+            probe_repo(&dir, RepoFrom::Start, send);
+            if let Some(s) = store {
+                send(Msg::ChatDirs(chat_dirs(&s)));
+            }
         });
         self.start_watcher();
+    }
+
+    /// `o` (or no repo at the start): the repo picker, with the folders your chats use freshly read.
+    fn open_picker(&mut self, cx: &Cx) {
+        self.mode = Mode::Repo(Picker { input: Input::new("", false), sel: if self.picker_rows().is_empty() { 0 } else { 1 }, err: String::new(), checking: false });
+        if let Some(s) = self.chat_store.clone() {
+            self.spawn(cx, move |send| send(Msg::ChatDirs(chat_dirs(&s))));
+        }
+    }
+
+    /// The picker's list under the path field: recent repos, then the folders your chats work in (true) that
+    /// aren't among them.
+    fn picker_rows(&self) -> Vec<(String, bool)> {
+        let mut v: Vec<(String, bool)> = self.store.repos.iter().map(|r| (r.clone(), false)).collect();
+        for d in &self.chat_dirs {
+            if !v.iter().any(|(r, _)| r == d) {
+                v.push((d.clone(), true));
+            }
+        }
+        v
+    }
+
+    /// The chat's folder, if it just said so (its /lead or /task is what sent the key) and it isn't inside the
+    /// repo the board is on.
+    fn chat_dir_now(&self) -> Option<PathBuf> {
+        let (dir, at) = self.chat_hint.lock().unwrap().clone()?;
+        if at.elapsed() > FROM_CHAT {
+            return None;
+        }
+        match &self.repo {
+            Some(r) if dir.starts_with(&r.root) => None,
+            _ => Some(dir),
+        }
+    }
+
+    /// n or L: the form, on the repo it's for. Straight from a chat working in another repo, that repo is looked
+    /// up first (the form opens once it's known, with anything pasted meanwhile).
+    fn open_form_key(&mut self, key: char, cx: &Cx) {
+        if let Some(dir) = self.chat_dir_now() {
+            self.pending_form = Some((key, String::new()));
+            self.spawn(cx, move |send| probe_repo(&dir, RepoFrom::Chat, send));
+        } else if self.repo.is_none() {
+            self.pending_form = Some((key, String::new()));
+        } else if key == 'L' {
+            self.open_lead_form();
+        } else {
+            self.open_task_form(None);
+        }
     }
 
     /// A thread that notices status files changing (hooks write them) and sends them over. Cheap: one
@@ -627,6 +1011,28 @@ impl Agents {
             if let Some(r) = self.column(c).iter().position(|&i| self.store.tasks[i].id == id) {
                 self.col = c;
                 self.row[c] = r;
+                self.sel_id[c] = Some(id.to_string());
+            }
+        }
+    }
+
+    /// Remember which task each column has selected (after the user moved), so the cursor stays on it.
+    fn pin_selection(&mut self) {
+        for c in 0..4 {
+            let col = self.column(c);
+            self.sel_id[c] = col.get(self.row[c].min(col.len().saturating_sub(1))).map(|&i| self.store.tasks[i].id.clone());
+        }
+    }
+
+    /// Keep each column's cursor on the task it had selected while cards arrive and leave around it (REVIEW and
+    /// DONE are newest first, so every finished worker shifts them). A task that left the column hands the
+    /// cursor to whatever now sits in its row.
+    fn follow_selection(&mut self) {
+        for c in 0..4 {
+            let col = self.column(c);
+            match self.sel_id[c].as_ref().and_then(|id| col.iter().position(|&i| self.store.tasks[i].id == *id)) {
+                Some(r) => self.row[c] = r,
+                None => self.sel_id[c] = col.get(self.row[c].min(col.len().saturating_sub(1))).map(|&i| self.store.tasks[i].id.clone()),
             }
         }
     }
@@ -642,8 +1048,21 @@ impl Agents {
         self.store.repos.truncate(12);
         self.repo = Some(r);
         self.row = [0; 4];
+        self.sel_id = Default::default();
         self.scroll = [0; 4];
+        self.prune_marks();
         self.save();
+    }
+
+    /// Marks only hold this repo's TODO tasks that still exist and aren't in a run: a switch of repo or a deleted
+    /// task mustn't send stale cards into the next run.
+    fn prune_marks(&mut self) {
+        if self.marked.is_empty() {
+            return;
+        }
+        let key = self.repo_key();
+        let keep: Vec<String> = self.marked.iter().filter(|id| self.task(id).is_some_and(|t| t.repo == key && t.status == Status::Todo && t.run.is_empty())).cloned().collect();
+        self.marked = keep;
     }
 
     fn open_repo(&mut self, path: PathBuf, cx: &Cx) {
@@ -651,7 +1070,7 @@ impl Agents {
             p.checking = true;
             p.err.clear();
         }
-        self.spawn(cx, move |send| send(Msg::Repo(git::repo_info(&path), true)));
+        self.spawn(cx, move |send| probe_repo(&path, RepoFrom::Picked, send));
     }
 
     fn today(&self) -> f64 {
@@ -660,8 +1079,8 @@ impl Agents {
             let d = crate::panes::files::clock::local(t);
             (d.year, d.month, d.day) == (now.year, now.month, now.day)
         };
-        // workers, plus the leads that orchestrated them
-        self.store.tasks.iter().filter(|t| same(t.started.max(t.created))).fold(0.0, |a, t| a + t.cost_usd) + self.store.runs.iter().filter(|r| same(r.created)).fold(0.0, |a, r| a + r.cost_usd)
+        // workers (with what they spent before a retry), plus the leads that orchestrated them
+        self.store.tasks.iter().filter(|t| same(t.started.max(t.created))).fold(0.0, |a, t| a + t.cost_usd + t.spent_before) + self.store.runs.iter().filter(|r| same(r.created)).fold(0.0, |a, r| a + r.cost_usd)
     }
 
     // ------------------------------------------------------------------ the state machine
@@ -686,11 +1105,18 @@ impl Agents {
             self.watchdog();
             self.check_waiters();
             self.watch_budgets(cx);
+            // runs without a lead at the wheel go to review once nothing's left, whichever way their tasks settled
+            let settle: Vec<String> = self.store.runs.iter().filter(|r| r.state == store::RunState::Running && (r.manual || r.finishing)).map(|r| r.id.clone()).collect();
+            for r in settle {
+                self.batch_check(&r, cx);
+            }
             if before != (self.store.tasks.iter().filter(|t| t.status == Status::Running).count(), self.merge_queue.len(), self.merging.clone()) {
                 dirty = true;
             }
         }
         self.refresh_limits(cx, runs);
+        self.prune_marks();
+        self.follow_selection();
         if dirty {
             self.save();
         }
@@ -714,32 +1140,75 @@ impl Agents {
     fn on_msg(&mut self, m: Msg, cx: &mut Cx) {
         match m {
             Msg::Agents(a) => self.agents = a,
-            Msg::Repo(r, picked) => {
+            Msg::Gate(repo, g) => {
+                self.gate_detect.insert(repo, g);
+            }
+            Msg::Project(repo, p) => match p {
+                Ok(p) => {
+                    self.project_err.remove(&repo);
+                    self.projects.insert(repo, p);
+                }
+                // a broken file: nothing from it applies, and it's said (once per mistake)
+                Err(e) => {
+                    self.projects.insert(repo.clone(), project::Project::default());
+                    if self.project_err.get(&repo) != Some(&e) {
+                        cx.notify(format!("{e} — its setup, copy, run and ports are ignored until it's fixed"));
+                        self.project_err.insert(repo, e);
+                    }
+                }
+            },
+            Msg::ChatDirs(v) => self.chat_dirs = v,
+            Msg::Repo(r, from) => {
                 self.repo_loading = false;
                 match r {
                     Ok(info) => {
-                        self.set_repo(info);
+                        if from == RepoFrom::Chat && self.repo.as_ref().is_some_and(|x| x.root != info.root) {
+                            cx.notify(format!("agents: on {}, the repo this chat works in", info.name));
+                        }
+                        if self.repo.as_ref().map(|x| &x.root) != Some(&info.root) || from != RepoFrom::Chat {
+                            self.set_repo(info);
+                        }
                         if matches!(self.mode, Mode::Repo(_)) {
                             self.mode = Mode::Board;
                         }
+                        self.open_pending_form(cx);
                     }
-                    Err(e) => {
-                        if picked {
+                    Err(e) => match from {
+                        RepoFrom::Picked => {
                             if let Mode::Repo(p) = &mut self.mode {
                                 p.checking = false;
                                 p.err = e;
                             }
-                        } else if self.repo.is_none() {
-                            // not started in a repo: pick one (recent ones listed)
-                            self.mode = Mode::Repo(Picker { input: Input::new("", false), sel: if self.store.repos.is_empty() { 0 } else { 1 }, err: String::new(), checking: false });
                         }
-                    }
+                        // the chat's folder isn't in a repo: the form opens on the board's (or the picker comes up)
+                        RepoFrom::Chat if self.repo.is_some() => {
+                            cx.notify(format!("this chat's folder isn't in a git repo — using {}", self.repo.as_ref().map(|r| r.name.clone()).unwrap_or_default()));
+                            self.open_pending_form(cx);
+                        }
+                        _ if self.repo.is_none() => {
+                            // not started in a repo: pick one (recent ones and your chats' folders listed)
+                            self.open_picker(cx);
+                        }
+                        _ => {}
+                    },
                 }
             }
+            Msg::Committed(then, r) => match r {
+                Ok(summary) => {
+                    cx.notify(summary);
+                    match then {
+                        DirtyThen::Merge(id) => self.merge(&id, cx),
+                        DirtyThen::MergeRun(id) => self.merge_run(&id, cx),
+                        _ => {}
+                    }
+                }
+                Err(e) => cx.notify(format!("couldn't commit: {e}")),
+            },
+            Msg::TryReady(l) => self.open_try_tab(l, cx),
             Msg::Status(id, st) => self.on_status(&id, st, cx),
             Msg::Started(id, r) => self.on_started(&id, r, cx),
             Msg::Refreshed(id, stats, c) => {
-                self.live(&id).busy = false;
+                // (a refresh isn't a git job: it leaves `busy` to whatever is running for the task)
                 if let Some(t) = self.task_mut(&id) {
                     if let Some(s) = stats {
                         (t.added, t.removed, t.files) = (s.added, s.removed, s.files);
@@ -750,6 +1219,17 @@ impl Agents {
                         }
                     }
                 }
+                // a budget on a task in a tab: claude's own cap only works headless, so close the tab once the
+                // transcript says it's spent (the card goes to REVIEW with what it did)
+                let over = self.task(&id).filter(|t| !t.headless() && t.run.is_empty() && t.status.active() && t.budget_usd > 0.0 && t.cost_usd >= t.budget_usd && !t.error.starts_with("stopped at its budget")).cloned();
+                if let Some(t) = over {
+                    let why = format!("stopped at its budget (${:.2} of ${:.2})", t.cost_usd, t.budget_usd);
+                    if let Some(tm) = self.task_mut(&id) {
+                        tm.error = why.clone();
+                    }
+                    cx.act(Action::CloseTag(t.tag()));
+                    cx.alert(crate::alerts::Kind::Usage, format!("{} {why} — its tab was closed", t.title));
+                }
             }
             Msg::Gone(id, changes) => {
                 self.live(&id).busy = false;
@@ -759,14 +1239,19 @@ impl Agents {
                 }
                 if changes {
                     self.to_review(&id, "agent tab closed · ready for review", cx);
-                } else if let Some(t) = self.task_mut(&id) {
-                    t.status = Status::Todo;
-                    t.last = "agent tab closed with no changes".into();
-                    t.question.clear();
-                    t.branch.clear();
-                    t.worktree.clear();
-                    t.base_sha.clear();
-                    self.select(&id);
+                } else {
+                    let following = self.selected().as_deref() == Some(id.as_str());
+                    if let Some(t) = self.task_mut(&id) {
+                        t.status = Status::Todo;
+                        t.last = "agent tab closed with no changes".into();
+                        t.question.clear();
+                        t.branch.clear();
+                        t.worktree.clear();
+                        t.base_sha.clear();
+                    }
+                    if following {
+                        self.select(&id);
+                    }
                 }
             }
             Msg::Diff(id, r) => {
@@ -780,6 +1265,7 @@ impl Agents {
                 if let Mode::Diff(v) = &mut self.mode {
                     if v.id == id {
                         v.data = Some(r);
+                        v.set_file(v.file); // the cursor on its first code line
                     }
                 }
             }
@@ -791,7 +1277,8 @@ impl Agents {
             Msg::Merged(id, r) => {
                 self.live(&id).busy = false;
                 let sp = self.paths.status(&id);
-                let Some(t) = self.task_mut(&id) else { return };
+                let following = self.selected().as_deref() == Some(id.as_str());
+                let Some(t) = self.task_mut(&id).filter(|t| t.status != Status::Done) else { return };
                 match r {
                     Ok(summary) => {
                         t.status = Status::Done;
@@ -802,12 +1289,19 @@ impl Agents {
                         let title = t.title.clone();
                         let _ = std::fs::remove_file(&sp);
                         cx.notify(format!("✓ {title} · {summary}"));
-                        self.select(&id);
+                        if following {
+                            self.select(&id);
+                        }
                     }
                     Err(e) => {
                         t.last.clear();
                         t.error = e.clone();
-                        cx.notify(format!("merge failed: {e}"));
+                        if e.contains(git::UNCOMMITTED) {
+                            // your own edits are in the way: offer to commit them and merge
+                            self.ask_dirty(DirtyThen::Merge(id), String::new(), cx);
+                        } else {
+                            cx.notify(format!("merge failed: {e}"));
+                        }
                     }
                 }
             }
@@ -825,7 +1319,9 @@ impl Agents {
                     }
                 }
                 let sp = self.paths.status(&id);
-                let Some(t) = self.task_mut(&id) else { return };
+                let following = self.selected().as_deref() == Some(id.as_str());
+                // a merge that landed first wins: it isn't relabelled "discarded" by a late removal
+                let Some(t) = self.task_mut(&id).filter(|t| !(t.status == Status::Done && t.outcome == "merged")) else { return };
                 match r {
                     Err(e) => {
                         t.error = e.clone();
@@ -840,6 +1336,8 @@ impl Agents {
                         if then == Then::Retry {
                             let t = self.task_mut(&id).unwrap();
                             t.status = Status::Todo;
+                            // what it spent so far still counts today
+                            t.spent_before += t.cost_usd;
                             (t.added, t.removed, t.files, t.cost_usd, t.tokens) = (0, 0, 0, 0.0, 0);
                             self.start(&id, cx);
                         } else {
@@ -847,25 +1345,67 @@ impl Agents {
                             t.outcome = "discarded".into();
                             t.finished = store::now();
                             t.last = "discarded".into();
-                            self.select(&id);
+                            t.queued = false;
+                            t.want_merge = false;
+                            if following {
+                                self.select(&id);
+                            }
                         }
                     }
                 }
             }
-            Msg::Plan(r) => {
+            Msg::Plan(repo, r) => {
                 self.planning = false;
                 match r {
-                    Ok((items, usd)) if !items.is_empty() => {
-                        let n = items.len();
-                        let agent = self.default_agent();
-                        for (title, prompt) in items {
-                            self.add_task(&title, &prompt, agent, "");
+                    Ok(out) if !out.items.is_empty() => {
+                        let n = out.items.len();
+                        // spread over the roster, cheap tier first, as a lead would (the planner's thread did it)
+                        let names = self.plan_names();
+                        let mut made: Vec<(String, String)> = vec![];
+                        for (i, it) in out.items.iter().enumerate() {
+                            let who = if it.worker.is_empty() { names[i % names.len()].clone() } else { it.worker.clone() };
+                            let (agent, model) = self.worker_of(&who);
+                            let id = self.add_task_in(&repo, &it.title, &it.goal, agent, &model);
+                            if let Some(t) = self.task_mut(&id) {
+                                t.owns = it.owns.clone();
+                                t.acceptance = it.acceptance.clone();
+                                t.priority = it.priority;
+                            }
+                            made.push((it.key.clone(), id));
                         }
-                        self.col = 0;
-                        cx.notify(format!("planned {n} tasks{}", if usd > 0.0 { format!(" · ${usd:.2}") } else { String::new() }));
+                        // what they wait for, as the cards' "after" links
+                        for (it, (_, id)) in out.items.iter().zip(made.clone()) {
+                            let deps: Vec<String> = it.depends_on.iter().filter_map(|d| made.iter().find(|(k, _)| k == d).map(|(_, x)| x.clone())).collect();
+                            if let Some(t) = self.task_mut(&id) {
+                                t.depends_on = deps;
+                            }
+                        }
+                        self.save();
+                        let ids: Vec<String> = made.into_iter().map(|x| x.1).collect();
+                        let cost = if out.cost > 0.0 { format!(" · ${:.2}", out.cost) } else { String::new() };
+                        let note = out.notes.first().map(|n| format!(" · {n}")).unwrap_or_default();
+                        if repo == self.repo_key() && !out.problems.is_empty() {
+                            // they don't check out (overlapping files, say): here, but not marked to run together
+                            cx.notify(format!("planned {n} tasks{cost}, but they don't check out: {} — look them over before running them together", out.problems[0]));
+                        } else if repo == self.repo_key() {
+                            // marked, ready to run together
+                            self.marked = ids;
+                            cx.notify(format!("planned {n} tasks{cost} · enter runs them (p together, s in order) · e edits one{note}"));
+                        } else {
+                            let name = Path::new(&repo).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                            cx.notify(format!("planned {n} tasks in {name}{cost}"));
+                        }
                     }
                     Ok(_) => cx.notify("the planner came back with no tasks"),
                     Err(e) => cx.notify(format!("plan failed: {e}")),
+                }
+            }
+            Msg::Reviewed(id, r) => self.on_reviewed(&id, r, cx),
+            Msg::ReviewSpent(run, cost, line) => {
+                // the lead asked for it: it counts as the lead's spend (the run's budget covers it)
+                if let Some(r) = self.run_mut(&run) {
+                    r.cost_usd += cost;
+                    r.log(&line);
                 }
             }
             Msg::Worker(id, e) => self.on_worker_ev(&id, e),
@@ -1071,12 +1611,35 @@ impl Agents {
         KINDS.iter().position(|k| self.installed(k.0).is_some()).unwrap_or(0)
     }
 
+    /// Who the planner's cards go to, in turn: the roster's enabled workers whose AI is installed, cheap tier first
+    /// (so parallel tasks spread over vendors and their limits). No usable roster: the first installed agent.
+    fn plan_names(&self) -> Vec<String> {
+        let mut w: Vec<crate::config::RosterEntry> = self.roster().into_iter().filter(|w| w.enabled && self.installed(&w.agent).is_some() && !self.paused.contains_key(&w.agent) && KINDS.iter().any(|k| k.0 == w.agent)).collect();
+        w.sort_by_key(|w| roster::TIERS.iter().position(|t| *t == w.tier).unwrap_or(1));
+        if w.is_empty() { vec![KINDS[self.default_agent()].0.to_string()] } else { w.into_iter().map(|w| w.name).collect() }
+    }
+
+    /// A planned card's worker as (agent, model): a roster name, or an agent's own id.
+    fn worker_of(&self, name: &str) -> (usize, String) {
+        if let Some(w) = self.roster().into_iter().find(|w| w.name.eq_ignore_ascii_case(name)) {
+            if let Some(i) = KINDS.iter().position(|k| k.0 == w.agent) {
+                return (i, w.model);
+            }
+        }
+        (KINDS.iter().position(|k| k.0 == name).unwrap_or(self.default_agent()), String::new())
+    }
+
     fn add_task(&mut self, title: &str, prompt: &str, agent: usize, model: &str) -> String {
+        let repo = self.repo_key();
+        self.add_task_in(&repo, title, prompt, agent, model)
+    }
+
+    fn add_task_in(&mut self, repo: &str, title: &str, prompt: &str, agent: usize, model: &str) -> String {
         let id = store::new_id(&self.store.tasks);
         let title = if title.trim().is_empty() { prompt.lines().next().unwrap_or("task").chars().take(60).collect() } else { title.trim().to_string() };
         self.store.tasks.push(Task {
             id: id.clone(),
-            repo: self.repo_key(),
+            repo: repo.to_string(),
             title,
             prompt: prompt.trim().to_string(),
             agent: KINDS[agent.min(KINDS.len() - 1)].0.to_string(),
@@ -1091,6 +1654,12 @@ impl Agents {
 
     /// TODO -> RUNNING: make the worktree (background), then open the agent's tab (on_started).
     fn start(&mut self, id: &str, cx: &mut Cx) {
+        self.start_with(id, None, cx)
+    }
+
+    /// `start`, saying what happens to uncommitted changes in your checkout (a hand task branches off it): None =
+    /// ask, unless you already chose to start without these very changes.
+    fn start_with(&mut self, id: &str, dirty: Option<git::Dirty>, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
         let faked = if t.headless() { self.fake_worker.is_some() } else { self.fake_agent.is_some() };
         if !faked && self.installed(&t.agent).is_none() {
@@ -1101,6 +1670,19 @@ impl Agents {
         }
         if self.live(id).busy {
             return;
+        }
+        if t.run.is_empty() {
+            // your own "after" links: it can't start until those are merged (a run of them orders it for you)
+            let deps: Vec<&Task> = t.depends_on.iter().filter_map(|d| self.task(d)).filter(|d| !(d.status == Status::Done && d.outcome == "merged")).collect();
+            if let Some(d) = deps.iter().find(|d| d.status == Status::Done) {
+                cx.notify(format!("\"{}\" waits for \"{}\", which was discarded — edit it (e) to drop the link", t.title, d.title));
+                return;
+            }
+            let waits: Vec<String> = deps.iter().map(|d| format!("\"{}\"", d.title)).collect();
+            if !waits.is_empty() {
+                cx.notify(format!("\"{}\" waits for {} to be merged — or mark them all (space) and press enter to run them in order", t.title, waits.join(", ")));
+                return;
+            }
         }
         // lead-run tasks branch off the run's integration branch, in the run's repo
         let base = if t.run.is_empty() { None } else { self.run_ref(&t.run).map(|r| r.branch.clone()) };
@@ -1134,38 +1716,121 @@ impl Agents {
         }
         self.save();
         let id2 = id.to_string();
-        self.spawn(cx, move |send| send(Msg::Started(id2.clone(), git::start_at(&root, &wt, &slug, &id2, hook.as_deref(), base.as_deref()))));
+        let dirty = dirty.unwrap_or_else(|| git::Dirty::Ask(self.dirty_seen.get(&root.display().to_string()).cloned().unwrap_or_default()));
+        let port = self.port_for(id);
+        let timeout = Duration::from_secs(self.lead_cfg.gate_timeout_s.max(30) as u64);
+        self.spawn(cx, move |send| {
+            let r = git::start_at(&root, &wt, &slug, &id2, hook.as_deref(), base.as_deref(), &dirty);
+            // the repo's own settings (.oriel/project.toml), read afresh: files git doesn't track, then its setup
+            // (pnpm install…) before any agent starts. A setup that fails takes the worktree with it.
+            let r = r.and_then(|s| {
+                let proj = project::load(&root);
+                send(Msg::Project(root.display().to_string(), proj.clone()));
+                let proj = proj.unwrap_or_default();
+                if !proj.setup.trim().is_empty() {
+                    send(Msg::Progress(id2.clone(), format!("setting up: {}…", proj.setup.trim())));
+                }
+                match project::prepare(&proj, &root, &s.worktree, port, timeout, false) {
+                    Ok(()) => Ok(s),
+                    Err(e) => {
+                        let _ = git::remove(&root, &s.worktree, &s.branch);
+                        Err(e)
+                    }
+                }
+            });
+            send(Msg::Started(id2.clone(), r));
+        });
+    }
+
+    /// The ORIEL_PORT of a task's (or a run's) checkout: the one it has, else the lowest free one in its repo's
+    /// range (project.toml `ports`) that no other open checkout holds.
+    fn port_for(&mut self, id: &str) -> u16 {
+        let (have, repo) = match (self.task(id), self.run_ref(id)) {
+            (Some(t), _) => (t.port, t.repo.clone()),
+            (None, Some(r)) => (r.port, r.repo.clone()),
+            _ => return 0,
+        };
+        let tasks = self.store.tasks.iter().filter(|t| t.id != id && t.port > 0 && t.status != Status::Done).map(|t| t.port);
+        let taken: Vec<u16> = tasks.chain(self.store.runs.iter().filter(|r| r.id != id && r.port > 0 && r.state.open()).map(|r| r.port)).collect();
+        if have > 0 && !taken.contains(&have) {
+            return have;
+        }
+        let range = self.projects.get(&repo).map(|p| p.port_range()).unwrap_or(project::DEFAULT_PORTS);
+        let port = project::free_port(range, &taken);
+        if let Some(t) = self.task_mut(id) {
+            t.port = port;
+        } else if let Some(r) = self.run_mut(id) {
+            r.port = port;
+        }
+        port
     }
 
     fn on_started(&mut self, id: &str, r: Result<git::Started, String>, cx: &mut Cx) {
         self.live(id).busy = false;
         match r {
+            // your checkout has uncommitted changes the new branch wouldn't have: ask what to do with them
+            Err(e) if e.starts_with(git::DIRTY) => {
+                if let Some(t) = self.task_mut(id) {
+                    t.status = Status::Todo;
+                    t.last.clear();
+                    t.error.clear();
+                }
+                self.select(id);
+                self.ask_dirty(DirtyThen::Task(id.to_string()), e[git::DIRTY.len()..].to_string(), cx);
+            }
             Err(e) => {
                 let headless = self.task(id).is_some_and(|t| t.headless());
+                // the repo's setup failed (project.toml): nothing will start until that's fixed, so it's blocked
+                let setup = e.starts_with("setup ");
+                let first = e.lines().next().unwrap_or("").trim_end_matches(':').to_string();
                 if let Some(t) = self.task_mut(id) {
                     t.status = if headless { Status::Review } else { Status::Todo };
                     t.last.clear();
                     t.error = e.clone();
+                    if headless && setup {
+                        t.blocked = true;
+                        t.questions = vec![format!("{first} — fix the setup in .oriel/project.toml; x discards the task")];
+                    }
                 }
-                cx.notify(format!("couldn't start: {e}"));
-                if headless {
+                if setup {
+                    let mut lines = e.lines();
+                    let l = self.live(id);
+                    lead::upsert(&mut l.log, stream::Entry::error(lines.next().unwrap_or("")));
+                    for line in lines.take(12) {
+                        lead::upsert(&mut l.log, stream::Entry::note(line));
+                    }
+                }
+                cx.notify(format!("couldn't start: {}", if setup { format!("{first} (its card has the rest)") } else { e.clone() }));
+                if headless && setup {
+                    let title = self.task(id).map(|t| t.title.clone()).unwrap_or_default();
+                    cx.alert(crate::alerts::Kind::NeedsYou, format!("{title}: {first}"));
+                    self.event(id, "blocked");
+                } else if headless {
                     self.event_failed(id);
                 } else {
                     self.select(id);
                 }
             }
             Ok(s) => {
+                let accepting = self.task(id).is_some_and(|t| t.run.is_empty() || self.run_accepting(&t.run));
                 let Some(t) = self.task_mut(id) else { return };
                 t.branch = s.branch;
                 t.base_branch = s.base_branch;
                 t.base_sha = s.base_sha;
                 t.worktree = s.worktree.display().to_string();
                 t.last = format!("starting {}…", if t.worker.is_empty() { &t.agent } else { &t.worker });
+                if !accepting {
+                    // its run was stopped while the worktree was made: back in the queue (start makes it afresh)
+                    t.status = Status::Todo;
+                    t.queued = true;
+                    t.last = "queued".into();
+                    return;
+                }
                 let t = t.clone();
                 if t.headless() {
                     self.start_worker(id, cx);
                 } else {
-                    self.open_agent(&t, &t.prompt, false, cx);
+                    self.open_agent(&t, &hand_prompt(&t), false, cx);
                 }
             }
         }
@@ -1189,7 +1854,7 @@ impl Agents {
                     cx.notify(format!("{} isn't installed", t.agent));
                     return;
                 };
-                wrap_cmd(&bin, agent_args, &t.id)
+                wrap_cmd(&bin, agent_args, &t.id, t.port)
             }
         };
         let icon = KINDS.iter().find(|k| k.0 == t.agent).map(|k| k.1).unwrap_or("robot");
@@ -1206,16 +1871,50 @@ impl Agents {
         if t.worktree.is_empty() || !Path::new(&t.worktree).is_dir() {
             return;
         }
-        self.mode = Mode::Diff(DiffView { id: id.to_string(), data: None, file: 0, scroll: 0 });
+        self.mode = Mode::Diff(DiffView::new(id));
         let id = id.to_string();
         // a lead-run task merges into its integration branch: check conflicts against that
         let target = if t.run.is_empty() { None } else { self.run_ref(&t.run).map(|r| r.branch.clone()) };
         self.spawn(cx, move |send| send(Msg::Diff(id, git::diff_against(Path::new(&t.repo), Path::new(&t.worktree), &t.base_sha, target.as_deref()))));
     }
 
+    /// Why `c` can't send feedback to this task or run right now (None = it can): the diff view and the
+    /// transcript show the key only when it works.
+    fn comment_block(&self, id: &str) -> Option<&'static str> {
+        if let Some(r) = self.run_ref(id) {
+            return self.feedback_block(r);
+        }
+        let t = self.task(id)?;
+        if t.worktree.is_empty() || t.status == Status::Done {
+            return Some("that task has no worktree any more");
+        }
+        if t.headless() && (self.live.get(id).is_some_and(|l| l.stop.is_some()) || t.status != Status::Review) {
+            return Some("it's still working — comment when it's done, or t to take it over");
+        }
+        self.can_act(id).err()
+    }
+
+    /// Can you act on this task right now (merge, discard, retry, comment, take over)? Not while a git step runs
+    /// for it (starting, checking, merging, resolving, removing): a second one at the same time would fight it.
+    fn can_act(&self, id: &str) -> Result<(), &'static str> {
+        if self.merging.as_deref() == Some(id) {
+            return Err("it's being merged right now — try again in a moment");
+        }
+        match self.live.get(id) {
+            Some(l) if l.busy || l.checking => Err("it's in the middle of a git step — try again in a moment"),
+            _ => Ok(()),
+        }
+    }
+
     fn merge(&mut self, id: &str, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
+        if let Err(why) = self.can_act(id) {
+            cx.notify(why);
+            return;
+        }
         if !t.run.is_empty() {
+            // a finished run takes it in again (and goes back to review once it's merged)
+            self.revive(&t.run);
             // a lead-run task lands on the run's integration branch, through the gated merge queue
             if !t.headless() {
                 cx.act(Action::CloseTag(t.tag()));
@@ -1236,6 +1935,7 @@ impl Agents {
             return;
         }
         cx.act(Action::CloseTag(t.tag()));
+        cx.act(Action::CloseTag(try_tag(id))); // an open shell would keep Windows from removing the worktree
         {
             let l = self.live(id);
             l.busy = true;
@@ -1255,6 +1955,7 @@ impl Agents {
     fn remove(&mut self, id: &str, then: Then, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
         cx.act(Action::CloseTag(t.tag()));
+        cx.act(Action::CloseTag(try_tag(id)));
         self.live(id).busy = true;
         self.task_mut(id).unwrap().last = if then == Then::Retry { "resetting…".into() } else { "discarding…".into() };
         let id = id.to_string();
@@ -1264,15 +1965,32 @@ impl Agents {
         });
     }
 
-    /// Feedback for a task: continue its agent's session in the worktree with the comment as the next prompt.
+    /// Feedback for a task: continue its agent's session in the worktree with the comment as the next prompt. For a
+    /// lead run it goes to the lead (run_feedback).
     fn comment(&mut self, id: &str, text: &str, cx: &mut Cx) {
-        let text = text.trim();
-        if text.is_empty() {
+        // your ticked line comments (and a second opinion's findings) go along, after what you typed
+        let lines = self.ticked(id);
+        let typed = text.trim().to_string();
+        let msg = review::message(self.notes_of(id), text);
+        if msg.is_empty() {
             return;
+        }
+        let text = msg.as_str();
+        if let Some(r) = self.run_ref(id) {
+            if let Some(why) = self.feedback_block(r) {
+                cx.notify(why);
+                return;
+            }
+            self.notes.remove(id);
+            return self.run_feedback(id, text, cx);
         }
         let Some(t) = self.task(id).cloned() else { return };
         if t.worktree.is_empty() || !Path::new(&t.worktree).is_dir() {
             cx.notify("that task has no worktree any more");
+            return;
+        }
+        if let Err(why) = self.can_act(id) {
+            cx.notify(why);
             return;
         }
         if t.headless() {
@@ -1280,17 +1998,31 @@ impl Agents {
                 cx.notify("it's still working — comment when it's done, or t to take it over");
                 return;
             }
+            if self.run_ref(&t.run).is_some_and(|r| r.state == store::RunState::Stopped) {
+                cx.notify("the run is stopped — resume it first (r on the lead panel)");
+                return;
+            }
+            // your answer unblocks it (worker_again), and a finished run takes the new round in
+            self.notes.remove(id);
+            self.revive(&t.run);
             self.worker_again(id, text, cx);
             self.save();
             return;
         }
+        let over = t.budget_usd > 0.0 && t.cost_usd >= t.budget_usd;
+        self.notes.remove(id);
         self.open_agent(&t, text, true, cx);
         let tm = self.task_mut(id).unwrap();
+        if over {
+            // you asked it to carry on past its budget: that's the budget lifted, or its tab would close at once
+            tm.budget_usd = 0.0;
+            cx.notify(format!("{} had spent its budget (${:.2} of ${:.2}) — lifted for this follow-up", t.title, t.cost_usd, t.budget_usd));
+        }
         tm.status = Status::Running;
         tm.followups += 1;
         tm.question.clear();
         tm.error.clear();
-        tm.last = format!("comment: {}", text.lines().next().unwrap_or(""));
+        tm.last = if typed.is_empty() && lines > 0 { format!("comment: {lines} line comment{}", if lines == 1 { "" } else { "s" }) } else { format!("comment: {}", text.lines().next().unwrap_or("")) };
         self.select(id);
         self.save();
     }
@@ -1302,7 +2034,9 @@ impl Agents {
             return;
         }
         self.planning = true;
-        self.spawn(cx, move |send| send(Msg::Plan(run_planner(&bin, &repo.root, &goal))));
+        let key = repo.root.display().to_string();
+        let names = self.plan_names();
+        self.spawn(cx, move |send| send(Msg::Plan(key, plan_checked(&bin, &repo.root, &goal, &names))));
     }
 
     /// enter on a card: start it, jump to its agent, or review it. Headless workers show their live transcript.
@@ -1331,6 +2065,13 @@ impl Agents {
 
     fn do_confirm(&mut self, c: Confirm, cx: &mut Cx) {
         self.mode = Mode::Board;
+        // a git step may have started for the task while the question was up
+        if matches!(c.what, Pending::Merge | Pending::Discard | Pending::Retry) {
+            if let Err(why) = self.can_act(&c.id) {
+                cx.notify(why);
+                return;
+            }
+        }
         match c.what {
             Pending::Merge => self.merge(&c.id, cx),
             Pending::Discard if self.task(&c.id).is_some_and(|t| !t.run.is_empty()) => self.discard_task(&c.id, None, cx),
@@ -1340,12 +2081,401 @@ impl Agents {
             Pending::DiscardRun => self.discard_run(&c.id, cx),
             Pending::Retry => self.remove(&c.id, Then::Retry, cx),
             Pending::Delete => {
+                // kept a moment: u puts it back
+                if let Some(t) = self.task(&c.id).cloned() {
+                    cx.notify(format!("deleted \"{}\" · u undo", t.title));
+                    self.deleted = Some((t, Instant::now()));
+                }
                 self.store.tasks.retain(|t| t.id != c.id);
                 self.live.remove(&c.id);
                 let _ = std::fs::remove_file(self.paths.status(&c.id));
             }
         }
         self.save();
+    }
+
+    /// u on the board: the task x just deleted comes back.
+    fn undo_delete(&mut self, cx: &mut Cx) {
+        match self.deleted.take() {
+            Some((t, at)) if at.elapsed() < UNDO_FOR && self.task(&t.id).is_none() => {
+                let (id, title) = (t.id.clone(), t.title.clone());
+                self.live.insert(id.clone(), Live::default());
+                self.store.tasks.push(t);
+                self.select(&id);
+                self.save();
+                cx.notify(format!("\"{title}\" is back"));
+            }
+            _ => cx.notify("nothing to undo"),
+        }
+    }
+
+    /// The repo is known now: open the form someone asked for before it was (see `pending_form`).
+    fn open_pending_form(&mut self, cx: &mut Cx) {
+        if !matches!(self.mode, Mode::Board) {
+            return;
+        }
+        let Some((key, text)) = self.pending_form.take() else { return };
+        if key == 'L' {
+            self.open_lead_form();
+        } else {
+            self.open_task_form(None);
+        }
+        if !text.is_empty() {
+            self.paste(&text, cx);
+        }
+    }
+
+    // ------------------------------------------------------------------ forms: drafts, recall, saved prompts
+
+    /// The task form (a new task, or `editing` one), with what you typed last time if you left it with esc.
+    fn open_task_form(&mut self, editing: Option<&Task>) {
+        let key = editing.map(|t| t.id.clone());
+        match self.drafts.task.take() {
+            Some(f) if f.editing == key => {
+                self.mode = Mode::Form(f);
+                self.restored = true;
+            }
+            other => {
+                self.drafts.task = other;
+                self.mode = Mode::Form(self.new_form(editing));
+                self.restored = false;
+            }
+        }
+        self.recall = None;
+        self.opened_at = Instant::now();
+    }
+
+    fn open_lead_form(&mut self) {
+        let (form, restored) = match self.drafts.lead.take() {
+            Some(f) => (f, true),
+            None => (self.new_lead_form(), false),
+        };
+        self.mode = Mode::LeadForm(form);
+        self.restored = restored;
+        self.recall = None;
+        self.opened_at = Instant::now();
+    }
+
+    fn open_plan(&mut self) {
+        let (inp, restored) = match self.drafts.plan.take() {
+            Some(i) => (i, true),
+            None => (Input::new("", true), false),
+        };
+        self.mode = Mode::Plan(inp);
+        self.restored = restored;
+        self.recall = None;
+        self.opened_at = Instant::now();
+    }
+
+    /// c: feedback for a task or a lead run.
+    fn open_comment(&mut self, id: String) {
+        self.comment_back = None;
+        let (inp, restored) = match self.drafts.comment.remove(&id) {
+            Some(i) => (i, true),
+            None => (Input::new("", true), false),
+        };
+        self.mode = Mode::Comment(id, inp);
+        self.restored = restored;
+        self.opened_at = Instant::now();
+    }
+
+    /// Something arrives in a form that came back from a draft before you touched it (/task or /lead sending
+    /// text right after opening the form): the draft goes back where it was and the text starts a fresh form.
+    fn set_draft_aside(&mut self) {
+        self.restored = false;
+        self.mode = match std::mem::replace(&mut self.mode, Mode::Board) {
+            Mode::Form(f) if f.editing.is_none() => {
+                self.drafts.task = Some(f);
+                Mode::Form(self.new_form(None))
+            }
+            Mode::LeadForm(f) => {
+                self.drafts.lead = Some(f);
+                Mode::LeadForm(self.new_lead_form())
+            }
+            Mode::Plan(i) => {
+                self.drafts.plan = Some(i);
+                Mode::Plan(Input::new("", true))
+            }
+            Mode::Comment(id, i) => {
+                self.drafts.comment.insert(id.clone(), i);
+                Mode::Comment(id, Input::new("", true))
+            }
+            m => m,
+        };
+    }
+
+    /// Goals and prompts you gave before in this repo, newest first: lead runs' goals and your own tasks' prompts
+    /// (not the ones a lead wrote for its workers).
+    fn recall_list(&self) -> Vec<String> {
+        let key = self.repo_key();
+        let mut v: Vec<(i64, &str)> = self.store.runs.iter().filter(|r| r.repo == key && !r.manual).map(|r| (r.created, r.goal.as_str())).collect();
+        v.extend(self.store.tasks.iter().filter(|t| t.repo == key && (t.run.is_empty() || self.run_ref(&t.run).is_some_and(|r| r.manual))).map(|t| (t.created, t.prompt.as_str())));
+        v.sort_by_key(|x| std::cmp::Reverse(x.0));
+        let mut out: Vec<String> = vec![];
+        for (_, s) in v {
+            let s = s.trim();
+            if !s.is_empty() && !out.iter().any(|o| o == s) {
+                out.push(s.to_string());
+            }
+        }
+        out
+    }
+
+    /// ↑/↓ in an empty goal or prompt field, or one still showing what ↑ brought back, step through
+    /// `recall_list` (↓ past the newest empties it again). true = the key was used.
+    fn recall_key(&mut self, k: KeyEvent, inp: &mut Input) -> bool {
+        if !matches!(k.code, KeyCode::Up | KeyCode::Down) || k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT) {
+            return false;
+        }
+        let list = self.recall_list();
+        let cur = self.recall.filter(|&i| list.get(i).is_some_and(|s| *s == inp.text));
+        if cur.is_none() && !inp.text.is_empty() {
+            self.recall = None;
+            return false;
+        }
+        let next = match (k.code, cur) {
+            (KeyCode::Up, None) if !list.is_empty() => Some(0),
+            (KeyCode::Up, Some(i)) => Some((i + 1).min(list.len() - 1)),
+            (KeyCode::Down, Some(0)) => None,
+            (KeyCode::Down, Some(i)) => Some(i - 1),
+            _ => return false,
+        };
+        *inp = Input::new(next.map(|i| list[i].as_str()).unwrap_or(""), inp.multi);
+        self.recall = next;
+        true
+    }
+
+    /// ctrl+t: the saved prompts, to insert one where you're typing (`field` = what's there now, which can be
+    /// saved as a new one from the list).
+    fn open_prompt_pick(&mut self, field: &str) {
+        self.prompt_pick = Some(PromptPick { items: prompts::load(), filter: Input::new("", false), sel: 0, field: field.to_string() });
+    }
+
+    /// Put a saved prompt's text into the open form's goal or prompt (after what's there, on its own line).
+    fn insert_prompt(&mut self, text: &str) {
+        let put = |i: &mut Input| {
+            if !i.text.is_empty() && !i.text.ends_with('\n') {
+                i.cur = i.text.chars().count();
+                i.insert("\n");
+            }
+            i.insert(text);
+        };
+        match &mut self.mode {
+            Mode::Form(f) => {
+                f.field = 1;
+                put(&mut f.prompt);
+            }
+            Mode::LeadForm(f) => {
+                f.field = 0;
+                put(&mut f.goal);
+            }
+            Mode::Plan(i) | Mode::Comment(_, i) => put(i),
+            _ => {}
+        }
+    }
+
+    fn pick_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
+        let Some(mut p) = self.prompt_pick.take() else { return false };
+        let rows = p.rows();
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => return true,
+            KeyCode::Up => p.sel = p.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => p.sel = (p.sel + 1).min(rows.len().saturating_sub(1)),
+            KeyCode::Enter => match rows.get(p.sel) {
+                Some(PickRow::Prompt(i)) => {
+                    let text = p.items[*i].text.clone();
+                    self.insert_prompt(&text);
+                    return true;
+                }
+                Some(PickRow::Save(name)) => {
+                    let mut items = p.items.clone();
+                    items.retain(|x| !x.name.eq_ignore_ascii_case(name));
+                    items.push(prompts::Prompt { name: name.clone(), text: p.field.trim().to_string() });
+                    match prompts::save_to(&prompts::path(), &items) {
+                        Ok(()) => cx.notify(format!("saved the prompt \"{name}\" · ctrl+t here or /p {name} in chat")),
+                        Err(e) => cx.notify(e),
+                    }
+                    return true;
+                }
+                None => {}
+            },
+            KeyCode::Delete => {
+                if let Some(PickRow::Prompt(i)) = rows.get(p.sel) {
+                    let gone = p.items.remove(*i);
+                    match prompts::save_to(&prompts::path(), &p.items) {
+                        Ok(()) => cx.notify(format!("deleted the prompt \"{}\"", gone.name)),
+                        Err(e) => cx.notify(e),
+                    }
+                    p.sel = p.sel.min(p.rows().len().saturating_sub(1));
+                }
+            }
+            _ if !ctrl || matches!(k.code, KeyCode::Char('u' | 'w')) => {
+                if p.filter.key(k) {
+                    p.sel = 0;
+                }
+            }
+            _ => {}
+        }
+        self.prompt_pick = Some(p);
+        true
+    }
+
+    // ------------------------------------------------------------------ uncommitted changes
+
+    /// Your checkout's uncommitted changes are in the way of `then`: ask (a popup) what to do with them.
+    fn ask_dirty(&mut self, then: DirtyThen, status: String, cx: &mut Cx) {
+        // a form you're in the middle of waits as a draft
+        match std::mem::replace(&mut self.mode, Mode::Board) {
+            Mode::Form(f) if f.editing.is_none() => self.drafts.task = Some(f),
+            Mode::LeadForm(f) => self.drafts.lead = Some(f),
+            Mode::Plan(i) => self.drafts.plan = Some(i),
+            Mode::Comment(id, i) => {
+                self.drafts.comment.insert(id, i);
+            }
+            Mode::Diff(_) | Mode::Board | Mode::Confirm(_) | Mode::Batch(_) | Mode::Try(_) | Mode::Dirty(_) => {}
+            m => {
+                // (the roster, the picker, a transcript…: back to it afterwards isn't worth a popup stack)
+                self.mode = m;
+                let why = match &then {
+                    DirtyThen::Merge(_) | DirtyThen::MergeRun(_) => "the repo has uncommitted changes — commit them, then merge again",
+                    _ => "the repo has uncommitted changes — start it again to choose what happens to them",
+                };
+                cx.notify(why);
+                if let DirtyThen::Run(id) = &then {
+                    self.cancel_dirty_run(id);
+                }
+                return;
+            }
+        }
+        self.mode = Mode::Dirty(DirtyAsk { then, status });
+    }
+
+    fn dirty_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
+        let Mode::Dirty(d) = std::mem::replace(&mut self.mode, Mode::Board) else { return false };
+        let merging = matches!(d.then, DirtyThen::Merge(_) | DirtyThen::MergeRun(_));
+        let repo = self.repo_key();
+        let what = |s: &Self| match &d.then {
+            DirtyThen::Task(id) | DirtyThen::Merge(id) => s.task(id).map(|t| t.title.clone()).unwrap_or_default(),
+            DirtyThen::Run(id) | DirtyThen::MergeRun(id) => s.run_ref(id).map(|r| r.goal.lines().next().unwrap_or("").chars().take(60).collect()).unwrap_or_default(),
+        };
+        let choice = match k.code {
+            KeyCode::Char('c') => git::Dirty::Commit(format!("work in progress (before {} \"{}\")", if merging { "merging" } else { "starting" }, what(self))),
+            KeyCode::Char('i') if !merging => git::Dirty::Include,
+            KeyCode::Enter if !merging => {
+                // started without them: these same changes won't ask again
+                self.dirty_seen.insert(repo, d.status.clone());
+                git::Dirty::Ignore
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                if let DirtyThen::Run(id) = &d.then {
+                    let manual = self.run_ref(id).is_some_and(|r| r.manual);
+                    self.cancel_dirty_run(id);
+                    cx.notify(if manual { "not started — your tasks are marked again (enter runs them)" } else { "not started — L brings your goal back" });
+                }
+                return true;
+            }
+            _ => {
+                self.mode = Mode::Dirty(d);
+                return true;
+            }
+        };
+        match d.then {
+            DirtyThen::Task(id) => self.start_with(&id, Some(choice), cx),
+            DirtyThen::Run(id) => self.spawn_run_start(&id, choice, cx),
+            then @ (DirtyThen::Merge(_) | DirtyThen::MergeRun(_)) => {
+                let git::Dirty::Commit(msg) = choice else { return true };
+                let root = match &then {
+                    DirtyThen::Merge(id) => self.task(id).map(|t| t.repo.clone()),
+                    DirtyThen::MergeRun(id) => self.run_ref(id).map(|r| r.repo.clone()),
+                    _ => None,
+                };
+                let Some(root) = root else { return true };
+                self.spawn(cx, move |send| send(Msg::Committed(then, git::commit_all(Path::new(&root), &msg))));
+            }
+        }
+        true
+    }
+
+    // ------------------------------------------------------------------ T: try it
+
+    /// T: a terminal in the checkout of a run (its integration branch as it stands) or of a task, to try the result
+    /// before merging it. The popup keeps a command to start there per repo ("pnpm dev").
+    fn open_try(&mut self, id: &str, cx: &mut Cx) {
+        let (dir, title, repo, lead) = if let Some(r) = self.run_ref(id) {
+            if r.state.active() {
+                cx.notify("the run is still going: its checkout moves with every merge — try it once it's in review (or stopped)");
+                return;
+            }
+            (r.worktree.clone(), format!("⚑ {}", r.goal.lines().next().unwrap_or("")), r.repo.clone(), true)
+        } else if let Some(t) = self.task(id) {
+            (t.worktree.clone(), t.title.clone(), t.repo.clone(), false)
+        } else {
+            return;
+        };
+        if dir.is_empty() || !Path::new(&dir).is_dir() {
+            cx.notify("nothing to try: its checkout is gone");
+            return;
+        }
+        // what you ran last in this repo, else its project.toml `run`
+        let proj = self.projects.get(&repo).cloned().unwrap_or_default();
+        let cmd = self.store.try_cmds.get(&repo).cloned().unwrap_or_else(|| proj.run.trim().to_string());
+        // workers' checkouts got the setup when they were made; the lead's own never did
+        let setup = if lead { proj.setup.trim().to_string() } else { String::new() };
+        let port = self.port_for(id);
+        self.save();
+        self.mode = Mode::Try(TryView { id: id.to_string(), dir: PathBuf::from(dir), title, input: Input::new(&cmd, false), setup, port });
+    }
+
+    fn try_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
+        let Mode::Try(mut v) = std::mem::replace(&mut self.mode, Mode::Board) else { return false };
+        match k.code {
+            KeyCode::Esc => {}
+            KeyCode::Enter => {
+                let repo = self.run_ref(&v.id).map(|r| r.repo.clone()).or_else(|| self.task(&v.id).map(|t| t.repo.clone())).unwrap_or_default();
+                let cmd = v.input.text.trim().to_string();
+                // remembered only when it isn't what project.toml says (then editing the file keeps applying)
+                if cmd == self.projects.get(&repo).map(|p| p.run.trim().to_string()).unwrap_or_default() {
+                    self.store.try_cmds.remove(&repo);
+                } else {
+                    self.store.try_cmds.insert(repo.clone(), cmd.clone());
+                }
+                self.save();
+                let l = TryLaunch { id: v.id, dir: v.dir, title: v.title, setup: project::with_port(&v.setup, v.port), cmd: project::with_port(&cmd, v.port), port: v.port };
+                self.spawn(cx, move |send| {
+                    // the files git doesn't track (.env…); a JS checkout without a setup borrows your node_modules, so
+                    // `pnpm dev` runs as it does in your own
+                    let proj = project::load(Path::new(&repo)).unwrap_or_default();
+                    project::copy_files(&proj, Path::new(&repo), &l.dir);
+                    if proj.setup.trim().is_empty() {
+                        git::link_deps(Path::new(&repo), &l.dir);
+                    } else if !l.setup.is_empty() {
+                        git::unlink_deps(&l.dir); // its setup installs its own
+                    }
+                    send(Msg::TryReady(l));
+                });
+            }
+            _ => {
+                v.input.key(k);
+                self.mode = Mode::Try(v);
+            }
+        }
+        true
+    }
+
+    fn open_try_tab(&mut self, l: TryLaunch, cx: &mut Cx) {
+        let name = format!("try · {}", ui_short(&l.title, 18));
+        let pane = match &self.fake_agent {
+            // tests: a no-op instead of a real shell
+            Some((prog, args)) => crate::panes::term::Term::new(&name, "term", prog, args.clone(), Some(l.dir)),
+            None => {
+                let (prog, args) = try_shell(cx.config, &l.setup, &l.cmd, l.port);
+                crate::panes::term::Term::new(&name, "term", &prog, args, Some(l.dir))
+            }
+        };
+        let tag = try_tag(&l.id);
+        cx.act(Action::CloseTag(tag.clone()));
+        cx.act(Action::OpenTagged { pane: Box::new(pane), tag, name, focus: true });
     }
 
     fn new_form(&self, editing: Option<&Task>) -> Form {
@@ -1379,18 +2509,52 @@ impl Agents {
         }
     }
 
-    /// "a1b2, fix the parser" -> task ids: exact ids, or the TODO task whose title starts with it.
+    /// "a1b2, fix the parser" -> task ids: exact ids, or the open task whose title starts with it. An exact id may
+    /// name a finished task (the field comes back prefilled when you edit): merged ones are simply met and drop
+    /// out, discarded ones never will be. No loops: a task can't wait for one that already waits for it.
     fn resolve_after(&self, text: &str, me: Option<&str>) -> Result<Vec<String>, String> {
         let mut out = vec![];
         for part in text.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()) {
             let low = part.to_lowercase();
+            if let Some(t) = self.store.tasks.iter().find(|t| t.id == part && Some(t.id.as_str()) != me && t.status == Status::Done) {
+                if t.outcome == "merged" {
+                    continue;
+                }
+                return Err(format!("'{}' was discarded — take it out of after", t.title));
+            }
             let hit = self.store.tasks.iter().filter(|t| Some(t.id.as_str()) != me && t.status != Status::Done).find(|t| t.id == part || t.title.to_lowercase().starts_with(&low));
             match hit {
-                Some(t) => out.push(t.id.clone()),
+                Some(t) => {
+                    if let Some(me) = me.filter(|me| self.waits_on(&t.id, me)) {
+                        let mine = self.task(me).map(|x| x.title.clone()).unwrap_or_default();
+                        return Err(format!("'{}' already waits for '{mine}'", t.title));
+                    }
+                    if !out.contains(&t.id) {
+                        out.push(t.id.clone());
+                    }
+                }
                 None => return Err(format!("no open task called '{part}'")),
             }
         }
         Ok(out)
+    }
+
+    /// Does task `a` wait for task `b`, directly or through what it waits for?
+    fn waits_on(&self, a: &str, b: &str) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![a.to_string()];
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x.clone()) {
+                continue;
+            }
+            for d in self.task(&x).map(|t| t.depends_on.clone()).unwrap_or_default() {
+                if d == b {
+                    return true;
+                }
+                stack.push(d);
+            }
+        }
+        false
     }
 
     fn submit_form(&mut self, mut form: Form, start: bool, cx: &mut Cx) {
@@ -1446,6 +2610,13 @@ impl Agents {
             t.depends_on = after;
             t.budget_usd = budget;
         }
+        // a waiting task of a finished run you just fixed up (another agent, say): the run takes it in again
+        if let Some(run) = self.task(&id).filter(|t| t.status == Status::Todo && !t.run.is_empty()).map(|t| t.run.clone()) {
+            if let Some(t) = self.task_mut(&id) {
+                t.queued = true;
+            }
+            self.revive(&run);
+        }
         self.save();
         self.mode = Mode::Board;
         self.select(&id);
@@ -1465,15 +2636,30 @@ impl Agents {
         match k.code {
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.lead_focus = false,
             KeyCode::Up | KeyCode::Char('k') => {}
-            KeyCode::Esc | KeyCode::Char('s') if run.state.active() => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::StopRun }),
+            // esc leaves the panel like everywhere else; stopping the run is s (and y)
+            KeyCode::Char('s') if run.state.active() => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::StopRun }),
             KeyCode::Esc => self.lead_focus = false,
             KeyCode::Char('w') => self.mode = Mode::Watch(WatchView { run: run.id, sel: 0 }),
+            // its plan waits for you: the cards first
+            KeyCode::Enter if !run.held.is_empty() => self.open_plan_review(&run.id),
             KeyCode::Enter => self.mode = Mode::Log(LogView { target: LogTarget::Lead(run.id), scroll: 0, back: None }),
             KeyCode::Char('d') if !run.branch.is_empty() => self.open_run_diff(&run.id, cx),
             KeyCode::Char('m') if !run.state.active() && !run.branch.is_empty() => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::MergeRun }),
             KeyCode::Char('x') => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::DiscardRun }),
+            // it never started (its branch couldn't be made): the same goal again
+            KeyCode::Char('r') if run.state == store::RunState::Stopped && run.branch.is_empty() => self.retry_run(&run.id, cx),
             KeyCode::Char('r') if run.state == store::RunState::Stopped => self.resume_run(&run.id, cx),
-            KeyCode::Char('d' | 'm' | 'r' | 's') => {}
+            KeyCode::Char('c') => match self.feedback_block(&run) {
+                None => self.open_comment(run.id),
+                Some(why) => cx.notify(why),
+            },
+            KeyCode::Char('T') if !run.branch.is_empty() => self.open_try(&run.id, cx),
+            // its tasks as a template, to run again (W)
+            KeyCode::Char('S') => self.open_save_template(&run.id, cx),
+            // another AI's opinion on the whole integration branch (its findings wait in the run's diff)
+            KeyCode::Char('V') if !run.state.active() && !run.branch.is_empty() => self.second_opinion(&run.id, cx),
+            KeyCode::Char('V') => {}
+            KeyCode::Char('d' | 'm' | 'r' | 's' | 'T') => {}
             _ => return false,
         }
         true
@@ -1484,7 +2670,7 @@ impl Agents {
         if !self.marked.is_empty() {
             match k.code {
                 KeyCode::Enter => {
-                    self.mode = Mode::Batch;
+                    self.open_batch();
                     return true;
                 }
                 KeyCode::Esc => {
@@ -1507,12 +2693,10 @@ impl Agents {
             KeyCode::BackTab => self.col = (self.col + 3) % 4,
             KeyCode::Up | KeyCode::Char('k') if self.row[self.col] == 0 && self.current_run().is_some() => self.lead_focus = true,
             KeyCode::Up | KeyCode::Char('k') => self.row[self.col] = self.row[self.col].min(n(self, self.col).saturating_sub(1)).saturating_sub(1),
-            KeyCode::Char('L') => {
-                if self.repo.is_some() {
-                    self.mode = Mode::LeadForm(self.new_lead_form());
-                }
-            }
+            KeyCode::Char('L') => self.open_form_key('L', cx),
+            KeyCode::Char('u') => self.undo_delete(cx),
             KeyCode::Char('R') => self.mode = Mode::Roster(RosterView { sel: 0, edit: None }),
+            KeyCode::Char('W') if self.repo.is_some() => self.open_templates(),
             KeyCode::Char('w') => {
                 if let Some(r) = self.current_run() {
                     self.mode = Mode::Watch(WatchView { run: r.id.clone(), sel: 0 });
@@ -1521,26 +2705,22 @@ impl Agents {
             KeyCode::Down | KeyCode::Char('j') => self.row[self.col] = (self.row[self.col] + 1).min(n(self, self.col).saturating_sub(1)),
             KeyCode::Home | KeyCode::Char('g') => self.row[self.col] = 0,
             KeyCode::End | KeyCode::Char('G') => self.row[self.col] = n(self, self.col).saturating_sub(1),
-            KeyCode::Char('n') => {
-                if self.repo.is_some() {
-                    self.mode = Mode::Form(self.new_form(None));
-                }
-            }
+            KeyCode::Char('n') => self.open_form_key('n', cx),
             KeyCode::Char('e') => {
                 if let Some(t) = self.selected().and_then(|id| self.task(&id).cloned()) {
                     if t.status == Status::Todo {
-                        self.mode = Mode::Form(self.new_form(Some(&t)));
+                        self.open_task_form(Some(&t));
                     }
                 }
             }
-            KeyCode::Char('o') => self.mode = Mode::Repo(Picker { input: Input::new("", false), sel: if self.store.repos.is_empty() { 0 } else { 1 }, err: String::new(), checking: false }),
+            KeyCode::Char('o') => self.open_picker(cx),
             KeyCode::Char('P') => {
                 if self.installed("claude").is_none() {
                     cx.notify("the planner needs claude installed");
                 } else if self.planning {
                     cx.notify("already planning…");
                 } else if self.repo.is_some() {
-                    self.mode = Mode::Plan(Input::new("", true));
+                    self.open_plan();
                 }
             }
             KeyCode::Enter => self.activate(cx),
@@ -1569,22 +2749,28 @@ impl Agents {
                 }
             }
             _ => {
-                let Some(id) = self.selected() else { return matches!(k.code, KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't')) };
+                let Some(id) = self.selected() else { return matches!(k.code, KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't' | 'T' | 'V')) };
                 let t = self.task(&id).unwrap().clone();
-                let busy = self.live(&id).busy;
                 let has_wt = !t.worktree.is_empty();
                 let running_headless = t.headless() && self.live(&id).stop.is_some();
                 let in_run = !t.run.is_empty();
+                if let (KeyCode::Char('c' | 'm' | 'x' | 'r' | 't' | 'V'), Err(why), false) = (k.code, self.can_act(&id), t.status == Status::Done) {
+                    cx.notify(why);
+                    return true;
+                }
                 match k.code {
                     KeyCode::Char('d') if has_wt => self.open_diff(&id, cx),
-                    KeyCode::Char('c') if has_wt && t.status != Status::Done && !busy && !running_headless => self.mode = Mode::Comment(id, Input::new("", true)),
-                    KeyCode::Char('m') if in_run && has_wt && !busy && t.status == Status::Review => self.confirm(Pending::Merge),
-                    KeyCode::Char('m') if !in_run && has_wt && !busy && matches!(t.status, Status::Review | Status::Running | Status::Blocked) => self.confirm(Pending::Merge),
-                    KeyCode::Char('x') if !busy && t.status == Status::Todo && !in_run => self.confirm(Pending::Delete),
-                    KeyCode::Char('x') if !busy && t.status != Status::Done => self.confirm(Pending::Discard),
-                    KeyCode::Char('r') if !in_run && !busy && t.status != Status::Todo && !(t.status == Status::Done && t.outcome == "merged") => self.confirm(Pending::Retry),
-                    KeyCode::Char('t') if t.headless() && has_wt && !busy => self.take_over(&id, cx),
-                    KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't') => {}
+                    // a second opinion on finished work: its findings wait in the diff view (d)
+                    KeyCode::Char('V') if has_wt && t.status == Status::Review && !running_headless => self.second_opinion(&id, cx),
+                    KeyCode::Char('T') if has_wt && t.status != Status::Done => self.open_try(&id, cx),
+                    KeyCode::Char('c') if has_wt && t.status != Status::Done && !running_headless => self.open_comment(id),
+                    KeyCode::Char('m') if in_run && has_wt && t.status == Status::Review => self.confirm(Pending::Merge),
+                    KeyCode::Char('m') if !in_run && has_wt && matches!(t.status, Status::Review | Status::Running | Status::Blocked) => self.confirm(Pending::Merge),
+                    KeyCode::Char('x') if t.status == Status::Todo && !in_run => self.confirm(Pending::Delete),
+                    KeyCode::Char('x') if t.status != Status::Done => self.confirm(Pending::Discard),
+                    KeyCode::Char('r') if !in_run && t.status != Status::Todo && !(t.status == Status::Done && t.outcome == "merged") => self.confirm(Pending::Retry),
+                    KeyCode::Char('t') if t.headless() && has_wt => self.take_over(&id, cx),
+                    KeyCode::Char('d' | 'c' | 'm' | 'x' | 'r' | 't' | 'T' | 'V') => {}
                     _ => return false,
                 }
             }
@@ -1592,58 +2778,82 @@ impl Agents {
         true
     }
 
-    fn diff_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
-        let Mode::Diff(v) = &mut self.mode else { return false };
-        let nfiles = v.data.as_ref().and_then(|d| d.as_ref().ok()).map(|d| d.files.len()).unwrap_or(0);
-        match k.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('d') => self.mode = Mode::Board,
-            KeyCode::Up | KeyCode::Char('k') => {
-                v.file = v.file.saturating_sub(1);
-                v.scroll = 0;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                v.file = (v.file + 1).min(nfiles.saturating_sub(1));
-                v.scroll = 0;
-            }
-            KeyCode::PageDown | KeyCode::Char(' ') => v.scroll += 20,
-            KeyCode::PageUp => v.scroll = v.scroll.saturating_sub(20),
-            KeyCode::Char('J') => v.scroll += 1,
-            KeyCode::Char('K') => v.scroll = v.scroll.saturating_sub(1),
-            KeyCode::Home | KeyCode::Char('g') => v.scroll = 0,
-            KeyCode::Char('R') => {
-                let id = v.id.clone();
-                if self.run_ref(&id).is_some() {
-                    self.open_run_diff(&id, cx);
-                } else {
-                    self.open_diff(&id, cx);
+    /// enter on marked tasks: the popup that runs them, with the gate this repo gets.
+    fn open_batch(&mut self) {
+        let gate = self.gate_prefill().0;
+        self.mode = Mode::Batch(BatchView { gate: Input::new(&gate, false), editing: false });
+    }
+
+    fn batch_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
+        let Mode::Batch(mut v) = std::mem::replace(&mut self.mode, Mode::Board) else { return false };
+        if v.editing {
+            match k.code {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Tab => v.editing = false,
+                _ => {
+                    v.gate.key(k);
                 }
             }
-            KeyCode::Char('m') => {
-                let id = v.id.clone();
-                let what = if self.run_ref(&id).is_some() { Pending::MergeRun } else { Pending::Merge };
-                self.mode = Mode::Confirm(Confirm { id, what });
+            self.mode = Mode::Batch(v);
+            return true;
+        }
+        let serial = match k.code {
+            KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Enter => false,
+            KeyCode::Char('s') | KeyCode::Char('S') => true,
+            KeyCode::Esc => return true,
+            KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::Tab => {
+                v.editing = true;
+                self.mode = Mode::Batch(v);
+                return true;
             }
-            KeyCode::Char('x') => {
-                let id = v.id.clone();
-                let what = if self.run_ref(&id).is_some() { Pending::DiscardRun } else { Pending::Discard };
-                self.mode = Mode::Confirm(Confirm { id, what });
+            _ => {
+                self.mode = Mode::Batch(v);
+                return true;
             }
-            KeyCode::Char('c') => {
-                let id = v.id.clone();
-                if self.task(&id).is_some() {
-                    self.mode = Mode::Comment(id, Input::new("", true));
-                }
+        };
+        let ids = std::mem::take(&mut self.marked);
+        match self.start_batch(&ids, serial, &v.gate.text, cx) {
+            Ok(_) => cx.notify(format!("running {} task{} {}", ids.len(), if ids.len() == 1 { "" } else { "s" }, if serial { "one after another" } else { "together" })),
+            Err(e) => {
+                self.marked = ids;
+                cx.notify(e);
             }
-            KeyCode::Enter => {
-                let id = v.id.clone();
-                if self.live(&id).pane {
-                    let tag = self.task(&id).map(|t| t.tag()).unwrap_or_default();
-                    cx.act(Action::FocusTag(tag));
-                }
-            }
-            _ => return false,
         }
         true
+    }
+
+    /// The gate a run in this repo gets unless you change it, and why: (command or "", note). The config's
+    /// gate if it names one (the repo's own `[lead.gates]` entry, else `[lead] gate`), else what the repo was
+    /// detected to build with.
+    pub(super) fn gate_default(&self) -> (String, String) {
+        let key = self.repo_key();
+        let (cmd, why) = self.gate_detect.get(&key).cloned().unwrap_or((None, "none detected — type one (e.g. pnpm test)".into()));
+        let want = crate::config::path_key(Path::new(&key));
+        let own = self.lead_cfg.gates.keys().any(|k| crate::config::path_key(Path::new(k)) == want);
+        let from = if own { "[lead.gates] for this repo" } else { "[lead] gate" };
+        match crate::config::gate_for(&self.lead_cfg, Path::new(&key)).trim() {
+            "none" | "off" => (String::new(), format!("off in the config ({from}) — type one to gate this run")),
+            "" => (cmd.unwrap_or_default(), why),
+            c => (c.to_string(), format!("from the config ({from})")),
+        }
+    }
+
+    /// What the gate row starts with: what you gave this repo last time, else `gate_default`.
+    pub(super) fn gate_prefill(&self) -> (String, String) {
+        match self.store.gates.get(&self.repo_key()) {
+            Some(g) if g.is_empty() => (String::new(), "none — you took it off for this repo · type one to gate merges".into()),
+            Some(g) => (g.clone(), "yours for this repo".into()),
+            None => self.gate_default(),
+        }
+    }
+
+    /// A run starts with `gate`: remember it for the repo when it isn't what the repo would get anyway.
+    pub(super) fn remember_gate(&mut self, gate: &str) {
+        let key = self.repo_key();
+        if gate.trim() == self.gate_default().0.trim() {
+            self.store.gates.remove(&key);
+        } else {
+            self.store.gates.insert(key, gate.trim().to_string());
+        }
     }
 
     fn form_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
@@ -1651,13 +2861,31 @@ impl Agents {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         form.err.clear();
         match k.code {
-            KeyCode::Esc => return true, // mode already Board
+            KeyCode::Esc => {
+                // (mode already Board) what you typed comes back with the next n (or e on the same task)
+                if !form.title.text.trim().is_empty() || !form.prompt.text.trim().is_empty() {
+                    self.drafts.task = Some(form);
+                }
+                return true;
+            }
             KeyCode::Char('s') if ctrl => {
                 self.submit_form(form, false, cx);
                 return true;
             }
+            // a restored draft: ctrl+u throws it all away
+            KeyCode::Char('u') if ctrl && self.restored => {
+                let t = form.editing.as_ref().and_then(|id| self.task(id).cloned());
+                form = self.new_form(t.as_ref());
+            }
+            KeyCode::Char('t') if ctrl => {
+                let text = form.prompt.text.clone();
+                self.mode = Mode::Form(form);
+                self.open_prompt_pick(&text);
+                return true;
+            }
             KeyCode::Tab => form.field = (form.field + 1) % 8,
             KeyCode::BackTab => form.field = (form.field + 7) % 8,
+            KeyCode::Up | KeyCode::Down if form.field == 1 && self.recall_key(k, &mut form.prompt) => {}
             _ => {
                 let used = match form.field {
                     0 => form.title.key(k),
@@ -1700,8 +2928,9 @@ impl Agents {
     }
 
     fn picker_key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
+        let rows = self.picker_rows();
         let Mode::Repo(p) = &mut self.mode else { return false };
-        let n = self.store.repos.len();
+        let n = rows.len();
         match k.code {
             KeyCode::Esc => {
                 if self.repo.is_some() {
@@ -1711,16 +2940,18 @@ impl Agents {
             KeyCode::Up => p.sel = p.sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Tab => p.sel = (p.sel + 1).min(n),
             KeyCode::Enter => {
-                let path = if p.sel == 0 { expand(p.input.text.trim()) } else { PathBuf::from(&self.store.repos[p.sel - 1]) };
+                // (the chats' folders arrive in the background: the list may have changed under the cursor)
+                let path = if p.sel == 0 { expand(p.input.text.trim()) } else { rows.get(p.sel - 1).map(|r| PathBuf::from(&r.0)).unwrap_or_default() };
                 if path.as_os_str().is_empty() {
                     p.err = "type a path to a git repo".into();
                 } else {
                     self.open_repo(path, cx);
                 }
             }
-            KeyCode::Delete if p.sel > 0 => {
+            // forget a recent repo (your chats' folders come from the chats themselves)
+            KeyCode::Delete if p.sel > 0 && p.sel <= self.store.repos.len() => {
                 self.store.repos.remove(p.sel - 1);
-                p.sel = p.sel.min(self.store.repos.len());
+                p.sel = p.sel.min(n.saturating_sub(1));
                 self.save();
             }
             _ => {
@@ -1748,11 +2979,65 @@ fn ui_short(s: &str, n: usize) -> String {
     crate::ui::fit(s, n)
 }
 
-/// The lead planner: a headless read-only Claude run that splits a goal into independent task cards.
-fn run_planner(bin: &Path, repo: &Path, goal: &str) -> Result<(Vec<(String, String)>, f64), String> {
-    let prompt = format!(
-        "You are the lead planner for several coding agents that will work in parallel on this repository, each alone in its own git worktree.\n\nGoal: {goal}\n\nLook at the code as much as you need, then reply with ONLY a JSON array (no prose, no code fence) of 2 to 6 independent tasks. Each item: {{\"title\": \"short imperative title, under 50 characters\", \"prompt\": \"complete, self-contained instructions for one agent: what to change, where, and how to check it works\"}}. Tasks must not depend on each other or edit the same lines."
+/// What the planner (P) came back with, checked by plan.rs like a lead's plan.
+pub(super) struct PlanOut {
+    /// In an order their depends_on allow; `worker` set when the planner's thread assigned one.
+    items: Vec<plan::Item>,
+    /// plan.rs's notes (a scaffold the rest waits for, two tasks one after the other)
+    notes: Vec<String>,
+    /// What still doesn't check out after a second go: the cards arrive, but unmarked.
+    problems: Vec<String>,
+    cost: f64,
+}
+
+/// P: the planner splits the goal into cards that own files and say how to check them, and plan.rs checks them
+/// (disjoint files for what runs at the same time, hotspots in one scaffold task, small sizes). A plan that
+/// doesn't check out goes back to the planner once with what's wrong. `names` = who the cards go to, in turn.
+fn plan_checked(bin: &Path, repo: &Path, goal: &str, names: &[String]) -> Result<PlanOut, String> {
+    let shell = git::gate_shell().2;
+    plan_checked_with(&|feedback: &str| run_planner(bin, repo, goal, shell, feedback), names)
+}
+
+/// `plan_checked` with any planner (`feedback` → its cards and what they cost).
+fn plan_checked_with(planner: &dyn Fn(&str) -> Result<(Vec<plan::Item>, f64), String>, names: &[String]) -> Result<PlanOut, String> {
+    let assign = |items: &mut Vec<plan::Item>| {
+        for (i, it) in items.iter_mut().enumerate() {
+            it.worker = names[i % names.len().max(1)].clone();
+        }
+    };
+    let (mut items, mut cost) = planner("")?;
+    assign(&mut items);
+    let errs = match plan::check(items.clone(), &[], names) {
+        Ok(c) => return Ok(PlanOut { items: c.items, notes: c.notes, problems: vec![], cost }),
+        Err(e) => e,
+    };
+    let before: Vec<serde_json::Value> = items.iter().map(|it| serde_json::json!({"id": it.key, "title": it.title, "owns": it.owns, "depends_on": it.depends_on})).collect();
+    let feedback = format!("Your last list was rejected:\n- {}\nIt was: {}\nFix those problems and reply with the whole list again.", errs.join("\n- "), serde_json::Value::Array(before));
+    match planner(&feedback) {
+        Ok((mut again, more)) => {
+            cost += more;
+            assign(&mut again);
+            match plan::check(again.clone(), &[], names) {
+                Ok(c) => Ok(PlanOut { items: c.items, notes: c.notes, problems: vec![], cost }),
+                Err(e) => Ok(PlanOut { items: again, notes: vec![], problems: e, cost }),
+            }
+        }
+        Err(_) => Ok(PlanOut { items, notes: vec![], problems: errs, cost }),
+    }
+}
+
+/// The lead planner: a headless read-only Claude run that splits a goal into task cards. `feedback` = what was
+/// wrong with its last answer.
+fn run_planner(bin: &Path, repo: &Path, goal: &str, shell: &str, feedback: &str) -> Result<(Vec<plan::Item>, f64), String> {
+    let mut prompt = format!(
+        "You are the lead planner for several coding agents that will work in parallel on this repository, each alone in its own git worktree.\n\nGoal: {goal}\n\n\
+         Look at the code as much as you need, then reply with ONLY a JSON array (no prose, no code fence) of 2 to 6 tasks. Each item: {{\"id\": \"a short id\", \"title\": \"short imperative title, under 50 characters\", \"prompt\": \"complete, self-contained instructions for one agent: what to change, where, and how to check it works\", \"owns\": [\"globs of the only files it may edit, e.g. src/cli/**\"], \"acceptance\": \"a {shell} command, run from the repo root, that passes once it's done (or empty)\", \"depends_on\": [\"ids of tasks it must wait for\"]}}.\n\
+         Tasks that can run at the same time must not own the same files. Manifests, lockfiles, module registries (mod.rs, lib.rs, index.ts) and migrations belong to ONE task that the others depend on. Prefer independent tasks, each touching at most 8 files."
     );
+    if !feedback.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(feedback);
+    }
     let p = bin.to_string_lossy().to_string();
     let args = ["-p", &prompt, "--output-format", "json", "--permission-mode", "plan", "--max-turns", "8"];
     let mut cmd = if cfg!(windows) && (p.to_lowercase().ends_with(".cmd") || p.to_lowercase().ends_with(".bat")) {
@@ -1776,19 +3061,24 @@ fn run_planner(bin: &Path, repo: &Path, goal: &str) -> Result<(Vec<(String, Stri
     })
 }
 
-/// Pull `[{title, prompt}]` out of `claude -p --output-format json` output.
-pub fn parse_plan(stdout: &str) -> Option<(Vec<(String, String)>, f64)> {
+/// Pull `[{id, title, prompt, owns, acceptance, depends_on}]` out of `claude -p --output-format json` output (a
+/// card without a prompt gets its title).
+pub fn parse_plan(stdout: &str) -> Option<(Vec<plan::Item>, f64)> {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
     let text = v["result"].as_str()?;
     let (a, b) = (text.find('[')?, text.rfind(']')?);
     let arr: serde_json::Value = serde_json::from_str(text.get(a..=b)?).ok()?;
-    let items: Vec<(String, String)> = arr
+    let items: Vec<plan::Item> = arr
         .as_array()?
         .iter()
-        .filter_map(|it| {
-            let title = it["title"].as_str()?.trim().to_string();
-            let prompt = it["prompt"].as_str().unwrap_or(&title).trim().to_string();
-            (!title.is_empty()).then_some((title, prompt))
+        .enumerate()
+        .map(|(i, it)| plan::parse_item(it, i))
+        .filter(|it| !it.title.is_empty())
+        .map(|mut it| {
+            if it.goal.is_empty() {
+                it.goal = it.title.clone();
+            }
+            it
         })
         .collect();
     Some((items, v["total_cost_usd"].as_f64().unwrap_or(0.0)))
@@ -1910,7 +3200,12 @@ impl Pane for Agents {
 
     fn key(&mut self, k: KeyEvent, cx: &mut Cx) -> bool {
         self.sync(cx);
-        match &self.mode {
+        if self.prompt_pick.is_some() {
+            return self.pick_key(k, cx);
+        }
+        // "restored your draft" shows until the first key in the form
+        let restored = self.restored;
+        let used = match &self.mode {
             Mode::Board => self.board_key(k, cx),
             Mode::Diff(_) => self.diff_key(k, cx),
             Mode::Form(_) => self.form_key(k, cx),
@@ -1919,33 +3214,19 @@ impl Pane for Agents {
             Mode::Roster(_) => self.roster_key(k, cx),
             Mode::Watch(_) => self.watch_key(k, cx),
             Mode::Log(_) => self.log_key(k, cx),
-            Mode::Batch => {
-                self.mode = Mode::Board;
-                let serial = match k.code {
-                    KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Enter => Some(false),
-                    KeyCode::Char('s') | KeyCode::Char('S') => Some(true),
-                    KeyCode::Esc => None,
-                    _ => {
-                        self.mode = Mode::Batch;
-                        return true;
-                    }
-                };
-                if let Some(serial) = serial {
-                    let ids = std::mem::take(&mut self.marked);
-                    match self.start_batch(&ids, serial, cx) {
-                        Ok(_) => cx.notify(format!("running {} task{} {}", ids.len(), if ids.len() == 1 { "" } else { "s" }, if serial { "one after another" } else { "together" })),
-                        Err(e) => {
-                            self.marked = ids;
-                            cx.notify(e);
-                        }
-                    }
-                }
-                true
-            }
+            Mode::Batch(_) => self.batch_key(k, cx),
+            Mode::Dirty(_) => self.dirty_key(k, cx),
+            Mode::Try(_) => self.try_key(k, cx),
+            Mode::PlanReview(_) => self.plan_review_key(k, cx),
+            Mode::SaveTemplate(_) => self.save_template_key(k, cx),
+            Mode::Templates(_) => self.templates_key(k, cx),
             Mode::Confirm(_) => {
                 let Mode::Confirm(c) = std::mem::replace(&mut self.mode, Mode::Board) else { return true };
+                // throwing something away (or stopping a run) takes a real y; enter only confirms merges
+                let destructive = matches!(c.what, Pending::StopRun | Pending::DiscardRun | Pending::Discard | Pending::Retry | Pending::Delete);
                 match k.code {
-                    KeyCode::Char('y') | KeyCode::Enter => self.do_confirm(c, cx),
+                    KeyCode::Char('y') => self.do_confirm(c, cx),
+                    KeyCode::Enter if !destructive => self.do_confirm(c, cx),
                     KeyCode::Char('n') | KeyCode::Esc => {}
                     _ => self.mode = Mode::Confirm(c),
                 }
@@ -1957,8 +3238,28 @@ impl Pane for Agents {
                     Mode::Plan(i) => (None, i, true),
                     _ => return true,
                 };
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                let back = |s: &mut Self, id: Option<String>, inp: Input| s.mode = if plan { Mode::Plan(inp) } else { Mode::Comment(id.unwrap_or_default(), inp) };
                 match k.code {
-                    KeyCode::Esc => {}
+                    KeyCode::Esc => {
+                        // opened from the diff view (its comments): back there
+                        if let Some(back) = id.clone().filter(|i| self.comment_back.as_deref() == Some(i.as_str())) {
+                            if self.run_ref(&back).is_some() {
+                                self.open_run_diff(&back, cx);
+                            } else {
+                                self.open_diff(&back, cx);
+                            }
+                        }
+                        // kept for the next P / c on the same card
+                        if !inp.text.trim().is_empty() {
+                            match id {
+                                Some(id) => {
+                                    self.drafts.comment.insert(id, inp);
+                                }
+                                None => self.drafts.plan = Some(inp),
+                            }
+                        }
+                    }
                     KeyCode::Enter if !k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
                         if plan {
                             self.plan(&inp.text, cx);
@@ -1966,21 +3267,82 @@ impl Pane for Agents {
                             self.comment(&id, &inp.text, cx);
                         }
                     }
+                    KeyCode::Char('u') if ctrl && self.restored => back(self, id, Input::new("", true)),
+                    KeyCode::Char('t') if ctrl => {
+                        let text = inp.text.clone();
+                        back(self, id, inp);
+                        self.open_prompt_pick(&text);
+                    }
+                    // feedback to a lead run whose budget is spent: a couple more dollars for this round
+                    KeyCode::Char('b') if ctrl && id.as_deref().is_some_and(|i| self.run_ref(i).is_some()) => {
+                        let rid = id.clone().unwrap_or_default();
+                        if let Some(r) = self.run_mut(&rid) {
+                            r.budget_usd += 2.0;
+                            let b = r.budget_usd;
+                            r.log(&format!("you raised the budget to ${b:.2}"));
+                            cx.notify(format!("run budget: ${b:.2}"));
+                        }
+                        if let Some(l) = self.runs_live.get_mut(&rid) {
+                            l.budget_warned = false;
+                        }
+                        self.save();
+                        back(self, id, inp);
+                    }
                     _ => {
-                        inp.key(k);
-                        self.mode = if plan { Mode::Plan(inp) } else { Mode::Comment(id.unwrap(), inp) };
+                        if !(plan && self.recall_key(k, &mut inp)) {
+                            inp.key(k);
+                        }
+                        back(self, id, inp);
                     }
                 }
                 true
             }
+        };
+        if restored {
+            self.restored = false;
         }
+        // the cursor stays on the card you moved it to, whatever arrives or leaves around it later
+        self.pin_selection();
+        used
     }
 
     fn paste(&mut self, text: &str, _cx: &mut Cx) {
+        if self.prompt_pick.is_some() {
+            if let Some(p) = &mut self.prompt_pick {
+                p.filter.insert(text.trim());
+                p.sel = 0;
+            }
+            return;
+        }
+        // a form that came back from a draft gets text the moment it opens (/task, /lead): the text starts a fresh
+        // one and the draft waits; a paste of yours later goes into the draft like typing
+        if self.restored && self.opened_at.elapsed() < Duration::from_millis(500) {
+            self.set_draft_aside();
+        }
+        self.restored = false;
+        if matches!(self.mode, Mode::PlanReview(_)) {
+            return self.plan_review_paste(text);
+        }
+        if matches!(self.mode, Mode::SaveTemplate(_) | Mode::Templates(_)) {
+            return self.templates_paste(text);
+        }
         match &mut self.mode {
+            Mode::Batch(v) if v.editing => v.gate.insert(text.trim()),
+            Mode::Diff(DiffView { typing: Some(i), .. }) => i.insert(text),
+            Mode::Try(v) => v.input.insert(text.trim()),
+            // a form asked for before the repo was known takes what's pasted meanwhile (/task, /lead)
+            Mode::Board if self.pending_form.is_some() => {
+                if let Some((_, t)) = &mut self.pending_form {
+                    t.push_str(text);
+                }
+            }
             Mode::Form(f) => match f.field {
-                0 => f.title.insert(text),
+                // a task description (several lines, or more than a title's worth) belongs in the prompt, even
+                // when it lands on a new form's empty title (/task sends one right after opening the form)
+                0 if !(f.title.text.is_empty() && (text.trim().contains('\n') || text.trim().chars().count() > 60)) => f.title.insert(text),
                 3 => f.model.insert(text),
+                5 => f.after.insert(text),
+                6 => f.budget.insert(text.trim()),
                 _ => {
                     f.field = 1;
                     f.prompt.insert(text)
@@ -1995,6 +3357,7 @@ impl Pane for Agents {
                 2 => f.model.insert(text.trim()),
                 3 => f.parallel.insert(text.trim()),
                 4 => f.budget.insert(text.trim()),
+                5 => f.gate.insert(text.trim()),
                 _ => {
                     f.field = 0;
                     f.goal.insert(text)
@@ -2057,19 +3420,29 @@ impl Pane for Agents {
             (MouseEventKind::Down(MouseButton::Left), Some(Hit::Column(c))) => self.col = c,
             (MouseEventKind::Down(MouseButton::Left), Some(Hit::File(i))) => {
                 if let Mode::Diff(v) = &mut self.mode {
-                    v.file = i;
-                    v.scroll = 0;
+                    if v.typing.is_none() {
+                        v.set_file(i);
+                    }
+                }
+            }
+            // a click puts the cursor on that line (c then comments on it)
+            (MouseEventKind::Down(MouseButton::Left), Some(Hit::DiffLine(i))) => {
+                if let Mode::Diff(v) = &mut self.mode {
+                    if v.typing.is_none() {
+                        v.cursor = i;
+                        v.step(0);
+                    }
                 }
             }
             (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp, Some(h)) => {
                 let down = ev.kind == MouseEventKind::ScrollDown;
                 match (&mut self.mode, h) {
                     (Mode::Diff(v), Hit::File(_)) => {
-                        let n = v.data.as_ref().and_then(|d| d.as_ref().ok()).map(|d| d.files.len()).unwrap_or(0);
-                        v.file = if down { (v.file + 1).min(n.saturating_sub(1)) } else { v.file.saturating_sub(1) };
-                        v.scroll = 0;
+                        let n = v.files().len();
+                        v.set_file(if down { (v.file + 1).min(n.saturating_sub(1)) } else { v.file.saturating_sub(1) });
                     }
-                    (Mode::Diff(v), _) => v.scroll = if down { v.scroll + 3 } else { v.scroll.saturating_sub(3) },
+                    // the wheel moves the cursor (the view follows it)
+                    (Mode::Diff(v), _) => v.step(if down { 3 } else { -3 }),
                     (Mode::Board, Hit::Card(c, _) | Hit::Column(c)) => {
                         self.col = c;
                         let n = self.column(c).len();
@@ -2080,6 +3453,7 @@ impl Pane for Agents {
             }
             _ => {}
         }
+        self.pin_selection();
     }
 
     fn side(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
@@ -2096,7 +3470,8 @@ impl Pane for Agents {
                         self.open_repo(PathBuf::from(path), cx);
                     }
                 }
-                Some(Hit::NewTask) if self.repo.is_some() => self.mode = Mode::Form(self.new_form(None)),
+                // (not over another popup: what's typed there would be lost)
+                Some(Hit::NewTask) if self.repo.is_some() && matches!(self.mode, Mode::Board | Mode::Diff(_) | Mode::Watch(_) | Mode::Log(_)) => self.open_task_form(None),
                 Some(Hit::Column(c)) if matches!(self.mode, Mode::Board) => {
                     self.col = c;
                     self.lead_focus = false;

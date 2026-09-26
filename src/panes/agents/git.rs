@@ -84,21 +84,98 @@ pub struct Started {
     pub worktree: PathBuf,
 }
 
+/// Uncommitted changes in the main checkout when work starts from it (a chat's edits, say): a branch made from
+/// HEAD wouldn't have them, so the worker never sees them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Dirty {
+    /// Refuse with `DIRTY` + the status, unless the status is exactly this one (already waved through).
+    Ask(String),
+    /// Commit everything first (`git add -A`) with this message, and start from that commit.
+    Commit(String),
+    /// Start from a snapshot commit of the checkout as it is, made through a scratch index: the checkout and its
+    /// real index aren't touched.
+    Include,
+    Ignore,
+}
+
+/// How starting work refuses under `Dirty::Ask`: this, then the `git status --porcelain` lines.
+pub const DIRTY: &str = "uncommitted changes:\n";
+/// What `merge` says when the checkout it merges into isn't clean (the board offers to commit and retry).
+pub const UNCOMMITTED: &str = "has uncommitted changes";
+
+/// `git status --porcelain` of a checkout: tracked edits and new files (ignored ones don't count). Untrimmed, so
+/// each line keeps its two status columns.
+pub fn porcelain(dir: &Path) -> Result<String, String> {
+    let o = run(dir, &["status", "--porcelain"]);
+    if o.ok { Ok(o.stdout.trim_end().to_string()) } else { Err(err_line(&o, &["status"])) }
+}
+
+/// The paths in a porcelain status, for showing.
+pub fn porcelain_files(st: &str) -> Vec<String> {
+    st.lines().filter_map(|l| l.get(3..)).map(|p| p.trim().trim_matches('"').to_string()).filter(|p| !p.is_empty()).collect()
+}
+
+/// `git add -A` and commit everything in `dir`: "committed 3 files as 1a2b3c4". Nothing staged = an error.
+pub fn commit_all(dir: &Path, msg: &str) -> Result<String, String> {
+    ok(dir, &["add", "-A"])?;
+    let files = run(dir, &["diff", "--cached", "--name-only"]).stdout.lines().filter(|l| !l.trim().is_empty()).count();
+    if files == 0 {
+        return Err("nothing to commit".into());
+    }
+    if let Err(e) = ok(dir, &["commit", "-q", "-m", msg]) {
+        let _ = run(dir, &["reset", "-q"]); // unstage again: the working tree is as it was
+        return Err(e);
+    }
+    let sha = ok(dir, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+    Ok(format!("committed {files} file{} as {sha}", if files == 1 { "" } else { "s" }))
+}
+
+/// A commit of HEAD plus everything uncommitted in `repo` (new files too), through a scratch index.
+fn snapshot(repo: &Path, head: &str) -> Result<String, String> {
+    let tree = with_snapshot_index(repo, |env| {
+        let o = run_env(repo, &["write-tree"], env);
+        if o.ok { Ok(o.stdout.trim().to_string()) } else { Err(err_line(&o, &["write-tree"])) }
+    })??;
+    ok(repo, &["commit-tree", &tree, "-p", head, "-m", "your uncommitted changes (oriel snapshot)"])
+}
+
+/// The commit new work in `repo` starts from: HEAD, or per `dirty` HEAD after committing everything, or a
+/// snapshot of the checkout.
+fn start_point(repo: &Path, dirty: &Dirty) -> Result<String, String> {
+    let head = ok(repo, &["rev-parse", "HEAD"]).map_err(|_| "the repo has no commits yet — commit something first".to_string())?;
+    if *dirty == Dirty::Ignore {
+        return Ok(head);
+    }
+    // oriel's own files (.oriel/: templates, the repo's setup) aren't work a new branch needs
+    let st = porcelain(repo)?.lines().filter(|l| !l.get(3..).is_some_and(|p| p.trim_matches('"').starts_with(".oriel/"))).collect::<Vec<_>>().join("\n");
+    if st.trim().is_empty() {
+        return Ok(head);
+    }
+    match dirty {
+        Dirty::Ask(seen) if *seen == st => Ok(head),
+        Dirty::Ask(_) => Err(format!("{DIRTY}{st}")),
+        Dirty::Commit(msg) => {
+            commit_all(repo, msg)?;
+            ok(repo, &["rev-parse", "HEAD"])
+        }
+        Dirty::Include => snapshot(repo, &head),
+        Dirty::Ignore => Ok(head),
+    }
+}
+
 /// `git worktree add -b oriel/<slug> <wt> HEAD`, then the per-worktree hooks file (kept out of commits via
 /// info/exclude). `hook_exe` = the oriel binary the hooks call; None skips the hooks (Codex/Kimi).
 #[cfg(test)]
 pub fn start(repo: &Path, wt: &Path, slug: &str, task_id: &str, hook_exe: Option<&Path>) -> Result<Started, String> {
-    start_at(repo, wt, slug, task_id, hook_exe, None)
+    start_at(repo, wt, slug, task_id, hook_exe, None, &Dirty::Ignore)
 }
 
 /// Like `start`, but branched off `base` (a lead run's integration branch) instead of the checked-out HEAD.
-pub fn start_at(repo: &Path, wt: &Path, slug: &str, task_id: &str, hook_exe: Option<&Path>, base: Option<&str>) -> Result<Started, String> {
+/// Without a base, `dirty` says what happens to uncommitted changes in the checkout.
+pub fn start_at(repo: &Path, wt: &Path, slug: &str, task_id: &str, hook_exe: Option<&Path>, base: Option<&str>, dirty: &Dirty) -> Result<Started, String> {
     let (base_sha, base_branch) = match base {
         Some(b) => (ok(repo, &["rev-parse", &format!("refs/heads/{b}")]).map_err(|_| format!("the branch {b} is gone"))?, b.to_string()),
-        None => (
-            ok(repo, &["rev-parse", "HEAD"]).map_err(|_| "the repo has no commits yet — commit something first".to_string())?,
-            ok(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".into()),
-        ),
+        None => (start_point(repo, dirty)?, ok(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".into())),
     };
     let branch = format!("oriel/{slug}");
     if let Some(p) = wt.parent() {
@@ -106,6 +183,7 @@ pub fn start_at(repo: &Path, wt: &Path, slug: &str, task_id: &str, hook_exe: Opt
     }
     // a leftover from an earlier run of the same task (retry): clear it first
     if wt.exists() {
+        unlink_deps(wt);
         let _ = run(repo, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
         let _ = std::fs::remove_dir_all(wt);
         let _ = run(repo, &["worktree", "prune"]);
@@ -365,7 +443,7 @@ pub fn merge(repo: &Path, wt: &Path, branch: &str, base_branch: &str, title: &st
     }
     let dirty = ok(repo, &["status", "--porcelain", "--untracked-files=no"])?;
     if !dirty.is_empty() {
-        return Err(format!("{} has uncommitted changes — commit or stash them, then merge", repo.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()));
+        return Err(format!("{} {UNCOMMITTED} — commit or stash them, then merge", repo.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()));
     }
     if wt.is_dir() {
         progress("committing leftovers…");
@@ -380,6 +458,11 @@ pub fn merge(repo: &Path, wt: &Path, branch: &str, base_branch: &str, title: &st
     if !o.ok {
         let _ = run(repo, &["reset", "--merge"]);
         let msg = err_line(&o, &["merge"]);
+        // new files of yours the branch also has (it started from a snapshot of your checkout): the same offer as
+        // for uncommitted edits
+        if format!("{}{}", o.stderr, o.stdout).contains("untracked working tree files would be overwritten") {
+            return Err(format!("{} {UNCOMMITTED} (new files the merge would overwrite) — commit them, then merge", repo.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()));
+        }
         return Err(if o.stdout.contains("CONFLICT") || msg.contains("conflict") { "merge conflicts — nothing was merged; comment to have the agent rebase, or merge by hand".into() } else { msg });
     }
     let staged = !run(repo, &["diff", "--cached", "--quiet"]).ok;
@@ -400,6 +483,8 @@ pub fn merge(repo: &Path, wt: &Path, branch: &str, base_branch: &str, title: &st
 /// can still hold the folder open for a moment.
 pub fn remove(repo: &Path, wt: &Path, branch: &str) -> Result<(), String> {
     let mut last = String::new();
+    // a borrowed node_modules goes first: nothing may delete through it into the main checkout's
+    unlink_deps(wt);
     for i in 0..15 {
         if !wt.exists() {
             break;
@@ -431,10 +516,10 @@ pub struct RunStarted {
     pub worktree: PathBuf,
 }
 
-/// A lead run's integration branch `oriel/lead-<slug>` at the current HEAD, plus the lead's own read-only
-/// (detached) checkout of it at `wt`.
-pub fn start_run(repo: &Path, wt: &Path, slug: &str) -> Result<RunStarted, String> {
-    let base_sha = ok(repo, &["rev-parse", "HEAD"]).map_err(|_| "the repo has no commits yet — commit something first".to_string())?;
+/// A lead run's integration branch `oriel/lead-<slug>` at the current HEAD (or per `dirty`, see `Dirty`), plus the
+/// lead's own read-only (detached) checkout of it at `wt`.
+pub fn start_run(repo: &Path, wt: &Path, slug: &str, dirty: &Dirty) -> Result<RunStarted, String> {
+    ok(repo, &["rev-parse", "HEAD"]).map_err(|_| "the repo has no commits yet — commit something first".to_string())?;
     let base_branch = ok(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".into());
     if base_branch == "HEAD" {
         return Err("the repo is on a detached HEAD — check out a branch first".into());
@@ -443,11 +528,13 @@ pub fn start_run(repo: &Path, wt: &Path, slug: &str) -> Result<RunStarted, Strin
     if run(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).ok {
         return Err(format!("{branch} already exists"));
     }
+    let base_sha = start_point(repo, dirty)?;
     ok(repo, &["branch", &branch, &base_sha])?;
     if let Some(p) = wt.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("couldn't make {}: {e}", p.display()))?;
     }
     if wt.exists() {
+        unlink_deps(wt);
         let _ = run(repo, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
         let _ = std::fs::remove_dir_all(wt);
         let _ = run(repo, &["worktree", "prune"]);
@@ -557,6 +644,7 @@ pub fn gate_checkout(repo: &Path, gate_wt: &Path, sha: &str) -> Result<(), Strin
         if let Some(p) = gate_wt.parent() {
             std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
         }
+        unlink_deps(gate_wt);
         let _ = std::fs::remove_dir_all(gate_wt);
         let _ = run(repo, &["worktree", "prune"]);
         ok(repo, &["worktree", "add", "--detach", &gate_wt.to_string_lossy(), sha])?;
@@ -565,42 +653,123 @@ pub fn gate_checkout(repo: &Path, gate_wt: &Path, sha: &str) -> Result<(), Strin
     ok(gate_wt, &["checkout", "-q", "-f", "--detach", sha]).map(|_| ())
 }
 
-/// The gate for a repo when the config doesn't name one: a quick compile check for the ecosystems where a
-/// fresh checkout can build without an install step, and a JS project's own build script (after installing
-/// with the package manager its lockfile names: the gate's checkout has no node_modules).
+/// The gate for a repo when nobody named one (see `detect_gate_in`).
 pub fn detect_gate(dir: &Path) -> Option<String> {
-    if dir.join("Cargo.toml").is_file() {
-        Some("cargo check --quiet".into())
-    } else if dir.join("go.mod").is_file() {
-        Some("go build ./...".into())
-    } else if let Some(pm) = js_build(dir) {
-        Some(match pm {
-            "pnpm" => "pnpm install --frozen-lockfile && pnpm run build",
-            "yarn" => "yarn install --frozen-lockfile && yarn build",
-            "bun" => "bun install --frozen-lockfile && bun run build",
-            _ if dir.join("package-lock.json").is_file() => "npm ci && npm run build",
-            _ => "npm install && npm run build",
-        }
-        .into())
-    } else {
-        None
-    }
+    detect_gate_in(dir).0
 }
 
-/// package.json has a "build" script: which package manager the repo uses.
-fn js_build(dir: &Path) -> Option<&'static str> {
-    let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("scripts")?.get("build")?.as_str()?;
-    Some(if dir.join("pnpm-lock.yaml").is_file() {
+/// The gate for a repo when nobody named one, and why: a check that can run in a fresh checkout of the merged
+/// result. Cargo and Go build as they are; a JS project runs its own scripts (borrowing the main checkout's
+/// node_modules, see `link_deps`, or installing first when there are none to borrow), a Python one needs a .venv
+/// with pytest in it. None = nothing fits, and the reason says what would.
+pub fn detect_gate_in(dir: &Path) -> (Option<String>, String) {
+    if dir.join("Cargo.toml").is_file() {
+        return (Some("cargo check --quiet".into()), "detected: a Cargo project".into());
+    }
+    if dir.join("go.mod").is_file() {
+        return (Some("go build ./...".into()), "detected: a Go module".into());
+    }
+    if dir.join("package.json").is_file() {
+        return js_gate(dir);
+    }
+    if ["pyproject.toml", "pytest.ini", "setup.cfg", "setup.py", "tox.ini"].iter().any(|f| dir.join(f).is_file()) {
+        return py_gate(dir);
+    }
+    (None, "none detected — type one (e.g. pnpm test)".into())
+}
+
+/// package.json: its typecheck and test scripts (else build), with the package manager its lockfile names. With
+/// node_modules installed the gate's checkout borrows them; without, it installs first (a fresh checkout has none).
+fn js_gate(dir: &Path) -> (Option<String>, String) {
+    let v: serde_json::Value = std::fs::read_to_string(dir.join("package.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    // npm init's placeholder test script only ever fails
+    let has = |k: &str| v["scripts"][k].as_str().is_some_and(|s| !s.trim().is_empty() && !s.contains("no test specified"));
+    let pm = if dir.join("pnpm-lock.yaml").is_file() {
         "pnpm"
     } else if dir.join("yarn.lock").is_file() {
         "yarn"
-    } else if dir.join("bun.lockb").is_file() || dir.join("bun.lock").is_file() {
+    } else if dir.join("bun.lock").is_file() || dir.join("bun.lockb").is_file() {
         "bun"
     } else {
         "npm"
-    })
+    };
+    let mut cmds: Vec<String> = ["typecheck", "test"].iter().filter(|s| has(s)).map(|s| format!("{pm} run {s}")).collect();
+    if cmds.is_empty() && has("build") {
+        cmds.push(format!("{pm} run build"));
+    }
+    if cmds.is_empty() {
+        return (None, "package.json has no typecheck, test or build script — type a gate".into());
+    }
+    if !dir.join("node_modules").is_dir() {
+        let install = match pm {
+            "pnpm" => "pnpm install --frozen-lockfile",
+            "yarn" => "yarn install --frozen-lockfile",
+            "bun" => "bun install --frozen-lockfile",
+            _ if dir.join("package-lock.json").is_file() => "npm ci",
+            _ => "npm install",
+        };
+        return (Some(format!("{install} && {}", cmds.join(" && "))), "detected from package.json (installs first: no node_modules here to borrow)".into());
+    }
+    (Some(cmds.join(" && ")), "detected from package.json (it borrows your node_modules)".into())
+}
+
+/// Does this gate install its own dependencies (`npm ci && …`)? Then its checkout must not borrow yours through
+/// a link, or the install would write into your node_modules.
+pub fn installs_deps(cmd: &str) -> bool {
+    let c = format!(" {} ", cmd.to_ascii_lowercase());
+    ["npm ci ", "npm install", "npm i ", "pnpm install", "pnpm i ", "yarn install", "bun install"].iter().any(|i| c.contains(&format!(" {i}")))
+}
+
+/// A Python project with pytest set up and a .venv that has it: that venv's pytest.
+fn py_gate(dir: &Path) -> (Option<String>, String) {
+    let mentions = ["pyproject.toml", "setup.cfg", "tox.ini"].iter().any(|f| std::fs::read_to_string(dir.join(f)).is_ok_and(|s| s.contains("pytest")));
+    if !(mentions || dir.join("pytest.ini").is_file() || dir.join("conftest.py").is_file() || dir.join("tests").is_dir()) {
+        return (None, "a Python project without pytest set up — type a gate".into());
+    }
+    for venv in [".venv", "venv"] {
+        let v = dir.join(venv);
+        let py = if cfg!(windows) { v.join("Scripts").join("python.exe") } else { v.join("bin").join("python") };
+        let pytest = if cfg!(windows) {
+            v.join("Lib").join("site-packages").join("pytest").is_dir()
+        } else {
+            std::fs::read_dir(v.join("lib")).into_iter().flatten().flatten().any(|e| e.path().join("site-packages").join("pytest").is_dir())
+        };
+        if py.is_file() && pytest {
+            // forward slashes read the same in bash, PowerShell and cmd; PowerShell runs a quoted path only with &
+            let call = if gate_shell().2 == "PowerShell" { "& " } else { "" };
+            return (Some(format!("{call}\"{}\" -m pytest -q -x", py.display().to_string().replace('\\', "/"))), format!("detected: pytest in {venv}"));
+        }
+    }
+    (None, "a Python project, but no .venv with pytest in it — type a gate (e.g. pytest -q)".into())
+}
+
+/// Give a fresh checkout of a JS project (the gate's, the one `T` opens) the main checkout's installed
+/// dependencies: a link to its node_modules (a junction on Windows: no admin rights needed). Nothing when the
+/// checkout has its own, or there's nothing to borrow. `remove` takes the link out before deleting a checkout.
+pub fn link_deps(repo: &Path, checkout: &Path) {
+    let (from, to) = (repo.join("node_modules"), checkout.join("node_modules"));
+    // (an empty path would mean oriel's own folder)
+    if checkout.as_os_str().is_empty() || !from.is_dir() || !checkout.join("package.json").is_file() || to.symlink_metadata().is_ok() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let _ = command("cmd.exe").args(["/d", "/c", "mklink", "/J"]).arg(&to).arg(&from).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink(&from, &to);
+    }
+}
+
+/// Take `link_deps`' link out of a checkout (only a link: a real node_modules stays).
+pub fn unlink_deps(checkout: &Path) {
+    let to = checkout.join("node_modules");
+    if !checkout.as_os_str().is_empty() && to.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+        // a junction or a directory symlink goes with remove_dir on Windows, remove_file elsewhere; neither
+        // touches what it points to
+        let _ = std::fs::remove_dir(&to).or_else(|_| std::fs::remove_file(&to));
+    }
 }
 
 /// The shell gates and acceptance commands run in: what agents write commands for. On Windows that's Git for
@@ -792,21 +961,32 @@ pub fn branch_diff(repo: &Path, base_sha: &str, branch: &str) -> Result<Diff, St
 mod gate_tests {
     use super::*;
 
-    /// With no gate in the config, a JS repo with a build script is built (after an install, since the gate's
-    /// checkout has no node_modules) instead of merging unchecked.
+    /// With no gate in the config, a JS repo with a build script is built (after an install when there's no
+    /// node_modules to borrow, since the gate's checkout has none) instead of merging unchecked; and a gate that
+    /// installs never borrows your node_modules.
     #[test]
     fn agents_detect_gate_knows_js_builds() {
         let d = std::path::absolute("target/test-scratch/config/detect-gate").unwrap();
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         assert_eq!(detect_gate(&d), None);
+        std::fs::write(d.join("package.json"), r#"{"scripts": {"lint": "eslint ."}}"#).unwrap();
+        assert_eq!(detect_gate(&d), None, "no typecheck, test or build script: nothing to run");
         std::fs::write(d.join("package.json"), r#"{"scripts": {"test": "vitest"}}"#).unwrap();
-        assert_eq!(detect_gate(&d), None, "no build script: nothing to run");
+        assert_eq!(detect_gate(&d).as_deref(), Some("npm install && npm run test"));
         std::fs::write(d.join("package.json"), r#"{"scripts": {"build": "vite build"}}"#).unwrap();
         assert_eq!(detect_gate(&d).as_deref(), Some("npm install && npm run build"));
+        std::fs::write(d.join("package-lock.json"), "{}").unwrap();
+        assert_eq!(detect_gate(&d).as_deref(), Some("npm ci && npm run build"));
         std::fs::write(d.join("pnpm-lock.yaml"), "").unwrap();
         assert_eq!(detect_gate(&d).as_deref(), Some("pnpm install --frozen-lockfile && pnpm run build"));
         std::fs::write(d.join("Cargo.toml"), "").unwrap();
         assert_eq!(detect_gate(&d).as_deref(), Some("cargo check --quiet"), "Cargo first");
+        for c in ["npm ci && npm run build", "pnpm install --frozen-lockfile && pnpm run test", "cd web && yarn install && yarn build", "npm i && npm test"] {
+            assert!(installs_deps(c), "{c}");
+        }
+        for c in ["pnpm run typecheck && pnpm run test", "cargo check --quiet", "npm run build", "pip install-ish-script.sh"] {
+            assert!(!installs_deps(c), "{c}");
+        }
     }
 }

@@ -411,6 +411,13 @@ impl Parser {
             if t > 0 {
                 self.tokens += t;
                 out(Ev::Tokens(self.tokens));
+                // priced here, so kimi tasks show a cost, hold a budget and count towards the run's
+                // (OpenAI style: prompt_tokens includes the cached ones; Anthropic style: cache reads come apart)
+                let input = n("prompt_tokens") + n("input_tokens") + n("cache_read_input_tokens");
+                let cached = (n("cached_tokens") + u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0) + n("cache_read_input_tokens")).min(input);
+                let (pi, pc, po) = super::cost::kimi_price(&self.model);
+                self.cost += ((input - cached) as f64 * pi + cached as f64 * pc + (n("output_tokens") + n("completion_tokens")) as f64 * po) / 1e6;
+                out(Ev::Cost(self.cost));
             }
         }
     }
@@ -602,5 +609,23 @@ mod tests {
         assert!(k.contains(&Ev::Session("K1".into())));
         assert!(k.contains(&Ev::Touched("n.md".into())));
         assert!(k.contains(&Ev::Final("Wrote n.md".into())));
+    }
+
+    /// Kimi's usage is priced as it streams (it reports tokens only), so its tasks cost something, hold their
+    /// budget and count towards the run's.
+    #[test]
+    fn agents_stream_kimi_prices_usage() {
+        let evs = run(
+            Kind::Kimi,
+            &[
+                json!({"role":"assistant","content":"Looking.","usage":{"prompt_tokens":1_000_000,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":500_000}}}),
+                json!({"role":"assistant","content":"Done.","usage":{"prompt_tokens":0,"completion_tokens":1_000_000}}),
+            ],
+        );
+        let (pi, pc, po) = crate::panes::agents::cost::kimi_price("");
+        let want = 0.5 * pi + 0.5 * pc + po;
+        let last = evs.iter().rev().find_map(|e| if let Ev::Cost(c) = e { Some(*c) } else { None }).expect("a cost");
+        assert!((last - want).abs() < 1e-9, "{last} vs {want}");
+        assert!(evs.contains(&Ev::Tokens(2_000_000)));
     }
 }

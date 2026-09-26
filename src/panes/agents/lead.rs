@@ -23,6 +23,7 @@ use super::stream::{Entry, Ev};
 use super::{Agents, Msg, Then};
 use crate::pane::Cx;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -37,6 +38,8 @@ const LOG_CAP: usize = 400;
 const MAX_TURNS: u32 = 80;
 /// Fix rounds in the same session before a fresh worker takes over.
 const MAX_ATTEMPTS: u32 = 2;
+/// What a worker cut off by a stop (or oriel closing) hears when its run carries on.
+const CARRY_ON: &str = "You were interrupted (the run was paused, or oriel restarted). Continue the task where you left off and finish with your report.";
 
 /// Something the lead should hear about.
 pub struct RunEvent {
@@ -225,6 +228,34 @@ fn is_build(line: &str) -> bool {
     ["cargo", "npm", "pnpm", "yarn", "test", "build", "make", "pytest", "go ", "gradle", "mvn", "dotnet", "sleep", "tsc"].iter().any(|k| l.contains(k))
 }
 
+/// A worker stopped by its own caps (budget, turns): another go would likely stop the same way.
+fn limit_stop(error: &str) -> bool {
+    let e = error.to_lowercase();
+    e.contains("hit its budget") || e.contains("stopped at its budget") || e.contains("turn limit") || e.contains("spent its budget")
+}
+
+/// The marked tasks in an order their "after" links allow (ties keep the order they were marked), or which of
+/// them wait for each other.
+pub(super) fn batch_order(tasks: &[Task]) -> Result<Vec<String>, String> {
+    let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    let mut order: Vec<String> = vec![];
+    let mut left: Vec<&Task> = tasks.iter().collect();
+    while !left.is_empty() {
+        let placed = |d: &String| !ids.contains(&d.as_str()) || order.contains(d);
+        let Some(i) = left.iter().position(|t| t.depends_on.iter().all(placed)) else {
+            let names: Vec<String> = left.iter().map(|t| format!("\"{}\"", t.title)).collect();
+            return Err(format!("these wait for each other: {} — edit one (e) to drop the link", names.join(", ")));
+        };
+        order.push(left.remove(i).id.clone());
+    }
+    Ok(order)
+}
+
+/// The roster entry a task runs as right now: its own agent, model and caps.
+fn worker_entry(t: &Task) -> crate::config::RosterEntry {
+    crate::config::RosterEntry { name: t.worker.clone(), agent: t.agent.clone(), model: t.model.clone(), tier: t.tier.clone(), max_turns: t.max_turns, budget_usd: t.budget_usd, enabled: true, ..Default::default() }
+}
+
 impl Agents {
     pub(super) fn run_ref(&self, id: &str) -> Option<&Run> {
         self.store.runs.iter().find(|r| r.id == id)
@@ -272,8 +303,101 @@ impl Agents {
         self.store.tasks.iter().rev().find(|t| t.run == run && (t.key == dep || t.id == dep))
     }
 
-    fn waiting_for(&self, t: &Task) -> Vec<String> {
+    pub(super) fn waiting_for(&self, t: &Task) -> Vec<String> {
         t.depends_on.iter().filter(|d| self.dep_state(&t.run, d).is_none_or(|x| !(x.status == Status::Done && x.outcome == "merged"))).cloned().collect()
+    }
+
+    /// A dependency that won't be merged by itself: (its title, why) — gone, discarded, or set aside (blocked or
+    /// failed, with nothing working on it). The waiting card says so instead of just waiting.
+    pub(super) fn dead_dep(&self, run: &str, dep: &str) -> Option<(String, &'static str)> {
+        let Some(d) = self.dep_state(run, dep) else { return Some((dep.to_string(), "is gone")) };
+        let why = match d.status {
+            Status::Done if d.outcome == "merged" => return None,
+            Status::Done => "was discarded",
+            Status::Review if self.in_motion(d) => return None,
+            Status::Review if d.blocked => "is blocked",
+            Status::Review if !d.error.is_empty() => "failed",
+            _ => return None,
+        };
+        Some((d.title.clone(), why))
+    }
+
+    /// Something is happening to this task right now, or will by itself: its worker (or its tab) runs, a git step
+    /// is going for it (start, check, merge, resolve, removal), or it waits in the merge queue.
+    pub(super) fn in_motion(&self, t: &Task) -> bool {
+        matches!(t.status, Status::Running | Status::Blocked)
+            || self.live.get(&t.id).is_some_and(|l| l.busy || l.checking || l.stop.is_some())
+            || self.merging.as_deref() == Some(t.id.as_str())
+            || self.merge_queue.contains(&t.id)
+    }
+
+    /// Can a worker on this agent start (installed, or tests' fake)?
+    pub(super) fn agent_ok(&self, agent: &str) -> bool {
+        self.fake_worker.is_some() || self.installed(agent).is_some()
+    }
+
+    pub(super) fn budget_left(&self, run: &str) -> bool {
+        self.run_ref(run).is_some_and(|r| r.budget_usd <= 0.0 || self.spend(run) < r.budget_usd)
+    }
+
+    /// Does the run take work in right now: merges, fix rounds, fresh workers? Only while it's running. A stopped
+    /// run keeps what it has (finished work waits in REVIEW, queued tasks stay queued) until it's resumed.
+    pub(super) fn run_accepting(&self, run: &str) -> bool {
+        self.run_ref(run).is_some_and(|r| r.state == RunState::Running)
+    }
+
+    /// Put a finished run back to work because you commented on, merged or edited one of its tasks: it goes to
+    /// review again by itself once that's done (batch_check).
+    pub(super) fn revive(&mut self, run: &str) {
+        if let Some(r) = self.run_mut(run).filter(|r| r.state == RunState::Review) {
+            r.state = RunState::Running;
+            r.finished = 0;
+            // a lead run's lead is gone: the board carries it from here
+            r.finishing = !r.manual;
+            r.log("back to work");
+        }
+    }
+
+    /// The run's tasks still going, or that will start by themselves. A queued task counts only if it can: the run
+    /// is running and has budget left, its agent is installed, and what it waits for is merged or still going.
+    pub(super) fn working(&self, run: &str) -> HashSet<String> {
+        let tasks = self.run_tasks(run);
+        let mut w: HashSet<String> = tasks.iter().filter(|t| self.in_motion(t)).map(|t| t.id.clone()).collect();
+        if !self.run_accepting(run) || !self.budget_left(run) {
+            return w;
+        }
+        loop {
+            let before = w.len();
+            for t in &tasks {
+                if t.status != Status::Todo || !t.queued || w.contains(&t.id) || !self.agent_ok(&t.agent) {
+                    continue;
+                }
+                let alive = |d: &String| self.dep_state(run, d).is_some_and(|x| (x.status == Status::Done && x.outcome == "merged") || w.contains(&x.id));
+                if t.depends_on.iter().all(alive) {
+                    w.insert(t.id.clone());
+                }
+            }
+            if w.len() == before {
+                return w;
+            }
+        }
+    }
+
+    /// What didn't make it into a settled run, a phrase per kind: "1 blocked", "2 not started (budget)".
+    pub(super) fn set_aside(&self, run: &str) -> Vec<String> {
+        let tasks = self.run_tasks(run);
+        let n = |f: &dyn Fn(&Task) -> bool| tasks.iter().filter(|t| f(t)).count();
+        let budget = !self.budget_left(run);
+        let kinds = [
+            (n(&|t| t.status == Status::Review && t.blocked), "blocked"),
+            (n(&|t| t.status == Status::Review && !t.blocked && !t.error.is_empty()), "failed"),
+            (n(&|t| t.status == Status::Review && !t.blocked && t.error.is_empty()), "not merged"),
+            (n(&|t| t.status == Status::Done && t.outcome != "merged"), "discarded"),
+            (n(&|t| t.status == Status::Todo && budget), "not started (budget reached)"),
+            (n(&|t| t.status == Status::Todo && !budget && !self.agent_ok(&t.agent)), "not started (its agent isn't installed)"),
+            (n(&|t| t.status == Status::Todo && !budget && self.agent_ok(&t.agent)), "not started"),
+        ];
+        kinds.iter().filter(|(c, _)| *c > 0).map(|(c, what)| format!("{c} {what}")).collect()
     }
 
     /// The compact result card the lead sees.
@@ -309,6 +433,9 @@ impl Agents {
         }
         if t.status == Status::Todo && t.queued {
             let w = self.waiting_for(t);
+            if let Some((title, why)) = w.iter().find_map(|d| self.dead_dep(&t.run, d)) {
+                v["stuck"] = json!(format!("waits for {title}, which {why} — it won't start unless that changes (or discard it)"));
+            }
             if !w.is_empty() {
                 v["waiting_for"] = json!(w);
             }
@@ -336,6 +463,8 @@ impl Agents {
             "merged": ids(&|t| t.status == Status::Done && t.outcome == "merged"),
             "spend_usd": (self.spend(run) * 1000.0).round() / 1000.0,
             "budget_usd": self.run_ref(run).map(|r| r.budget_usd).unwrap_or(0.0),
+            // a plan waiting for the user: nothing starts until they approve it
+            "awaiting_approval": self.run_ref(run).map(|r| r.held.len()).unwrap_or(0),
         })
     }
 
@@ -400,8 +529,10 @@ impl Agents {
 
     // ---------------------------------------------------------------- starting a run
 
-    /// L → a new lead run: the integration branch + the lead's checkout (background), then the lead.
-    pub(super) fn start_run(&mut self, goal: &str, agent: &str, model: &str, max_parallel: u32, budget: f64, cx: &mut Cx) -> Result<String, String> {
+    /// L → a new lead run: the integration branch + the lead's checkout (background), then the lead. `gate` = the
+    /// command every merge must pass ("" = none).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start_run(&mut self, goal: &str, agent: &str, model: &str, max_parallel: u32, budget: f64, gate: &str, approve: bool, cx: &mut Cx) -> Result<String, String> {
         let goal = goal.trim().to_string();
         if goal.is_empty() {
             return Err("what's the goal?".into());
@@ -431,23 +562,102 @@ impl Agents {
             budget_usd: budget,
             max_parallel: max_parallel.clamp(1, 5),
             created: store::now(),
+            gate: Some(gate.trim().to_string()),
+            approve,
             ..Default::default()
         });
         self.runs_live.insert(id.clone(), RunLive::new());
+        self.store.approve_plan = approve;
         // remember the choice for next time
         self.lead_cfg.agent = agent.to_string();
         self.lead_cfg.model = model.trim().to_string();
         self.lead_cfg.max_parallel = max_parallel.clamp(1, 5);
         self.lead_cfg.run_budget_usd = budget;
         self.save_config(cx);
+        self.remember_gate(gate);
         self.lead_focus = true;
         self.save();
-        let (root, id2) = (repo.root.clone(), id.clone());
-        self.spawn(cx, move |send| send(Msg::RunStarted(id2, git::start_run(&root, &wt, &slug))));
+        self.starting.insert(id.clone(), (repo.root.clone(), wt, slug));
+        let seen = self.dirty_seen.get(&repo.root.display().to_string()).cloned().unwrap_or_default();
+        self.spawn_run_start(&id, git::Dirty::Ask(seen), cx);
         Ok(id)
     }
 
+    /// Make a run's integration branch (background); `dirty` says what happens to uncommitted changes in your
+    /// checkout (see git::Dirty). Its arguments wait in `starting` until it's made.
+    pub(super) fn spawn_run_start(&mut self, id: &str, dirty: git::Dirty, cx: &Cx) {
+        let Some((root, wt, slug)) = self.starting.get(id).cloned() else { return };
+        let id2 = id.to_string();
+        self.spawn(cx, move |send| send(Msg::RunStarted(id2, git::start_run(&root, &wt, &slug, &dirty))));
+    }
+
+    /// Esc on the uncommitted-changes question for a run: it never started, so it goes; your goal waits in the lead
+    /// form (L), or your tasks are marked again.
+    pub(super) fn cancel_dirty_run(&mut self, id: &str) {
+        self.starting.remove(id);
+        let Some(r) = self.run_ref(id).cloned() else { return };
+        if r.manual {
+            self.marked = r.batch.iter().filter(|t| self.task(t).is_some_and(|x| x.status == Status::Todo && x.run.is_empty())).cloned().collect();
+        } else {
+            self.drafts.lead = Some(self.lead_form_from(&r));
+        }
+        self.store.runs.retain(|x| x.id != id);
+        self.runs_live.remove(id);
+        self.lead_focus = false;
+        self.save();
+    }
+
+    /// The lead form filled in from a run (retrying one that never started, or bringing a cancelled goal back).
+    pub(super) fn lead_form_from(&self, r: &Run) -> super::LeadForm {
+        let mut f = self.new_lead_form();
+        f.goal = super::Input::new(&r.goal, true);
+        if let Some(i) = super::KINDS.iter().position(|k| k.0 == r.agent) {
+            f.agent = i;
+        }
+        f.model = super::Input::new(&r.model, false);
+        f.parallel = super::Input::new(&r.max_parallel.clamp(1, 5).to_string(), false);
+        f.budget = super::Input::new(&format!("{:.2}", r.budget_usd), false);
+        if let Some(g) = &r.gate {
+            f.gate = super::Input::new(g, false);
+        }
+        f.approve = r.approve;
+        f
+    }
+
+    /// r on a run that never started (its integration branch couldn't be made: a detached HEAD, a branch in the
+    /// way): the lead form again with everything it had, or for your own tasks the run popup with them marked.
+    /// The failed run goes once the new one starts.
+    pub(super) fn retry_run(&mut self, id: &str, cx: &mut Cx) {
+        let Some(r) = self.run_ref(id).cloned() else { return };
+        if r.manual {
+            let marked: Vec<String> = r.batch.iter().filter(|t| self.task(t).is_some_and(|x| x.status == Status::Todo && x.run.is_empty())).cloned().collect();
+            if marked.is_empty() {
+                cx.notify("its tasks aren't waiting in TODO any more");
+                return;
+            }
+            self.marked = marked;
+            if let Some(x) = self.run_mut(id) {
+                x.state = RunState::Discarded;
+            }
+            self.lead_focus = false;
+            self.save();
+            self.open_batch();
+            return;
+        }
+        let mut f = self.lead_form_from(&r);
+        f.retry = Some(id.to_string());
+        self.mode = super::Mode::LeadForm(f);
+        self.restored = false;
+    }
+
     pub(super) fn on_run_started(&mut self, id: &str, r: Result<git::RunStarted, String>, cx: &mut Cx) {
+        // your checkout has uncommitted changes the branch wouldn't have: ask, then make it (spawn_run_start)
+        if let Err(e) = &r {
+            if let Some(st) = e.strip_prefix(git::DIRTY) {
+                return self.ask_dirty(super::DirtyThen::Run(id.to_string()), st.to_string(), cx);
+            }
+        }
+        self.starting.remove(id);
         let Some(run) = self.run_mut(id) else { return };
         match r {
             Err(e) => {
@@ -519,7 +729,8 @@ impl Agents {
             }
         }
         let roster = self.roster();
-        let brief = mcp::Brief { integration: &r.branch, base: &r.base_branch, max_parallel: r.max_parallel, budget: r.budget_usd, roster: &roster::roster_brief(&roster), shell: git::gate_shell().2 };
+        let gate = self.run_gate(&r).unwrap_or_default();
+        let brief = mcp::Brief { integration: &r.branch, base: &r.base_branch, max_parallel: r.max_parallel, budget: r.budget_usd, roster: &roster::roster_brief(&roster), shell: git::gate_shell().2, gate: &gate, approve: r.approve };
         let d = Driver {
             run: id.to_string(),
             agent: r.agent.clone(),
@@ -543,31 +754,149 @@ impl Agents {
         self.spawn(cx, move |send| drive(d, stop, send));
     }
 
-    /// After a restart: pick a stopped run back up — the lead resumes its session with the current state, and
-    /// the workers that were cut off continue theirs.
+    /// The gate command a run's merges pass (None = none): what its form said, or for older runs the config's,
+    /// else what the repo was detected to build with.
+    pub(super) fn run_gate(&self, r: &Run) -> Option<String> {
+        let g = match &r.gate {
+            Some(g) => g.trim().to_string(),
+            None => match crate::config::gate_for(&self.lead_cfg, Path::new(&r.repo)).trim() {
+                "none" | "off" => String::new(),
+                "" => self.gate_detect.get(&r.repo).and_then(|d| d.0.clone()).unwrap_or_default(),
+                c => c.to_string(),
+            },
+        };
+        (!g.is_empty()).then_some(g)
+    }
+
+    /// Why the lead can't take feedback on this run (c) right now, or None: only a lead run that's finished or
+    /// stopped, with its branch and checkout still there.
+    pub(super) fn feedback_block(&self, r: &Run) -> Option<&'static str> {
+        if r.manual {
+            return Some("a run of your own tasks has no lead to tell — add a task (n) and run it");
+        }
+        match r.state {
+            RunState::Starting | RunState::Running => return Some("the lead is still at it — c works once the run is in review (or stopped)"),
+            RunState::Merged | RunState::Discarded => return Some("that run is over"),
+            _ => {}
+        }
+        if r.branch.is_empty() {
+            return Some("that run never started — r retries it");
+        }
+        if r.worktree.is_empty() || !Path::new(&r.worktree).is_dir() {
+            return Some("the run's checkout is gone");
+        }
+        None
+    }
+
+    /// c on a finished (or stopped) lead run: the lead picks it up again in its own session with your feedback, on
+    /// the same integration branch and budget, and the run goes back to review when it's done again.
+    pub(super) fn run_feedback(&mut self, id: &str, text: &str, cx: &mut Cx) {
+        let Some(r) = self.run_ref(id).cloned() else { return };
+        if let Some(why) = self.feedback_block(&r) {
+            cx.notify(why);
+            return;
+        }
+        if r.budget_usd > 0.0 && self.spend(id) >= r.budget_usd {
+            cx.notify(format!("the run's budget is spent (${:.2}): the lead can answer and merge, but start no workers — ctrl+b in the box adds $2", r.budget_usd));
+        }
+        if r.state == RunState::Stopped {
+            return self.resume_run_with(id, Some(text), cx);
+        }
+        if let Some(x) = self.run_mut(id) {
+            x.state = RunState::Running;
+            x.finished = 0;
+            x.finishing = false;
+            x.error.clear();
+            x.summary.clear();
+            // a new round for the lead needs a little of its own budget
+            if x.lead_budget_usd > 0.0 && x.cost_usd + 0.25 > x.lead_budget_usd {
+                x.lead_budget_usd = x.cost_usd + 1.0;
+                x.log("the lead's own budget +$1 for your feedback");
+            }
+            x.log(&format!("› {text}"));
+        }
+        if let Some(l) = self.runs_live.get_mut(id) {
+            l.budget_warned = false;
+        }
+        let state = json!({"board": self.board_json(id), "tasks": self.run_tasks(id).iter().map(|t| self.card(t)).collect::<Vec<_>>()});
+        let first = format!(
+            "The user reviewed the result and asks: {text}\n\nGoal (as before): {}\n\nCurrent state:\n{state}\n\nKeep working on the same integration branch ({}): plan what this needs, merge it, then call done again.",
+            r.goal, r.branch
+        );
+        self.launch_lead(id, first, r.session_id.clone(), cx);
+        self.save();
+    }
+
+    /// After a stop or a restart: pick a stopped run back up — the lead resumes its session with the current
+    /// state, the workers that were cut off continue theirs, queued tasks start again and finished work that never
+    /// got merged goes back through the check and the merge queue (neither survives a stop or a restart).
     pub(super) fn resume_run(&mut self, id: &str, cx: &mut Cx) {
+        self.resume_run_with(id, None, cx)
+    }
+
+    /// `resume_run`, with something from you for the lead (c on a stopped run): it wakes up even if it was done.
+    pub(super) fn resume_run_with(&mut self, id: &str, note: Option<&str>, cx: &mut Cx) {
         let Some(r) = self.run_ref(id).cloned() else { return };
         if r.state != RunState::Stopped || r.branch.is_empty() || !Path::new(&r.worktree).is_dir() {
             cx.notify("that run can't be resumed (its branch or checkout is gone)");
             return;
         }
+        let wake = note.is_some() && !r.manual;
         if let Some(run) = self.run_mut(id) {
             run.state = RunState::Running;
             run.error.clear();
             run.finished = 0;
             run.log("resumed");
+            if let Some(n) = note {
+                run.log(&format!("› {n}"));
+            }
+            if wake {
+                run.finishing = false;
+                run.summary.clear();
+                if run.lead_budget_usd > 0.0 && run.cost_usd + 0.25 > run.lead_budget_usd {
+                    run.lead_budget_usd = run.cost_usd + 1.0;
+                }
+            }
         }
-        let cut: Vec<String> = self.run_tasks(id).iter().filter(|t| t.headless() && t.status == Status::Review && t.last.starts_with("stopped")).map(|t| t.id.clone()).collect();
-        for t in &cut {
-            self.worker_again(t, "oriel was restarted while you worked. Continue the task where you left off and finish with your report.", cx);
+        if let Some(l) = self.runs_live.get_mut(id) {
+            l.budget_warned = false;
         }
-        if r.manual {
+        let tasks: Vec<Task> = self.run_tasks(id).into_iter().filter(|t| t.headless()).cloned().collect();
+        for t in &tasks {
+            if self.in_motion(t) {
+                continue;
+            }
+            let wt = !t.worktree.is_empty() && Path::new(&t.worktree).is_dir();
+            match t.status {
+                // older saves: a stop used to take waiting tasks out of the queue
+                Status::Todo if !t.queued && t.last == "not started (the run was stopped)" => {
+                    if let Some(tm) = self.task_mut(&t.id) {
+                        tm.queued = true;
+                        tm.last = "queued".into();
+                    }
+                }
+                // cut off mid-task: carry on in its session (or its brief again, in the same worktree)
+                Status::Review if t.last.starts_with("stopped") && wt && !t.session_id.is_empty() => self.worker_again(&t.id, CARRY_ON, cx),
+                Status::Review if t.last.starts_with("stopped") && wt => self.start_worker(&t.id, cx),
+                // its worktree is gone, or a fresh start was on its way when the run stopped: start it over
+                Status::Review if t.last.starts_with("stopped") || t.last.starts_with("starting over") => self.on_redispatched(&t.id, Ok(()), worker_entry(t), cx),
+                // finished and wanting to merge: conflicts go back to its worker, the rest through the check
+                Status::Review if t.want_merge && !t.blocked && wt && !t.conflicts.is_empty() => self.start_resolve(&t.id, None, cx),
+                Status::Review if t.want_merge && !t.blocked => self.check_task(&t.id, cx),
+                // a lead's task whose round ended while the run was stopped (or as oriel closed, before its
+                // check): checked now, so the lead hears it finished
+                Status::Review if !r.manual && !t.blocked && t.error.is_empty() && wt && (t.last.starts_with("finished · the run is stopped") || t.file_stats.is_empty()) => self.check_task(&t.id, cx),
+                _ => {}
+            }
+        }
+        if r.manual || (r.finishing && !wake) {
             // no lead to wake: just carry on
             self.schedule(cx);
             return;
         }
         let state = json!({"board": self.board_json(id), "tasks": self.run_tasks(id).iter().map(|t| self.card(t)).collect::<Vec<_>>()});
-        let first = format!("oriel restarted and resumed this run. Goal (unchanged): {}\n\nCurrent state:\n{state}\n\nCarry on: wait for events, merge what's ready, finish with done.", r.goal);
+        let ask = note.map(|n| format!("The user paused this run, looked at it, and asks: {n}\n\n")).unwrap_or_default();
+        let first = format!("{ask}oriel restarted and resumed this run. Goal (unchanged): {}\n\nCurrent state:\n{state}\n\nCarry on: wait for events, merge what's ready, finish with done.", r.goal);
         self.launch_lead(id, first, r.session_id.clone(), cx);
         self.schedule(cx);
     }
@@ -622,20 +951,29 @@ impl Agents {
         if run.state != RunState::Running {
             return; // stopped by the user: already handled
         }
-        run.finished = store::now();
         match r {
             Ok(summary) => {
                 if run.summary.is_empty() {
                     run.summary = summary.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
                 }
-                run.state = RunState::Review;
-                let msg = format!("lead finished · review {} (d) and merge it (m)", run.branch);
-                run.log(&msg);
-                cx.alert(crate::alerts::Kind::AgentDone, msg);
+                // the run goes to review once its workers are done too (batch_check): until then queued tasks
+                // still start and what the lead asked to merge still merges
+                run.finishing = true;
+                self.batch_check(id, cx);
+                if self.run_ref(id).is_some_and(|r| r.state == RunState::Running) {
+                    let open = self.working(id).len();
+                    if let Some(run) = self.run_mut(id) {
+                        run.log(&format!("the lead is done · {open} task(s) still going — the run goes to review once they're in"));
+                    }
+                }
             }
-            Err(e) if e == "stopped" => run.state = RunState::Stopped,
+            Err(e) if e == "stopped" => {
+                run.state = RunState::Stopped;
+                run.finished = store::now();
+            }
             Err(e) => {
                 run.state = RunState::Stopped;
+                run.finished = store::now();
                 run.error = e.clone();
                 run.log(&format!("lead stopped: {e}"));
                 cx.alert(crate::alerts::Kind::BuildFailed, format!("lead stopped: {e}"));
@@ -718,6 +1056,17 @@ impl Agents {
                 self.queue_merge(&t.id)
             }),
             "resolve_conflicts" => return self.call_resolve(&run, arg(a, "id"), c.reply, cx),
+            // another vendor's opinion on a task's diff (review.rs), answered when it's in
+            "review" => {
+                if let Err(e) = self.check_budget(&run.id, cx) {
+                    let _ = c.reply.send(Err(e));
+                    return;
+                }
+                if let Some(x) = self.run_mut(&run.id) {
+                    x.log(&format!("asked for a second opinion on {}", arg(a, "id")));
+                }
+                return self.call_review(&run, arg(a, "id"), c.reply, cx);
+            }
             "discard" => {
                 return match self.task_in(&run, arg(a, "id")) {
                     Ok(t) => self.discard_task(&t.id, Some(c.reply), cx),
@@ -742,14 +1091,15 @@ impl Agents {
                     Ok("noted on the board".into())
                 }
             }
+            "done" if !run.held.is_empty() => Err("your plan still waits for the user's approval — call wait for plan_approved or plan_rejected first".into()),
             "done" => {
                 let summary = arg(a, "summary").to_string();
                 if let Some(r) = self.run_mut(&run.id) {
                     r.summary = summary.clone();
                     r.log(&format!("done: {summary}"));
                 }
-                let open = self.run_tasks(&run.id).iter().filter(|t| matches!(t.status, Status::Running | Status::Blocked) || (t.status == Status::Todo && t.queued) || t.want_merge && t.status == Status::Review).count();
-                Ok(if open > 0 { format!("noted. {open} task(s) are still running or merging; the user reviews {} when they finish", run.branch) } else { format!("thanks — the user will review {} and merge it", run.branch) })
+                let open = self.working(&run.id).len();
+                Ok(if open > 0 { format!("noted. {open} task(s) are still running, queued or merging: oriel finishes them (merging only what you already asked to merge), then the user reviews {}", run.branch) } else { format!("thanks — the user will review {} and merge it", run.branch) })
             }
             other => Err(format!("no tool called {other}")),
         };
@@ -810,7 +1160,7 @@ impl Agents {
         }
     }
 
-    fn task_in(&self, run: &Run, id: &str) -> Result<Task, String> {
+    pub(super) fn task_in(&self, run: &Run, id: &str) -> Result<Task, String> {
         match self.store.tasks.iter().rev().find(|t| t.run == run.id && (t.id == id || (!t.key.is_empty() && t.key == id))) {
             Some(t) => Ok(t.clone()),
             None => {
@@ -820,23 +1170,86 @@ impl Agents {
         }
     }
 
-    fn call_plan(&mut self, run: &Run, a: &Value, cx: &mut Cx) -> Result<String, String> {
-        let items: Vec<plan::Item> = a["tasks"].as_array().ok_or("plan needs a tasks list")?.iter().enumerate().map(|(i, v)| plan::parse_item(v, i)).collect();
-        let existing: Vec<plan::Existing> = self
-            .run_tasks(&run.id)
+    /// The run's tasks a new plan must not collide with (plan.rs).
+    pub(super) fn plan_existing(&self, run: &str) -> Vec<plan::Existing> {
+        self.run_tasks(run)
             .iter()
             .filter(|t| !(t.status == Status::Done && t.outcome == "discarded"))
             .map(|t| plan::Existing { key: t.key.clone(), id: t.id.clone(), owns: if t.owns.is_empty() { t.touched.clone() } else { t.owns.clone() }, open: t.status != Status::Done })
-            .collect();
+            .collect()
+    }
+
+    /// The roster workers a plan may name: enabled, and their AI installed.
+    pub(super) fn plan_worker_names(&self) -> Vec<String> {
+        self.roster().iter().filter(|w| w.enabled && (self.fake_worker.is_some() || self.installed(&w.agent).is_some())).map(|w| w.name.clone()).collect()
+    }
+
+    fn call_plan(&mut self, run: &Run, a: &Value, cx: &mut Cx) -> Result<String, String> {
+        let items: Vec<plan::Item> = a["tasks"].as_array().ok_or("plan needs a tasks list")?.iter().enumerate().map(|(i, v)| plan::parse_item(v, i)).collect();
+        let existing = self.plan_existing(&run.id);
         if let Some(dup) = items.iter().find(|i| existing.iter().any(|e| e.key == i.key)) {
             return Err(format!("task id {:?} is already used in this run — pick new ids", dup.key));
         }
-        let roster = self.roster();
-        let workers: Vec<String> = roster.iter().filter(|w| w.enabled && (self.fake_worker.is_some() || self.installed(&w.agent).is_some())).map(|w| w.name.clone()).collect();
+        let workers = self.plan_worker_names();
         let checked = plan::check(items, &existing, &workers).map_err(|e| format!("plan rejected, nothing started — fix these and submit again:\n- {}", e.join("\n- ")))?;
         self.check_budget(&run.id, cx)?;
+        if run.approve {
+            return self.hold_plan(run, checked, cx);
+        }
+        let serial = checked.serial;
+        let notes = checked.notes.clone();
+        let out = self.spawn_plan(run, checked.items, cx);
+        Ok(self.plan_reply(&out, serial, &notes).to_string())
+    }
+
+    /// The user approves plans in this run: this one waits for them (plan_view.rs), checked but not started.
+    fn hold_plan(&mut self, run: &Run, checked: plan::Checked, cx: &mut Cx) -> Result<String, String> {
+        if !run.held.is_empty() {
+            return Err("a plan of yours is already waiting for the user's approval — call wait: you'll get plan_approved or plan_rejected".into());
+        }
+        let n = checked.items.len();
+        let keys: Vec<Value> = checked.items.iter().map(|it| json!({"key": it.key, "title": it.title, "worker": it.worker})).collect();
+        if let Some(r) = self.run_mut(&run.id) {
+            r.held = checked.items;
+            r.held_notes = checked.notes;
+            r.dropped.clear();
+            r.edited.clear();
+            r.log(&format!("plan of {n} task{} waits for your approval · enter on this panel", if n == 1 { "" } else { "s" }));
+        }
+        cx.alert(crate::alerts::Kind::NeedsYou, format!("the lead's plan is ready: {n} task{} — approve it on the agents board (enter on the lead panel)", if n == 1 { "" } else { "s" }));
+        self.save();
+        Ok(json!({"held": true, "tasks": keys, "note": "The user approves plans in this run: nothing starts until they do. Call wait now; you'll get plan_approved (the tasks as they finally are, with ids; they may have dropped or edited some) or plan_rejected (with their note: submit a new plan)."}).to_string())
+    }
+
+    /// The plan's answer: each task's id, key, worker and state.
+    pub(super) fn plan_reply(&self, out: &[(String, String, String)], serial: bool, notes: &[String]) -> Value {
+        let tasks: Vec<Value> = out
+            .iter()
+            .filter_map(|(id, key, w)| {
+                let t = self.task(id)?;
+                let mut v = json!({"id": id, "key": key, "worker": w, "state": state_name(t)});
+                let wf = self.waiting_for(t);
+                if !wf.is_empty() {
+                    v["waiting_for"] = json!(wf);
+                }
+                Some(v)
+            })
+            .collect();
+        let mut v = json!({"tasks": tasks});
+        if serial {
+            v["solo"] = json!(true);
+        }
+        if !notes.is_empty() {
+            v["notes"] = json!(notes);
+        }
+        v
+    }
+
+    /// A checked plan's tasks, queued in the run (they start as their dependencies merge): (id, key, worker).
+    pub(super) fn spawn_plan(&mut self, run: &Run, items: Vec<plan::Item>, cx: &mut Cx) -> Vec<(String, String, String)> {
+        let roster = self.roster();
         let mut out = vec![];
-        for it in checked.items {
+        for it in items {
             let w = roster.iter().find(|w| w.name.eq_ignore_ascii_case(&it.worker)).cloned().unwrap_or_default();
             let id = store::new_id(&self.store.tasks);
             self.store.tasks.push(Task {
@@ -869,26 +1282,14 @@ impl Agents {
             out.push((id, it.key, w.name));
         }
         self.schedule(cx);
-        let tasks: Vec<Value> = out
-            .iter()
-            .map(|(id, key, w)| {
-                let t = self.task(id).unwrap();
-                let mut v = json!({"id": id, "key": key, "worker": w, "state": state_name(t)});
-                let wf = self.waiting_for(t);
-                if !wf.is_empty() {
-                    v["waiting_for"] = json!(wf);
-                }
-                v
-            })
-            .collect();
-        let mut v = json!({"tasks": tasks});
-        if checked.serial {
-            v["solo"] = json!(true);
-        }
-        if !checked.notes.is_empty() {
-            v["notes"] = json!(checked.notes);
-        }
-        Ok(v.to_string())
+        out
+    }
+
+    /// Something about the whole run the lead should hear (plan_approved, plan_rejected): wakes any `wait`.
+    pub(super) fn run_event(&mut self, run: &str, card: Value) {
+        let l = self.runs_live.entry(run.to_string()).or_insert_with(RunLive::new);
+        l.events.push(RunEvent { task: String::new(), card, delivered: false });
+        self.check_waiters();
     }
 
     fn call_followup(&mut self, run: &Run, id: &str, text: &str, cx: &mut Cx) -> Result<String, String> {
@@ -907,11 +1308,10 @@ impl Agents {
             return Err(format!("{} has no worktree any more ({})", t.id, state_name(&t)));
         }
         self.check_budget(&run.id, cx)?;
-        if let Some(tm) = self.task_mut(&t.id) {
-            tm.blocked = false;
-            tm.questions.clear();
-        }
         self.worker_again(&t.id, text, cx);
+        if self.task(&t.id).is_some_and(|x| x.status != Status::Running) {
+            return Err(self.task(&t.id).and_then(|x| x.questions.first().cloned()).unwrap_or_else(|| format!("{} couldn't start again", t.id)));
+        }
         Ok(format!("sent to {} — {} is running again", t.worker, t.id))
     }
 
@@ -937,6 +1337,12 @@ impl Agents {
     /// Merge the integration branch into the task's worktree (background), then hand the markers to its worker.
     fn start_resolve(&mut self, id: &str, reply: Option<Reply>, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
+        if !self.run_accepting(&t.run) {
+            if let Some(r) = reply {
+                let _ = r.send(Err("the run is stopped".into()));
+            }
+            return;
+        }
         let integ = self.run_ref(&t.run).map(|r| r.branch.clone()).unwrap_or_default();
         self.live(id).busy = true;
         if let Some(tm) = self.task_mut(id) {
@@ -955,6 +1361,19 @@ impl Agents {
         self.live(id).busy = false;
         let Some(t) = self.task(id).cloned() else { return };
         let integ = self.run_ref(&t.run).map(|r| r.branch.clone()).unwrap_or_default();
+        if !self.run_accepting(&t.run) {
+            // stopped meanwhile: no worker starts. Its conflicts are remembered, so resuming the run hands them over
+            if let Some(tm) = self.task_mut(id) {
+                if let Ok(files) = &r {
+                    tm.conflicts = files.clone();
+                }
+                tm.last = "conflicts to resolve · the run is stopped".into();
+            }
+            if let Some(reply) = reply {
+                let _ = reply.send(Err("the run was stopped".into()));
+            }
+            return;
+        }
         let answer = match r {
             Err(e) => Err(e),
             Ok(files) if files.is_empty() => {
@@ -1005,9 +1424,10 @@ impl Agents {
         let mut keep = vec![];
         for w in std::mem::take(&mut self.waiters) {
             let board = self.board_json(&w.run);
-            let nothing_left = board["running"].as_array().is_some_and(|a| a.is_empty()) && board["queued"].as_array().is_some_and(|a| a.is_empty()) && board["merging"].as_array().is_some_and(|a| a.is_empty());
+            let nothing_left = board["running"].as_array().is_some_and(|a| a.is_empty()) && board["queued"].as_array().is_some_and(|a| a.is_empty()) && board["merging"].as_array().is_some_and(|a| a.is_empty()) && board["awaiting_approval"] == 0;
             let l = self.runs_live.entry(w.run.clone()).or_insert_with(RunLive::new);
-            let news: Vec<usize> = l.events.iter().enumerate().filter(|(_, e)| !e.delivered && (w.ids.is_empty() || w.ids.contains(&e.task))).map(|(i, _)| i).collect();
+            // (news about the whole run, like the user approving the plan, wakes every wait)
+            let news: Vec<usize> = l.events.iter().enumerate().filter(|(_, e)| !e.delivered && (w.ids.is_empty() || e.task.is_empty() || w.ids.contains(&e.task))).map(|(i, _)| i).collect();
             if !news.is_empty() || now >= w.deadline || (nothing_left && l.events.iter().all(|e| e.delivered)) {
                 let cards: Vec<Value> = news
                     .iter()
@@ -1050,22 +1470,44 @@ impl Agents {
                 if running >= max {
                     break;
                 }
-                let mut ready: Vec<&Task> = self.store.tasks.iter().filter(|t| t.run == run && t.status == Status::Todo && t.queued && !self.paused.contains_key(&t.agent)).filter(|t| self.waiting_for(t).is_empty()).collect();
+                let mut ready: Vec<&Task> = self
+                    .store
+                    .tasks
+                    .iter()
+                    .filter(|t| t.run == run && t.status == Status::Todo && t.queued && !self.paused.contains_key(&t.agent) && self.agent_ok(&t.agent))
+                    .filter(|t| !self.live.get(&t.id).is_some_and(|l| l.busy) && self.waiting_for(t).is_empty())
+                    .collect();
                 // highest priority first, then oldest
                 ready.sort_by_key(|t| (std::cmp::Reverse(t.priority), t.created, t.id.clone()));
-                let pick = ready.iter().find(|t| self.last_start.get(&(t.agent.clone(), t.model.clone())).is_none_or(|s| s.elapsed() >= self.stagger)).map(|t| t.id.clone());
+                // only the best priority tier may take the slot: when its model just started a sibling, it waits
+                // out the stagger (a second or so) rather than letting a lower-priority task run ahead of it
+                let top = ready.first().map(|t| t.priority);
+                let pick = ready.iter().take_while(|t| Some(t.priority) == top).find(|t| self.last_start.get(&(t.agent.clone(), t.model.clone())).is_none_or(|s| s.elapsed() >= self.stagger)).map(|t| t.id.clone());
                 let Some(id) = pick else { break };
                 if self.check_budget(&run, cx).is_err() {
                     break;
                 }
-                let t = self.task(&id).unwrap();
+                let t = self.task(&id).unwrap().clone();
                 self.last_start.insert((t.agent.clone(), t.model.clone()), Instant::now());
-                if let Some(t) = self.task_mut(&id) {
-                    t.queued = false;
+                if t.resume_after_limit && !t.session_id.is_empty() && Path::new(&t.worktree).is_dir() {
+                    // paused by a rate limit mid-task: carry on where it stopped, edits and session intact
+                    if let Some(tm) = self.task_mut(&id) {
+                        tm.resume_after_limit = false;
+                    }
+                    self.worker_again(&id, "You were paused by a rate limit; continue where you left off and finish with your report.", cx);
+                } else {
+                    if let Some(tm) = self.task_mut(&id) {
+                        tm.resume_after_limit = false;
+                    }
+                    self.start(&id, cx);
                 }
-                self.start(&id, cx);
-                if self.task(&id).map(|t| t.status) != Some(Status::Running) {
-                    break; // couldn't start (its card says why)
+                match self.task(&id).map(|t| t.status) {
+                    Some(Status::Todo) => break, // couldn't start: it stays queued (its card says why)
+                    _ => {
+                        if let Some(tm) = self.task_mut(&id) {
+                            tm.queued = false;
+                        }
+                    }
                 }
             }
         }
@@ -1078,13 +1520,15 @@ impl Agents {
         self.spawn_worker(id, &prompt, "", cx);
     }
 
-    /// Send a finished worker more to do in the same session.
+    /// Send a finished worker more to do in the same session. Whatever it was blocked on is answered by this.
     pub(super) fn worker_again(&mut self, id: &str, prompt: &str, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
         if let Some(tm) = self.task_mut(id) {
             tm.status = Status::Running;
             tm.followups += 1;
             tm.error.clear();
+            tm.blocked = false;
+            tm.questions.clear();
             tm.finished = 0;
             tm.last = format!("› {}", prompt.lines().next().unwrap_or(""));
         }
@@ -1102,8 +1546,36 @@ impl Agents {
             self.event(id, "failed");
             return;
         };
+        // the task's budget covers all its rounds (fix rounds, nudges, follow-ups), not each process: every run
+        // gets what's left, and none starts once it's spent
+        let cap = if t.budget_usd > 0.0 {
+            let left = t.budget_usd - t.cost_usd;
+            if left <= 0.0 {
+                if let Some(tm) = self.task_mut(id) {
+                    tm.status = Status::Review;
+                    tm.finished = store::now();
+                    tm.blocked = true;
+                    tm.want_merge = false;
+                    tm.questions = vec![format!("spent its budget (${:.2} of ${:.2}) — t continues it in a tab, x discards it", t.cost_usd, t.budget_usd)];
+                    tm.last = "budget used up".into();
+                }
+                cx.alert(crate::alerts::Kind::NeedsYou, format!("{} spent its budget (${:.2} of ${:.2})", t.title, t.cost_usd, t.budget_usd));
+                self.event(id, "blocked");
+                return;
+            }
+            left.max(0.05)
+        } else {
+            0.0
+        };
         let wt = PathBuf::from(&t.worktree);
-        let spec = run::worker_spec(&t.agent, &bin, &t.model, prompt, resume, t.max_turns, t.budget_usd, &wt, &self.paths.agents.join("tmp"));
+        // a node_modules T borrowed from your checkout goes before the worker is back: an install it runs mustn't
+        // land in your checkout through the link
+        git::unlink_deps(&wt);
+        let mut spec = run::worker_spec(&t.agent, &bin, &t.model, prompt, resume, t.max_turns, cap, &wt, &self.paths.agents.join("tmp"));
+        if t.port > 0 {
+            // its checkout's own port, for a dev server or a test that needs one (project.rs)
+            spec.env.push(("ORIEL_PORT".into(), t.port.to_string()));
+        }
         let stop = Arc::new(AtomicBool::new(false));
         {
             let l = self.live(id);
@@ -1206,6 +1678,14 @@ impl Agents {
             (std::mem::take(&mut l.takeover), l.discard.take(), l.nudge.take())
         };
         let cost_base = self.live.get(id).map(|l| l.cost_base).unwrap_or(0.0);
+        // already merged or discarded (it exited after its merge landed): nothing to bring back
+        if self.task(id).is_none_or(|t| t.status == Status::Done) {
+            if let Some(reply) = discard {
+                let _ = reply.send(Err(format!("{id} is already done")));
+            }
+            return;
+        }
+        let accepting = self.task(id).is_some_and(|t| self.run_accepting(&t.run));
         let Some(t) = self.task_mut(id) else { return };
         if !o.session.is_empty() {
             t.session_id = o.session.clone();
@@ -1229,7 +1709,8 @@ impl Agents {
             self.take_over_now(id, cx);
             return;
         }
-        if let Some((reason, fresh)) = nudge {
+        // (a run stopped meanwhile gets no nudge: the worker is simply stopped, below)
+        if let Some((reason, fresh)) = nudge.filter(|_| accepting) {
             if fresh {
                 self.redispatch(id, &format!("watchdog: {reason}"), cx);
             } else {
@@ -1239,7 +1720,8 @@ impl Agents {
             }
             return;
         }
-        // rate limited: the vendor is paused; put it back in the queue for later instead of failing it
+        // rate limited: the vendor is paused. It waits in the queue and, once the pause is over, carries on in
+        // the same worktree and session (schedule) instead of failing or starting over
         let limited = o.error.as_deref().is_some_and(|e| {
             let e = e.to_lowercase();
             e.contains("rate limit") || e.contains("usage limit") || e.contains("429")
@@ -1250,8 +1732,10 @@ impl Agents {
             if let Some(t) = self.task_mut(id) {
                 t.status = Status::Todo;
                 t.queued = true;
-                t.last = "rate limited — queued until its plan resets".into();
+                t.resume_after_limit = true;
+                t.last = "paused by a rate limit — carries on when its plan resets".into();
             }
+            upsert(&mut self.live(id).log, Entry::note("paused by a rate limit — it carries on where it stopped once the limit resets"));
             return;
         }
         let t = self.task_mut(id).unwrap();
@@ -1263,8 +1747,17 @@ impl Agents {
             t.summary = o.text.split_whitespace().take(120).collect::<Vec<_>>().join(" ");
         }
         if o.stopped && o.error.is_none() {
+            // stopped by you (the run's s, or oriel closing): half-done work stays in REVIEW, never merged by
+            // itself; resuming the run carries on from here
             t.last = "stopped".into();
-        } else if let Some(e) = &o.error {
+            upsert(&mut self.live(id).log, Entry::note("stopped"));
+            if accepting {
+                // the run was resumed before this worker had even let go: carry straight on
+                self.worker_again(id, CARRY_ON, cx);
+            }
+            return;
+        }
+        if let Some(e) = &o.error {
             t.error = e.clone();
             t.last.clear();
         } else {
@@ -1291,7 +1784,12 @@ impl Agents {
         self.spawn(cx, move |send| {
             let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
             let wt = Path::new(&t.worktree);
-            let resolved = if resolving { Some(git::finish_resolve(wt).map(|_| ())) } else { None };
+            // a conflict merge still open in the worktree is oriel's (workers don't run git), even when oriel
+            // restarted since and forgot it was resolving: commit it now
+            let resolved = match git::finish_resolve(wt) {
+                Ok(false) if !resolving => None,
+                r => Some(r.map(|_| ())),
+            };
             let stats = git::file_stats(wt, &t.base_sha).ok();
             let conflicts = git::conflicts_with(Path::new(&t.repo), wt, &t.base_sha, &integ);
             send(Msg::Checked(id2, stats, conflicts, resolved));
@@ -1322,8 +1820,28 @@ impl Agents {
         if !t.headless() || t.run.is_empty() {
             return;
         }
+        if !self.run_accepting(&t.run) {
+            // the run was stopped meanwhile: the work waits in REVIEW, and resuming the run picks it up from here
+            if let Some(tm) = self.task_mut(id).filter(|tm| tm.error.is_empty() && !tm.blocked) {
+                tm.last = "finished · the run is stopped (r resumes it)".into();
+            }
+            return;
+        }
         let worker = t.worker.clone();
         if self.run_ref(&t.run).is_some_and(|r| r.manual) {
+            if !t.error.is_empty() && limit_stop(&t.error) {
+                // it ran out of budget or turns: another go would most likely stop the same way, so it's yours
+                self.record(&worker).failed += 1;
+                let err = t.error.lines().next().unwrap_or("").to_string();
+                let next = if err.contains("budget") { "t continues it in a tab, x discards it" } else { "c tells it to carry on, x discards it" };
+                if let Some(tm) = self.task_mut(id) {
+                    tm.blocked = true;
+                    tm.want_merge = false;
+                    tm.questions = vec![format!("{err} — {next}")];
+                }
+                cx.alert(crate::alerts::Kind::NeedsYou, format!("{} {err}", t.title));
+                return self.event(id, "blocked");
+            }
             if !t.error.is_empty() {
                 // it failed: one fresh start with the same agent and model, then it waits for you
                 self.record(&worker).failed += 1;
@@ -1364,6 +1882,9 @@ impl Agents {
     /// Put a finished task in line for the integration branch. Merges run one at a time (pump_merges).
     pub(super) fn queue_merge(&mut self, id: &str) -> Result<String, String> {
         let Some(t) = self.task(id).cloned() else { return Err(format!("no task {id}")) };
+        if !self.run_accepting(&t.run) {
+            return Err(format!("{id} can't be merged now: the run is stopped (r on the lead panel resumes it)"));
+        }
         let l = self.live.get(id);
         if matches!(t.status, Status::Running | Status::Blocked) || l.is_some_and(|l| l.stop.is_some()) {
             return Err(format!("{id} is still running — wait for it first"));
@@ -1395,14 +1916,28 @@ impl Agents {
                 continue; // it went back to work; it queues again when it's done
             }
             let Some(run) = self.run_ref(&t.run).cloned() else { continue };
+            if run.state != RunState::Running {
+                // its run was stopped: it keeps wanting the merge, and resuming the run queues it again
+                if let Some(tm) = self.task_mut(&id) {
+                    tm.last = "merge on hold · the run is stopped".into();
+                }
+                continue;
+            }
             self.merging = Some(id.clone());
             self.live(&id).busy = true;
             if let Some(tm) = self.task_mut(&id) {
                 tm.last = format!("merging into {}…", run.branch);
             }
+            // its worktree goes once it's merged: a `T` terminal in it would keep Windows from removing it
+            cx.act(crate::pane::Action::CloseTag(super::try_tag(&id)));
             let lock = self.merge_lock.clone();
-            // the repo's own gate ([lead.gates]) when it has one, else the global one
-            let gate_cmd = crate::config::gate_for(&self.lead_cfg, Path::new(&t.repo)).trim().to_string();
+            // the run's own gate (from its form); an older run without one takes the config's (the repo's own
+            // [lead.gates] when it has one, else [lead] gate), or detects it in the checkout, as before
+            let gate_cmd = match &run.gate {
+                Some(g) if g.trim().is_empty() => "none".to_string(),
+                Some(g) => g.trim().to_string(),
+                None => crate::config::gate_for(&self.lead_cfg, Path::new(&t.repo)).trim().to_string(),
+            };
             let timeout = Duration::from_secs(self.lead_cfg.gate_timeout_s.max(30) as u64);
             let gate_wt = PathBuf::from(format!("{}-gate", run.worktree.trim_end_matches(['/', '\\'])));
             self.spawn(cx, move |send| {
@@ -1417,6 +1952,16 @@ impl Agents {
                     let mut cmds: Vec<String> = vec![];
                     if gate_cmd.is_empty() || base.is_some() || !t.acceptance.is_empty() {
                         git::gate_checkout(repo, &gate_wt, sha)?;
+                        // the repo's own setup (.oriel/project.toml: pnpm install, .env…) on the merged tree, so a
+                        // dependency a worker added is there; without one a JS gate borrows the main checkout's
+                        let proj = super::project::load(repo).unwrap_or_default();
+                        // a gate that installs its own dependencies (npm ci && …) never runs through a link into
+                        // your checkout's node_modules
+                        let borrow = !base.as_deref().is_some_and(git::installs_deps);
+                        if !borrow {
+                            git::unlink_deps(&gate_wt); // left by an earlier gate that borrowed
+                        }
+                        super::project::prepare(&proj, repo, &gate_wt, 0, timeout, borrow)?;
                         if let Some(c) = base.or_else(|| if gate_cmd.is_empty() { git::detect_gate(&gate_wt) } else { None }) {
                             cmds.push(c);
                         }
@@ -1520,9 +2065,18 @@ impl Agents {
         }
     }
 
-    /// A merge bounced (conflict or gate): back to the same worker, twice; then a fresh worker.
+    /// A merge bounced (conflict or gate): back to the same worker for up to MAX_ATTEMPTS fix rounds; then a fresh
+    /// start (a stronger worker in a lead run; your own tasks keep their agent and model).
     fn bounce(&mut self, id: &str, why: &str, conflict: bool, cx: &mut Cx) {
         let Some(t) = self.task(id).cloned() else { return };
+        if !self.run_accepting(&t.run) {
+            // the run was stopped while this merged: nothing new starts. It still wants the merge, so resuming the
+            // run tries again (and sends it back to its worker then)
+            if let Some(tm) = self.task_mut(id) {
+                tm.last = format!("merge bounced ({}) · the run is stopped", crate::ui::fit(why.lines().next().unwrap_or(""), 80));
+            }
+            return;
+        }
         if t.attempts >= MAX_ATTEMPTS {
             return self.redispatch(id, why, cx);
         }
@@ -1542,6 +2096,9 @@ impl Agents {
                 t.attempts + 1
             );
             self.worker_again(id, &p, cx);
+            if self.task(id).is_some_and(|t| t.status != Status::Running) {
+                return; // it couldn't start (its budget is spent): already told
+            }
         }
         // told after the fix started, so the card says what's actually happening
         self.event(id, "bounced");
@@ -1563,9 +2120,11 @@ impl Agents {
     }
 
     /// Start a task over with a fresh worker (a premium one, if the roster has another), carrying notes about
-    /// what went wrong. The second time, it's blocked for the lead or the user to decide.
+    /// what went wrong. The second time, it's blocked for the lead or the user to decide. Your own tasks (a run
+    /// without a lead) always keep the agent, model and budget you gave them.
     fn redispatch(&mut self, id: &str, why: &str, cx: &mut Cx) {
-        self.redispatch_with(id, why, false, cx)
+        let keep = self.task(id).is_some_and(|t| self.run_ref(&t.run).is_some_and(|r| r.manual));
+        self.redispatch_with(id, why, keep, cx)
     }
 
     fn redispatch_with(&mut self, id: &str, why: &str, keep: bool, cx: &mut Cx) {
@@ -1584,16 +2143,21 @@ impl Agents {
         let roster = self.roster();
         let usable = |w: &&crate::config::RosterEntry| w.enabled && (self.fake_worker.is_some() || self.installed(&w.agent).is_some()) && !self.paused.contains_key(&w.agent);
         let next = if keep {
-            crate::config::RosterEntry { name: t.worker.clone(), agent: t.agent.clone(), model: t.model.clone(), tier: t.tier.clone(), max_turns: t.max_turns, budget_usd: t.budget_usd, enabled: true, ..Default::default() }
+            worker_entry(&t)
         } else {
-            roster
+            let mut w = roster
                 .iter()
                 .filter(usable)
                 .filter(|w| w.tier == "premium" && w.name != t.worker)
                 .next()
                 .or_else(|| roster.iter().filter(usable).find(|w| w.agent != t.agent))
                 .cloned()
-                .unwrap_or_else(|| roster.iter().find(|w| w.name == t.worker).cloned().unwrap_or_default())
+                .unwrap_or_else(|| roster.iter().find(|w| w.name == t.worker).cloned().unwrap_or_default());
+            // a task's budget covers all its rounds; a fresh worker gets its own cap on top of what was spent
+            if w.budget_usd > 0.0 {
+                w.budget_usd += t.cost_usd;
+            }
+            w
         };
         let note = format!("{} ({}) tried and failed: {}", t.worker, t.agent, crate::ui::fit(why.lines().next().unwrap_or(""), 200));
         if let Some(tm) = self.task_mut(id) {
@@ -1601,6 +2165,7 @@ impl Agents {
             tm.last = format!("starting over with {}", next.name);
         }
         self.live(id).busy = true;
+        cx.act(crate::pane::Action::CloseTag(super::try_tag(id)));
         let id2 = id.to_string();
         let (repo, wt, branch) = (t.repo.clone(), t.worktree.clone(), t.branch.clone());
         let pick = next.clone();
@@ -1612,11 +2177,13 @@ impl Agents {
     }
 
     pub(super) fn on_redispatched(&mut self, id: &str, r: Result<(), String>, w: crate::config::RosterEntry, cx: &mut Cx) {
+        // (the fresh worker's watchdog count starts over with it: start() resets the task's live state)
         self.live(id).busy = false;
         let Some(t) = self.task_mut(id) else { return };
         if let Err(e) = r {
+            // its old worktree wouldn't go: it waits in REVIEW with the error (a run of yours settles without it)
             t.error = e;
-            return;
+            return self.event(id, "failed");
         }
         t.redispatches += 1;
         t.attempts = 0;
@@ -1688,18 +2255,23 @@ impl Agents {
     // ---------------------------------------------------------------- the watchdog
 
     /// Stuck (the same call 4×, the same failing command 3×), spinning (25 calls without an edit), hung (no
-    /// output for 5 minutes): first a nudge in the same session, then a fresh worker, then blocked.
+    /// output for 5 minutes, or as long as the merge gate gets while a build or test command runs): first a nudge
+    /// in the same session, then a fresh worker, then blocked.
     pub(super) fn watchdog(&mut self) {
         let ids: Vec<String> = self.store.tasks.iter().filter(|t| t.headless() && t.status == Status::Running).map(|t| t.id.clone()).collect();
+        let hung = self.hung_after;
+        let long = hung.max(Duration::from_secs(self.lead_cfg.gate_timeout_s as u64));
         for id in ids {
-            let hung = self.hung_after;
             let Some(l) = self.live.get_mut(&id) else { continue };
             let Some(stop) = l.stop.clone() else { continue };
             if l.nudge.is_some() {
                 continue;
             }
-            let reason = if l.last_event.is_some_and(|t| t.elapsed() > hung) {
-                Some(format!("hung (no output for {} minutes)", hung.as_secs() / 60))
+            // agents print nothing while a command runs, and a build in a fresh worktree starts from zero
+            let building = l.log.iter().rev().find(|e| e.kind == 't').is_some_and(|e| e.status == "running" && matches!(e.label.as_str(), "Bash" | "PowerShell" | "Run" | "Shell") && is_build(&e.target));
+            let limit = if building { long } else { hung };
+            let reason = if l.last_event.is_some_and(|t| t.elapsed() > limit) {
+                Some(format!("hung (no output for {} minutes)", limit.as_secs() / 60))
             } else if l.repeat.1 >= 4 {
                 Some(format!("stuck (repeating \"{}\")", crate::ui::fit(&l.repeat.0, 60)))
             } else if let Some((cmd, _)) = l.fails.iter().find(|(_, n)| **n >= 3) {
@@ -1731,14 +2303,9 @@ impl Agents {
             if let Some(stop) = self.live.get(&tid).and_then(|l| l.stop.clone()) {
                 stop.store(true, Ordering::SeqCst);
             }
+            // out of the merge queue, but queued tasks stay queued and wanted merges stay wanted: nothing moves
+            // while the run is stopped (run_accepting), and resuming it carries on from here
             self.merge_queue.retain(|x| *x != tid);
-            if let Some(t) = self.task_mut(&tid) {
-                t.want_merge = false;
-                if t.status == Status::Todo && t.queued {
-                    t.queued = false;
-                    t.last = "not started (the run was stopped)".into();
-                }
-            }
         }
         self.answer_waiters(id, "the run was stopped by the user");
         if let Some(r) = self.run_mut(id) {
@@ -1758,7 +2325,7 @@ impl Agents {
         if r.branch.is_empty() {
             return;
         }
-        self.mode = super::Mode::Diff(super::DiffView { id: id.to_string(), data: None, file: 0, scroll: 0 });
+        self.mode = super::Mode::Diff(super::DiffView::new(id));
         let id = id.to_string();
         self.spawn(cx, move |send| send(Msg::Diff(id, git::branch_diff(Path::new(&r.repo), &r.base_sha, &r.branch))));
     }
@@ -1766,8 +2333,9 @@ impl Agents {
     /// Merge the whole run into the user's branch (same rules as a task: clean tree, same branch).
     pub(super) fn merge_run(&mut self, id: &str, cx: &mut Cx) {
         let Some(r) = self.run_ref(id).cloned() else { return };
-        let running = self.run_tasks(id).iter().filter(|t| matches!(t.status, Status::Running | Status::Blocked)).count();
-        if r.state.active() || running > 0 || self.merging.as_ref().is_some_and(|m| self.task(m).is_some_and(|t| t.run == id)) {
+        // anything still going (a worker, a check, a merge, one waiting in the merge queue, a queued task that will
+        // start) would land on a branch that's gone
+        if r.state.active() || !self.working(id).is_empty() {
             cx.notify("the run is still working — stop it (s) or let it finish before merging");
             return;
         }
@@ -1777,6 +2345,13 @@ impl Agents {
         if let Some(x) = self.run_mut(id) {
             x.log("merging into your branch…");
         }
+        // what never made it in goes with the run: their worktrees and branches too (on_run_final marks them)
+        let leftovers: Vec<Task> = self.run_tasks(id).into_iter().filter(|t| t.status != Status::Done && (!t.worktree.is_empty() || !t.branch.is_empty())).cloned().collect();
+        // T terminals in those checkouts would keep Windows from removing them
+        cx.act(crate::pane::Action::CloseTag(super::try_tag(id)));
+        for t in &leftovers {
+            cx.act(crate::pane::Action::CloseTag(super::try_tag(&t.id)));
+        }
         let id2 = id.to_string();
         self.spawn(cx, move |send| {
             let repo = Path::new(&r.repo);
@@ -1785,15 +2360,31 @@ impl Agents {
             let res = git::merge(repo, Path::new(""), &r.branch, &r.base_branch, &title, &|_| {});
             if res.is_ok() {
                 let _ = git::remove(repo, Path::new(&r.worktree), "");
+                for t in &leftovers {
+                    let _ = git::remove(repo, Path::new(&t.worktree), &t.branch);
+                }
             }
             send(Msg::RunFinal(id2, res));
         });
     }
 
     pub(super) fn on_run_final(&mut self, id: &str, r: Result<String, String>, cx: &mut Cx) {
-        let Some(run) = self.run_mut(id) else { return };
         match r {
             Ok(s) => {
+                let left: Vec<String> = self.run_tasks(id).iter().filter(|t| t.status != Status::Done).map(|t| t.id.clone()).collect();
+                for tid in &left {
+                    if let Some(t) = self.task_mut(tid) {
+                        t.status = Status::Done;
+                        t.outcome = "discarded".into();
+                        t.finished = store::now();
+                        t.last = "left out when the run was merged".into();
+                        t.worktree.clear();
+                        t.branch.clear();
+                        t.queued = false;
+                        t.want_merge = false;
+                    }
+                }
+                let Some(run) = self.run_mut(id) else { return };
                 run.state = RunState::Merged;
                 run.finished = store::now();
                 run.worktree.clear();
@@ -1805,9 +2396,15 @@ impl Agents {
                 self.lead_focus = false;
             }
             Err(e) => {
+                let Some(run) = self.run_mut(id) else { return };
                 run.error = e.clone();
                 run.log(&format!("merge failed: {e}"));
-                cx.notify(format!("merge failed: {e}"));
+                if e.contains(git::UNCOMMITTED) {
+                    // your own edits are in the way: offer to commit them and merge
+                    self.ask_dirty(super::DirtyThen::MergeRun(id.to_string()), String::new(), cx);
+                } else {
+                    cx.notify(format!("merge failed: {e}"));
+                }
             }
         }
     }
@@ -1815,8 +2412,13 @@ impl Agents {
     /// Throw the whole run away: its workers' worktrees, the lead's checkout and the integration branch.
     pub(super) fn discard_run(&mut self, id: &str, cx: &mut Cx) {
         self.stop_run(id, cx);
+        self.starting.remove(id);
         let Some(r) = self.run_ref(id).cloned() else { return };
         let tasks: Vec<Task> = self.run_tasks(id).into_iter().filter(|t| t.status != Status::Done).cloned().collect();
+        cx.act(crate::pane::Action::CloseTag(super::try_tag(id)));
+        for t in &tasks {
+            cx.act(crate::pane::Action::CloseTag(super::try_tag(&t.id)));
+        }
         let id2 = id.to_string();
         self.spawn(cx, move |send| {
             let repo = Path::new(&r.repo);
@@ -1924,6 +2526,7 @@ impl Agents {
                 r.error = "oriel was closed while it ran — r resumes it".into();
             }
         }
+        // (queued tasks stay queued, finished ones keep wanting their merge: resume_run carries on from there)
         for t in &mut self.store.tasks {
             if t.headless() && matches!(t.status, Status::Running | Status::Blocked) {
                 t.status = Status::Review;

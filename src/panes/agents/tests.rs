@@ -37,16 +37,17 @@ pub(super) fn noop_agent() -> (String, Vec<String>) {
     if cfg!(windows) { ("cmd.exe".into(), vec!["/c".into(), "exit".into()]) } else { ("true".into(), vec![]) }
 }
 
-fn pane(dir: &Path, repo: &Path) -> Agents {
+pub(super) fn pane(dir: &Path, repo: &Path) -> Agents {
     let mut a = Agents::with_paths(Paths { agents: dir.join("agents"), wt: dir.join("wt") });
     a.start_dir = Some(repo.to_path_buf());
     a.fake_agent = Some(noop_agent());
     a
 }
 
-/// Poll until `cond` holds (or fail after `ms`).
+/// Poll until `cond` holds (or fail after `ms`, times four: the suite runs many git-heavy tests at once, often
+/// next to builds, and a passing wait returns the moment its condition holds anyway).
 pub(super) fn until(k: &mut Kit, p: &mut Agents, ms: u64, what: &str, cond: impl Fn(&Agents) -> bool) {
-    let deadline = Instant::now() + Duration::from_millis(ms);
+    let deadline = Instant::now() + Duration::from_millis(ms * 4);
     loop {
         k.poll(p);
         if cond(p) {
@@ -294,11 +295,19 @@ fn agents_cost_from_transcript_dedupes() {
     assert!((c.usd - (1.0 + 0.1 + 1.2)).abs() < 1e-6, "{}", c.usd);
 }
 
+/// The planner's cards (P), as its thread would send them: no worker yet (the board spreads them).
+pub(super) fn plan_out(items: &[(&str, &str)], cost: f64) -> PlanOut {
+    let items = items.iter().enumerate().map(|(i, (t, g))| plan::Item { key: format!("t{}", i + 1), title: t.to_string(), goal: g.to_string(), ..Default::default() }).collect();
+    PlanOut { items, notes: vec![], problems: vec![], cost }
+}
+
 #[test]
 fn agents_plan_parse_and_args() {
-    let out = r#"{"type":"result","result":"Here you go:\n[{\"title\":\"Fix resize\",\"prompt\":\"Do it\"},{\"title\":\"Add tests\"}]","total_cost_usd":0.12}"#;
+    let out = r#"{"type":"result","result":"Here you go:\n[{\"title\":\"Fix resize\",\"prompt\":\"Do it\",\"owns\":[\"src/term.rs\"],\"acceptance\":\"cargo test term\"},{\"id\":\"t\",\"title\":\"Add tests\",\"depends_on\":[\"t1\"]}]","total_cost_usd":0.12}"#;
     let (items, usd) = parse_plan(out).unwrap();
-    assert_eq!(items, vec![("Fix resize".into(), "Do it".into()), ("Add tests".into(), "Add tests".into())]);
+    assert_eq!(items.iter().map(|i| (i.key.as_str(), i.title.as_str(), i.goal.as_str())).collect::<Vec<_>>(), vec![("t1", "Fix resize", "Do it"), ("t", "Add tests", "Add tests")]);
+    assert_eq!((items[0].owns.clone(), items[0].acceptance.as_str()), (vec!["src/term.rs".to_string()], "cargo test term"));
+    assert_eq!(items[1].depends_on, vec!["t1".to_string()]);
     assert_eq!(usd, 0.12);
     assert_eq!(agent_args("claude", "sonnet", "go", false), vec!["--model", "sonnet", "go"]);
     assert_eq!(agent_args("claude", "", "more", true), vec!["--continue", "more"]);
@@ -412,10 +421,280 @@ fn agents_snapshots_board_form_diff() {
     let id = p.store.tasks[4].id.clone();
     p.store.tasks[4].branch = "oriel/usage-sink-status-li-t4".into();
     p.store.tasks[4].base_branch = "master".into();
-    p.mode = Mode::Diff(DiffView { id, data: Some(Ok(git::Diff { files, conflicts: Some(vec![]), target: "master".into() })), file: 0, scroll: 0 });
+    p.mode = Mode::Diff(DiffView { data: Some(Ok(git::Diff { files, conflicts: Some(vec![]), target: "master".into() })), ..DiffView::new(&id) });
     let diff = snap(&mut k, &mut p, "diff");
     println!("{diff}");
     assert!(diff.contains("merges cleanly") && diff.contains("serde_json::Value") && diff.contains("usage.rs"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The demo board on a repo path that doesn't exist (in the scratch folder): any git work a test sets off in the
+/// background fails at once instead of reaching a real folder.
+pub(super) fn offline(dir: &Path) -> Agents {
+    let mut p = demo(dir);
+    let root = dir.join("no-repo");
+    let key = root.display().to_string();
+    for t in &mut p.store.tasks {
+        t.repo = key.clone();
+    }
+    p.repo = Some(git::RepoInfo { root, name: "demo".into(), branch: "master".into() });
+    p
+}
+
+pub(super) fn with_cx<R>(k: &mut Kit, f: impl FnOnce(&mut Cx) -> R) -> R {
+    let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut k.actions, focused: true, time: 1.0 };
+    f(&mut cx)
+}
+
+pub(super) fn id_of(p: &Agents, title: &str) -> String {
+    p.store.tasks.iter().find(|t| t.title == title).map(|t| t.id.clone()).unwrap_or_else(|| panic!("no task {title}"))
+}
+
+/// Running marked tasks together follows their own "after" links whatever order you marked them in, and refuses
+/// what could never finish: a loop, a link to a task that isn't coming along, an agent that isn't installed
+/// (B19, B18, B44). The form refuses a loop too, and takes the ids of finished tasks it comes back with.
+#[test]
+fn agents_batch_order_follows_links_and_refuses_loops() {
+    let dir = scratch("batch-order");
+    let mut k = Kit::new();
+    let mut p = offline(&dir);
+    let api = p.add_task("Add the API", "api", 0, "");
+    let ui = p.add_task("Add the UI", "ui", 0, "");
+    p.task_mut(&ui).unwrap().depends_on = vec![api.clone()];
+    // UI marked first, then the API it waits for: one after another still means API first
+    let run = with_cx(&mut k, |cx| p.start_batch(&[ui.clone(), api.clone()], true, "", cx)).unwrap();
+    assert_eq!(p.run_ref(&run).unwrap().batch, vec![api.clone(), ui.clone()]);
+    // a loop
+    let x = p.add_task("Task x", "x", 0, "");
+    let y = p.add_task("Task y", "y", 0, "");
+    p.task_mut(&x).unwrap().depends_on = vec![y.clone()];
+    p.task_mut(&y).unwrap().depends_on = vec![x.clone()];
+    let e = with_cx(&mut k, |cx| p.start_batch(&[x.clone(), y.clone()], false, "", cx)).unwrap_err();
+    assert!(e.contains("wait for each other") && e.contains("Task x") && e.contains("Task y"), "{e}");
+    // a link to an open task that isn't marked
+    let e = with_cx(&mut k, |cx| p.start_batch(&[x.clone()], false, "", cx)).unwrap_err();
+    assert!(e.contains("isn't marked") && e.contains("Task y"), "{e}");
+    // an agent that isn't installed (kimi, in the demo)
+    let z = p.add_task("Task z", "z", 2, "");
+    let e = with_cx(&mut k, |cx| p.start_batch(&[z.clone()], false, "", cx)).unwrap_err();
+    assert!(e.contains("kimi") && e.contains("isn't installed"), "{e}");
+    // the form: y already waits for x, so x can't wait for y
+    p.task_mut(&x).unwrap().depends_on.clear();
+    let e = p.resolve_after("Task y", Some(&x)).unwrap_err();
+    assert!(e.contains("'Task y' already waits for 'Task x'"), "{e}");
+    // finished tasks by id: a merged one is met and drops out, a discarded one never will be
+    let merged = id_of(&p, "Font cache warmup");
+    let discarded = id_of(&p, "Try a GPU text renderer");
+    assert_eq!(p.resolve_after(&format!("{merged}, Task z"), Some(&x)).unwrap(), vec![z.clone()]);
+    assert!(p.resolve_after(&discarded, Some(&x)).unwrap_err().contains("was discarded"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A task waiting on one that won't merge says so on its card instead of waiting quietly forever (B19).
+#[test]
+fn agents_card_names_a_dead_dependency() {
+    let dir = scratch("dead-dep");
+    let mut k = Kit::new();
+    let mut p = offline(&dir);
+    p.store.tasks.clear();
+    let repo = p.repo_key();
+    p.store.runs.push(store::Run { id: "r9".into(), repo: repo.clone(), goal: "together".into(), state: store::RunState::Running, branch: "oriel/batch-x".into(), manual: true, max_parallel: 1, created: store::now(), ..Default::default() });
+    let task = |id: &str, title: &str, status: Status| Task { id: id.into(), key: id.into(), title: title.into(), repo: repo.clone(), run: "r9".into(), mode: "headless".into(), agent: "claude".into(), status, created: store::now(), ..Default::default() };
+    p.store.tasks.push(Task { outcome: "discarded".into(), ..task("d1", "Old parser", Status::Done) });
+    p.store.tasks.push(Task { queued: true, depends_on: vec!["d1".into()], prompt: "use the new parser".into(), ..task("d2", "Use the parser", Status::Todo) });
+    let board = k.render(&mut p, 300, 44);
+    assert!(board.contains("stuck: Old parser was discarded · x drops it"), "{board}");
+    assert!(p.card(p.task("d2").unwrap())["stuck"].as_str().is_some_and(|s| s.contains("discarded")));
+    // and the run doesn't wait for it: nothing else is going, so it's ready for review
+    assert!(p.working("r9").is_empty());
+    k.poll(&mut p);
+    assert_eq!(p.run_ref("r9").unwrap().state, store::RunState::Review);
+    assert!(p.run_ref("r9").unwrap().summary.contains("1 not started"), "{}", p.run_ref("r9").unwrap().summary);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A hand-made task's "after" and budget mean something without a run (B44): it won't start before what it waits
+/// for is merged, and a task in a tab is stopped once its transcript says the budget is spent. A retry keeps
+/// counting what the first go cost (B43).
+#[test]
+fn agents_hand_task_after_budget_and_retry_spend() {
+    let dir = scratch("hand-after");
+    let mut k = Kit::new();
+    let mut p = offline(&dir);
+    let first = p.add_task("First part", "one", 0, "");
+    let second = p.add_task("Second part", "two", 0, "");
+    p.task_mut(&second).unwrap().depends_on = vec![first.clone()];
+    p.select(&second);
+    k.key(&mut p, KeyCode::Enter);
+    assert_eq!(p.task(&second).unwrap().status, Status::Todo, "it waits");
+    assert!(k.notices().iter().any(|n| n.contains("waits for \"First part\" to be merged")), "{:?}", k.notices());
+    // what it waits for was thrown away: it never will be merged, so say how to get out
+    if let Some(t) = p.task_mut(&first) {
+        (t.status, t.outcome) = (Status::Done, "discarded".into());
+    }
+    k.key(&mut p, KeyCode::Enter);
+    assert_eq!(p.task(&second).unwrap().status, Status::Todo);
+    assert!(k.notices().last().is_some_and(|n| n.contains("which was discarded — edit it (e)")), "{:?}", k.notices());
+    // over budget in its tab
+    let run = id_of(&p, "Fix pty resize on split");
+    p.task_mut(&run).unwrap().budget_usd = 0.20;
+    with_cx(&mut k, |cx| p.on_msg(Msg::Refreshed(run.clone(), None, Some(cost::Cost { usd: 0.25, tokens: 900 })), cx));
+    let t = p.task(&run).unwrap().clone();
+    assert!(t.error.contains("stopped at its budget ($0.25 of $0.20)"), "{t:?}");
+    assert!(k.actions.iter().any(|a| matches!(a, Action::CloseTag(tag) if *tag == t.tag())), "its tab is closed");
+    // telling it to carry on anyway lifts the budget (or the new tab would close at once)
+    p.task_mut(&run).unwrap().worktree = dir.display().to_string();
+    p.fake_agent = Some(noop_agent()); // the tab it opens runs a no-op, never a real agent
+    with_cx(&mut k, |cx| p.comment(&run, "finish the last bit", cx));
+    assert_eq!(p.task(&run).unwrap().budget_usd, 0.0);
+    assert!(k.notices().iter().any(|n| n.contains("lifted for this follow-up")), "{:?}", k.notices());
+    k.actions.clear(); // drops the tab the comment opened
+    // retry: what it spent still counts today
+    let rev = id_of(&p, "Usage sink status line");
+    let before = p.today();
+    with_cx(&mut k, |cx| p.on_msg(Msg::Removed(rev.clone(), Ok(()), Then::Retry), cx));
+    let t = p.task(&rev).unwrap();
+    assert_eq!((t.cost_usd, t.spent_before), (0.0, 0.61));
+    assert!((p.today() - before).abs() < 1e-9, "today's total didn't drop");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Marks belong to this repo's TODO cards (B45): deleted ones and other repos' go, and the planner's cards land in
+/// the repo it read even if the board moved meanwhile, without yanking the cursor.
+#[test]
+fn agents_marks_and_plans_stay_with_their_repo() {
+    let dir = scratch("marks");
+    let mut k = Kit::new();
+    let mut p = demo(&dir);
+    let (a, b) = (id_of(&p, "Theme toggle in the palette"), id_of(&p, "Kimi usage parser"));
+    p.marked = vec![a.clone(), b.clone()];
+    p.store.tasks.retain(|t| t.id != a);
+    k.poll(&mut p);
+    assert_eq!(p.marked, vec![b.clone()], "a deleted card's mark goes");
+    let here = p.repo_key();
+    let other = if cfg!(windows) { r"C:\code\website" } else { "/home/you/code/website" }.to_string();
+    p.col = 2;
+    with_cx(&mut k, |cx| p.on_msg(Msg::Plan(other.clone(), Ok(plan_out(&[("Hero image", "add it")], 0.0))), cx));
+    assert_eq!(p.store.tasks.iter().find(|t| t.title == "Hero image").map(|t| t.repo.clone()), Some(other.clone()));
+    assert_eq!(p.col, 2, "the cursor stayed");
+    assert!(k.notices().iter().any(|n| n.contains("planned 1 tasks in website")), "{:?}", k.notices());
+    // another repo: this one's marks don't come along
+    p.set_repo(git::RepoInfo { root: PathBuf::from(&other), name: "website".into(), branch: "main".into() });
+    assert!(p.marked.is_empty());
+    assert_ne!(here, p.repo_key());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No second git step for a task while one runs (B46): the diff view's and the board's keys refuse with the
+/// reason, and a worker that exits after its task was merged doesn't bring it back.
+#[test]
+fn agents_busy_task_refuses_and_done_stays_done() {
+    let dir = scratch("busy");
+    let mut k = Kit::new();
+    let mut p = demo(&dir);
+    let id = id_of(&p, "Usage sink status line");
+    p.task_mut(&id).unwrap().worktree = dir.display().to_string();
+    p.live(&id).busy = true;
+    p.mode = Mode::Diff(DiffView::new(&id));
+    for key in ['c', 'm', 'x'] {
+        k.key(&mut p, KeyCode::Char(key));
+        assert!(matches!(p.mode, Mode::Diff(_)), "{key} refused in the diff view");
+    }
+    assert!(k.notices().iter().filter(|n| n.contains("git step")).count() >= 3, "{:?}", k.notices());
+    p.mode = Mode::Board;
+    p.select(&id);
+    k.key(&mut p, KeyCode::Char('x'));
+    assert!(matches!(p.mode, Mode::Board), "no discard while it's busy");
+    // a transcript's c, on a headless task being merged
+    p.live(&id).busy = false;
+    p.merging = Some(id.clone());
+    p.task_mut(&id).unwrap().mode = "headless".into();
+    p.mode = Mode::Log(LogView { target: LogTarget::Task(id.clone()), scroll: 0, back: None });
+    k.key(&mut p, KeyCode::Char('c'));
+    assert!(matches!(p.mode, Mode::Log(_)), "no follow-up mid-merge");
+    assert!(k.notices().last().is_some_and(|n| n.contains("being merged")));
+    // merged, then its worker exits: it stays merged
+    p.merging = None;
+    if let Some(t) = p.task_mut(&id) {
+        (t.status, t.outcome) = (Status::Done, "merged".into());
+    }
+    p.live(&id).stop = Some(Arc::new(AtomicBool::new(true)));
+    with_cx(&mut k, |cx| p.on_worker_done(&id, run::Outcome { stopped: true, ..Default::default() }, cx));
+    assert_eq!(p.task(&id).map(|t| (t.status, t.outcome.clone())), Some((Status::Done, "merged".to_string())));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cursor stays on the card you picked while others arrive and leave (REVIEW is newest first), and a
+/// discard elsewhere doesn't pull it into DONE.
+#[test]
+fn agents_selection_stays_on_its_card() {
+    let dir = scratch("selection");
+    let mut k = Kit::new();
+    let mut p = demo(&dir);
+    let old = p.add_task("Older review", "x", 0, "");
+    if let Some(t) = p.task_mut(&old) {
+        (t.status, t.finished) = (Status::Review, store::now() - 5000);
+    }
+    k.render(&mut p, 150, 44);
+    p.col = 2;
+    k.key(&mut p, KeyCode::Char('j'));
+    assert_eq!(p.selected().as_deref(), Some(old.as_str()));
+    // a worker finishes: its card lands on top of REVIEW
+    let new = p.add_task("Fresh result", "y", 0, "");
+    if let Some(t) = p.task_mut(&new) {
+        (t.status, t.finished) = (Status::Review, store::now());
+    }
+    k.poll(&mut p);
+    assert_eq!(p.selected().as_deref(), Some(old.as_str()), "still on the card you picked");
+    // another task is discarded in the background
+    let blocked = id_of(&p, "ais pane: plan bars");
+    with_cx(&mut k, |cx| p.on_msg(Msg::Removed(blocked, Ok(()), Then::Discarded), cx));
+    k.poll(&mut p);
+    assert_eq!((p.col, p.selected()), (2, Some(old.clone())), "the cursor didn't jump to DONE");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Another app's /lead or /task opens this one and pastes right away (L or n, then the text): it lands in the lead's
+/// goal or the task's prompt, even on a fresh pane that doesn't know its repo yet. The form's after and budget
+/// fields and the comment box take a paste too.
+#[test]
+fn agents_paste_reaches_the_form_opened_for_it() {
+    let dir = scratch("paste");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let mut p = pane(&dir, &repo);
+    // L arrives before the repo is detected, the goal right after it
+    k.key(&mut p, KeyCode::Char('L'));
+    assert!(p.repo.is_none() && matches!(p.mode, Mode::Board), "still detecting the repo");
+    with_cx(&mut k, |cx| p.paste("Add dark mode\nto every pane", cx));
+    until(&mut k, &mut p, 5000, "repo", |p| p.repo.is_some());
+    match &p.mode {
+        Mode::LeadForm(f) => assert_eq!(f.goal.text, "Add dark mode\nto every pane"),
+        _ => panic!("the lead form should be open"),
+    }
+    k.key(&mut p, KeyCode::Esc);
+    // n, then a task description: the prompt, not the one-line title
+    k.key(&mut p, KeyCode::Char('n'));
+    let long = "Fix the login button on narrow windows: it stops responding once the sidebar is open";
+    with_cx(&mut k, |cx| p.paste(long, cx));
+    let Mode::Form(f) = &mut p.mode else { panic!("the task form should be open") };
+    assert_eq!((f.title.text.as_str(), f.prompt.text.as_str(), f.field), ("", long, 1));
+    // a short line on the title is a title; after and budget take theirs
+    f.field = 0;
+    f.prompt = Input::new("", true);
+    with_cx(&mut k, |cx| p.paste("Fix login", cx));
+    for (field, text) in [(5, "k3f9"), (6, " 1.5 ")] {
+        if let Mode::Form(f) = &mut p.mode {
+            f.field = field;
+        }
+        with_cx(&mut k, |cx| p.paste(text, cx));
+    }
+    let Mode::Form(f) = &p.mode else { panic!() };
+    assert_eq!((f.title.text.as_str(), f.prompt.text.as_str(), f.after.text.as_str(), f.budget.text.as_str()), ("Fix login", "", "k3f9", "1.5"));
+    // the comment box
+    p.mode = Mode::Comment("x".into(), Input::new("", true));
+    with_cx(&mut k, |cx| p.paste("use the default", cx));
+    assert!(matches!(&p.mode, Mode::Comment(_, i) if i.text == "use the default"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

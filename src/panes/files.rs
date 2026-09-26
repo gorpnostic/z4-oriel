@@ -1351,11 +1351,11 @@ pub(crate) mod tests {
         let idx = p.shown.iter().position(|&i| p.all[i].name == "src").unwrap() + 1;
         p.select(idx);
         k.key(&mut p, KeyCode::Enter);
-        k.wait_wake(&mut p, 300);
+        assert!(wait_for(&mut k, &mut p, |p| !p.loading), "src is listed");
         assert_eq!(p.dir, d.join("src"));
         assert!(k.render(&mut p, 150, 44).contains("(empty)"));
         k.key(&mut p, KeyCode::Backspace);
-        k.wait_wake(&mut p, 300);
+        assert!(wait_for(&mut k, &mut p, |p| !p.loading), "back up, listed");
         assert_eq!(p.dir, d);
         assert_eq!(p.sel_entry().map(|e| e.name.as_str()), Some("src"));
         // enter on a file focuses the preview; esc gives focus back
@@ -1419,6 +1419,20 @@ pub(crate) mod tests {
             Some(Body::Text { lines, .. }) => lines.iter().flat_map(|l| l.iter().map(|(_, s)| s.as_str())).collect(),
             _ => String::new(),
         }
+    }
+
+    /// Poll on each wake, as the app does, until `ok` holds (10 s at most). It returns as soon as it does, so a
+    /// busy machine makes the test slower, never wrong — a fixed wait would fail when the listing takes longer.
+    fn wait_for(k: &mut Kit, p: &mut Files, ok: impl Fn(&Files) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ok(p) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            k.wait_wake(p, 20);
+            k.poll(p);
+        }
+        true
     }
 
     #[test]

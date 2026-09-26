@@ -42,6 +42,8 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/provider", "<ai>", "switch AI: claude, codex, ollama, openai, anthropic — remembered"),
     ("/model", "<model>", "switch model for the current AI — remembered per AI"),
     ("/cwd", "<folder>", "folder Claude Code / Codex work in for this chat"),
+    ("/commit", "[message]", "commit everything in this chat's folder (git add -A), the chat's title as the message"),
+    ("/p", "<name>", "put a saved prompt in the box (ctrl+t in agents' forms saves them)"),
     ("/perms", "<ask|edits|auto|plan|bypass>", "what coding agents may do in this chat (shift+tab cycles) · /perms default <mode> for new chats"),
     ("/effort", "<low|medium|high|xhigh|max|ultracode>", "how hard coding agents think — remembered for every chat"),
     ("/key", "<openai|anthropic> <key>", "save an API key"),
@@ -321,6 +323,11 @@ impl Chat {
         }
     }
 
+    /// The chat's folder as chosen (/cwd, else where oriel was started), without workdir's fallback.
+    fn folder(&self) -> PathBuf {
+        self.chat.cwd.clone().map(PathBuf::from).unwrap_or_else(|| self.launch_dir.clone())
+    }
+
     /// Where CLI agents run: the chat's folder (/cwd), else the folder oriel was started in. Only if that folder
     /// no longer exists does it fall back to oriel's own work folder.
     fn workdir(&self) -> PathBuf {
@@ -371,6 +378,7 @@ impl Chat {
         self.cache.clear();
         self.scroll = 0;
         self.info.clear();
+        crate::panes::agents::note_chat_dir(&self.folder());
     }
 
     /// Save only if it differs from the saved copy — just looking at a chat mustn't bump it to the top.
@@ -544,6 +552,7 @@ impl Chat {
             }
         }
         self.chat.messages.push(store::Msg { role: "user".into(), content: text, ..Default::default() });
+        crate::panes::agents::note_chat_dir(&self.folder());
         self.start_reply(cx);
     }
 
@@ -606,8 +615,39 @@ impl Chat {
         let cmd = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim().to_string();
         self.info.clear();
+        // agents follows the chat you're in (its /lead and /task run on this folder's repo)
+        crate::panes::agents::note_chat_dir(&self.folder());
         match cmd {
             "/new" => self.new_chat(),
+            "/commit" => {
+                let dir = self.workdir();
+                let msg = if arg.is_empty() { self.chat.title.clone() } else { arg.clone() };
+                let msg = if msg.trim().is_empty() || msg == "New chat" { "work in progress".to_string() } else { msg };
+                match crate::panes::agents::commit_all(&dir, &msg) {
+                    Ok(s) => cx.notify(format!("{s} · \"{msg}\"")),
+                    Err(e) => self.info.push(format!("couldn't commit in {}: {e}", dir.display())),
+                }
+            }
+            "/p" => {
+                let all = crate::panes::agents::prompts::load();
+                match crate::panes::agents::prompts::find(&all, &arg) {
+                    Some(p) => {
+                        self.input = p.text.clone();
+                        self.cursor = self.input.chars().count();
+                    }
+                    None => {
+                        let path = crate::panes::agents::prompts::path();
+                        if all.is_empty() {
+                            self.info.push(format!("no saved prompts yet: ctrl+t in an agents goal or prompt saves one, or add [[prompt]] name/text to {}", path.display()));
+                        } else {
+                            self.info.push(if arg.is_empty() { "saved prompts (/p <name>):".to_string() } else { format!("no saved prompt called {arg}:") });
+                            for p in &all {
+                                self.info.push(format!("  /p {:<16} {}", p.name, ui::fit(&p.text.replace('\n', " "), 60)));
+                            }
+                        }
+                    }
+                }
+            }
             "/retry" => self.retry(cx),
             // /model <name>: a model for the current AI; the old "/model <ai> [model]" still works
             "/model" if !arg.is_empty() && !providers::PROVIDERS.iter().any(|p| p.0 == arg.split_whitespace().next().unwrap_or("").to_lowercase()) => {
@@ -675,7 +715,8 @@ impl Chat {
                 if p.is_dir() {
                     self.chat.cwd = Some(p.to_string_lossy().to_string());
                     self.chat.state.clear(); // CLI sessions are per folder
-                    cx.notify(format!("agents work in {}", p.display()));
+                    crate::panes::agents::note_chat_dir(&p);
+                    cx.notify(format!("this chat's agent works in {}", p.display()));
                 } else {
                     self.info.push(format!("not a folder: {arg}"));
                 }
@@ -875,6 +916,7 @@ impl Chat {
             "/model" => self.models_for(&self.provider_of()),
             "/perms" => PERMS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
             "/effort" => EFFORTS.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect(),
+            "/p" => crate::panes::agents::prompts::load().into_iter().map(|p| (p.name, ui::fit(&p.text.replace('\n', " "), 60))).collect(),
             "/key" => pairs(&[("openai", "OpenAI-compatible key"), ("anthropic", "Anthropic API key")]),
             "/settings" => crate::panes::settings::topics(),
             "/theme" => {
@@ -2819,6 +2861,61 @@ mod tests {
         assert!(c.stream.is_none() && c.busy() == 0);
         assert!(serde_json::to_string(c.chat.messages.last().unwrap()).unwrap().contains("half an answer"));
         assert!(!c.wind_down(), "nothing left running");
+    }
+
+    /// /commit commits the chat's folder (the title as the message by default), /p puts a saved prompt in the box,
+    /// and /cwd says it's this chat's agent that moves (not the agents app).
+    #[test]
+    fn chat_commit_prompts_and_cwd() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("test-scratch").join(format!("chat-commit-{}", std::process::id()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "oriel test"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        c.chat.cwd = Some(repo.display().to_string());
+        c.chat.title = "add the a file".into();
+        k.typ(&mut c, "/commit");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(git(&["log", "-1", "--format=%s"]), "add the a file", "the chat's title");
+        assert!(k.notices().iter().any(|n| n.contains("committed 1 file")), "{:?}", k.notices());
+        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+        k.typ(&mut c, "/commit b too");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(git(&["log", "-1", "--format=%s"]), "b too");
+        k.typ(&mut c, "/commit");
+        k.key(&mut c, KeyCode::Enter);
+        assert!(c.info.iter().any(|l| l.contains("nothing to commit")), "{:?}", c.info);
+        // /p <name>
+        let file = base.join("prompts.toml");
+        crate::panes::agents::prompts::save_to(&file, &[crate::panes::agents::prompts::Prompt { name: "careful".into(), text: "keep changes small".into() }]).unwrap();
+        crate::panes::agents::prompts::TEST_PATH.with(|t| *t.borrow_mut() = Some(file.clone()));
+        c.input = "/p ".into();
+        c.cursor = 3;
+        assert!(k.render(&mut c, 130, 40).contains("careful"), "the / menu lists them");
+        c.input.clear();
+        c.cursor = 0;
+        k.typ(&mut c, "/p careful");
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.input, "keep changes small", "in the box, not sent");
+        assert!(c.chat.messages.is_empty());
+        crate::panes::agents::prompts::TEST_PATH.with(|t| *t.borrow_mut() = None);
+        // /cwd
+        c.input.clear();
+        c.cursor = 0;
+        k.typ(&mut c, &format!("/cwd {}", base.display()));
+        k.key(&mut c, KeyCode::Enter);
+        assert!(k.notices().last().is_some_and(|n| n.starts_with("this chat's agent works in")), "{:?}", k.notices());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

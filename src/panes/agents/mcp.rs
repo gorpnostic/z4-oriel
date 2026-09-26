@@ -23,6 +23,7 @@ pub const TOOLS: &[(&str, &str, &str)] = &[
     ("merge", "Queue a finished task for merging into the integration branch. Merges run one at a time: conflict check, then the gate (build/tests + the task's acceptance command) on the merged result, then the branch moves. A conflict or failed gate goes back to the same worker automatically (2 tries, then a fresh worker) and merges when fixed. If the acceptance command itself was wrong (event acceptance_broken), merge again with a corrected one (or \"\" for none). Watch wait for the outcome.", r#"{"type":"object","properties":{"id":{"type":"string"},"acceptance":{"type":"string","description":"replace the task's acceptance command first"}},"required":["id"]}"#),
     ("send_followup", "Send a finished task's worker more instructions in the same session (review feedback); it goes back to running.", r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"}},"required":["id","text"]}"#),
     ("resolve_conflicts", "Merge the current integration branch into a task's worktree now and have its worker resolve the conflict markers (merge does this by itself on a conflict).", r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
+    ("review", "A second opinion on a finished task's diff from another vendor's AI (read-only, up to $1 of the run's budget): its blocking and optional findings with path:line. Worth it for big or risky diffs (over 150 lines, hotspot files, size M, concurrency or security); send the blocking ones back with send_followup before you merge.", r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
     ("spawn_task", "Add one task outside a plan (same checks as plan).", r#"{"type":"object","properties":{"worker":{"type":"string"},"title":{"type":"string"},"goal":{"type":"string"},"owns":{"type":"array","items":{"type":"string"}},"depends_on":{"type":"array","items":{"type":"string"}},"acceptance":{"type":"string"},"size":{"type":"string","enum":["S","M"]},"priority":{"type":"string","enum":["low","normal","high","urgent"]}},"required":["worker","title","goal","owns"]}"#),
     ("discard", "Throw a task away: stops its worker and deletes its worktree and branch.", r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
     ("note", "Post a short progress note on oriel's board. Set needs_user to notify the user (e.g. a task is blocked and needs a decision).", r#"{"type":"object","properties":{"text":{"type":"string"},"needs_user":{"type":"boolean"}},"required":["text"]}"#),
@@ -243,6 +244,10 @@ pub struct Brief<'a> {
     pub roster: &'a str,
     /// The shell acceptance commands and the gate run in ("bash", "PowerShell", "cmd", "sh").
     pub shell: &'a str,
+    /// The run's merge gate ("" = none: only acceptance commands check a merge).
+    pub gate: &'a str,
+    /// The user approves each plan before anything starts (plan_approved / plan_rejected come through wait).
+    pub approve: bool,
 }
 
 /// oriel's instructions for the lead (Claude gets them as an appended system prompt, the others at the top of
@@ -256,7 +261,7 @@ pub fn lead_system(b: &Brief, mcp: bool) -> String {
          HOW TO WORK\n\
          1. roster first. Then ONE plan with small tasks (S about 100 lines / 3 files, M about 400 / 8), each owning disjoint globs, each with an acceptance command when there's a way to check it. Hotspot files (Cargo.toml, package.json, lockfiles, mod.rs/lib.rs/index.ts registries, migrations) go to one scaffold task the others depend on. Two tasks or fewer run one after the other: for a small goal use a single task.\n\
          2. Write each goal so a worker with no other context can do it: what, where, how to verify. Never paste transcripts.\n\
-         3. wait for events. For each finished card: merge it if the summary and files look right, send_followup with precise fixes, or discard it. Use task_diff only when the card isn't enough.\n\
+         3. wait for events. For each finished card: merge it if the summary and files look right, send_followup with precise fixes, or discard it. Use task_diff only when the card isn't enough. For a big or risky diff (over 150 lines, hotspot files, size M), call review first and send its blocking findings back with send_followup.\n\
          4. If a task comes back blocked, answer its questions with send_followup, re-plan it, or post a note with needs_user.\n\
          5. When everything useful is merged, call done with a short summary.\n\n\
          ROUTING\n\
@@ -266,7 +271,7 @@ pub fn lead_system(b: &Brief, mcp: bool) -> String {
          - Spread concurrent tasks across vendors (separate usage limits). Skip a worker at 5h >= 85% or weekly >= 90%; below 25% weekly left, give it only S tasks.\n\n",
     );
     s.push_str(&format!(
-        "THIS RUN\n- Integration branch: {} (made from the user's {}).\n- At most {} workers at once; the rest queue.\n- Budget for the whole run (you + workers): ${:.2}. New work is refused once it's spent.\n- Acceptance commands and the gate run in {} from the repo root: write them for {}{}.\n- Workers:\n{}\n",
+        "THIS RUN\n- Integration branch: {} (made from the user's {}).\n- At most {} workers at once; the rest queue.\n- Budget for the whole run (you + workers): ${:.2}. New work is refused once it's spent.\n- Acceptance commands and the gate run in {} from the repo root: write them for {}{}.\n{}- Workers:\n{}\n",
         b.integration,
         b.base,
         b.max_parallel.clamp(1, 5),
@@ -278,10 +283,17 @@ pub fn lead_system(b: &Brief, mcp: bool) -> String {
             "PowerShell" => " (e.g. `if (-not (Select-String -Quiet Usage notes.md)) { exit 1 }`)",
             _ => " (e.g. `findstr /c:Usage notes.md`)",
         },
+        match b.gate.trim() {
+            "" => "- This repo has no build/test gate: a merge is checked only for conflicts and by the task's acceptance command, so give every task one.\n".to_string(),
+            g => format!("- The merge gate is `{g}`: it runs on every merged result, before the task's acceptance command.\n"),
+        },
         b.roster
     ));
+    if b.approve {
+        s.push_str("- The user approves every plan before anything starts: after plan (or spawn_task) nothing runs until they do. Call wait: you get plan_approved (the tasks as they finally are, with ids: they may drop or edit some) or plan_rejected (their note: submit a new plan that takes it into account).\n");
+    }
     if mcp {
-        s.push_str("\nYour tools are oriel's MCP tools (mcp__oriel__*): roster, plan, wait, task_status, task_diff, merge, send_followup, resolve_conflicts, spawn_task, discard, note, done.\n");
+        s.push_str("\nYour tools are oriel's MCP tools (mcp__oriel__*): roster, plan, wait, task_status, task_diff, merge, send_followup, resolve_conflicts, review, spawn_task, discard, note, done.\n");
     } else {
         s.push_str(&text_protocol());
     }
@@ -399,12 +411,16 @@ mod tests {
         assert_eq!(a[1], ("wait".to_string(), json!({})));
         assert_eq!(parse_actions("{\"actions\":[{\"tool\":\"done\",\"args\":{\"summary\":\"ok\"}}]}").unwrap()[0].0, "done");
         assert!(parse_actions("no json here").is_none());
-        let sys = lead_system(&Brief { integration: "oriel/lead-x", base: "master", max_parallel: 3, budget: 5.0, roster: "- codex", shell: "bash" }, false);
+        let sys = lead_system(&Brief { integration: "oriel/lead-x", base: "master", max_parallel: 3, budget: 5.0, roster: "- codex", shell: "bash", gate: "", approve: false }, false);
         assert!(sys.contains("END EVERY REPLY") && sys.contains("resolve_conflicts") && sys.contains("oriel/lead-x"));
-        let a = lead_system(&Brief { integration: "i", base: "b", max_parallel: 3, budget: 5.0, roster: "", shell: "bash" }, true);
+        assert!(sys.contains("no build/test gate") && sys.contains("give every task one"), "a run without a gate says so");
+        assert!(!sys.contains("plan_approved"));
+        let a = lead_system(&Brief { integration: "i", base: "b", max_parallel: 3, budget: 5.0, roster: "", shell: "bash", gate: "cargo check", approve: true }, true);
         assert!(a.contains("mcp__oriel__") && a.contains("ROUTING"));
+        assert!(a.contains("The merge gate is `cargo check`"));
+        assert!(a.contains("The user approves every plan") && a.contains("plan_rejected"), "a run you approve plans in says so");
         // byte-stable: the shared part comes first and doesn't depend on the run
-        let b = lead_system(&Brief { integration: "j", base: "c", max_parallel: 2, budget: 1.0, roster: "- kimi", shell: "bash" }, true);
+        let b = lead_system(&Brief { integration: "j", base: "c", max_parallel: 2, budget: 1.0, roster: "- kimi", shell: "bash", gate: "", approve: false }, true);
         let cut = a.find("THIS RUN").unwrap();
         assert_eq!(a[..cut], b[..cut]);
     }
@@ -412,13 +428,31 @@ mod tests {
     /// A slow call (wait) sends progress notifications when the client asked for them.
     #[test]
     fn agents_mcp_progress_while_waiting() {
+        /// What the server writes, readable while it's still serving.
+        #[derive(Clone, Default)]
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
         let rpc = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "wait", "arguments": {}, "_meta": {"progressToken": "p1"}}}).to_string();
-        let mut out = vec![];
-        serve_with(rpc.as_bytes(), &mut out, |_, _| {
-            std::thread::sleep(Duration::from_millis(250));
+        let out = Shared::default();
+        let seen = out.clone();
+        // the call lasts until two ticks are out (not a fixed time a busy machine might not give the ticker)
+        serve_with(rpc.as_bytes(), out.clone(), move |_, _| {
+            let t0 = std::time::Instant::now();
+            while String::from_utf8_lossy(&seen.0.lock().unwrap()).matches("notifications/progress").count() < 2 && t0.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             Ok("{\"events\":[]}".into())
         }, Duration::from_millis(60));
-        let lines: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         let progress = lines.iter().filter(|l| l["method"] == "notifications/progress").count();
         assert!(progress >= 2, "{lines:?}");
         assert_eq!(lines.last().unwrap()["id"], 7, "the answer comes last");

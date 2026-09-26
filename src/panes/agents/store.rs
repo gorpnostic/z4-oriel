@@ -56,6 +56,8 @@ pub struct Task {
     pub session_id: String,
     pub transcript_path: String,
     pub cost_usd: f64,
+    /// What earlier attempts cost before a retry started it over (today's total still counts it).
+    pub spent_before: f64,
     pub tokens: u64,
     pub added: u64,
     pub removed: u64,
@@ -79,6 +81,8 @@ pub struct Task {
     pub tier: String,
     /// Waiting in TODO for a free worker slot (lead runs start these by themselves).
     pub queued: bool,
+    /// Paused by a rate limit mid-task: once its vendor unpauses it carries on in the same worktree and session.
+    pub resume_after_limit: bool,
     /// Caps from the roster: claude --max-turns / --max-budget-usd (others are stopped past the budget).
     pub max_turns: u32,
     pub budget_usd: f64,
@@ -116,6 +120,8 @@ pub struct Task {
     pub want_merge: bool,
     /// Notes carried into a fresh re-dispatch (what went wrong before).
     pub history: Vec<String>,
+    /// Its checkout's own ORIEL_PORT (0 = none yet): the setup, the worker and `T` get it (project.rs).
+    pub port: u16,
 }
 
 /// How a roster worker has done so far (shown to the lead in roster()).
@@ -224,6 +230,21 @@ pub struct Run {
     pub manual: bool,
     pub serial: bool,
     pub batch: Vec<String>,
+    /// The lead is done but some of its work isn't: the run carries on without it (like a run of yours) and goes
+    /// to review once nothing is left.
+    pub finishing: bool,
+    /// The merge gate chosen when it started ("" = none). None = a run from before the form had a gate row: the
+    /// config's `[lead] gate`, else what's detected in the gate checkout.
+    pub gate: Option<String>,
+    /// The ORIEL_PORT `T` gives the lead's checkout (0 = none yet).
+    pub port: u16,
+    /// You approve the lead's plan before any worker starts: a plan it submits waits in `held` (checked by
+    /// plan.rs) until you do (plan_view.rs). `dropped` and `edited` are the keys you took out or changed.
+    pub approve: bool,
+    pub held: Vec<super::plan::Item>,
+    pub held_notes: Vec<String>,
+    pub dropped: Vec<String>,
+    pub edited: Vec<String>,
 }
 
 impl Run {
@@ -248,6 +269,12 @@ pub struct Store {
     pub runs: Vec<Run>,
     /// Per roster worker name.
     pub records: std::collections::BTreeMap<String, Record>,
+    /// Per repo: the merge gate you typed in a run's form ("" = none), when it isn't the default.
+    pub gates: std::collections::BTreeMap<String, String>,
+    /// Per repo: what `T` starts in the checkout it opens ("pnpm dev"), "" = just a shell.
+    pub try_cmds: std::collections::BTreeMap<String, String>,
+    /// The lead form's "approve the plan first", as you left it.
+    pub approve_plan: bool,
 }
 
 /// Where the orchestrator keeps things. `agents` = tasks.json + status/, `wt` = the worktrees.

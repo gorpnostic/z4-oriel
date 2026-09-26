@@ -100,6 +100,7 @@ impl Agents {
         }
         match self.mode {
             Mode::Diff(_) => self.draw_diff(f, area, cx),
+            Mode::PlanReview(_) => self.draw_plan_review(f, area, cx),
             Mode::Watch(_) => self.draw_watch(f, area, cx),
             Mode::Log(_) => self.draw_log(f, area, cx),
             _ => {
@@ -126,16 +127,130 @@ impl Agents {
             Mode::Repo(_) => self.draw_picker(f, area, cx),
             Mode::LeadForm(_) => self.draw_lead_form(f, area, cx),
             Mode::Roster(_) => self.draw_roster(f, area, cx),
-            Mode::Batch => self.draw_batch(f, area, cx),
+            Mode::Batch(_) => self.draw_batch(f, area, cx),
+            Mode::Dirty(_) => self.draw_dirty(f, area, cx),
+            Mode::Try(_) => self.draw_try(f, area, cx),
+            Mode::SaveTemplate(_) => self.draw_save_template(f, area, cx),
+            Mode::Templates(_) => self.draw_templates(f, area, cx),
             _ => {}
         }
+        if self.prompt_pick.is_some() {
+            self.draw_prompt_pick(f, area, cx);
+        }
+    }
+
+    /// Uncommitted changes in your checkout: commit them, take them along, or go without.
+    fn draw_dirty(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
+        let t = cx.theme;
+        let Mode::Dirty(d) = &self.mode else { return };
+        let repo = self.repo.as_ref().map(|r| r.name.clone()).unwrap_or_else(|| "the repo".into());
+        let files = super::git::porcelain_files(&d.status);
+        let shown: Vec<String> = files.iter().take(4).cloned().collect();
+        let more = if files.len() > 4 { format!(" and {} more", files.len() - 4) } else { String::new() };
+        let what_files = if files.is_empty() { String::new() } else { format!("{}{more}", shown.join(", ")) };
+        let key = |k: &str, c: Color| Span::styled(format!(" {k} "), Style::default().fg(Color::Black).bg(c).add_modifier(Modifier::BOLD));
+        let (title, body, keys): (&str, Vec<String>, Vec<Line>) = match &d.then {
+            super::DirtyThen::Merge(_) | super::DirtyThen::MergeRun(_) => (
+                "uncommitted changes",
+                vec![format!("{repo} has changes that aren't committed, so nothing was merged."), "Commit them (git add -A) and the merge goes ahead right after.".into()],
+                vec![Line::from(vec![key("c", t.accent), Span::styled("  commit your changes and merge", Style::default().fg(t.fg))])],
+            ),
+            then => {
+                let what = match then {
+                    super::DirtyThen::Task(id) => format!("\"{}\"", self.task(id).map(|x| x.title.clone()).unwrap_or_default()),
+                    _ => "the run".into(),
+                };
+                (
+                    "uncommitted changes",
+                    vec![
+                        format!("{} file{} in {repo} {} committed{}", files.len(), if files.len() == 1 { "" } else { "s" }, if files.len() == 1 { "isn't" } else { "aren't" }, if what_files.is_empty() { String::new() } else { format!(": {what_files}") }),
+                        "A chat's edits? A new branch starts from your last commit, so".to_string(),
+                        format!("{what} wouldn't see them."),
+                    ],
+                    vec![
+                        Line::from(vec![key("c", t.accent), Span::styled("  commit them first (git add -A), then start", Style::default().fg(t.fg))]),
+                        Line::from(vec![key("i", t.shine), Span::styled("  take them along: start from a snapshot (your checkout isn't touched)", Style::default().fg(t.fg))]),
+                        Line::from(vec![key("enter", t.frame), Span::styled("  start without them", Style::default().fg(t.fg))]),
+                    ],
+                )
+            }
+        };
+        let h = (body.len() + keys.len()) as u16 + 7;
+        let inner = ui::popup(f, area, 80, h, title, t);
+        let inner = Rect { x: inner.x + 2, width: inner.width.saturating_sub(4), y: inner.y + 1, height: inner.height.saturating_sub(1) };
+        let mut lines: Vec<Line> = body.iter().enumerate().map(|(i, s)| Line::styled(ui::fit(s, inner.width as usize), if i == 0 { bold(t.fg) } else { ui::muted(t) })).collect();
+        lines.push(Line::raw(""));
+        lines.extend(keys);
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![Span::styled("esc", bold(t.fg)), Span::styled(" cancel", ui::muted(t))]));
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// T: which checkout, and what to start in it.
+    fn draw_try(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
+        let t = cx.theme;
+        let Mode::Try(v) = &self.mode else { return };
+        let setup = !v.setup.trim().is_empty();
+        let inner = ui::popup(f, area, 80, if setup { 12 } else { 11 }, &format!("{}try it", ui::lead("term")), t);
+        let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+        let w = inner.width as usize;
+        // (the port first: a long path gets cut)
+        let port = if v.port > 0 { format!("ORIEL_PORT {} · ", v.port) } else { String::new() };
+        let mut head = vec![Line::styled(ui::fit(&v.title, w), bold(t.fg)), Line::styled(ui::fit(&format!("{port}a terminal in {}", v.dir.display()), w), ui::muted(t))];
+        if setup {
+            head.push(Line::styled(ui::fit(&format!("runs the repo's setup first: {}", v.setup.trim()), w), Style::default().fg(t.shine)));
+        }
+        let hh = head.len() as u16;
+        f.render_widget(Paragraph::new(head), Rect { height: hh, ..inner });
+        let r = Rect { y: inner.y + hh + 1, height: 3, ..inner };
+        let ri = ui::frame(f, r, "run there (remembered for this repo · $ORIEL_PORT is its port)", None, true, t);
+        draw_input(f, ri, &v.input, "nothing — just a shell · or e.g. pnpm dev --port $ORIEL_PORT (.oriel/project.toml `run`)", true, t);
+        let hr = Rect { y: inner.bottom().saturating_sub(1), height: 1, ..inner };
+        f.render_widget(Paragraph::new(Line::from(vec![Span::styled("enter", bold(t.fg)), Span::styled(" open", ui::muted(t)), Span::styled(" · ", ui::muted(t)), Span::styled("esc", bold(t.fg)), Span::styled(" cancel", ui::muted(t))])).centered(), hr);
+    }
+
+    /// ctrl+t: your saved prompts.
+    fn draw_prompt_pick(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
+        let t = cx.theme;
+        let Some(p) = &self.prompt_pick else { return };
+        let rows = p.rows();
+        let h = (rows.len() as u16 + 9).clamp(11, 24);
+        let inner = ui::popup(f, area, 76, h, &format!("{}saved prompts", ui::lead("new")), t);
+        let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+        let w = inner.width as usize;
+        let r = Rect { height: 3, ..inner };
+        let ri = ui::frame(f, r, "", None, true, t);
+        draw_input(f, ri, &p.filter, "type to filter · or a name to save the field under", true, t);
+        let mut y = inner.y + 4;
+        if p.items.is_empty() {
+            f.render_widget(Paragraph::new(Span::styled(ui::fit(&format!("none yet — they live in {}", super::prompts::path().display()), w), ui::muted(t))), Rect { y, height: 1, ..inner });
+            y += 2;
+        }
+        let room = inner.bottom().saturating_sub(1).saturating_sub(y) as usize;
+        let start = p.sel.saturating_sub(room.saturating_sub(1));
+        for (i, row) in rows.iter().enumerate().skip(start).take(room) {
+            let on = i == p.sel;
+            let bg = if on { Style::default().bg(tint(t.accent, 0.18)) } else { Style::default() };
+            let line = match row {
+                super::PickRow::Prompt(k) => {
+                    let pr = &p.items[*k];
+                    spread(vec![Span::styled(format!("{} {}", if on { "›" } else { " " }, pr.name), if on { bold(t.accent) } else { bold(t.fg) }), Span::styled(format!("  {}", pr.text.replace('\n', " ")), ui::muted(t))], vec![], w)
+                }
+                super::PickRow::Save(name) => spread(vec![Span::styled(format!("{} + save what's in the field as \"{name}\"", if on { "›" } else { " " }), if on { bold(t.shine) } else { Style::default().fg(t.shine) })], vec![], w),
+            };
+            f.render_widget(Paragraph::new(line.style(bg)), Rect { y, height: 1, ..inner });
+            y += 1;
+        }
+        let hr = Rect { y: inner.bottom().saturating_sub(1), height: 1, ..inner };
+        f.render_widget(Paragraph::new(Span::styled("enter insert · ↑↓ choose · del delete · esc close · chat: /p <name>", ui::muted(t))).centered(), hr);
     }
 
     /// Run the marked tasks together: which, how, and where their work ends up.
     fn draw_batch(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
         let n = self.marked.len();
-        let inner = ui::popup(f, area, 76, (n as u16 + 12).min(26), &format!("{}run {n} task{} together", ui::lead("robot"), if n == 1 { "" } else { "s" }), t);
+        let Mode::Batch(v) = &self.mode else { return };
+        let inner = ui::popup(f, area, 80, (n as u16 + 16).min(30), &format!("{}run {n} task{} together", ui::lead("robot"), if n == 1 { "" } else { "s" }), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let mut lines = vec![];
         for (i, id) in self.marked.iter().enumerate() {
@@ -156,22 +271,36 @@ impl Agents {
         lines.push(Line::raw(""));
         let par = self.lead_cfg.max_parallel.clamp(1, 5);
         lines.push(Line::from(vec![Span::styled(" p ", Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD)), Span::styled(format!("  all at once: up to {par} at a time, highest priority first"), Style::default().fg(t.fg))]));
-        lines.push(Line::from(vec![Span::styled(" s ", Style::default().fg(Color::Black).bg(t.shine).add_modifier(Modifier::BOLD)), Span::styled("  one after another, in the order you marked them", Style::default().fg(t.fg))]));
+        lines.push(Line::from(vec![Span::styled(" s ", Style::default().fg(Color::Black).bg(t.shine).add_modifier(Modifier::BOLD)), Span::styled("  one after another, in the order you marked them (after-links first)", Style::default().fg(t.fg))]));
         lines.push(Line::raw(""));
+        let top = (inner.y + lines.len() as u16).min(inner.bottom());
+        f.render_widget(Paragraph::new(lines), Rect { height: top - inner.y, ..inner });
+        // the gate row: what every merged result must pass (g edits it)
+        let (prefill, why) = self.gate_prefill();
+        let gate_r = Rect { y: top, height: 3.min(inner.bottom().saturating_sub(top)), ..inner };
+        let note = (!v.gate.text.is_empty() && v.gate.text == prefill).then_some(why.as_str());
+        let ri = ui::frame(f, gate_r, if v.editing { "gate · enter done" } else { "gate · g edits" }, note, v.editing, t);
+        let ph = if prefill.is_empty() { why.clone() } else { "none — merges get only a conflict check".to_string() };
+        draw_input(f, ri, &v.gate, &ph, v.editing, t);
+        // what happens, with what actually runs
         let budget = self.lead_cfg.run_budget_usd;
-        for l in [
-            "Each runs in its own worktree with its own AI and model. Finished work".to_string(),
-            "is merged one at a time into a new branch: a conflict check and your".to_string(),
-            format!("build/tests first (a failure goes back to it, then one fresh try)."),
+        let gate = v.gate.text.trim();
+        let w = inner.width as usize;
+        let mut tail: Vec<Line> = [
+            "Each runs in its own worktree with its own AI and model. Finished work is".to_string(),
+            if gate.is_empty() { "merged one at a time into a new branch after a conflict check only:".to_string() } else { "merged one at a time into a new branch after a conflict check and".to_string() },
+            if gate.is_empty() { "no gate, so nothing builds or tests it (g sets one).".to_string() } else { format!("`{}` on the merged result (a failure goes back to it).", ui::fit(gate, w.saturating_sub(40))) },
             format!("Budget ${budget:.2} for the run. When they're all in: d reviews, m merges."),
-        ] {
-            lines.push(Line::from(Span::styled(l, ui::muted(t))));
-        }
-        lines.push(Line::from(Span::styled("esc cancels", ui::muted(t))));
-        f.render_widget(Paragraph::new(lines), inner);
+        ]
+        .into_iter()
+        .map(|l| Line::from(Span::styled(ui::fit(&l, w), ui::muted(t))))
+        .collect();
+        tail.push(Line::from(Span::styled("esc cancels", ui::muted(t))));
+        let ty = (top + 4).min(inner.bottom());
+        f.render_widget(Paragraph::new(tail), Rect { y: ty, height: inner.bottom() - ty, ..inner });
     }
 
-    fn board_hints(&self) -> Vec<(&'static str, &'static str)> {
+    pub(super) fn board_hints(&self) -> Vec<(&'static str, &'static str)> {
         if self.repo.is_none() {
             return vec![("o", "open a repo")];
         }
@@ -180,14 +309,24 @@ impl Agents {
         }
         if self.lead_focus {
             if let Some(r) = self.current_run() {
-                let mut h = vec![("enter", "lead transcript"), ("w", "watch")];
+                if r.state == super::store::RunState::Stopped && r.branch.is_empty() {
+                    // it never started
+                    return vec![("r", "retry with the same goal"), ("x", "discard"), ("↓", "cards")];
+                }
+                let mut h = if r.held.is_empty() { vec![("enter", "lead transcript"), ("w", "watch")] } else { vec![("enter", "review the lead's plan"), ("w", "watch")] };
                 if r.state.active() {
                     h.extend([("s", "stop run"), ("d", "diff so far")]);
                 } else {
-                    h.extend([("d", "review"), ("m", "merge into your branch"), ("x", "discard run")]);
                     if r.state == super::store::RunState::Stopped {
                         h.push(("r", "resume"));
                     }
+                    if self.feedback_block(r).is_none() {
+                        h.push(("c", "feedback to the lead"));
+                    }
+                    h.extend([("d", "review"), ("V", "second opinion"), ("T", "try it"), ("m", "merge into your branch"), ("x", "discard run")]);
+                }
+                if r.manual || !r.state.active() {
+                    h.push(("S", "save as template"));
                 }
                 h.extend([("↓", "cards"), ("R", "roster")]);
                 return h;
@@ -198,20 +337,25 @@ impl Agents {
         let headless = sel.as_ref().is_some_and(|t| t.headless());
         match sel.as_ref().map(|t| t.status) {
             Some(Status::Todo) if headless => h.extend([("enter", "transcript"), ("x", "discard")]),
-            Some(Status::Todo) => h.extend([("enter", "start"), ("e", "edit"), ("x", "delete")]),
+            Some(Status::Todo) => h.extend([("enter", "start"), ("space", "mark"), ("e", "edit"), ("x", "delete")]),
             Some(Status::Running | Status::Blocked) if headless => h.extend([("enter", "live transcript"), ("t", "take over"), ("d", "diff"), ("x", "discard")]),
             Some(Status::Running | Status::Blocked) => h.extend([("enter", "open agent"), ("d", "diff"), ("c", "comment"), ("m", "merge"), ("x", "discard")]),
-            Some(Status::Review) if headless => h.extend([("enter", "transcript"), ("d", "diff"), ("m", "merge"), ("c", "follow-up"), ("t", "take over"), ("x", "discard")]),
-            Some(Status::Review) => h.extend([("d", "diff"), ("m", "merge"), ("c", "comment"), ("x", "discard"), ("r", "retry")]),
+            Some(Status::Review) if headless => h.extend([("enter", "transcript"), ("d", "diff"), ("V", "second opinion"), ("T", "try it"), ("m", "merge"), ("c", "follow-up"), ("t", "take over"), ("x", "discard")]),
+            Some(Status::Review) => h.extend([("d", "diff"), ("V", "second opinion"), ("T", "try it"), ("m", "merge"), ("c", "comment"), ("x", "discard"), ("r", "retry")]),
             Some(Status::Done) if sel.as_ref().map(|t| t.outcome != "merged" && t.run.is_empty()).unwrap_or(false) => h.push(("r", "retry")),
             _ => {}
         }
+        if self.deleted.as_ref().is_some_and(|(_, at)| at.elapsed() < super::UNDO_FOR) {
+            h.insert(0, ("u", "undo delete"));
+        }
         if self.current_run().is_some() {
             h.push(("w", "watch run"));
-        } else if self.installed("claude").is_some() {
+        }
+        // planning only reads the repo: fine next to a run
+        if self.installed("claude").is_some() {
             h.push(("P", "plan"));
         }
-        h.extend([("R", "roster"), ("o", "repo"), ("←→↑↓", "move")]);
+        h.extend([("W", "templates"), ("R", "roster"), ("o", "repo"), ("←→↑↓", "move")]);
         h
     }
 
@@ -396,6 +540,7 @@ impl Agents {
             Status::Todo => Span::styled(format!("added {}", dur(now - task.created)), ui::muted(t)),
             Status::Running => Span::styled(dur(now - task.started), ui::accent(t)),
             Status::Blocked => Span::styled("BLOCKED", bold(t.danger)),
+            Status::Review if task.want_merge && !self.run_accepting(&task.run) => Span::styled("merge on hold", ui::muted(t)),
             Status::Review if task.want_merge => Span::styled("merging", bold(t.shine)),
             Status::Review => Span::styled(format!("took {}", dur(task.finished - task.started)), ui::muted(t)),
             Status::Done => Span::styled(format!("{} {}", task.outcome, crate::panes::files::clock::stamp(task.finished).get(0..6).unwrap_or("")), ui::muted(t)),
@@ -404,7 +549,7 @@ impl Agents {
         if task.followups > 0 {
             right.insert(0, Span::styled(format!("↻{} ", task.followups), ui::muted(t)));
         }
-        let who = if task.run.is_empty() {
+        let mut who = if task.run.is_empty() {
             vec![Span::styled(format!("{}{} · {model}", ui::lead(icon), task.agent), ui::muted(t))]
         } else {
             let tier_c = match task.tier.as_str() {
@@ -418,6 +563,10 @@ impl Agents {
             }
             v
         };
+        // its checkout's own port, in a repo whose project.toml sets checkouts up
+        if task.port > 0 && !task.worktree.is_empty() && task.status != Status::Done && self.projects.get(&task.repo).is_some_and(|p| p.is_set()) {
+            who.push(Span::styled(format!(" · :{}", task.port), Style::default().fg(t.accent)));
+        }
         lines.push(spread(who, right, w));
         // 3-4: what it's doing / asking / the error, and the numbers
         let stat_spans = |t: &Theme| -> Vec<Span<'static>> {
@@ -434,7 +583,8 @@ impl Agents {
             if m.is_empty() { vec![] } else { vec![Span::styled(m, bold(t.fg))] }
         };
         if !task.error.is_empty() {
-            let (a, b) = two_lines(&format!("✗ {}", task.error), w);
+            // (a setup's or gate's failure has several lines: they run on)
+            let (a, b) = two_lines(&format!("✗ {}", task.error.split('\n').map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" · ")), w);
             lines.push(Line::styled(a, Style::default().fg(t.danger)));
             lines.push(Line::styled(b, Style::default().fg(t.danger)));
         } else {
@@ -442,7 +592,11 @@ impl Agents {
                 Status::Todo if task.queued && !task.depends_on.is_empty() => {
                     let (a, _) = two_lines(&task.prompt.replace('\n', " "), w);
                     lines.push(Line::styled(a, ui::muted(t)));
-                    lines.push(Line::styled(ui::fit(&format!("after {}", task.depends_on.join(", ")), w), Style::default().fg(t.frame)));
+                    // waiting on something that won't merge by itself: say so, rather than wait forever
+                    match self.waiting_for(task).iter().find_map(|d| self.dead_dep(&task.run, d)) {
+                        Some((title, why)) => lines.push(Line::styled(ui::fit(&format!("stuck: {title} {why} · x drops it"), w), Style::default().fg(t.danger))),
+                        None => lines.push(Line::styled(ui::fit(&format!("after {}", task.depends_on.join(", ")), w), Style::default().fg(t.frame))),
+                    }
                 }
                 Status::Todo => {
                     let (a, b) = two_lines(&task.prompt.replace('\n', " "), w);
@@ -472,7 +626,9 @@ impl Agents {
                 Status::Review | Status::Done => {
                     let st = if task.status == Status::Review && !busy { Style::default().fg(t.shine) } else { ui::muted(t) };
                     let last = if task.status == Status::Review && !task.summary.is_empty() && !task.want_merge && !busy { task.summary.clone() } else { task.last.clone() };
-                    lines.push(Line::styled(ui::fit(&last, w), st));
+                    // where its review stands, at the end of the line (it wins over the summary)
+                    let chip = if task.status == Status::Review { self.review_chip(task, spin, t) } else { vec![] };
+                    lines.push(spread(vec![Span::styled(last, st)], chip, w));
                     lines.push(spread(stat_spans(t), cost(t), w));
                 }
             }
@@ -480,23 +636,81 @@ impl Agents {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// Where a finished card's review stands: a second opinion being written, comments waiting to go, or (a big
+    /// or hotspot diff, where research says another vendor's eyes pay off) a nudge to ask for one.
+    fn review_chip(&self, task: &Task, spin: &str, t: &Theme) -> Vec<Span<'static>> {
+        if let Some(by) = self.reviewing.get(&task.id) {
+            return vec![Span::styled(format!("{spin} {by}"), ui::accent(t))];
+        }
+        let notes = self.notes_of(&task.id);
+        if !notes.is_empty() {
+            let blocking = notes.iter().filter(|n| n.finding == Some(true)).count();
+            let on = notes.iter().filter(|n| n.on).count();
+            return vec![Span::styled(if blocking > 0 { format!("● {blocking} blocking") } else { format!("● {on} to send") }, bold(if blocking > 0 { t.danger } else { t.accent }))];
+        }
+        let hot = task.file_stats.iter().map(|f| f.0.as_str()).chain(task.touched.iter().map(String::as_str)).any(super::plan::is_hotspot);
+        if !task.worktree.is_empty() && (task.added + task.removed > 150 || hot || task.size == "M") {
+            return vec![Span::styled("V 2nd opinion?", Style::default().fg(t.muted))];
+        }
+        vec![]
+    }
+
     // ------------------------------------------------------------------ diff
 
     fn draw_diff(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
-        let Mode::Diff(v) = &mut self.mode else { return };
+        let Mode::Diff(v) = &self.mode else { return };
         let id = v.id.clone();
+        let typing = v.typing.is_some();
         // a lead run's review diff shows as a task: its goal, integration branch → the user's branch
         let task = self.store.tasks.iter().find(|x| x.id == id).cloned().or_else(|| {
             self.store.runs.iter().find(|r| r.id == id).map(|r| Task { id: r.id.clone(), title: format!("⚑ {}", r.goal.lines().next().unwrap_or("")), branch: r.branch.clone(), base_branch: r.base_branch.clone(), error: r.error.clone(), ..Default::default() })
         });
         let task = task.unwrap_or_default();
-        let hints = [("↑↓", "file"), ("pgup/pgdn", "scroll"), ("m", "merge"), ("c", "comment"), ("x", "discard"), ("R", "reload"), ("esc", "board")];
-        let body = ui::hint_line(f, area, &fit_hints(&hints, area.width as usize), t);
+        let is_run = self.run_ref(&id).is_some();
+        let block = self.comment_block(&id);
+        let notes: Vec<super::review::Note> = self.notes_of(&id).to_vec();
+        let ticked = notes.iter().filter(|n| n.on).count();
+        let reviewing = self.reviewing.get(&id).cloned();
+        // keys only where they work: c and enter when feedback can go (a run: its lead; a task: its session)
+        let mut hints: Vec<(String, String)> = vec![];
+        let mut h = |k: &str, d: &str| hints.push((k.to_string(), d.to_string()));
+        if typing {
+            h("enter", "add the comment");
+            h("esc", "drop it");
+        } else {
+            h("↑↓", "line");
+            h("←→", "file");
+            if block.is_none() {
+                h("c", "comment on the line");
+                if ticked > 0 {
+                    h("enter", &format!("send {ticked}"));
+                }
+            }
+            if !notes.is_empty() {
+                h("space", "tick");
+                h("n", "next comment");
+            }
+            if reviewing.is_none() {
+                h("V", "second opinion");
+            }
+            if block.is_none() {
+                h("C", if is_run { "feedback to the lead" } else { "comment on it all" });
+            }
+            for (k, d) in [("m", "merge"), ("T", "try it"), ("x", "discard"), ("R", "reload"), ("esc", "board")] {
+                h(k, d);
+            }
+        }
+        let hint_refs: Vec<(&str, &str)> = hints.iter().map(|(k, d)| (k.as_str(), d.as_str())).collect();
+        let body = ui::hint_line(f, area, &fit_hints(&hint_refs, area.width as usize), t);
         let body = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };
+        let Mode::Diff(v) = &mut self.mode else { return };
         // header: title, branch → target, totals, merge check
         let mut right: Vec<Span> = vec![];
         let mut left = vec![Span::styled("◆ ", bold(t.shine)), Span::styled(task.title.clone(), bold(t.fg)), Span::styled(format!("   {} → {}", task.branch, task.base_branch), ui::muted(t))];
+        if let Some(by) = &reviewing {
+            right.push(Span::styled(format!("{} {by} is reviewing…   ", SPIN[(cx.time * 10.0) as usize % 10]), ui::accent(t)));
+        }
         match &v.data {
             None => right.push(Span::styled(format!("{} reading diff", SPIN[(cx.time * 10.0) as usize % 10]), ui::muted(t))),
             Some(Err(e)) => right.push(Span::styled(e.clone(), Style::default().fg(t.danger))),
@@ -513,7 +727,7 @@ impl Agents {
             }
         }
         if !task.error.is_empty() {
-            left.push(Span::styled(format!("   ✗ {}", task.error), Style::default().fg(t.danger)));
+            left.push(Span::styled(format!("   ✗ {}", task.error.lines().next().unwrap_or("")), Style::default().fg(t.danger)));
         }
         f.render_widget(Paragraph::new(spread(left, right, body.width as usize)), Rect { height: 1, ..body });
         let main = Rect { y: body.y + 2, height: body.height.saturating_sub(2), ..body };
@@ -528,8 +742,10 @@ impl Agents {
         let lw = (main.width / 3).clamp(24, 44).min(main.width.saturating_sub(20));
         let lr = Rect { width: lw, ..main };
         let rr = Rect { x: main.x + lw + 1, width: main.width.saturating_sub(lw + 1), ..main };
-        // file list
-        let li = ui::frame(f, lr, &format!("{}files", ui::lead("files")), Some(&format!("{}/{}", v.file + 1, d.files.len())), false, t);
+        // the left column: the files, and under them your comments and the findings, when there are any
+        let nh = if notes.is_empty() { 0 } else { (notes.len() as u16 + 2).min(lr.height / 2).max(4.min(lr.height)) };
+        let fr = Rect { height: lr.height.saturating_sub(nh), ..lr };
+        let li = ui::frame(f, fr, &format!("{}files", ui::lead("files")), Some(&format!("{}/{}", v.file + 1, d.files.len())), false, t);
         let conflicted: Vec<&String> = d.conflicts.iter().flatten().collect();
         let h = li.height as usize;
         let start = v.file.saturating_sub(h.saturating_sub(1));
@@ -537,48 +753,104 @@ impl Agents {
             let y = li.y + row as u16;
             let r = Rect { y, height: 1, ..li };
             let on = i == v.file;
-            let nums = format!("+{} −{}", file.added, file.removed);
             let name = file.path.rsplit(['/', '\\']).next().unwrap_or(&file.path).to_string();
             let dir = file.path.strip_suffix(&name).unwrap_or("").to_string();
-            let mark = if conflicted.iter().any(|c| **c == file.path) { "✗ " } else if file.note == "new" { "+ " } else if file.note == "deleted" { "− " } else { "  " };
-            let mark_st = if mark == "✗ " { bold(t.danger) } else { Style::default().fg(t.good) };
+            let commented = notes.iter().any(|n| n.path == file.path);
+            let mark = if conflicted.iter().any(|c| **c == file.path) {
+                "✗ "
+            } else if commented {
+                "● "
+            } else if file.note == "new" {
+                "+ "
+            } else if file.note == "deleted" {
+                "− "
+            } else {
+                "  "
+            };
+            let mark_st = match mark {
+                "✗ " => bold(t.danger),
+                "● " => bold(t.accent),
+                _ => Style::default().fg(t.good),
+            };
             let mut line = spread(
                 vec![Span::styled(mark, mark_st), Span::styled(dir, ui::muted(t)), Span::styled(name, if on { bold(t.accent) } else { Style::default().fg(t.fg) })],
                 vec![Span::styled(format!("+{}", file.added), Style::default().fg(t.good)), Span::styled(format!(" −{}", file.removed), Style::default().fg(t.danger))],
                 r.width as usize,
             );
-            let _ = nums;
             if on {
                 line = line.style(Style::default().bg(tint(t.accent, 0.18)));
             }
             f.render_widget(Paragraph::new(line), r);
             self.hits.push((r, Hit::File(i)));
         }
-        // hunks
         let file = &d.files[v.file];
+        if nh > 0 {
+            let nr = Rect { y: fr.bottom(), height: nh, ..lr };
+            let sub = format!("{ticked} to send");
+            let ni = ui::frame(f, nr, "comments", Some(&sub), false, t);
+            let here: Vec<&super::review::Note> = file.lines.get(v.cursor).map(|l| notes.iter().filter(|n| n.at(&file.path, l)).collect()).unwrap_or_default();
+            let mut lines = vec![];
+            for n in notes.iter().take(ni.height as usize) {
+                let (tag, c) = note_style(n, t);
+                let at_cursor = here.contains(&n);
+                let st = if at_cursor { Style::default().bg(tint(t.accent, 0.18)) } else { Style::default() };
+                let text = format!("{}: {}", n.anchor().rsplit(['/', '\\']).next().unwrap_or(""), n.text);
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(if n.on { "● " } else { "○ " }, bold(c)),
+                        Span::styled(tag, Style::default().fg(c)),
+                        Span::styled(ui::fit(&text, (ni.width as usize).saturating_sub(2 + tag.width())), if n.on { Style::default().fg(t.fg) } else { ui::muted(t) }),
+                    ])
+                    .style(st),
+                );
+            }
+            f.render_widget(Paragraph::new(lines), ni);
+        }
+        // hunks, with the cursor's line lit and a mark by every line that has a comment
         let sub = if file.note.is_empty() { format!("+{} −{}", file.added, file.removed) } else { format!("{} · +{} −{}", file.note, file.added, file.removed) };
         let ri = ui::frame(f, rr, &format!("{}{}", ui::lead("code"), file.path), Some(&sub), true, t);
         self.hits.push((rr, Hit::DiffBody));
+        // typing a comment: its box sits at the bottom
+        let ri_lines = if typing && ri.height > 6 { Rect { height: ri.height - 3, ..ri } } else { ri };
         let gw = file.lines.iter().filter_map(|l| l.old.max(l.new)).max().unwrap_or(1).to_string().len().max(3);
-        let h = ri.height as usize;
+        let h = ri_lines.height as usize;
         let max_scroll = file.lines.len().saturating_sub(h);
+        // keep the cursor in view, with a little context around it
+        let margin = 2.min(h / 4);
+        if v.cursor < v.scroll + margin {
+            v.scroll = v.cursor.saturating_sub(margin);
+        } else if v.cursor + margin + 1 > v.scroll + h {
+            v.scroll = (v.cursor + margin + 1).saturating_sub(h);
+        }
         v.scroll = v.scroll.min(max_scroll);
-        let (add_bg, del_bg) = (tint(t.good, 0.16), tint(t.danger, 0.16));
-        let tw = (ri.width as usize).saturating_sub(gw * 2 + 4);
+        let (add_bg, del_bg, cur_bg) = (tint(t.good, 0.16), tint(t.danger, 0.16), tint(t.accent, 0.30));
+        let tw = (ri_lines.width as usize).saturating_sub(gw * 2 + 5);
         let mut lines = vec![];
-        for l in file.lines.iter().skip(v.scroll).take(h) {
+        for (i, l) in file.lines.iter().enumerate().skip(v.scroll) {
+            if lines.len() >= h {
+                break;
+            }
             let num = |n: Option<u32>| n.map(|x| format!("{x:>gw$}")).unwrap_or_else(|| " ".repeat(gw));
             let text = ui::fit(&l.text.replace('\t', "    "), tw);
-            let line = match l.kind {
+            let here: Vec<&super::review::Note> = notes.iter().filter(|n| n.at(&file.path, l)).collect();
+            let cursor = i == v.cursor;
+            let mark = match here.first().map(|n| note_style(n, t).1) {
+                _ if cursor => Span::styled("›", bold(t.accent)),
+                Some(c) => Span::styled("●", bold(c)),
+                None => Span::raw(" "),
+            };
+            let mut line = match l.kind {
                 Kind::Hunk => Line::from(vec![
+                    Span::raw(" "),
                     Span::styled(format!("{} ", "┄".repeat(gw * 2 + 1)), Style::default().fg(t.frame)),
                     Span::styled(format!("@@ -{} +{} ", l.old.unwrap_or(0), l.new.unwrap_or(0)), ui::accent(t)),
                     Span::styled(ui::fit(&l.text, tw.saturating_sub(14)), ui::muted(t)),
                 ]),
-                Kind::Note => Line::styled(format!("  {}", l.text), ui::muted(t)),
+                Kind::Note => Line::styled(format!("   {}", l.text), ui::muted(t)),
                 Kind::Add => {
                     let pad = tw.saturating_sub(text.width());
                     Line::from(vec![
+                        mark,
                         Span::styled(format!("{} {} ", num(None), num(l.new)), Style::default().fg(t.good).bg(add_bg)),
                         Span::styled("+ ", bold(t.good).bg(add_bg)),
                         Span::styled(format!("{text}{}", " ".repeat(pad)), Style::default().fg(t.good).bg(add_bg)),
@@ -587,20 +859,48 @@ impl Agents {
                 Kind::Del => {
                     let pad = tw.saturating_sub(text.width());
                     Line::from(vec![
+                        mark,
                         Span::styled(format!("{} {} ", num(l.old), num(None)), Style::default().fg(t.danger).bg(del_bg)),
                         Span::styled("- ", bold(t.danger).bg(del_bg)),
                         Span::styled(format!("{text}{}", " ".repeat(pad)), Style::default().fg(t.danger).bg(del_bg)),
                     ])
                 }
-                Kind::Ctx => Line::from(vec![Span::styled(format!("{} {} ", num(l.old), num(l.new)), Style::default().fg(t.frame)), Span::raw("  "), Span::styled(text, Style::default().fg(t.fg))]),
+                Kind::Ctx => {
+                    let pad = tw.saturating_sub(text.width());
+                    Line::from(vec![mark, Span::styled(format!("{} {} ", num(l.old), num(l.new)), Style::default().fg(t.frame)), Span::raw("  "), Span::styled(format!("{text}{}", " ".repeat(pad)), Style::default().fg(t.fg))])
+                }
             };
+            if cursor {
+                for s in line.spans.iter_mut().skip(1) {
+                    s.style = s.style.bg(cur_bg);
+                }
+            }
+            let row = Rect { y: ri_lines.y + lines.len() as u16, height: 1, ..ri_lines };
+            self.hits.push((row, Hit::DiffLine(i)));
             lines.push(line);
+            // the comments (and findings) on this line, right under it
+            for n in &here {
+                let (tag, c) = note_style(n, t);
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(gw * 2 + 3)),
+                    Span::styled(format!("{} {tag}", if n.on { "▸" } else { "▹" }), bold(c)),
+                    Span::styled(ui::fit(&n.text, tw.saturating_sub(4 + tag.width())), Style::default().fg(c)),
+                ]));
+            }
         }
-        f.render_widget(Paragraph::new(lines), ri);
-        if max_scroll > 0 {
+        lines.truncate(h);
+        f.render_widget(Paragraph::new(lines), ri_lines);
+        if max_scroll > 0 && !typing {
             let pct = v.scroll * 100 / max_scroll.max(1);
             let r = Rect { x: rr.x + 2, y: rr.bottom().saturating_sub(1), width: 12.min(rr.width.saturating_sub(4)), height: 1 };
             f.render_widget(Paragraph::new(Span::styled(format!(" {pct}% "), ui::muted(t))), r);
+        }
+        if let (Some(inp), Some(l)) = (&v.typing, file.lines.get(v.cursor)) {
+            let at = if l.kind == Kind::Del { format!("{}:{} (removed)", file.path, l.old.unwrap_or(0)) } else { format!("{}:{}", file.path, l.new.unwrap_or(0)) };
+            let br = Rect { y: ri.bottom().saturating_sub(3), height: 3.min(ri.height), ..ri };
+            f.render_widget(Clear, br);
+            let bi = ui::frame(f, br, &format!("comment on {at} · enter adds it · esc drops it"), None, true, t);
+            draw_input(f, bi, inp, "what's wrong here, or what should change?", true, t);
         }
     }
 
@@ -610,7 +910,7 @@ impl Agents {
         let t = cx.theme;
         let Mode::Form(form) = &self.mode else { return };
         let title = if form.editing.is_some() { "edit task" } else { "new task" };
-        let inner = ui::popup(f, area, 86, 37, &format!("{}{title}", ui::lead("new")), t);
+        let inner = ui::popup(f, area, 90, 37, &format!("{}{title}", ui::lead("new")), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let repo = self.repo.as_ref().map(|r| format!("{} · a new branch off {}", r.name, r.branch)).unwrap_or_default();
         f.render_widget(Paragraph::new(Span::styled(repo, ui::muted(t))), Rect { height: 1, ..inner });
@@ -627,7 +927,7 @@ impl Agents {
         // prompt
         let ph = (bottom.saturating_sub(y + 21)).clamp(3, 12);
         let r = field(f, "prompt", ph + 2, 1, &mut y);
-        draw_input(f, r, &form.prompt, "what should the agent do? (enter = new line, paste works)", form.field == 1, t);
+        draw_input(f, r, &form.prompt, "what should the agent do? (enter = new line · ↑ earlier prompts · ctrl+t saved prompts)", form.field == 1, t);
         // agent chooser
         let r = field(f, "agent", 3, 2, &mut y);
         let mut spans = vec![];
@@ -674,11 +974,11 @@ impl Agents {
         }
         f.render_widget(Paragraph::new(Line::from(spans)), r);
         // after
-        let r = field(f, "after (waits for these to be merged)", 3, 5, &mut y);
+        let r = field(f, "after (starts once these are merged)", 3, 5, &mut y);
         draw_input(f, r, &form.after, "task ids or the start of their titles, comma separated · empty = no wait", form.field == 5, t);
         // budget
         let r = field(f, "budget $ (stops it past this)", 3, 6, &mut y);
-        draw_input(f, r, &form.budget, "empty = the roster's cap for this agent", form.field == 6, t);
+        draw_input(f, r, &form.budget, "empty = none (run together: the roster's cap) · kimi tabs can't be capped", form.field == 6, t);
         // buttons
         y += 1;
         if y < bottom {
@@ -699,7 +999,11 @@ impl Agents {
         }
         if bottom > inner.y + 1 {
             let hr = Rect { y: bottom - 1, height: 1, ..inner };
-            let hints = [("tab", "next field"), ("ctrl+s", "add to todo"), ("enter", "on the buttons"), ("esc", "cancel")];
+            if self.restored {
+                f.render_widget(Paragraph::new(Span::styled("restored your draft · ctrl+u clears", bold(t.accent))).centered(), hr);
+                return;
+            }
+            let hints = [("tab", "next field"), ("ctrl+s", "add to todo"), ("enter", "on the buttons"), ("esc", "cancel (kept)")];
             let mut spans = vec![];
             for (i, (k, w)) in hints.iter().enumerate() {
                 if i > 0 {
@@ -718,9 +1022,26 @@ impl Agents {
         if let Some(run) = self.run_ref(&c.id) {
             let goal: String = run.goal.lines().next().unwrap_or("").chars().take(50).collect();
             let workers = self.run_tasks(&run.id).iter().filter(|x| matches!(x.status, Status::Running | Status::Blocked)).count();
+            let left = self.run_tasks(&run.id).iter().filter(|x| x.status != Status::Done).count();
             let (title, body, yes, danger): (&str, Vec<String>, &str, bool) = match c.what {
-                Pending::StopRun => ("stop the lead run", vec![format!("Stop \"{goal}\"?"), format!("The lead and {workers} running worker(s) stop now. What's merged stays on"), format!("{} for you to review or merge.", run.branch)], "stop", true),
-                Pending::MergeRun => ("merge the lead run", vec![format!("Squash-merge {} into {}?", run.branch, run.base_branch), format!("Everything the run merged ({} task(s)) becomes one commit on {}.", run.merged, run.base_branch), "Then the integration branch and the lead's checkout are removed.".into()], "merge", false),
+                Pending::StopRun => (
+                    "stop the lead run",
+                    vec![
+                        format!("Stop \"{goal}\"?"),
+                        format!("The lead and {workers} running worker(s) stop now, and nothing new merges."),
+                        format!("What's merged stays on {} for you to review or merge;", run.branch),
+                        "r resumes the run where it stopped.".into(),
+                    ],
+                    "stop",
+                    true,
+                ),
+                Pending::MergeRun => {
+                    let mut body = vec![format!("Squash-merge {} into {}?", run.branch, run.base_branch), format!("Everything the run merged ({} task(s)) becomes one commit on {}.", run.merged, run.base_branch), "Then the integration branch and the lead's checkout are removed.".into()];
+                    if left > 0 {
+                        body.push(format!("{left} task(s) that didn't make it in go too (worktrees and all)."));
+                    }
+                    ("merge the lead run", body, "merge", false)
+                }
                 _ => ("discard the lead run", vec![format!("Throw away \"{goal}\"?"), format!("Stops everything and deletes {} and every worker's worktree.", run.branch), "Nothing reaches your branch.".into()], "discard", true),
             };
             let h = body.len() as u16 + 6;
@@ -739,16 +1060,17 @@ impl Agents {
         }
         let Some(task) = self.task(&c.id) else { return };
         let (title, body, yes, danger): (&str, Vec<String>, &str, bool) = match c.what {
-            Pending::Merge if !task.run.is_empty() => (
-                "merge into the run",
-                vec![
-                    format!("Queue \"{}\" for the run's integration branch?", task.title),
-                    "It's conflict-checked and gated (build/tests) on the merged result".into(),
-                    format!("first; nothing reaches {} until you merge the run.", self.run_ref(&task.run).map(|r| r.base_branch.clone()).unwrap_or_default()),
-                ],
-                "queue merge",
-                false,
-            ),
+            Pending::Merge if !task.run.is_empty() => {
+                // what the merge is actually checked with: the run's gate, or only a conflict check
+                let run = self.run_ref(&task.run);
+                let mut body = vec![format!("Queue \"{}\" for the run's integration branch?", task.title)];
+                match run.and_then(|r| self.run_gate(r)) {
+                    Some(g) => body.extend(["Checked first: conflicts, then the run's gate".to_string(), format!("(`{}`) on the merged result.", ui::fit(&g, 40))]),
+                    None => body.push("Checked first: conflicts only (the run has no gate).".into()),
+                }
+                body.push(format!("Nothing reaches {} until you merge the run.", run.map(|r| r.base_branch.clone()).unwrap_or_default()));
+                ("merge into the run", body, "queue merge", false)
+            }
             Pending::StopRun | Pending::MergeRun | Pending::DiscardRun => return,
             Pending::Merge => (
                 "merge",
@@ -780,7 +1102,20 @@ impl Agents {
 
     fn draw_prompt_box(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
+        let mut extra: Option<(String, Style)> = None;
         let (title, head, inp, ph) = match &self.mode {
+            // feedback for a lead run: the lead picks it up again
+            Mode::Comment(id, i) if self.run_ref(id).is_some() => {
+                let r = self.run_ref(id).cloned().unwrap_or_default();
+                let goal = ui::fit(r.goal.lines().next().unwrap_or(""), 30);
+                let spend = self.spend(id);
+                if r.budget_usd > 0.0 && spend >= r.budget_usd {
+                    extra = Some((format!("the run's budget is spent (${spend:.2} of ${:.2}) — ctrl+b adds $2, or the lead can only merge and answer", r.budget_usd), Style::default().fg(t.danger)));
+                } else if r.budget_usd > 0.0 {
+                    extra = Some((format!("${spend:.2} of ${:.2} spent · ctrl+b adds $2", r.budget_usd), ui::muted(t)));
+                }
+                ("feedback to the lead", format!("\"{goal}\" · the lead picks it up again on {}", r.branch), i, "what should change or come next? (\"also add tests\", \"the toggle icon is wrong\")")
+            }
             Mode::Comment(id, i) => {
                 let task = self.task(id);
                 let name = task.map(|x| x.title.clone()).unwrap_or_default();
@@ -791,18 +1126,57 @@ impl Agents {
                 };
                 ("comment", format!("feedback for \"{name}\" · continues its session ({how})"), i, "what should change?")
             }
-            Mode::Plan(i) => ("plan", "claude reads the repo (read-only) and splits the goal into TODO cards".to_string(), i, "what's the goal?"),
+            Mode::Plan(i) => ("plan", "claude reads the repo (read-only) and splits the goal into TODO cards".to_string(), i, "what's the goal? (↑ earlier goals)"),
             _ => return,
         };
-        let inner = ui::popup(f, area, 80, 12, &format!("{}{title}", ui::lead(if title == "plan" { "claude" } else { "new" })), t);
+        // your ticked line comments and findings go along with it
+        let notes: Vec<&super::review::Note> = match &self.mode {
+            Mode::Comment(id, _) => self.notes_of(id).iter().filter(|n| n.on).collect(),
+            _ => vec![],
+        };
+        let shown = notes.len().min(6);
+        let more = if notes.len() > shown { 1 } else { 0 };
+        let ph = if notes.is_empty() { ph } else { "anything to add? (optional) — enter sends it with the comments above" };
+        let h = if extra.is_some() { 13 } else { 12 } + if notes.is_empty() { 0 } else { shown as u16 + more + 1 };
+        let inner = ui::popup(f, area, 84, h, &format!("{}{title}", ui::lead(if title == "plan" { "claude" } else { "new" })), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
-        f.render_widget(Paragraph::new(Span::styled(ui::fit(&head, inner.width as usize), ui::muted(t))), Rect { height: 1, ..inner });
-        let r = Rect { y: inner.y + 2, height: inner.height.saturating_sub(4), ..inner };
+        let w = inner.width as usize;
+        let mut head_lines = vec![Line::styled(ui::fit(&head, w), ui::muted(t))];
+        if let Some((s, st)) = &extra {
+            head_lines.push(Line::styled(ui::fit(s, w), *st));
+        }
+        if !notes.is_empty() {
+            head_lines.push(Line::styled(format!("with {} comment{}:", notes.len(), if notes.len() == 1 { "" } else { "s" }), bold(t.fg)));
+            for n in notes.iter().take(shown) {
+                let (tag, c) = note_style(n, t);
+                head_lines.push(Line::from(vec![Span::styled(format!("● {tag}"), Style::default().fg(c)), Span::styled(ui::fit(&format!("{}: {}", n.anchor(), n.text), w.saturating_sub(2 + tag.width())), Style::default().fg(t.fg))]));
+            }
+            if more > 0 {
+                head_lines.push(Line::styled(format!("  … and {} more", notes.len() - shown), ui::muted(t)));
+            }
+        }
+        let hh = head_lines.len() as u16;
+        f.render_widget(Paragraph::new(head_lines), Rect { height: hh, ..inner });
+        let r = Rect { y: inner.y + hh + 1, height: inner.height.saturating_sub(hh + 3), ..inner };
         let ri = ui::frame(f, r, "", None, true, t);
         draw_input(f, ri, inp, ph, true, t);
         let hr = Rect { y: inner.bottom().saturating_sub(1), height: 1, ..inner };
+        if self.restored {
+            f.render_widget(Paragraph::new(Span::styled("restored your draft · ctrl+u clears", bold(t.accent))).centered(), hr);
+            return;
+        }
         f.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled("enter", bold(t.fg)), Span::styled(if title == "plan" { " plan" } else { " send" }, ui::muted(t)), Span::styled(" · ", ui::muted(t)), Span::styled("esc", bold(t.fg)), Span::styled(" cancel", ui::muted(t))])).centered(),
+            Paragraph::new(Line::from(vec![
+                Span::styled("enter", bold(t.fg)),
+                Span::styled(if title == "plan" { " plan" } else { " send" }, ui::muted(t)),
+                Span::styled(" · ", ui::muted(t)),
+                Span::styled("ctrl+t", bold(t.fg)),
+                Span::styled(" saved prompts", ui::muted(t)),
+                Span::styled(" · ", ui::muted(t)),
+                Span::styled("esc", bold(t.fg)),
+                Span::styled(" cancel (kept)", ui::muted(t)),
+            ]))
+            .centered(),
             hr,
         );
     }
@@ -810,7 +1184,9 @@ impl Agents {
     fn draw_picker(&self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
         let Mode::Repo(p) = &self.mode else { return };
-        let h = (self.store.repos.len() as u16 + 11).min(22);
+        let rows = self.picker_rows();
+        let chats = rows.iter().filter(|r| r.1).count();
+        let h = (rows.len() as u16 + 11 + if chats > 0 { 2 } else { 0 }).min(26);
         let inner = ui::popup(f, area, 78, h, &format!("{}open a repo", ui::lead("files")), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         f.render_widget(Paragraph::new(Span::styled("agents work in git worktrees of a repo — which one?", ui::muted(t))), Rect { height: 1, ..inner });
@@ -822,9 +1198,21 @@ impl Agents {
             f.render_widget(Paragraph::new(Span::styled("recent", bold(t.muted))), Rect { y, height: 1, ..inner });
             y += 1;
         }
-        for (i, path) in self.store.repos.iter().enumerate() {
+        for (i, (path, from_chat)) in rows.iter().enumerate() {
             if y + 1 >= inner.bottom() {
                 break;
+            }
+            if *from_chat && (i == 0 || !rows[i - 1].1) {
+                // the folders your chats work in
+                y += if i > 0 { 1 } else { 0 };
+                if y + 1 >= inner.bottom() {
+                    break;
+                }
+                f.render_widget(Paragraph::new(Span::styled("from your chats", bold(t.muted))), Rect { y, height: 1, ..inner });
+                y += 1;
+                if y + 1 >= inner.bottom() {
+                    break;
+                }
             }
             let on = p.sel == i + 1;
             let name = std::path::Path::new(path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -912,6 +1300,16 @@ impl Agents {
                 f.render_widget(Paragraph::new(spread(vec![Span::styled("today", ui::muted(t))], vec![Span::styled(format!("${today:.2}"), bold(t.fg))], r.width as usize)), r);
             }
         }
+    }
+}
+
+/// How a comment shows: (tag, colour). Yours in the accent, a reviewer's blocking finding in red, an optional one
+/// in yellow.
+fn note_style(n: &super::review::Note, t: &Theme) -> (&'static str, Color) {
+    match n.finding {
+        Some(true) => ("blocking · ", t.danger),
+        Some(false) => ("optional · ", t.shine),
+        None => ("", t.accent),
     }
 }
 

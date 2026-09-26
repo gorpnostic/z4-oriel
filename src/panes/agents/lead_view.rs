@@ -66,6 +66,7 @@ fn spread<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, w: usize) -> Line<'a> {
 fn state_label(r: &Run) -> &'static str {
     match r.state {
         RunState::Starting => "starting",
+        RunState::Running if r.finishing => "finishing",
         RunState::Running => "running",
         RunState::Review => "ready for review",
         RunState::Merged => "merged",
@@ -137,16 +138,23 @@ impl Agents {
         let spin = SPIN[(cx.time * 10.0) as usize % 10];
         let proto = if run.protocol == "mcp" { "MCP tools" } else { "text protocol" };
         let title = format!("⚑ lead · {}{} · {}", run.agent, if run.model.is_empty() { String::new() } else { format!(" {}", run.model) }, proto);
-        let hints = if !focus {
+        let feedback = if self.feedback_block(&run).is_none() { "c feedback · " } else { "" };
+        let hints = if !focus && !run.held.is_empty() {
+            "↑ then enter: its plan waits for you".to_string()
+        } else if !focus {
             "↑ select".to_string()
+        } else if !run.held.is_empty() {
+            "enter review the plan · w watch · s stop".to_string()
         } else if run.state.active() {
             "enter transcript · w watch · s stop · d diff so far".to_string()
+        } else if run.state == RunState::Stopped && run.branch.is_empty() {
+            "r retry with the same goal · x discard".to_string()
         } else if run.state == RunState::Stopped && run.error.contains("r resumes") {
-            "r resume · d review · m merge · x discard".to_string()
+            format!("r resume · {feedback}d review · T try it · m merge · x discard")
         } else {
-            "enter transcript · w watch · d review · m merge · x discard".to_string()
+            format!("enter transcript · {feedback}d review · T try it · m merge · x discard")
         };
-        let border = if focus { t.accent } else if run.state == RunState::Review { t.shine } else { t.frame };
+        let border = if focus { t.accent } else if run.state == RunState::Review || !run.held.is_empty() { t.shine } else { t.frame };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -202,7 +210,8 @@ impl Agents {
             add(format!("{review} to review"), Style::default().fg(t.shine));
         }
         if merging > 0 {
-            add(format!("{merging} merging"), Style::default().fg(t.shine));
+            // a stopped run holds its merges until it's resumed
+            add(if run.state == RunState::Running { format!("{merging} merging") } else { format!("{merging} waiting to merge") }, Style::default().fg(t.shine));
         }
         add(format!("{merged} merged"), if merged > 0 { Style::default().fg(t.good) } else { ui::muted(t) });
         let lead_cost = vec![Span::styled(format!("lead {}", money(run.cost_usd)), ui::muted(t))];
@@ -245,6 +254,9 @@ impl Agents {
             model: Input::new(&self.lead_cfg.model, false),
             parallel: Input::new(&self.lead_cfg.max_parallel.clamp(1, 5).to_string(), false),
             budget: Input::new(&format!("{:.2}", self.lead_cfg.run_budget_usd), false),
+            gate: Input::new(&self.gate_prefill().0, false),
+            approve: self.store.approve_plan,
+            retry: None,
             err: String::new(),
         }
     }
@@ -257,8 +269,15 @@ impl Agents {
             let agent = KINDS[form.agent].0;
             let par = form.parallel.text.trim().parse::<u32>().unwrap_or(3).clamp(1, 5);
             let budget = form.budget.text.trim().trim_start_matches('$').parse::<f64>().unwrap_or(s.lead_cfg.run_budget_usd).max(0.0);
-            match s.start_run(&form.goal.text, agent, &form.model.text, par, budget, cx) {
-                Ok(_) => {}
+            match s.start_run(&form.goal.text, agent, &form.model.text, par, budget, &form.gate.text, form.approve, cx) {
+                Ok(_) => {
+                    // it replaces a run that never started
+                    if let Some(old) = &form.retry {
+                        if let Some(r) = s.run_mut(old) {
+                            r.state = RunState::Discarded;
+                        }
+                    }
+                }
                 Err(e) => {
                     let mut form = form;
                     form.err = e;
@@ -267,28 +286,45 @@ impl Agents {
             }
         };
         match k.code {
-            KeyCode::Esc => return true,
+            KeyCode::Esc => {
+                // L brings it back
+                if !form.goal.text.trim().is_empty() {
+                    self.drafts.lead = Some(form);
+                }
+                return true;
+            }
             KeyCode::Char('s') if ctrl => {
                 submit(self, form, cx);
                 return true;
             }
-            KeyCode::Tab => form.field = (form.field + 1) % 6,
-            KeyCode::BackTab => form.field = (form.field + 5) % 6,
+            // a restored draft: ctrl+u throws it all away
+            KeyCode::Char('u') if ctrl && self.restored => form = self.new_lead_form(),
+            KeyCode::Char('t') if ctrl => {
+                let text = form.goal.text.clone();
+                self.mode = Mode::LeadForm(form);
+                self.open_prompt_pick(&text);
+                return true;
+            }
+            KeyCode::Tab => form.field = (form.field + 1) % 8,
+            KeyCode::BackTab => form.field = (form.field + 7) % 8,
+            KeyCode::Up | KeyCode::Down if form.field == 0 && self.recall_key(k, &mut form.goal) => {}
             _ => {
                 let used = match form.field {
                     0 => form.goal.key(k),
                     2 => form.model.key(k),
                     3 => matches!(k.code, KeyCode::Char(c) if !c.is_ascii_digit() && !ctrl) || form.parallel.key(k),
                     4 => matches!(k.code, KeyCode::Char(c) if !(c.is_ascii_digit() || c == '.') && !ctrl) || form.budget.key(k),
+                    5 => form.gate.key(k),
                     _ => false,
                 };
                 if !used {
                     match k.code {
-                        KeyCode::Enter if form.field == 5 => {
+                        KeyCode::Enter if form.field == 7 => {
                             submit(self, form, cx);
                             return true;
                         }
-                        KeyCode::Enter | KeyCode::Down => form.field = (form.field + 1).min(5),
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 6 => form.approve = !form.approve,
+                        KeyCode::Enter | KeyCode::Down => form.field = (form.field + 1).min(7),
                         KeyCode::Up => form.field = form.field.saturating_sub(1),
                         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 1 => {
                             let any = self.agents.iter().any(|a| a.1.is_some()) && self.fake_lead.is_none();
@@ -312,7 +348,7 @@ impl Agents {
     pub(super) fn draw_lead_form(&self, f: &mut Frame, area: Rect, cx: &Cx) {
         let t = cx.theme;
         let Mode::LeadForm(form) = &self.mode else { return };
-        let inner = ui::popup(f, area, 92, 25, "⚑ new lead run", t);
+        let inner = ui::popup(f, area, 92, 30, if form.retry.is_some() { "⚑ lead run · again" } else { "⚑ new lead run" }, t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let repo = self.repo.as_ref().map(|r| format!("{} · a lead agent plans the goal and hands it to workers on a new branch off {}", r.name, r.branch)).unwrap_or_default();
         f.render_widget(Paragraph::new(Span::styled(ui::fit(&repo, inner.width as usize), ui::muted(t))), Rect { height: 1, ..inner });
@@ -324,7 +360,7 @@ impl Agents {
             ui::frame(f, rr, label, None, form.field == idx, t)
         };
         let r = field(f, "goal", 7, 0, &mut y, inner);
-        super::view::draw_input(f, r, &form.goal, "what should the team get done? (enter = new line)", form.field == 0, t);
+        super::view::draw_input(f, r, &form.goal, "what should the team get done? (enter = new line · ↑ earlier goals · ctrl+t saved prompts)", form.field == 0, t);
         // who leads
         let r = field(f, "lead", 4, 1, &mut y, inner);
         let mut spans = vec![];
@@ -368,6 +404,31 @@ impl Agents {
         let ri = ui::frame(f, c, "run budget $ (all agents)", None, form.field == 4, t);
         super::view::draw_input(f, ri, &form.budget, "8.00", form.field == 4, t);
         y += 4;
+        // the merge gate: what every merged result must pass
+        let (prefill, why) = self.gate_prefill();
+        let gr = Rect { y, height: 3.min(bottom.saturating_sub(y)), ..inner };
+        // where the command came from, on the frame (when it's still the one filled in)
+        let note = (!form.gate.text.is_empty() && form.gate.text == prefill).then_some(why.as_str());
+        let r = ui::frame(f, gr, "gate (runs on every merged result)", note, form.field == 5, t);
+        let ph = if prefill.is_empty() { why.clone() } else { "none — merges get only a conflict check".to_string() };
+        super::view::draw_input(f, r, &form.gate, &ph, form.field == 5, t);
+        y += 3;
+        // approve the plan first: the lead's tasks come to you as cards before any worker starts
+        if y < bottom {
+            let on = form.field == 6;
+            let (box_, st) = if form.approve { ("[x]", bold(t.accent)) } else { ("[ ]", Style::default().fg(t.fg)) };
+            let mut spans = vec![
+                Span::styled(if on { "› " } else { "  " }, bold(t.accent)),
+                Span::styled(box_, if on { st.bg(tint(t.accent, 0.2)) } else { st }),
+                Span::styled(" approve the plan first", if on { bold(t.fg) } else { Style::default().fg(t.fg) }),
+                Span::styled(" — you see its tasks as cards before any worker starts", ui::muted(t)),
+            ];
+            if on {
+                spans.push(Span::styled("  space toggles", ui::muted(t)));
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)), Rect { y, height: 1, ..inner });
+        }
+        y += 2;
         // the roster, briefly
         if y + 1 < bottom {
             let roster = self.roster();
@@ -387,7 +448,7 @@ impl Agents {
             y += 2;
         }
         if y < bottom {
-            let btn = if form.field == 5 { Span::styled(" start lead run ", Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD)) } else { Span::styled("[start lead run]", bold(t.accent)) };
+            let btn = if form.field == 7 { Span::styled(" start lead run ", Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD)) } else { Span::styled("[start lead run]", bold(t.accent)) };
             let mut spans = vec![btn];
             if !form.err.is_empty() {
                 spans.push(Span::styled(format!("   {}", form.err), Style::default().fg(t.danger)));
@@ -396,7 +457,11 @@ impl Agents {
         }
         if bottom > inner.y + 1 {
             let hr = Rect { y: bottom - 1, height: 1, ..inner };
-            let hints = [("tab", "next field"), ("ctrl+s", "start"), ("esc", "cancel")];
+            if self.restored {
+                f.render_widget(Paragraph::new(Span::styled("restored your draft · ctrl+u clears", bold(t.accent))).centered(), hr);
+                return;
+            }
+            let hints = [("tab", "next field"), ("ctrl+s", "start"), ("esc", "cancel (kept)")];
             let mut spans = vec![];
             for (i, (k, w)) in hints.iter().enumerate() {
                 if i > 0 {
@@ -909,13 +974,27 @@ impl Agents {
                 LogTarget::Task(id) => self.open_diff(&id, cx),
                 LogTarget::Lead(run) => self.open_run_diff(&run, cx),
             },
-            KeyCode::Char('c') => {
-                if let LogTarget::Task(id) = v.target.clone() {
+            KeyCode::Char('c') => match v.target.clone() {
+                LogTarget::Task(id) => {
                     let ok = self.task(&id).is_some_and(|t| !t.worktree.is_empty() && t.status == Status::Review);
-                    if ok {
-                        self.mode = Mode::Comment(id, Input::new("", true));
+                    match self.can_act(&id) {
+                        Err(why) => cx.notify(why),
+                        Ok(()) if ok => self.open_comment(id),
+                        Ok(()) => {}
                     }
                 }
+                // feedback for the lead: it picks the finished run up again
+                LogTarget::Lead(run) => match self.run_ref(&run).and_then(|r| self.feedback_block(r)) {
+                    None if self.run_ref(&run).is_some() => self.open_comment(run),
+                    Some(why) => cx.notify(why),
+                    None => {}
+                },
+            },
+            KeyCode::Char('T') => {
+                let id = match v.target.clone() {
+                    LogTarget::Task(id) | LogTarget::Lead(id) => id,
+                };
+                self.open_try(&id, cx);
             }
             _ => {}
         }
@@ -929,9 +1008,22 @@ impl Agents {
         let (title, sub, log, color) = self.target_info(&target, cx);
         let task = if let LogTarget::Task(id) = &target { self.task(id).cloned() } else { None };
         let hints: Vec<(&str, &str)> = match &task {
-            Some(tk) if tk.headless() && !tk.worktree.is_empty() => vec![("↑↓", "scroll"), ("t", "take over in a tab"), ("d", "diff"), ("c", "follow-up"), ("esc", "back")],
+            // a follow-up only when it can start: finished, and no git step (a merge, a check) running for it
+            Some(tk) if tk.headless() && !tk.worktree.is_empty() && tk.status == Status::Review && self.can_act(&tk.id).is_ok() => vec![("↑↓", "scroll"), ("t", "take over in a tab"), ("d", "diff"), ("c", "follow-up"), ("esc", "back")],
+            Some(tk) if tk.headless() && !tk.worktree.is_empty() => vec![("↑↓", "scroll"), ("t", "take over in a tab"), ("d", "diff"), ("esc", "back")],
             Some(_) => vec![("↑↓", "scroll"), ("d", "diff"), ("esc", "back")],
-            None => vec![("↑↓", "scroll"), ("d", "integration diff"), ("esc", "back")],
+            None => {
+                let run = if let LogTarget::Lead(r) = &target { self.run_ref(r).cloned() } else { None };
+                let mut h = vec![("↑↓", "scroll"), ("d", "integration diff")];
+                if run.as_ref().is_some_and(|r| self.feedback_block(r).is_none()) {
+                    h.push(("c", "feedback to the lead"));
+                }
+                if run.as_ref().is_some_and(|r| !r.state.active() && !r.worktree.is_empty()) {
+                    h.push(("T", "try it"));
+                }
+                h.push(("esc", "back"));
+                h
+            }
         };
         let body = ui::hint_line(f, area, &hints, t);
         let body = Rect { x: body.x + 1, width: body.width.saturating_sub(2), ..body };

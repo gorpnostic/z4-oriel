@@ -113,7 +113,9 @@ impl Agents {
             return false;
         }
         // a form you're filling in isn't thrown away for it
-        if !matches!(self.mode, Mode::Board | Mode::Diff(_) | Mode::Log(_) | Mode::Watch(_)) {
+        // (nor a line comment half typed in a diff)
+        let typing = matches!(&self.mode, Mode::Diff(d) if d.typing.is_some());
+        if typing || !matches!(self.mode, Mode::Board | Mode::Diff(_) | Mode::Log(_) | Mode::Watch(_)) {
             cx.notify("finish or esc what's open in agents first");
             return false;
         }
@@ -196,9 +198,15 @@ mod tests {
         assert!(p.answer_open("run:r1", Reply::Go, &mut cx) && p.lead_focus);
         assert!(!p.answer_open("task:gone", Reply::Go, &mut cx));
         // mid-form: left alone
-        p.mode = Mode::Batch;
+        p.mode = Mode::Batch(super::super::BatchView { gate: super::super::Input::new("", false), editing: false });
         assert!(!p.answer_open("task:t2", Reply::Go, &mut cx));
-        assert!(matches!(p.mode, Mode::Batch));
+        assert!(matches!(p.mode, Mode::Batch(_)));
+        // a line comment being typed in a diff is left alone too
+        let mut d = super::super::DiffView::new("t2");
+        d.typing = Some(super::super::Input::new("half a thought", false));
+        p.mode = Mode::Diff(d);
+        assert!(!p.answer_open("task:t2", Reply::Go, &mut cx));
+        assert!(matches!(&p.mode, Mode::Diff(d) if d.typing.as_ref().is_some_and(|t| t.text == "half a thought")));
         assert!(actions.iter().any(|a| matches!(a, Action::FocusTag(t) if t == "agent-task:t1")), "went to its tab");
     }
 }

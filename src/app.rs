@@ -4384,14 +4384,17 @@ mod tests {
 
     #[test]
     fn app_theme_file_bursts_become_one_event() {
+        // the quiet window is far longer than the gaps, so a busy machine stretching a 5 ms sleep (Windows timers
+        // alone round it up to ~16 ms) can't split the burst in two
+        let quiet = Duration::from_millis(400);
         let (tx, rx) = std::sync::mpsc::channel();
-        let ping = debounced(tx, Duration::from_millis(40));
+        let ping = debounced(tx, quiet);
         for _ in 0..8 {
             ping.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(matches!(rx.recv_timeout(Duration::from_secs(2)), Ok(Event::ThemeFilesChanged)));
-        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "just the one");
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Event::ThemeFilesChanged)));
+        assert!(rx.recv_timeout(quiet * 2).is_err(), "just the one");
     }
 
     #[test]
