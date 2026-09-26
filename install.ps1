@@ -3,7 +3,8 @@
 # Re-running it (or `oriel update`) updates to the latest release.
 $ErrorActionPreference = 'Stop'
 $repo = 'gorpnostic/z4-oriel'
-$dir = Join-Path $env:LOCALAPPDATA 'oriel\bin'
+# `oriel update` passes the folder the running oriel lives in, so a fallback install replaces that one
+$dir = if ($env:ORIEL_BIN_DIR) { $env:ORIEL_BIN_DIR } else { Join-Path $env:LOCALAPPDATA 'oriel\bin' }
 $url = "https://github.com/$repo/releases/latest/download/oriel-windows-x86_64.zip"
 
 function Say($m) { Write-Host ':: ' -ForegroundColor Yellow -NoNewline; Write-Host $m }
@@ -32,11 +33,11 @@ try {
 }
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-if (($userPath -split ';') -notcontains $dir) {
+if (-not $env:ORIEL_BIN_DIR -and ($userPath -split ';') -notcontains $dir) {
     [Environment]::SetEnvironmentVariable('Path', "$userPath;$dir".TrimStart(';'), 'User')
     $env:Path = "$env:Path;$dir"
     Say "added $dir to your PATH (new terminals pick it up)"
 }
 $v = & (Join-Path $dir 'oriel.exe') --version
-Say "installed $v — run it with: oriel"
+Say "installed $v to $exe — run it with: oriel"
 Say 'icons need a Nerd Font in your terminal, e.g. "Cascadia Mono NF" (Windows Terminal: Settings > Profiles > Appearance)'

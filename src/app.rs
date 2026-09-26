@@ -185,6 +185,9 @@ pub struct App {
     cfg_path: Option<std::path::PathBuf>,
     /// config.toml changed on disk: re-read it at this point (editors write in two steps).
     config_reload_at: Option<Instant>,
+    /// Reload the theme at this time: its files changed, and a burst of watcher events (one save can be two or
+    /// three) settles into one reload.
+    theme_reload_at: Option<Instant>,
     /// A newer version is out: shown at the bottom of the sidebar.
     update_ready: Option<String>,
     /// Is the terminal the window you're in? (desktop notifications only when it isn't)
@@ -238,6 +241,7 @@ impl App {
             cfg_path: if cfg!(test) { None } else { Some(config::path()) },
             config_reload_at: None,
             update_ready: None,
+            theme_reload_at: None,
             term_focused: true,
             alert_th: alert_th.clone(),
             renaming: None,
@@ -267,8 +271,12 @@ impl App {
                     }
                 });
             }
-            if let Some((from, to)) = crate::update::just_updated() {
-                app.notify(format!("{}updated {from} → {to} · alt p → updates for what's new", ui::lead("package")));
+            if let Some((from, to, back)) = crate::update::just_updated() {
+                app.notify(if back {
+                    format!("{}rolled back to {to} (from {from}) · alt p → updates", ui::lead("package"))
+                } else {
+                    format!("{}updated {from} → {to} · alt p → updates for what's new", ui::lead("package"))
+                });
             }
         }
         if !cfg!(test) && !crate::onboard::done_before() {
@@ -459,8 +467,11 @@ impl App {
                 }
                 t.zoom = false;
             } else {
-                // last pane in the tab: drop the tab
+                // last pane in the tab: drop the tab (and stay on the tab you were on, if it was another one)
                 self.tabs.remove(ti);
+                if ti < self.cur {
+                    self.cur -= 1;
+                }
                 if self.tabs.is_empty() {
                     self.goto_app("ai");
                 }
@@ -577,6 +588,26 @@ impl App {
         }
     }
 
+    /// The theme's files changed a moment ago (see theme_reload_at): recolour, unless the change was oriel's own.
+    fn reload_theme_if_due(&mut self) {
+        let Some(at) = self.theme_reload_at else { return };
+        if Instant::now() < at {
+            return;
+        }
+        self.theme_reload_at = None;
+        if self.theme.name == "omarchy" {
+            self.set_theme("omarchy", false);
+            self.notify(format!("{}omarchy theme updated", ui::lead("theme")));
+        } else if theme::is_custom(&self.theme.name) && !theme::own_write(&self.theme.name) {
+            // your theme file changed in an editor: recolour (the themes app's own saves are applied already)
+            let name = self.theme.name.clone();
+            self.set_theme(&name, false);
+            if let Some(p) = theme::problems(&name).into_iter().next() {
+                self.notify(format!("⚠ {p}"));
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ loop
     pub fn run(&mut self, term: &mut DefaultTerminal, rx: Receiver<Event>) -> anyhow::Result<()> {
         loop {
@@ -597,6 +628,7 @@ impl App {
                 }
             }
             self.reap();
+            self.reload_theme_if_due();
             self.track_agents();
             if self.config_reload_at.is_some_and(|t| Instant::now() >= t) {
                 self.reload_config();
@@ -624,6 +656,9 @@ impl App {
         }
         if let Some(t) = self.config_reload_at {
             d = d.min(t.saturating_duration_since(Instant::now()));
+        }
+        if let Some(at) = self.theme_reload_at {
+            d = d.min(at.saturating_duration_since(Instant::now()));
         }
         let mut ids = self.visible();
         ids.extend(self.panes.iter().filter(|(_, p)| p.is_terminal() || p.ticks_hidden()).map(|(id, _)| *id));
@@ -790,8 +825,10 @@ impl App {
                     }
                 }
                 Action::ApplyTheme(t) => {
+                    // a nudge in the themes app re-applies the file it just wrote (the app shows its problems)
+                    let switching = t != self.theme.name;
                     self.set_theme(&t, true);
-                    if let Some(p) = theme::problems(&t).into_iter().next() {
+                    if let Some(p) = theme::problems(&t).into_iter().next().filter(|_| switching) {
                         self.notify(format!("⚠ {p}"));
                     }
                 }
@@ -893,21 +930,14 @@ impl App {
             // a moment later, once the writer is done (the run loop re-reads it then)
             Event::ConfigFileChanged => self.config_reload_at = Some(Instant::now() + Duration::from_millis(150)),
             Event::ThemeFilesChanged => {
-                if self.theme.name == "omarchy" {
-                    std::thread::sleep(Duration::from_millis(150)); // let omarchy finish swapping files
-                    self.set_theme("omarchy", false);
-                    self.notify(format!("{}omarchy theme updated", ui::lead("theme")));
-                } else if theme::is_custom(&self.theme.name) {
-                    // your theme file changed (the themes app, or you, in an editor): recolour
-                    std::thread::sleep(Duration::from_millis(60)); // editors write in two steps
-                    let name = self.theme.name.clone();
-                    self.set_theme(&name, false);
-                    if let Some(p) = theme::problems(&name).into_iter().next() {
-                        self.notify(format!("⚠ {p}"));
-                    }
-                }
+                // not now: editors write in steps and omarchy swaps several files, so wait until it's been quiet a
+                // moment (was a sleep here, on the UI thread, for every event: holding an arrow in the themes app
+                // queued them up)
+                let quiet = Duration::from_millis(if self.theme.name == "omarchy" { 150 } else { 80 });
+                self.theme_reload_at = Some(Instant::now() + quiet);
             }
             Event::Tick => {
+                self.reload_theme_if_due();
                 let mut ids = self.visible();
                 ids.extend(self.panes.iter().filter(|(id, p)| (p.is_terminal() || p.ticks_hidden()) && !ids.contains(id)).map(|(id, _)| *id).collect::<Vec<_>>());
                 for id in ids {
@@ -1163,6 +1193,7 @@ impl App {
                     self.close_tab(i);
                 }
             }
+            Cmd::Open(name, _) if panes::SINGLE.contains(&name) => self.goto_app(name),
             Cmd::Open(name, place) => match panes::open(name, &self.config) {
                 Some(p) => self.open(p, place, from),
                 None => self.notify(format!("{name} isn't installed")),
@@ -1201,15 +1232,13 @@ impl App {
         for &(name, icon, label, key) in SIDEBAR {
             items.push((format!("{}go to {label}  {key}", ui::lead(icon)), Cmd::App(name)));
         }
-        for &(name, _, icon, label) in APPS {
-            if available(name) {
-                items.push((format!("{}split: open {label} beside this", ui::lead(icon)), Cmd::Open(name, Place::Split)));
-            }
+        // (the apps that keep one copy have their "go to" above instead)
+        let extra = || APPS.iter().filter(|a| !panes::SINGLE.contains(&a.0) && available(a.0));
+        for &(name, _, icon, label) in extra() {
+            items.push((format!("{}split: open {label} beside this", ui::lead(icon)), Cmd::Open(name, Place::Split)));
         }
-        for &(name, _, icon, label) in APPS {
-            if available(name) {
-                items.push((format!("{}open {label} in a new tab", ui::lead(icon)), Cmd::Open(name, Place::Tab)));
-            }
+        for &(name, _, icon, label) in extra() {
+            items.push((format!("{}open {label} in a new tab", ui::lead(icon)), Cmd::Open(name, Place::Tab)));
         }
         items.push((format!("{}split right", ui::lead("split")), Cmd::SplitRight));
         items.push((format!("{}split down", ui::lead("split")), Cmd::SplitDown));
@@ -2374,6 +2403,79 @@ mod tests {
         }
         let s = snap(&mut app, "palette");
         assert!(s.contains("theme ocean"), "theme list missing");
+    }
+
+    #[test]
+    fn app_theme_saves_dont_stall_or_reload() {
+        let d = std::path::absolute("target/test-scratch/newer/app-theme").unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        theme::TEST_DIR.with(|t| *t.borrow_mut() = Some(d.clone()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "ultra".into();
+        let mut app = App::new(cfg, tx);
+        // what the themes app does on each nudge: save the file, then apply it
+        theme::save_custom("mine", "ultra", &theme::get("ultra")).unwrap();
+        let id = app.focused();
+        app.apply(id, vec![Action::ApplyTheme("mine".into())]);
+        assert_eq!((app.theme.name.as_str(), app.config.theme.as_str()), ("mine", "mine"));
+        // the watcher's burst of events: no sleep on the UI thread, one reload once it's quiet
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            app.handle(Event::ThemeFilesChanged);
+        }
+        assert!(t0.elapsed() < Duration::from_millis(50), "{:?}", t0.elapsed());
+        assert!(app.theme_reload_at.is_some() && app.next_deadline() <= Duration::from_millis(80));
+        // it was oriel's own save: nothing to reload (a marker on the live theme survives)
+        app.theme.accent = ratatui::style::Color::Rgb(1, 2, 3);
+        std::thread::sleep(Duration::from_millis(90));
+        app.handle(Event::Tick);
+        assert!(app.theme_reload_at.is_none());
+        assert_eq!(app.theme.accent, ratatui::style::Color::Rgb(1, 2, 3), "no reload for its own write");
+        // a save from an editor does recolour
+        std::fs::write(d.join("mine.toml"), "base = \"ultra\"\naccent = \"#102030\"\n").unwrap();
+        app.handle(Event::ThemeFilesChanged);
+        std::thread::sleep(Duration::from_millis(90));
+        app.handle(Event::Tick);
+        assert_eq!(app.theme.accent, ratatui::style::Color::Rgb(0x10, 0x20, 0x30));
+        theme::TEST_DIR.with(|t| *t.borrow_mut() = None);
+    }
+
+    #[test]
+    fn app_launcher_goes_to_app_tabs() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut cfg = Config::default();
+        cfg.theme = "oriel".into();
+        let mut app = App::new(cfg, tx);
+        // the F4 tab, with a stand-in pane: a real music player would scan the music folder on this machine
+        let id = app.add(Box::new(crate::panes::themes::Themes::new()));
+        app.tabs.push(Tab { app: Some("music"), name: None, root: Node::Leaf(id), focus: id, zoom: false });
+        let music_tabs = |app: &App| app.tabs.iter().filter(|t| t.app == Some("music")).count();
+        // m on a new tab's launcher, twice: the F4 tab both times, and the launcher steps aside
+        for _ in 0..2 {
+            app.new_tab(Box::new(crate::panes::home::Home::new()));
+            let mine = app.user_tabs().len();
+            app.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+            assert_eq!(app.tabs[app.cur].app, Some("music"));
+            assert_eq!(app.user_tabs().len(), mine - 1, "the launcher's tab closed");
+        }
+        assert_eq!(music_tabs(&app), 1, "one music player");
+        // the palette and ctrl+space m go to it too
+        app.run_cmd(Cmd::Open("music", Place::Split));
+        app.prefix_cmd(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(music_tabs(&app), 1);
+        app.open_palette();
+        let items: Vec<String> = app.palette.as_ref().unwrap().items.iter().map(|i| i.0.clone()).collect();
+        app.palette = None;
+        assert!(!items.iter().any(|i| i.contains("open music")) && items.iter().any(|i| i.contains("go to music")));
+        // closing a tab before the one you're on keeps you on yours
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        let first = app.cur;
+        app.new_tab(Box::new(crate::panes::home::Home::new()));
+        let mine = app.focused();
+        app.close_tab(first);
+        assert_eq!(app.focused(), mine);
     }
 
     #[test]

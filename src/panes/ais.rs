@@ -110,12 +110,29 @@ enum Msg {
     Readouts(Readouts),
     Plan(Result<saver::Connect, String>),
     Applied(Result<String, String>),
+    /// installers recomputed (after r: a tool like npm may have been installed since)
+    Picks(Vec<Option<(String, bool)>>),
 }
 
 enum Ask {
     Install { cli: usize, cmd: String, ready: bool },
     Edit(Plan),
 }
+
+/// An install or sign-in running in a terminal pane. Its shell writes the exit code to `marker` the moment the
+/// command ends (before the "press enter" pause), so the result lands in alerts and the row is re-detected even
+/// if you're elsewhere.
+struct Running {
+    cli: usize,
+    /// "Qwen Code install"
+    what: String,
+    marker: std::path::PathBuf,
+    started: std::time::Instant,
+}
+
+/// A pane closed before its command ended never writes the marker: stop watching for it after this long (and
+/// check that CLI once more).
+const RUNNING_MAX: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// A message box (no action): e.g. how to chain an existing statusLine.
 struct Note {
@@ -156,6 +173,8 @@ pub struct Ais {
     ask_scroll: usize,
     note: Option<Note>,
     busy: bool,
+    running: Vec<Running>,
+    runs: usize,
     side_hits: Vec<(Rect, View)>,
     row_hits: Vec<(Rect, usize)>,
     #[cfg(test)]
@@ -201,6 +220,8 @@ impl Ais {
             ask_scroll: 0,
             note: None,
             busy: false,
+            running: vec![],
+            runs: 0,
             side_hits: vec![],
             row_hits: vec![],
             #[cfg(test)]
@@ -265,13 +286,68 @@ impl Ais {
         if !self.live {
             return;
         }
-        for (i, c) in CLIS.iter().enumerate() {
+        for i in 0..CLIS.len() {
             self.found[i] = None;
-            let (paths, tx, waker) = (self.paths.clone(), self.tx.clone(), self.waker.clone());
-            std::thread::spawn(move || Ais::send(&tx, &waker, Msg::Found(i, catalog::detect(c, &paths))));
+            self.detect_one(i);
         }
         let (base, tx, waker) = (self.paths.ollama.clone(), self.tx.clone(), self.waker.clone());
         std::thread::spawn(move || Ais::send(&tx, &waker, Msg::Ollama(ollama::probe(&base))));
+    }
+
+    /// Check one CLI again (after its install or sign-in finished).
+    fn detect_one(&mut self, i: usize) {
+        if !self.live {
+            return;
+        }
+        let (paths, tx, waker) = (self.paths.clone(), self.tx.clone(), self.waker.clone());
+        std::thread::spawn(move || Ais::send(&tx, &waker, Msg::Found(i, catalog::detect(&CLIS[i], &paths))));
+    }
+
+    /// Installers again, against PATH as it is now: installing Node (say) puts npm on the machine's PATH, which
+    /// this process's own copy of PATH never learns about.
+    fn repick(&mut self) {
+        if !self.live {
+            return;
+        }
+        let (os, tx, waker) = (self.os, self.tx.clone(), self.waker.clone());
+        std::thread::spawn(move || {
+            let path = util::fresh_path();
+            let picks = CLIS.iter().map(|c| catalog::pick(c, os, &|t| util::which_in(t, &path).is_some())).collect();
+            Ais::send(&tx, &waker, Msg::Picks(picks));
+        });
+    }
+
+    /// Installs and sign-ins that have finished since the last look: alert, and re-detect that CLI.
+    fn check_running(&mut self, cx: &mut Cx) {
+        let mut done = vec![];
+        self.running.retain(|r| {
+            // an empty file is one the shell is still writing: next look
+            match std::fs::read_to_string(&r.marker).ok().filter(|c| !c.trim().is_empty()) {
+                Some(code) => {
+                    let _ = std::fs::remove_file(&r.marker);
+                    // "ended": the script exited by itself (or ctrl+c), code unknown
+                    done.push((r.cli, r.what.clone(), Some(code.trim().parse::<i32>().ok())));
+                    false
+                }
+                None if r.started.elapsed() >= RUNNING_MAX => {
+                    done.push((r.cli, r.what.clone(), None));
+                    false
+                }
+                None => true,
+            }
+        });
+        use crate::alerts::Kind;
+        for (i, what, code) in done {
+            // "installed" in alerts only for an install that worked; a sign-in, or an end we can't read, "finished"
+            let fine = if what.ends_with(" install") { Kind::Download } else { Kind::AgentDone };
+            match code {
+                Some(Some(0)) => cx.alert(fine, format!("{what}: done")),
+                Some(Some(code)) => cx.alert(Kind::BuildFailed, format!("{what}: failed (exit {code}) — the terminal shows why")),
+                Some(None) => cx.alert(Kind::AgentDone, format!("{what}: ended — this list checks whether it worked")),
+                None => {} // its pane went away mid-way: nothing to report, but look at the row again
+            }
+            self.detect_one(i);
+        }
     }
 
     fn load_readouts(&mut self) {
@@ -294,6 +370,7 @@ impl Ais {
                     self.claude_lim = claude;
                 }
                 Msg::Ollama(o) => self.ollama = Some(o),
+                Msg::Picks(p) => self.picks = p,
                 Msg::Readouts(r) => self.readouts = Some(r),
                 Msg::Plan(r) => {
                     self.busy = false;
@@ -421,20 +498,26 @@ impl Ais {
             }
             _ => login.to_string(),
         };
-        self.run_in_terminal(&format!("sign in: {}", c.name), &cmdline, cx);
-        cx.notify(format!("{}: follow the prompts in the new pane, then press r here to recheck", c.name));
+        self.run_in_terminal(i, &format!("{} sign-in", c.name), &cmdline, cx);
+        cx.notify(format!("{}: follow the prompts in the new pane — this list rechecks it when that ends", c.name));
     }
 
-    fn run_in_terminal(&mut self, title: &str, cmdline: &str, cx: &mut Cx) {
-        let (prog, args) = util::host_command(cmdline);
+    /// Run an install / sign-in for CLI `cli` in a terminal pane beside this one; `what` names it in alerts.
+    fn run_in_terminal(&mut self, cli: usize, what: &str, cmdline: &str, cx: &mut Cx) {
+        self.runs += 1;
+        let marker = self.paths.data.join("ais").join(format!("done-{}-{}-{}", std::process::id(), CLIS[cli].id, self.runs));
+        let _ = std::fs::create_dir_all(self.paths.data.join("ais"));
+        let _ = std::fs::remove_file(&marker);
+        let (prog, args) = util::host_command(cmdline, &marker);
+        self.running.push(Running { cli, what: what.to_string(), marker, started: std::time::Instant::now() });
         #[cfg(test)]
         {
-            let _ = (title, &cx, &prog, &args);
+            let _ = (&cx, &prog, &args);
             self.launched.push(format!("term: {cmdline}"));
         }
         #[cfg(not(test))]
         {
-            let term = crate::panes::term::Term::new(title, "package", &prog, args, None);
+            let term = crate::panes::term::Term::new(what, "package", &prog, args, None);
             cx.act(Action::Open(Box::new(term), Place::Split));
         }
     }
@@ -491,8 +574,8 @@ impl Ais {
         match self.ask.take() {
             Some(Ask::Install { cli, cmd, .. }) => {
                 let c = &CLIS[cli];
-                self.run_in_terminal(&format!("install {}", c.name), &cmd, cx);
-                cx.notify(format!("installing {} — press r here when it's done to recheck", c.name));
+                self.run_in_terminal(cli, &format!("{} install", c.name), &cmd, cx);
+                cx.notify(format!("installing {} — alerts says when it's done, and this list rechecks it", c.name));
             }
             Some(Ask::Edit(plan)) => {
                 self.busy = true;
@@ -512,6 +595,7 @@ impl Ais {
     fn refresh_all(&mut self, cx: &mut Cx) {
         self.rescan_usage();
         self.detect();
+        self.repick();
         self.load_readouts();
         cx.notify("rechecking your AIs…");
     }

@@ -25,7 +25,23 @@ pub struct Themes {
     msg: Option<String>,
     rows: Vec<(Rect, usize)>,
     side_hits: Vec<(Rect, String)>,
+    files: Option<Files>,
 }
+
+/// What the screen shows about the theme files, kept between frames (it used to list the folder and parse the
+/// file on every one): worked out again for another theme, after a save here, and every couple of seconds for
+/// edits made in an editor.
+struct Files {
+    theme: String,
+    at: std::time::Instant,
+    /// every theme, and whether it's yours
+    names: Vec<(String, bool)>,
+    mine: bool,
+    base: String,
+    problem: Option<String>,
+}
+
+const FILES_FRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The colours, then the rainbow switch.
 fn row_count() -> usize {
@@ -34,7 +50,28 @@ fn row_count() -> usize {
 
 impl Themes {
     pub fn new() -> Themes {
-        Themes { sel: 0, input: None, msg: None, rows: vec![], side_hits: vec![] }
+        Themes { sel: 0, input: None, msg: None, rows: vec![], side_hits: vec![], files: None }
+    }
+
+    fn files(&mut self, name: &str) -> &Files {
+        if self.files.as_ref().is_none_or(|f| f.theme != name || f.at.elapsed() >= FILES_FRESH) {
+            let mine = theme::is_custom(name);
+            self.files = Some(Files {
+                theme: name.to_string(),
+                at: std::time::Instant::now(),
+                names: theme::names()
+                    .into_iter()
+                    .map(|n| {
+                        let yours = theme::is_custom(&n);
+                        (n, yours)
+                    })
+                    .collect(),
+                mine,
+                base: if mine { theme::base_of(name) } else { name.to_string() },
+                problem: if mine { theme::problems(name).into_iter().next() } else { None },
+            });
+        }
+        self.files.as_ref().unwrap()
     }
 
     /// Change the live theme and save it: to its own file if it's yours, else to a new copy of the built-in.
@@ -49,6 +86,7 @@ impl Themes {
             (n, th.name.clone())
         };
         th.name = name.clone();
+        self.files = None;
         match theme::save_custom(&name, &base, &th) {
             Ok(_) => cx.act(Action::ApplyTheme(name)),
             Err(e) => self.msg = Some(format!("couldn't save the theme: {e}")),
@@ -146,12 +184,15 @@ impl Pane for Themes {
         };
         let area = ui::hint_line(f, area, hints, t);
         let body = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(1) };
-        let mine = theme::is_custom(&t.name);
+        let (mine, base, problem) = {
+            let f = self.files(&t.name);
+            (f.mine, f.base.clone(), f.problem.clone())
+        };
         let mut y = body.y;
         let head = if mine {
             vec![
                 Span::styled(format!("{}{}", ui::lead("theme"), t.name), ui::bold_accent(t)),
-                Span::styled(format!("  yours · starts from {} · saved as you go", theme::base_of(&t.name)), ui::muted(t)),
+                Span::styled(format!("  yours · starts from {base} · saved as you go"), ui::muted(t)),
             ]
         } else {
             vec![Span::styled(format!("{}{}", ui::lead("theme"), t.name), ui::bold_accent(t)), Span::styled("  built in · change anything and it becomes your own copy", ui::muted(t))]
@@ -194,7 +235,6 @@ impl Pane for Themes {
                 Some(Input::Hex(s)) => f.render_widget(Paragraph::new(Line::from(vec![Span::styled("colour › ", ui::bold_accent(t)), Span::raw(s.clone()), Span::styled("▏", ui::accent(t))])), r),
                 Some(Input::Name(s)) => f.render_widget(Paragraph::new(Line::from(vec![Span::styled("new theme called › ", ui::bold_accent(t)), Span::raw(s.clone()), Span::styled("▏", ui::accent(t))])), r),
                 None => {
-                    let problem = if mine { theme::problems(&t.name).into_iter().next() } else { None };
                     if let Some(p) = problem {
                         f.render_widget(Paragraph::new(Span::styled(ui::fit(&format!("⚠ {p}"), list_w as usize), Style::default().fg(t.danger))), r);
                     } else if let Some(m) = &self.msg {
@@ -241,6 +281,7 @@ impl Pane for Themes {
                         let mut th = cx.theme.clone();
                         let base = if theme::is_custom(&th.name) { theme::base_of(&th.name) } else { th.name.clone() };
                         th.name = name.clone();
+                        self.files = None;
                         match theme::save_custom(&name, &base, &th) {
                             Ok(_) => {
                                 self.msg = Some(format!("made {name}: change its colours here"));
@@ -309,12 +350,12 @@ impl Pane for Themes {
         let t = cx.theme;
         self.side_hits.clear();
         let mut y = area.y;
-        for name in theme::names() {
+        for (name, yours) in self.files(&t.name).names.clone() {
             if y >= area.bottom() {
                 break;
             }
             let r = Rect { y, height: 1, ..area };
-            let right = if theme::is_custom(&name) { "yours" } else { "" };
+            let right = if yours { "yours" } else { "" };
             ui::side_row(f, r, "theme", &name, right, name == t.name, t);
             self.side_hits.push((r, name));
             y += 1;
@@ -426,6 +467,31 @@ mod tests {
         assert!(s.contains("yours · starts from ultra"), "{s}");
         let side = k.render_side(&mut p, 30, 20);
         assert!(side.contains("my-ultra") && side.contains("yours"), "{side}");
+        theme::TEST_DIR.with(|t| *t.borrow_mut() = None);
+    }
+
+    #[test]
+    fn themes_reads_files_on_change_not_every_frame() {
+        let _d = with_dir("frames");
+        let reads = || theme::FILE_READS.with(|c| c.get());
+        let mut k = Kit::new();
+        k.theme = theme::get("ultra");
+        let mut p = Themes::new();
+        k.key(&mut p, KeyCode::Right); // your own copy: a file to list and check for problems
+        apply(&mut k);
+        let _ = k.render(&mut p, 150, 40);
+        let first = reads();
+        // was: a folder listing and a parse per frame (the rainbow logo redraws 8 times a second)
+        for _ in 0..20 {
+            let _ = k.render(&mut p, 150, 40);
+            let _ = k.render_side(&mut p, 30, 20);
+        }
+        assert_eq!(reads(), first, "frames reuse what was read");
+        // a change here looks again
+        k.key(&mut p, KeyCode::Right);
+        apply(&mut k);
+        let _ = k.render(&mut p, 150, 40);
+        assert!(reads() > first);
         theme::TEST_DIR.with(|t| *t.borrow_mut() = None);
     }
 }

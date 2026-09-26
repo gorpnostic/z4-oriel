@@ -490,7 +490,7 @@ impl Agents {
         let mut proto = Proto::Text;
         let mut calls = None;
         if r.protocol == "mcp" {
-            let exe = self.mcp_exe.clone().or_else(|| std::env::current_exe().ok());
+            let exe = self.mcp_exe.clone().or_else(|| crate::update::exe_path().ok());
             let (tx, waker) = (self.tx.clone(), self.waker.clone());
             let deliver: Arc<dyn Fn(Call) + Send + Sync> = Arc::new(move |c| {
                 let _ = tx.send(Msg::Call(c));

@@ -96,12 +96,13 @@ pub struct Plan {
 /// Write a confirmed plan: refuse if the file changed since, back it up, then temp file + rename.
 /// Returns the backup's path (None when the file is new).
 pub fn apply(p: &Plan, stamp: &str) -> Result<Option<PathBuf>, String> {
-    let now = std::fs::read_to_string(&p.target).ok();
+    let now = read_opt(&p.target)?;
     if now != p.original {
         return Err(format!("{} changed since the diff was made — nothing written, try again", p.target.display()));
     }
     let mut backup = None;
-    if p.original.is_some() {
+    // whatever `original` says: a file that's there is never overwritten without a copy
+    if p.target.exists() {
         let mut b = p.target.as_os_str().to_owned();
         b.push(format!(".oriel-backup-{stamp}"));
         let b = PathBuf::from(b);
@@ -110,6 +111,16 @@ pub fn apply(p: &Plan, stamp: &str) -> Result<Option<PathBuf>, String> {
     }
     write_atomic(&p.target, p.new_text.as_bytes()).map_err(|e| format!("couldn't write {}: {e}", p.target.display()))?;
     Ok(backup)
+}
+
+/// Read a config file that may not exist yet: Ok(None) only when it isn't there. Any other failure (not UTF-8,
+/// no permission) is an error, never "a new file", or the edit would start from nothing and replace it.
+pub fn read_opt(path: &std::path::Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("couldn't read {}: {e} — nothing changed", path.display())),
+    }
 }
 
 // ------------------------------------------------------------------ JSON member surgery
@@ -333,7 +344,7 @@ pub fn edit_settings(text: Option<&str>, changes: &[(&str, Option<Value>)], env:
 
 pub fn plan_claude(paths: &Paths, p: &Preset) -> Result<Plan, String> {
     let target = paths.claude_settings();
-    let original = std::fs::read_to_string(&target).ok();
+    let original = read_opt(&target)?;
     let changes: Vec<(&str, Option<Value>)> = p.claude.iter().map(|(k, v)| (*k, Some(v.json()))).collect();
     let (new_text, diff) = edit_settings(original.as_deref(), &changes, p.env)?;
     let notes = vec![
@@ -343,10 +354,17 @@ pub fn plan_claude(paths: &Paths, p: &Preset) -> Result<Plan, String> {
     Ok(Plan { title: format!("apply {} to Claude Code?", p.name), target, original, new_text, diff, notes, done: format!("Claude Code set to {}", p.name) })
 }
 
-/// The command Claude Code should run as its statusLine.
-pub fn sink_command() -> String {
-    let exe = std::env::current_exe().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_else(|_| "oriel".into());
-    format!("\"{exe}\" usage-sink")
+/// The command Claude Code should run as its statusLine: this oriel's file, which has to exist (Linux calls a
+/// replaced binary "…/oriel (deleted)", and a status line pointing there would just break).
+pub fn sink_command() -> Result<String, String> {
+    let exe = crate::update::exe_path()?;
+    Ok(format!("\"{}\" usage-sink", exe.to_string_lossy().replace('\\', "/")))
+}
+
+/// One POSIX shell word (Claude runs statusLine commands through a shell, Git Bash on Windows): the shell hands
+/// it over as a single argument, so `usage-sink --then` gets the command back exactly as written.
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 pub enum Connect {
@@ -358,20 +376,18 @@ pub enum Connect {
 
 pub fn plan_connect(paths: &Paths) -> Result<Connect, String> {
     let target = paths.claude_settings();
-    let original = std::fs::read_to_string(&target).ok();
+    let original = read_opt(&target)?;
     let cur: Value = match &original {
         Some(t) => serde_json::from_str(t).map_err(|e| format!("settings.json isn't valid JSON ({e})"))?,
         None => json!({}),
     };
-    let cmd = sink_command();
+    let cmd = sink_command()?;
     if let Some(sl) = cur.get("statusLine") {
         let current = sl.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string();
         if current.contains("usage-sink") {
             return Ok(Connect::Already);
         }
-        // quote their command as one argument when it's safe to (Claude runs statusLine through a shell)
-        let theirs = if current.contains('\'') || !current.contains(' ') { current.clone() } else { format!("'{current}'") };
-        let suggestion = if current.is_empty() { cmd } else { format!("{cmd} --then {theirs}") };
+        let suggestion = if current.is_empty() { cmd } else { format!("{cmd} --then {}", sh_quote(&current)) };
         return Ok(Connect::Chain { current: if current.is_empty() { serde_json::to_string(sl).unwrap_or_default() } else { current }, suggestion });
     }
     let v = json!({ "type": "command", "command": cmd });
@@ -459,7 +475,7 @@ pub fn edit_codex(text: Option<&str>, p: &Preset) -> Result<(String, Vec<(char, 
 
 pub fn plan_codex(paths: &Paths, p: &Preset) -> Result<Plan, String> {
     let target = paths.codex_config();
-    let original = std::fs::read_to_string(&target).ok();
+    let original = read_opt(&target)?;
     let (new_text, diff) = edit_codex(original.as_deref(), p)?;
     Ok(Plan {
         title: format!("add the {} profile to Codex?", p.profile),
@@ -499,15 +515,19 @@ pub fn readouts(paths: &Paths) -> Readouts {
     if let Ok(t) = std::fs::read_to_string(paths.claude.join("CLAUDE.md")) {
         r.claude_md = Some((t.lines().count(), t.len()));
     }
-    let settings: Option<Value> = match std::fs::read_to_string(paths.claude_settings()) {
-        Ok(t) => match serde_json::from_str(&t) {
+    let settings: Option<Value> = match read_opt(&paths.claude_settings()) {
+        Ok(Some(t)) => match serde_json::from_str(&t) {
             Ok(v) => Some(v),
             Err(e) => {
                 r.settings_error = Some(format!("settings.json doesn't parse: {e}"));
                 None
             }
         },
-        Err(_) => None,
+        Ok(None) => None,
+        Err(e) => {
+            r.settings_error = Some(e);
+            None
+        }
     };
     let mut names: Vec<String> = vec![];
     if let Ok(b) = std::fs::read(&paths.claude_json) {
@@ -594,6 +614,60 @@ mod tests {
         assert_eq!(set_member("{\"a\":1,\"b\":2}", "a", None).unwrap(), "{\"b\":2}");
         assert_eq!(set_member("{\"a\":1,\"b\":2}", "b", None).unwrap(), "{\"a\":1}");
         assert_eq!(set_member("{\"a\":1}", "a", None).unwrap(), "{}");
+    }
+
+    fn scratch(name: &str) -> (PathBuf, Paths) {
+        let root = std::path::absolute(format!("target/test-scratch/newer/{name}")).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = Paths::under(&root);
+        std::fs::create_dir_all(&paths.claude).unwrap();
+        std::fs::create_dir_all(&paths.codex).unwrap();
+        (root, paths)
+    }
+
+    #[test]
+    fn ais_unreadable_config_is_never_replaced() {
+        let (root, paths) = scratch("saver-not-utf8");
+        // a hook path an old editor saved in ANSI: one cp1252 byte, so not UTF-8 (Claude itself still reads it)
+        let settings: &[u8] = b"{\n  \"hooks\": {\"Stop\": \"C:\\\\Users\\\\J\xf6rg\\\\hook.cmd\"},\n  \"model\": \"opus\"\n}\n";
+        std::fs::write(paths.claude_settings(), settings).unwrap();
+        let toml: &[u8] = b"model = \"gpt-5.6-terra\"\n# J\xf6rg's\n";
+        std::fs::write(paths.codex_config(), toml).unwrap();
+        let errs = [plan_claude(&paths, &PRESETS[0]).err(), plan_connect(&paths).err(), plan_codex(&paths, &PRESETS[0]).err()];
+        for e in errs {
+            let e = e.expect("refused, not planned as a new file");
+            assert!(e.contains("couldn't read") && e.contains("nothing changed"), "{e}");
+        }
+        assert_eq!(std::fs::read(paths.claude_settings()).unwrap(), settings);
+        assert_eq!(std::fs::read(paths.codex_config()).unwrap(), toml);
+        // the token saver view says so, instead of "(not set)" everywhere
+        assert!(readouts(&paths).settings_error.is_some_and(|e| e.contains("couldn't read")));
+        // and a plan made while the file was missing won't write over one that appeared, readable or not
+        let plan = Plan { title: String::new(), target: paths.claude_settings(), original: None, new_text: "{}".into(), diff: vec![], notes: vec![], done: String::new() };
+        assert!(apply(&plan, "t1").unwrap_err().contains("couldn't read"));
+        assert_eq!(std::fs::read(paths.claude_settings()).unwrap(), settings);
+        // a readable file is always backed up before it's replaced
+        let target = root.join("s.json");
+        std::fs::write(&target, "{\"a\": 1}").unwrap();
+        let plan = Plan { target: target.clone(), original: Some("{\"a\": 1}".into()), ..plan };
+        let b = apply(&plan, "t2").unwrap().expect("a backup");
+        assert_eq!(std::fs::read_to_string(b).unwrap(), "{\"a\": 1}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}");
+        // a missing file is new, not an error
+        assert!(plan_claude(&Paths::under(&root.join("empty")), &PRESETS[0]).is_ok());
+    }
+
+    #[test]
+    fn ais_connect_quotes_the_existing_status_line() {
+        let (_root, paths) = scratch("saver-chain");
+        let theirs = r#"jq -r '"[\(.model.display_name)]"' | head -c 40"#;
+        std::fs::write(paths.claude_settings(), serde_json::to_string(&json!({"statusLine": {"type": "command", "command": theirs}})).unwrap()).unwrap();
+        let Ok(Connect::Chain { current, suggestion }) = plan_connect(&paths) else { panic!("expected the chain note") };
+        assert_eq!(current, theirs);
+        // one shell word, each ' spelled '\'' — the shell hands usage-sink the command exactly as it was
+        assert!(suggestion.ends_with(r#" usage-sink --then 'jq -r '\''"[\(.model.display_name)]"'\'' | head -c 40'"#), "{suggestion}");
+        assert_eq!(sh_quote("a"), "'a'");
     }
 
     #[test]

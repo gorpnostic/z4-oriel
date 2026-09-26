@@ -27,17 +27,35 @@ pub const APPS: &[(&str, char, &str, &str)] = &[
     ("ai", 'a', "ai", "ai chat"),
     ("claude", 'c', "claude", "claude code"),
     ("codex", 'x', "robot", "codex"),
+    ("agents", 'r', "robot", "agents"),
+    ("ais", 'i', "gauge", "your AIs"),
     ("music", 'm', "music", "music"),
     ("system", 's', "system", "system"),
     ("files", 'f', "files", "files"),
     ("notes", 'n', "notes", "notes"),
+    ("calendar", 'd', "calendar", "calendar"),
     ("storage", 'g', "storage", "storage"),
+    ("themes", 'l', "theme", "themes"),
+    ("help", '?', "search", "help"),
 ];
+
+/// Apps that keep a single copy, in their sidebar tab: a second would play over the first (music), fire every
+/// reminder twice (calendar) or fight the first over the same state (agents, your AIs). Opening one again goes to
+/// its tab instead.
+pub const SINGLE: &[&str] = &["music", "calendar", "agents", "ais"];
 
 /// CLI agents that run as a terminal pane when installed: (app name, program, title).
 const AGENTS: &[(&str, &str, &str)] = &[("claude", "claude", "claude code"), ("codex", "codex", "codex")];
 
+#[cfg(test)]
+thread_local! {
+    /// How often `available` ran on this thread: the launcher must not ask on every frame.
+    pub static AVAILABLE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn available(name: &str) -> bool {
+    #[cfg(test)]
+    AVAILABLE_CALLS.with(|c| c.set(c.get() + 1));
     match AGENTS.iter().find(|a| a.0 == name) {
         Some(a) => which(a.1).is_some(),
         None => true,
