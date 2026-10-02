@@ -18,6 +18,8 @@ mod qa_sizes;
 mod qa_keys;
 #[cfg(test)]
 mod qa_first_run;
+#[cfg(test)]
+mod qa_data;
 mod testkit;
 mod theme;
 mod ui;
