@@ -20,7 +20,13 @@ pub struct Caps {
     pub secs: u64,
 }
 
+#[cfg(not(test))]
 pub const CAPS: Caps = Caps { files: 20_000, bytes: 300 << 20, secs: 8 };
+/// Tests run with no time limit on the listing: with the whole suite running, listing even a tiny folder has taken
+/// 9-14 s, and a folder found "too slow" is skipped for 10 minutes, so a checkpoint test would hang on a busy
+/// machine. The time cap isn't under test; the file and size caps are (chat_ckpt_* tests pass their own).
+#[cfg(test)]
+pub const CAPS: Caps = Caps { files: 20_000, bytes: 300 << 20, secs: 3600 };
 
 /// Checkpoints kept per chat, and for how long.
 const KEEP: usize = 50;

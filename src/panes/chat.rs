@@ -6369,11 +6369,12 @@ mod tests {
 
     // ------------------------------------------------------------ checkpoints, checks, context, handoffs
 
-    /// Poll until `done` holds (background git work and checks report back through the pane's poll).
+    /// Poll until `done` holds (background git work and checks report back through the pane's poll). The limit only
+    /// catches a hang: with the whole suite running, this git work has taken over a minute.
     fn wait_until(k: &mut Kit, c: &mut Chat, what: &str, mut done: impl FnMut(&Chat) -> bool) {
         let t0 = Instant::now();
         while !done(c) {
-            assert!(t0.elapsed() < Duration::from_secs(60), "timed out waiting for {what}");
+            assert!(t0.elapsed() < Duration::from_secs(300), "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(15));
             k.poll(c);
         }

@@ -736,23 +736,26 @@ mod tests {
         let pid = Arc::new(AtomicU32::new(0));
         let (s2, p2) = (stop.clone(), pid.clone());
         // the process id is there while it runs (so closing oriel can kill it at once); then esc
+        // (generous waits: on a busy machine starting and killing processes can take seconds, and what this checks is
+        // that esc cuts a two-minute command short, well inside its time, not how fast the machine is)
         let seen = std::thread::spawn(move || {
             let t0 = Instant::now();
-            while p2.load(Ordering::SeqCst) == 0 && t0.elapsed() < Duration::from_secs(5) {
+            while p2.load(Ordering::SeqCst) == 0 && t0.elapsed() < Duration::from_secs(60) {
                 std::thread::sleep(Duration::from_millis(10));
             }
             let running = p2.load(Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(400));
             s2.store(true, Ordering::SeqCst);
-            running
+            (running, Instant::now())
         });
         let (exe, args): (&str, Vec<String>) =
-            if cfg!(windows) { ("cmd", vec!["/c".into(), "ping -n 30 127.0.0.1 >nul".into()]) } else { ("sh", vec!["-c".into(), "sleep 30".into()]) };
-        let t0 = Instant::now();
+            if cfg!(windows) { ("cmd", vec!["/c".into(), "ping -n 120 127.0.0.1 >nul".into()]) } else { ("sh", vec!["-c".into(), "sleep 120".into()]) };
         let r = run_cli(exe, &args, |_| {}, &std::env::temp_dir(), &stop, &pid, |_| Ok(()));
+        let ended = Instant::now();
         assert!(r.is_ok(), "{r:?}");
-        assert!(t0.elapsed() < Duration::from_secs(5), "took {:?}", t0.elapsed());
-        assert_ne!(seen.join().unwrap(), 0, "the process id is kept while it runs");
+        let (running, stopped) = seen.join().unwrap();
+        assert!(ended.saturating_duration_since(stopped) < Duration::from_secs(30), "esc didn't stop it: it ran on {:?} after", ended.saturating_duration_since(stopped));
+        assert_ne!(running, 0, "the process id is kept while it runs");
         assert_eq!(pid.load(Ordering::SeqCst), 0, "and forgotten once it's gone (the id could be another process's by then)");
     }
 
