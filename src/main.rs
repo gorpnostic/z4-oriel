@@ -22,6 +22,8 @@ mod qa_first_run;
 mod qa_data;
 #[cfg(test)]
 mod qa_tools;
+#[cfg(test)]
+mod qa_cli;
 mod testkit;
 mod theme;
 mod ui;
