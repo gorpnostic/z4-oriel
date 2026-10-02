@@ -295,14 +295,19 @@ impl Pane for Calendar {
         let (y0, m0, _) = civil_from_days(self.sel);
         // ---- the month's name
         let head = Line::from(Span::styled(format!("{} {y0}", MONTHS[m0 as usize - 1]), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)));
-        f.render_widget(Paragraph::new(head), Rect { x: body.x, y: body.y + 1, width: grid_w, height: 1 });
-        // ---- weekday names
+        if body.height > 1 {
+            f.render_widget(Paragraph::new(head), Rect { x: body.x, y: body.y + 1, width: grid_w, height: 1 });
+        }
+        // ---- weekday names (the grid is at least 28 wide: in a narrower pane it's cut at the right edge)
         let cw = (grid_w / 7).max(4);
         let wy = body.y + 3;
         for (i, d) in DAYS.iter().enumerate() {
             let label = if cw >= 10 { &d[..3] } else { &d[..2] };
             let st = if i >= 5 { ui::muted(t) } else { Style::default().fg(t.shine) };
-            f.render_widget(Paragraph::new(Span::styled(format!(" {label}"), st)), Rect { x: body.x + i as u16 * cw, y: wy, width: cw, height: 1 });
+            let r = Rect { x: body.x + i as u16 * cw, y: wy, width: cw, height: 1 }.intersection(body);
+            if !r.is_empty() {
+                f.render_widget(Paragraph::new(Span::styled(format!(" {label}"), st)), r);
+            }
         }
         // ---- the weeks: 6 rows, each cell the day number and what's on
         let first = days_from_civil(y0, m0, 1);
@@ -319,6 +324,10 @@ impl Pane for Calendar {
                 let day = start + (w * 7 + d) as i64;
                 let r = Rect { x: body.x + d * cw, y: wy + 1 + w * ch, width: cw.saturating_sub(1), height: ch };
                 if r.bottom() > body.bottom() {
+                    continue;
+                }
+                let r = r.intersection(body);
+                if r.is_empty() {
                     continue;
                 }
                 let (_, m, dn) = civil_from_days(day);
@@ -514,12 +523,15 @@ impl Pane for Calendar {
     fn side(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
         let t = cx.theme;
         self.side_hits.clear();
+        if area.height == 0 {
+            return;
+        }
         let mut y = area.y;
         f.render_widget(Paragraph::new(Span::styled("coming up", ui::muted(t))), Rect { y, height: 1, ..area });
         y += 1;
         // what's still ahead: this morning's plans are gone from it by the evening
         let soon: Vec<&Plan> = self.plans.iter().filter(|p| p.day >= self.today && p.day < self.today + 14 && !self.finished(p)).collect();
-        if soon.is_empty() {
+        if soon.is_empty() && y < area.bottom() {
             f.render_widget(Paragraph::new(Span::styled("nothing in the next two weeks", ui::muted(t))), Rect { y, height: 1, ..area });
         }
         for p in soon {

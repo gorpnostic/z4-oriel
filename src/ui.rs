@@ -141,6 +141,34 @@ pub fn fit(s: &str, w: usize) -> String {
     out
 }
 
+/// Keep the end of `s` in `w` display columns, with an ellipsis in front when cut (a text field you're typing
+/// into: the cursor end stays in view).
+pub fn fit_tail(s: &str, w: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= w {
+        return s.to_string();
+    }
+    if w == 0 {
+        return String::new();
+    }
+    let mut used = 1; // the ellipsis
+    let mut tail: Vec<char> = vec![];
+    for c in s.chars().rev() {
+        let cw = c.width().unwrap_or(0);
+        if used + cw > w {
+            break;
+        }
+        tail.push(c);
+        used += cw;
+    }
+    // a combining mark whose letter was cut off would land on the ellipsis
+    while tail.last().is_some_and(|c| c.width().unwrap_or(0) == 0) {
+        tail.pop();
+    }
+    std::iter::once('…').chain(tail.into_iter().rev()).collect()
+}
+
 pub fn human_bytes(n: u64) -> String {
     let mut v = n as f64;
     for unit in ["B", "K", "M", "G", "T"] {
@@ -168,6 +196,9 @@ pub fn logo_lines() -> Vec<String> {
 pub fn logo(f: &mut Frame, area: Rect, t: &Theme, time: f64) -> u16 {
     let lines = logo_lines();
     let w = lines[0].chars().count() as u16;
+    if area.height == 0 {
+        return 0;
+    }
     if area.width < w + 2 || area.height < 9 {
         let p = Paragraph::new(Line::from(Span::styled("oriel", bold_accent(t)))).centered();
         f.render_widget(p, Rect { height: 1, ..area });

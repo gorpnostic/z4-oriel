@@ -560,7 +560,6 @@ mod tests {
     /// calls panes::available() for each app, and for claude / codex that's config::which(): a PATH search on
     /// disk (4 extensions x every PATH folder until a hit). Help renders the same kind of screen without it.
     #[test]
-    #[ignore = "fails: home 36-43 ms/frame vs help 6.5: Home::apps() runs two PATH searches (18-28 ms, 89 PATH folders) per render/key/mouse move (home.rs:25, mod.rs:41)"]
     fn qa_keys_home_frame_cost() {
         let mut k = Kit::new();
         let (mut home, mut help) = (panes::home::Home::new(), panes::help::Help::new());
@@ -573,21 +572,37 @@ mod tests {
             }
             t.elapsed().as_secs_f64() * 1000.0 / n as f64
         };
-        let (home_ms, help_ms) = (time(&mut k, &mut home), time(&mut k, &mut help));
-        let t = Instant::now();
-        for _ in 0..n {
-            let _ = panes::available("claude");
-            let _ = panes::available("codex");
+        // home's frames, keys and mouse moves ask nothing of PATH (a per-thread count: other tests can't skew it)
+        let calls = || panes::AVAILABLE_CALLS.with(|c| c.get());
+        let help_ms = time(&mut k, &mut help);
+        let before = calls();
+        let home_ms = time(&mut k, &mut home);
+        for x in 0..n as u16 {
+            k.mouse(&mut home, MouseEvent { kind: MouseEventKind::Moved, column: x % 120, row: 20, modifiers: KeyModifiers::NONE }, Rect::new(0, 0, 120, 40));
+            k.key(&mut home, KeyCode::Down);
         }
-        let which_ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        let asked = calls() - before;
+        // what an ask costs once it's cached: the cheapest of 10 batches, so a rescan another test forces
+        // (refresh_available, when it opens the palette) in the middle of one doesn't count
+        let _ = panes::available("claude");
+        let which_ms = (0..10)
+            .map(|_| {
+                let t = Instant::now();
+                for _ in 0..n {
+                    let _ = panes::available("claude");
+                    let _ = panes::available("codex");
+                }
+                t.elapsed().as_secs_f64() * 1000.0 / n as f64
+            })
+            .fold(f64::INFINITY, f64::min);
         let dirs = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).count()).unwrap_or(0);
-        println!("home {home_ms:.2} ms/frame, help {help_ms:.2} ms/frame, available(claude)+available(codex) {which_ms:.2} ms ({dirs} PATH folders)");
-        assert!(which_ms < 0.5, "two PATH searches cost {which_ms:.2} ms, paid on every home frame, key and mouse move (home {home_ms:.2} ms vs help {help_ms:.2} ms per frame)");
+        println!("home {home_ms:.2} ms/frame, help {help_ms:.2} ms/frame, available(claude)+available(codex) {which_ms:.4} ms ({dirs} PATH folders)");
+        assert_eq!(asked, 0, "home's frames, keys and mouse moves looked on PATH {asked} times (home {home_ms:.2} ms vs help {help_ms:.2} ms per frame)");
+        assert!(which_ms < 0.5, "two PATH searches cost {which_ms:.2} ms even when cached");
     }
 
     /// Found by qa_keys_help. In the app: F10, `/`, type something no topic has, enter, then ↓ — oriel exits.
     #[test]
-    #[ignore = "fails: help panics (index out of bounds, help.rs:414) on ↓/↑/tab after a search that matches nothing"]
     fn qa_keys_help_bug_move_after_search_with_no_match() {
         let mut k = Kit::new();
         let mut p = panes::help::Help::new();
@@ -601,7 +616,6 @@ mod tests {
     /// Found by qa_keys_app. In the app on an 80x24 terminal: ctrl+space - five times (split down, each time in the
     /// new pane) and oriel exits: the fifth split halves a pane that is one row tall.
     #[test]
-    #[ignore = "fails: layout::split_rect panics (clamp min > max, layout.rs:148) splitting a 1-row/1-col area: 5 split-downs on 80x24"]
     fn qa_keys_layout_bug_split_a_one_row_pane() {
         use crate::layout::{Dir, Node};
         let mut root = Node::Leaf(1);
@@ -614,7 +628,6 @@ mod tests {
 
     /// Same crash, smaller: any split on a terminal one row tall (or one column wide).
     #[test]
-    #[ignore = "fails: layout::split_rect panics (clamp min > max, layout.rs:148/143) for an area 1 cell thick"]
     fn qa_keys_layout_bug_split_rect_one_cell() {
         let _ = crate::layout::split_rect(Rect::new(0, 0, 80, 1), crate::layout::Dir::Down, 0.5);
     }

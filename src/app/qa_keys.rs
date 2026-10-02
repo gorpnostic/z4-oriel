@@ -361,7 +361,6 @@ const SYS32: &str = r"C:\Windows\System32";
 /// qa_keys_help_bug_move_after_search_with_no_match through the real key path: F10, `/`, a query no topic
 /// matches, enter (the box closes, the empty result stays), ↓.
 #[test]
-#[ignore = "fails: in the app, F10 / zzqqxx enter ↓ panics (index out of bounds, help.rs:414)"]
 fn qa_keys_app_bug_help_search_no_match() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = App::new(Config::default(), tx);
@@ -403,7 +402,6 @@ fn click(app: &mut App, r: Rect, b: MouseButton) {
 /// the sidebar's × (app.rs:1229) and middle-click (app.rs:1208) call close_tab without that check. On any other
 /// tab the same double-click silently closes a second tab, the one that slid into its place.
 #[test]
-#[ignore = "fails: two clicks on the last tab's sidebar × before a redraw panic (index out of bounds, app.rs:598): app.rs:1229/1208 skip the bound check of app.rs:1014"]
 fn qa_keys_app_bug_double_click_last_tab_close() {
     let (mut app, _term, _row, x) = three_tabs();
     let n = app.tabs.len();
@@ -416,7 +414,6 @@ fn qa_keys_app_bug_double_click_last_tab_close() {
 /// in the same burst. SideHit::Tab sets self.cur = n (app.rs:1224) with no check, and the next frame's first
 /// self.tabs[self.cur] (draw_sidebar, app.rs:1433; app.rs:1328 without the sidebar) panics.
 #[test]
-#[ignore = "fails: closing the last tab then clicking its old sidebar row before a redraw sets cur past the end (app.rs:1224); the next draw panics (app.rs:1433)"]
 fn qa_keys_app_bug_click_closed_tab_row() {
     let (mut app, mut term, row, x) = three_tabs();
     click(&mut app, x, MouseButton::Left);
@@ -428,7 +425,6 @@ fn qa_keys_app_bug_click_closed_tab_row() {
 /// ctrl+space then `-` five times. Each split-down opens a terminal (here the inert ping) in a pane half as tall;
 /// the fifth halves a pane one row tall and the next frame panics.
 #[test]
-#[ignore = "fails: 5x ctrl+space - on 80x24 panics in layout::split_rect (clamp min > max, layout.rs:148)"]
 fn qa_keys_app_bug_split_down_five_times() {
     if !cfg!(windows) {
         return;

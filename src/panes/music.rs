@@ -602,6 +602,9 @@ impl Music {
 
     /// Two-line now-playing strip for narrow panes (no room for the column).
     fn draw_strip(&mut self, f: &mut Frame, r: Rect, s: &Snap, t: &Theme) {
+        if r.height == 0 {
+            return; // a pane too short for it
+        }
         let Some(tr) = &s.track else {
             f.render_widget(Paragraph::new(Line::from(vec![
                 Span::styled("nothing playing  ", Style::default().add_modifier(Modifier::BOLD)),
@@ -616,6 +619,9 @@ impl Music {
             Span::styled(format!("  {artist}"), ui::muted(t)),
         ]);
         f.render_widget(Paragraph::new(line), Rect { height: 1, ..r });
+        if r.height < 2 {
+            return;
+        }
         let bar_w = r.width.saturating_sub(14) as usize;
         let frac = if s.dur > 0.0 { (s.pos / s.dur).clamp(0.0, 1.0) } else { 0.0 };
         let filled = (frac * bar_w as f64) as usize;

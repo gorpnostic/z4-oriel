@@ -71,8 +71,22 @@ fn frame_intact(b: &Buffer, r: Rect, plain_bottom: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// A pane's frame: sides and corners intact, and the bottom edge only line plus (part of) the subtitle.
-fn pane_frame_intact(b: &Buffer, r: Rect, sub: Option<String>) -> Result<(), String> {
+/// The focused frame's "← N need(s) you" label (what's waiting in other tabs), set into its bottom-left
+/// border on purpose: the rest of the bottom edge after it, or None if `s` doesn't start with that label.
+fn after_need_label(s: &str) -> Option<&str> {
+    let r = s.strip_prefix("← ")?;
+    let digits = r.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let r = &r[digits..];
+    let r = r.strip_prefix(" needs you").or_else(|| r.strip_prefix(" need you"))?;
+    Some(r.trim_start())
+}
+
+/// A pane's frame: sides and corners intact, and the bottom edge only line plus (part of) the subtitle (and, on
+/// the focused frame, the need-you label at its left).
+fn pane_frame_intact(b: &Buffer, r: Rect, sub: Option<String>, focused: bool) -> Result<(), String> {
     frame_intact(b, r, false)?;
     if r.intersection(b.area) != r || r.width < 3 || r.height < 2 {
         return Ok(());
@@ -80,6 +94,7 @@ fn pane_frame_intact(b: &Buffer, r: Rect, sub: Option<String>) -> Result<(), Str
     let bm = r.bottom() - 1;
     let rest: String = (r.x + 1..r.right() - 1).map(|x| sym(b, x, bm)).collect::<String>().replace('─', "");
     let rest = rest.trim();
+    let rest = if focused { after_need_label(rest).unwrap_or(rest) } else { rest };
     if !rest.is_empty() && !sub.unwrap_or_default().contains(rest) {
         return Err(format!("pane {}x{} at ({},{}): bottom border overwritten: {:?}", r.width, r.height, r.x, r.y, rest));
     }
@@ -109,10 +124,18 @@ fn shot_with(app: &mut App, scen: &str, w: u16, h: u16, bad: &mut Vec<Problem>, 
             bad.push(problem(scen, "sidebar", w, h, e));
         }
     }
+    let (zoom, focus) = app.tabs.get(app.cur).map(|t| (t.zoom, t.focus)).unwrap_or((false, 0));
     for (id, r) in app.outer.clone() {
-        let sub = app.panes.get(&id).and_then(|p| p.subtitle());
+        let mut sub = app.panes.get(&id).and_then(|p| p.subtitle());
+        if zoom {
+            // a zoomed pane says so in its subtitle (the other panes are only hidden)
+            sub = Some(match sub {
+                Some(s) => format!("{s} · zoomed"),
+                None => "zoomed".into(),
+            });
+        }
         let title = app.panes.get(&id).map(|p| p.title()).unwrap_or_default();
-        if let Err(e) = pane_frame_intact(&b, r, sub) {
+        if let Err(e) = pane_frame_intact(&b, r, sub, id == focus) {
             bad.push(problem(scen, &format!("pane '{title}'"), w, h, e));
         }
     }
@@ -172,24 +195,14 @@ fn as_pane_problem(p: &Problem) -> Option<Problem> {
     Some(problem(name, "app", w.parse::<u16>().ok()?.saturating_sub(2), h.parse::<u16>().ok()?.saturating_sub(2), "drew outside its rect (onto its frame)"))
 }
 
-/// Known, reported bugs the app sweeps run into (each also has its own ignored test). Everything else fails.
-const KNOWN: &[Known] = &[
-    (
-        "layout::split_rect panics (clamp: min > max) on a split 1 cell wide or tall: ~7+ alt n splits at 80x24, or any split tab on a 1-column/1-row screen, crash the app (src/layout.rs:143, 148)",
-        |p| p.msg.contains("layout.rs:143") || p.msg.contains("layout.rs:148"),
-    ),
-    (
-        "a pane-level overflow bug (crate::qa_sizes::PANE_KNOWN: home, calendar, themes, music) showing up as text on that pane's own frame",
-        |p| as_pane_problem(p).is_some_and(|pp| qa::PANE_KNOWN.iter().any(|(_, hit)| hit(&pp))),
-    ),
-    ("right-click menu: every item is drawn even when the menu was cut down to a short screen: they go over its bottom border and past it (src/app.rs:1409-1420)", |p| p.pane.starts_with("right-click menu") && p.phase == "frame"),
-    ("palette: 'nothing matches' is drawn on the palette's own bottom border when it has 2 rows inside (src/app.rs:1612)", |p| p.pane.starts_with("palette") && p.phase == "frame" && p.msg.contains("nothing matc")),
-    ("tour card: its two buttons need 35 columns and aren't fitted to the card: on screens under ~41 columns the second spills over its right border (src/onboard.rs:655, 672-675)", |p| p.phase == "tour card" && p.msg.contains("side border")),
-    ("welcome: laid out for 19 rows, and the logo's rows are reserved even when it's too narrow to draw: buttons off screen below ~17 rows, a blank screen at 40x10 (src/onboard.rs:620-625)", |p| p.phase == "buttons"),
-    ("rename: invisible below 70 columns (start_rename turns the sidebar on but draw() hides it under 70), and at 70+ the field doesn't scroll, so a long name pushes the cursor off (src/app.rs:593, 1319, 1533-1540)", |p| p.pane == "rename" && p.phase == "field"),
-    ("pane frames: a title longer than the pane runs under the × close button, leaving a stray letter between the × and the corner (the title isn't shortened to make room: src/ui.rs:90-93, src/app.rs:1348-1356)", |p| p.phase.ends_with("close button")),
-    ("sidebar: your own tabs are listed with no scrolling, after the fixed app list: at 80x24 only the first 2 fit, so the tab you're on (and its rename field) can be missing from the sidebar (src/app.rs:1514-1517)", |p| p.pane == "own tabs" && p.phase == "sidebar list"),
-];
+/// Known, reported bugs the app sweeps run into and that aren't fixed yet (each also has its own ignored test).
+/// Everything else fails. (Fixed, each with its test below: split_rect on a 1-cell split, the right-click menu
+/// and palette on short screens, the tour card's buttons, the welcome's layout, the rename field, titles under
+/// the × button, the sidebar's tab list.)
+const KNOWN: &[Known] = &[(
+    "a pane-level overflow bug (crate::qa_sizes::PANE_KNOWN) showing up as text on that pane's own frame",
+    |p| as_pane_problem(p).is_some_and(|pp| qa::PANE_KNOWN.iter().any(|(_, hit)| hit(&pp))),
+)];
 
 // ------------------------------------------------------------------ many splits, zoom (here: only light panes)
 
@@ -349,6 +362,15 @@ fn popup_rect(screen: Rect, w: u16, h: u16) -> Rect {
     Rect { x: screen.x + (screen.width - w) / 2, y: screen.y + screen.height.saturating_sub(h) / 3, width: w, height: h }
 }
 
+/// The palette's box (76x22, placed like ui::popup) is intact; its bottom border holds only the match count
+/// ("3/19", or "0").
+fn palette_intact(app: &App, b: &Buffer) -> Result<(), String> {
+    let Some(p) = app.palette.as_ref() else { return Err("the palette isn't open".into()) };
+    let m = App::palette_matches(p);
+    let count = if m.is_empty() { "0".to_string() } else { format!("{}/{}", p.sel + 1, m.len()) };
+    pane_frame_intact(b, popup_rect(b.area, 76, 22), Some(count), false)
+}
+
 #[test]
 fn qa_sizes_app_palette() {
     let mut bad = vec![];
@@ -364,7 +386,7 @@ fn qa_sizes_app_palette() {
             }
             let scen = format!("palette ({label})");
             if let Some(b) = shot_with(&mut app, &scen, w, h, &mut bad, false) {
-                if let Err(e) = frame_intact(&b, popup_rect(b.area, 64, 18), true) {
+                if let Err(e) = palette_intact(&app, &b) {
                     bad.push(problem(&scen, "frame", w, h, e));
                 }
             }
@@ -440,21 +462,31 @@ fn qa_sizes_app_rename_toast_prefix() {
         for c in AWKWARD[1].chars().chain(AWKWARD[2].chars()) {
             press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
         }
-        if let Some(b) = shot(&mut app, "rename", w, h, &mut bad) {
+        // the field is in the tab's sidebar row when that row is drawn, else in a small box over everything
+        if let Some(b) = shot_with(&mut app, "rename", w, h, &mut bad, false) {
+            let in_sidebar = app.sidebar && w >= 70 && listed(&app, app.cur);
+            if in_sidebar {
+                let _ = shot(&mut app, "rename", w, h, &mut bad);
+            } else if let Err(e) = frame_intact(&b, popup_rect(b.area, 48, 4), true) {
+                bad.push(problem("rename", "box", w, h, e));
+            }
             // what you're typing has to be somewhere on screen: the field's cursor at least
             if w >= 20 && h >= 3 && !text(&b).contains('▏') {
-                bad.push(problem("rename", "field", w, h, format!("renaming, but the name being typed isn't on screen (sidebar {})", if w >= 70 { "shown: the field scrolls off" } else { "hidden below 70 columns" })));
+                bad.push(problem("rename", "field", w, h, format!("renaming, but the name being typed isn't on screen ({})", if in_sidebar { "sidebar row: the field scrolls off" } else { "the rename box" })));
             }
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         let _ = shot(&mut app, "renamed tab", w, h, &mut bad);
-        // a toast with a long message, then the prefix hint
+        // a toast with a long message (at the top right of the panes), then the prefix hint
         app.notify(AWKWARD.join(" · "));
         if let Some(b) = shot_with(&mut app, "toast", w, h, &mut bad, false) {
-            let tw = (unicode_width::UnicodeWidthStr::width(format!(" {} ", AWKWARD.join(" · ")).as_str()) as u16 + 10).min(w);
-            let r = Rect { x: w.saturating_sub(tw + 1), y: h.saturating_sub(4), width: tw, height: 3 };
-            if let Err(e) = frame_intact(&b, r, true) {
-                bad.push(problem("toast", "frame", w, h, e));
+            if app.toast_hits.is_empty() && w >= 20 && h >= 6 {
+                bad.push(problem("toast", "frame", w, h, "no toast on screen"));
+            }
+            for &(r, _) in &app.toast_hits {
+                if let Err(e) = frame_intact(&b, r, true) {
+                    bad.push(problem("toast", "frame", w, h, e));
+                }
             }
         }
         app.notices.clear();
@@ -591,6 +623,11 @@ fn tour_frame(b: &Buffer) -> Option<Rect> {
     None
 }
 
+/// The first run: welcome, the setup pages, then the tour (App::start_tour is the replay, straight into the tour).
+fn first_run(app: &mut App) {
+    app.onboard = Some(crate::onboard::Onboard::new(&app.theme.name, &app.config));
+}
+
 fn onboard_step(app: &mut App) {
     let p = app.probe();
     let out = app.onboard.as_mut().map(|o| o.check(&p));
@@ -606,7 +643,7 @@ fn onboarding_sweep(dir: &std::path::Path, bad: &mut Vec<Problem>) {
     c.theme = "ultra".into();
     c.startup = "help".into();
     let mut app = App::new(c, tx);
-    app.start_tour();
+    first_run(&mut app);
     let sweep = |app: &mut App, page: &str, bad: &mut Vec<Problem>| {
         for &(w, h) in APP_SIZES {
             let Some(b) = shot_with(app, &format!("onboarding: {page}"), w, h, bad, false) else { continue };
@@ -683,7 +720,6 @@ fn qa_sizes_child_app_onboarding() {
 // ------------------------------------------------------------------ known bugs, one test each (ignored: they fail)
 
 #[test]
-#[ignore = "fails: splitting the way alt n does at 80x24 crashes the app within ~12 splits: layout::split_rect panics on a 1-cell area (src/layout.rs:143, 148)"]
 fn qa_sizes_bug_app_many_splits_crash() {
     let (mut app, _rx) = new_app();
     app.new_tab(Box::new(crate::panes::home::Home::new()));
@@ -696,7 +732,6 @@ fn qa_sizes_bug_app_many_splits_crash() {
 }
 
 #[test]
-#[ignore = "fails: a tab with two side-by-side panes crashes the app when the terminal is 1 column wide (src/layout.rs:143)"]
 fn qa_sizes_bug_app_split_tab_one_column() {
     let (mut app, _rx) = new_app();
     app.new_tab(Box::new(crate::panes::home::Home::new()));
@@ -707,7 +742,6 @@ fn qa_sizes_bug_app_split_tab_one_column() {
 }
 
 #[test]
-#[ignore = "fails: the right-click menu draws all 6 items on an 80x5 screen: they go over its bottom border (src/app.rs:1409-1420)"]
 fn qa_sizes_bug_context_menu_short_screen() {
     let (mut app, _rx) = new_app();
     app.new_tab(Box::new(crate::panes::home::Home::new()));
@@ -720,7 +754,6 @@ fn qa_sizes_bug_context_menu_short_screen() {
 }
 
 #[test]
-#[ignore = "fails: on a 20x6 screen the palette draws 'nothing matches' on its own bottom border (src/app.rs:1612)"]
 fn qa_sizes_bug_palette_short_screen() {
     let (mut app, _rx) = new_app();
     app.open_palette();
@@ -728,11 +761,10 @@ fn qa_sizes_bug_palette_short_screen() {
         press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
     }
     let b = draw(&mut app, 20, 6).unwrap();
-    frame_intact(&b, popup_rect(b.area, 64, 18), true).unwrap_or_else(|e| panic!("{e}\n{}", text(&b)));
+    palette_intact(&app, &b).unwrap_or_else(|e| panic!("{e}\n{}", text(&b)));
 }
 
 #[test]
-#[ignore = "fails: renaming a tab on a screen under 70 columns is invisible: start_rename turns the sidebar on, but draw() only shows it from 70 columns (src/app.rs:593, 1319)"]
 fn qa_sizes_bug_rename_invisible_when_narrow() {
     let (mut app, _rx) = new_app();
     app.new_tab(Box::new(crate::panes::home::Home::new()));
@@ -746,7 +778,6 @@ fn qa_sizes_bug_rename_invisible_when_narrow() {
 }
 
 #[test]
-#[ignore = "fails: the tab rename field doesn't scroll: a 30-character name pushes the cursor (and the end of the name) out of the sidebar (src/app.rs:1533-1540)"]
 fn qa_sizes_bug_rename_long_name_cut_off() {
     let (mut app, _rx) = new_app();
     app.new_tab(Box::new(crate::panes::home::Home::new()));
@@ -763,7 +794,6 @@ fn qa_sizes_bug_rename_long_name_cut_off() {
 }
 
 #[test]
-#[ignore = "fails: on an 80x24 screen the sidebar lists only 2 of your own tabs and doesn't scroll, so with 3 the one you're on isn't in it (src/app.rs:1514-1517)"]
 fn qa_sizes_bug_sidebar_hides_current_tab() {
     let (mut app, _rx) = new_app();
     for _ in 0..3 {
@@ -774,7 +804,6 @@ fn qa_sizes_bug_sidebar_hides_current_tab() {
 }
 
 #[test]
-#[ignore = "fails: closing a tab while renaming another one moves the rename to the next tab over: it's kept as an index, so Enter renames the wrong tab (src/app.rs:164, 592, 837-838; close() at 410-429 never adjusts it)"]
 fn qa_sizes_bug_rename_moves_when_a_tab_closes() {
     // found in passing: the mouse still works while renaming, and a middle-click on a tab in the sidebar closes it
     let (mut app, _rx) = new_app();
@@ -802,7 +831,6 @@ fn qa_sizes_bug_rename_moves_when_a_tab_closes() {
 }
 
 #[test]
-#[ignore = "fails: FocusGained/FocusLost never reach their arms: Event::Input(_) above them matches first, so term_focused never changes (desktop notifications never fire, alerts are always marked read) (src/app.rs:727 vs 755-756)"]
 fn qa_sizes_bug_focus_events_ignored() {
     // found in passing: rustc also warns "unreachable pattern" on these two arms
     let (mut app, _rx) = new_app();
@@ -811,7 +839,6 @@ fn qa_sizes_bug_focus_events_ignored() {
 }
 
 #[test]
-#[ignore = "fails: the tour card's buttons spill over its right border on a 40x10 screen (src/onboard.rs:655, 672-675)"]
 fn qa_sizes_bug_tour_buttons_narrow() {
     qa::run_child("app::qa_sizes_app::qa_sizes_child_tour_buttons", &qa::scratch("tour-buttons"));
 }
@@ -822,7 +849,7 @@ fn qa_sizes_child_tour_buttons() {
     let Some(dir) = qa::child_dir() else { return };
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = App::new(qa::quiet_config(Some(&dir.join("music"))), tx);
-    app.start_tour();
+    first_run(&mut app);
     for c in [KeyCode::Enter, KeyCode::Enter, KeyCode::Char('y'), KeyCode::Esc, KeyCode::Esc, KeyCode::Esc, KeyCode::Enter] {
         press(&mut app, c, KeyModifiers::NONE); // welcome, theme, icons, music, notes, defaults, your AIs -> tour
     }
@@ -832,7 +859,6 @@ fn qa_sizes_child_tour_buttons() {
 }
 
 #[test]
-#[ignore = "fails: the welcome screen's buttons are off screen at 100x12, and at 40x10 it's blank: it lays out for 19 rows and reserves the logo's 10 even when the logo isn't drawn (src/onboard.rs:620-625)"]
 fn qa_sizes_bug_welcome_buttons_short_screen() {
     qa::run_child("app::qa_sizes_app::qa_sizes_child_welcome_buttons", &qa::scratch("welcome-buttons"));
 }
@@ -843,7 +869,7 @@ fn qa_sizes_child_welcome_buttons() {
     let Some(dir) = qa::child_dir() else { return };
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = App::new(qa::quiet_config(Some(&dir.join("music"))), tx);
-    app.start_tour();
+    first_run(&mut app);
     for (w, h) in [(100, 12), (40, 10)] {
         let b = draw(&mut app, w, h).unwrap();
         assert!(text(&b).contains("take the tour"), "{w}x{h}: the welcome's buttons aren't on screen:\n{}", text(&b));
@@ -851,7 +877,6 @@ fn qa_sizes_child_welcome_buttons() {
 }
 
 #[test]
-#[ignore = "fails: a pane title longer than its frame runs under the × close button: at 80x24 with 4 panes the help pane's top reads '╭ 󰍉 help  × e╮' (the title isn't shortened to make room: src/ui.rs:90-93, src/app.rs:1348-1356)"]
 fn qa_sizes_bug_title_under_close_button() {
     let (mut app, _rx) = new_app();
     split_tab(&mut app, 3, 80, 24, &mut vec![]);

@@ -197,7 +197,9 @@ impl Pane for Themes {
         } else {
             vec![Span::styled(format!("{}{}", ui::lead("theme"), t.name), ui::bold_accent(t)), Span::styled("  built in · change anything and it becomes your own copy", ui::muted(t))]
         };
-        f.render_widget(Paragraph::new(Line::from(head)), Rect { y, height: 1, ..body });
+        if body.height > 0 {
+            f.render_widget(Paragraph::new(Line::from(head)), Rect { y, height: 1, ..body });
+        }
         y += 2;
         // ---- the colours
         let wide = body.width >= 112;
