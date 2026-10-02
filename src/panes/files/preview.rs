@@ -69,6 +69,19 @@ pub struct Entry {
     pub kind: Kind,
 }
 
+/// Hidden unless `.` shows them: dotfiles, SKIP folders and (on Windows) files with the hidden attribute.
+fn is_hidden(name: &str, de: &std::fs::DirEntry) -> bool {
+    let hidden = name.starts_with('.') || SKIP.contains(&name);
+    #[cfg(windows)]
+    let hidden = hidden || {
+        use std::os::windows::fs::MetadataExt;
+        de.metadata().map(|m| m.file_attributes() & 0x2 != 0).unwrap_or(false) // FILE_ATTRIBUTE_HIDDEN
+    };
+    #[cfg(not(windows))]
+    let _ = de;
+    hidden
+}
+
 /// Every entry in `dir`, folders first then by name (case-insensitive). `hidden` marks dotfiles, OS-hidden files
 /// and SKIP folders; the pane filters on it.
 pub fn list_dir(dir: &Path) -> Result<Vec<Entry>, String> {
@@ -81,12 +94,7 @@ pub fn list_dir(dir: &Path) -> Result<Vec<Entry>, String> {
         let meta = if ft.map(|t| t.is_symlink()).unwrap_or(false) { std::fs::metadata(de.path()).ok() } else { de.metadata().ok() };
         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         let size = meta.as_ref().map(|m| if m.is_dir() { 0 } else { m.len() }).unwrap_or(0);
-        let hidden = name.starts_with('.') || SKIP.contains(&name.as_str());
-        #[cfg(windows)]
-        let hidden = hidden || {
-            use std::os::windows::fs::MetadataExt;
-            de.metadata().map(|m| m.file_attributes() & 0x2 != 0).unwrap_or(false) // FILE_ATTRIBUTE_HIDDEN
-        };
+        let hidden = is_hidden(&name, &de);
         out.push(Entry { kind: kind_of(&name, is_dir), name, is_dir, size, hidden });
     }
     out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
@@ -127,7 +135,9 @@ pub struct Preview {
 
 const MAX_LINES: usize = 400;
 
-pub fn build(path: &Path, cols: u16, rows: u16) -> Preview {
+/// The preview of `path` in a `cols` x `rows` area. A folder's lists what the list would (`show_hidden`: what `.`
+/// is set to), so a dotfile or node_modules hidden from the list isn't shown in the preview either.
+pub fn build(path: &Path, cols: u16, rows: u16, show_hidden: bool) -> Preview {
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string_lossy().to_string());
     let mk = |meta: String, body: Body| Preview { name: name.clone(), meta, body };
     let st = match std::fs::metadata(path) {
@@ -143,6 +153,9 @@ pub fn build(path: &Path, cols: u16, rows: u16) -> Preview {
         let (mut dirs, mut files) = (vec![], vec![]);
         for de in rd.flatten() {
             let n = de.file_name().to_string_lossy().to_string();
+            if !show_hidden && is_hidden(&n, &de) {
+                continue;
+            }
             let is_dir = std::fs::metadata(de.path()).map(|m| m.is_dir()).unwrap_or(false);
             if is_dir { dirs.push(n) } else { files.push(n) }
         }

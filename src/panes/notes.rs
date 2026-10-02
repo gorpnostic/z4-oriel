@@ -41,8 +41,11 @@ struct Meta {
     mtime: std::time::SystemTime,
 }
 
+/// The UTF-8 byte-order mark Notepad and friends put at the start of a file.
+const BOM: char = '\u{feff}';
+
 fn title_of(text: &str) -> String {
-    let first = text.lines().next().unwrap_or("").trim_start_matches('#').trim();
+    let first = text.trim_start_matches(BOM).lines().next().unwrap_or("").trim_start_matches('#').trim();
     if first.is_empty() { "untitled".into() } else { first.to_string() }
 }
 
@@ -72,6 +75,8 @@ pub struct Notes {
     cur: Option<String>,
     ed: Editor,
     crlf: bool,
+    /// The file starts with a byte-order mark: kept out of the editor, put back on save.
+    bom: bool,
     dirty_at: Option<Instant>,
     saved_at: Option<i64>,
     previewing: bool,
@@ -130,6 +135,7 @@ impl Notes {
             cur: None,
             ed: Editor::new(""),
             crlf: false,
+            bom: false,
             dirty_at: None,
             saved_at: None,
             previewing: false,
@@ -238,7 +244,8 @@ impl Notes {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 self.crlf = text.contains("\r\n");
-                self.ed.set_text(&text);
+                self.bom = text.starts_with(BOM);
+                self.ed.set_text(text.strip_prefix(BOM).unwrap_or(&text));
                 self.cur = Some(id.to_string());
                 self.disk = stamp(&path);
                 self.conflict = false;
@@ -247,7 +254,10 @@ impl Notes {
                 self.pscroll = 0;
                 self.error = None;
             }
-            Err(e) => self.error = Some(format!("can't open that note: {e}")),
+            Err(e) => {
+                let then = if self.cur.is_none() { " · what you type becomes a new note" } else { "" };
+                self.error = Some(format!("can't open that note: {e}{then}"));
+            }
         }
     }
 
@@ -259,7 +269,8 @@ impl Notes {
             Ok(text) => {
                 let (row, col, scroll) = (self.ed.row, self.ed.col, self.ed.scroll);
                 self.crlf = text.contains("\r\n");
-                self.ed.set_text(&text);
+                self.bom = text.starts_with(BOM);
+                self.ed.set_text(text.strip_prefix(BOM).unwrap_or(&text));
                 self.ed.row = row.min(self.ed.lines.len() - 1);
                 self.ed.col = col.min(self.ed.lines[self.ed.row].chars().count());
                 self.ed.scroll = scroll;
@@ -301,7 +312,13 @@ impl Notes {
     /// Write the open note if it has unsaved edits. Unless `force` (ctrl+s on "keep mine"), it first checks that
     /// nobody else wrote the file since we read it; if they did, it writes nothing and asks instead.
     fn write(&mut self, force: bool) {
-        let (Some(id), Some(_)) = (self.cur.clone(), self.dirty_at) else { return };
+        if self.dirty_at.is_none() {
+            return;
+        }
+        let Some(id) = self.cur.clone() else {
+            self.write_orphan();
+            return;
+        };
         let path = self.path(&id);
         if !force && (self.conflict || stamp(&path) != self.disk) {
             self.conflict = true;
@@ -310,6 +327,9 @@ impl Notes {
         let mut text = self.ed.text();
         if self.crlf {
             text = text.replace('\n', "\r\n");
+        }
+        if self.bom {
+            text.insert(0, BOM);
         }
         let tmp = path.with_extension("md.tmp");
         let dir_before = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
@@ -340,6 +360,24 @@ impl Notes {
                 self.error = Some(format!("couldn't save: {e}"));
             }
         }
+    }
+
+    /// Typing with no note open (the one picked couldn't be read, say it isn't UTF-8): what you typed becomes a note
+    /// of its own instead of going nowhere, and that note is the open one from then on.
+    fn write_orphan(&mut self) {
+        let text = self.ed.text();
+        if text.trim().is_empty() {
+            self.dirty_at = None;
+            return;
+        }
+        self.error = None;
+        let id = self.create(&text);
+        if self.error.is_some() {
+            return; // create said why; the text stays in the editor, unsaved
+        }
+        let path = self.path(&id);
+        (self.cur, self.disk, self.crlf, self.bom, self.conflict, self.dirty_at) = (Some(id), stamp(&path), false, false, false, None);
+        self.saved_at = Some(clock::now_secs());
     }
 
     fn touch(&mut self) {

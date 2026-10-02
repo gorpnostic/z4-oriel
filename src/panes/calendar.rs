@@ -77,6 +77,33 @@ fn hhmm(m: u32) -> String {
     format!("{:02}:{:02}", m / 60, m % 60)
 }
 
+/// Which of a day's `n` plans fit in `room` rows with the picked one in view, moving as little as it can from the
+/// last first row `s`: (first, how many). When they don't all fit (and there are 3+ rows), one row each goes to
+/// "↑ n more" above (when the list doesn't start at the first plan) and "↓ n more" below (when it stops short).
+fn day_window(n: usize, pick: usize, room: usize, s: usize) -> (usize, usize) {
+    if n <= room {
+        return (0, n);
+    }
+    if room < 3 {
+        // no space for the "more" rows: just keep the picked one in view
+        let s = s.clamp(pick.saturating_sub(room.saturating_sub(1)), pick).min(n - room.max(1));
+        return (s, room);
+    }
+    let shown = |s: usize| {
+        let r = room - usize::from(s > 0);
+        if s + r >= n { n - s } else { r - 1 }
+    };
+    // never start so late that rows go spare at the bottom
+    let mut s = s.min(n + 1 - room);
+    if pick < s {
+        s = pick;
+    }
+    if pick >= s + shown(s) {
+        s = (pick + 3).saturating_sub(room).min(n + 1 - room).max(1);
+    }
+    (s, shown(s))
+}
+
 /// A time at the start of what you typed: "14:30 x", "2pm x", "2:30pm x", "9am x". Returns it and the rest.
 pub fn parse_time(s: &str) -> (Option<u32>, String) {
     let s = s.trim();
@@ -98,14 +125,15 @@ pub fn parse_time(s: &str) -> (Option<u32>, String) {
         None => (None, None),
     };
     match (h, m) {
-        (Some(mut h), Some(m)) if h <= 24 && m < 60 && !rest.trim().is_empty() => {
+        // 24:00 would be the END of the day, which a plan on this day can't be: it isn't a time
+        (Some(mut h), Some(m)) if h < 24 && m < 60 && !rest.trim().is_empty() => {
             if pm && h < 12 {
                 h += 12;
             }
             if am && h == 12 {
                 h = 0;
             }
-            (Some((h % 24) * 60 + m), rest.trim().to_string())
+            (Some(h * 60 + m), rest.trim().to_string())
         }
         _ => (None, s.to_string()),
     }
@@ -128,6 +156,12 @@ pub struct Calendar {
     reminded: HashSet<(i64, u32, String)>,
     cells: Vec<(Rect, i64)>,
     side_hits: Vec<(Rect, i64)>,
+    /// The first of the chosen day's plans on screen, when they don't all fit (the list follows `pick`).
+    day_scroll: usize,
+    /// Something to say once, at the next poll (calendar.json couldn't be read and was moved aside).
+    warn: Option<String>,
+    /// calendar.json couldn't be read or moved aside: never write over it.
+    frozen: bool,
     /// A fixed (day, minute) instead of the clock, for tests.
     fake_now: Option<(i64, u32)>,
 }
@@ -149,6 +183,28 @@ fn load(path: &std::path::Path) -> Vec<Plan> {
     std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
+/// The plans for the pane to edit. A file that's there but doesn't parse (a hand edit with a typo, a torn write) is
+/// never read as empty and then written over: it's moved aside to calendar.json.bad (or .bad-2...), and the
+/// message says so. Returns (plans, what to say, frozen = it couldn't be moved aside either, so never save).
+fn load_for_edit(path: &std::path::Path) -> (Vec<Plan>, Option<String>, bool) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (vec![], None, false),
+        Err(e) => return (vec![], Some(format!("can't read {}: {e} · nothing is saved until it can be", path.display())), true),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(plans) => (plans, None, false),
+        Err(e) => {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "calendar.json".into());
+            let bad = (1..100).map(|i| path.with_file_name(if i == 1 { format!("{name}.bad") } else { format!("{name}.bad-{i}") })).find(|p| !p.exists());
+            match bad.filter(|b| std::fs::rename(path, b).is_ok()) {
+                Some(b) => (vec![], Some(format!("{name} couldn't be read ({e}): kept as {}, starting a new one", b.display())), false),
+                None => (vec![], Some(format!("{name} couldn't be read ({e}) · nothing is saved until it's fixed")), true),
+            }
+        }
+    }
+}
+
 impl Calendar {
     pub fn new() -> Calendar {
         Calendar::open_at(store_path())
@@ -156,7 +212,8 @@ impl Calendar {
 
     pub fn open_at(path: PathBuf) -> Calendar {
         let (today, _) = now();
-        let mut c = Calendar { plans: load(&path), path, sel: today, today, pick: 0, input: None, undo: None, reminded: HashSet::new(), cells: vec![], side_hits: vec![], fake_now: None };
+        let (plans, warn, frozen) = load_for_edit(&path);
+        let mut c = Calendar { plans, path, sel: today, today, pick: 0, input: None, undo: None, reminded: HashSet::new(), cells: vec![], side_hits: vec![], day_scroll: 0, warn, frozen, fake_now: None };
         c.sort();
         c
     }
@@ -188,12 +245,16 @@ impl Calendar {
         self.pick_plan(&p);
     }
 
+    /// By day, then all-day plans before the timed ones (not mixed in with midnight), then by time and text.
     fn sort(&mut self) {
-        self.plans.sort_by(|a, b| (a.day, a.at.unwrap_or(0), &a.text).cmp(&(b.day, b.at.unwrap_or(0), &b.text)));
+        self.plans.sort_by(|a, b| (a.day, a.at.is_some(), a.at, &a.text).cmp(&(b.day, b.at.is_some(), b.at, &b.text)));
     }
 
     fn save(&mut self) {
         self.sort();
+        if self.frozen {
+            return; // the file there couldn't be read: never write over it
+        }
         if let Some(d) = self.path.parent() {
             let _ = std::fs::create_dir_all(d);
         }
@@ -254,9 +315,13 @@ impl Pane for Calendar {
 
     /// Reminders: a toast when a timed plan starts (and the date rolls over at midnight).
     fn poll(&mut self, cx: &mut Cx) {
+        if let Some(w) = self.warn.take() {
+            cx.notify(w);
+        }
         let (today, mins) = self.now();
         if today != self.today {
-            if self.sel == self.today {
+            // the view follows the date, unless you're typing a plan: it goes on the day whose heading you saw
+            if self.sel == self.today && self.input.is_none() {
                 self.sel = today;
             }
             self.today = today;
@@ -376,14 +441,27 @@ impl Pane for Calendar {
             if on.is_empty() {
                 lines.push(Line::from(Span::styled("nothing planned · a adds something", ui::muted(t))));
             }
-            for (k, &i) in on.iter().enumerate() {
+            // more plans than rows: the list follows the picked one, so e / x act on one you can see
+            let tail = if self.input.is_some() || self.undo.is_some() { 2 } else { 0 };
+            let room = (body.bottom().saturating_sub(ay) as usize).saturating_sub(lines.len() + tail);
+            let pick = self.pick.min(on.len().saturating_sub(1));
+            let (from, shown) = day_window(on.len(), pick, room, self.day_scroll);
+            self.day_scroll = from;
+            let below = on.len() - from - shown;
+            if from > 0 && room >= 3 {
+                lines.push(Line::from(Span::styled(format!("  ↑ {from} more"), ui::muted(t))));
+            }
+            for (k, &i) in on.iter().enumerate().skip(from).take(shown) {
                 let mut l = self.plan_line(&self.plans[i], aw as usize - 2, t);
-                if k == self.pick.min(on.len() - 1) {
+                if k == pick {
                     l.spans.insert(0, Span::styled("▸ ", ui::bold_accent(t)));
                 } else {
                     l.spans.insert(0, Span::raw("  "));
                 }
                 lines.push(l);
+            }
+            if below > 0 && room >= 3 {
+                lines.push(Line::from(Span::styled(format!("  ↓ {below} more"), ui::muted(t))));
             }
             match &self.input {
                 Some(Input::Add(s)) | Some(Input::Edit(_, s)) => {
@@ -574,6 +652,32 @@ mod tests {
         assert_eq!(parse_time("14.30 lunch"), (Some(14 * 60 + 30), "lunch".into()));
         assert_eq!(parse_time("1.5 miles run"), (None, "1.5 miles run".into()));
         assert_eq!(parse_time("2.5pm maybe"), (None, "2.5pm maybe".into()));
+    }
+
+    /// The day list's window: the picked plan is always in it, it never runs past the plans, and with the
+    /// "↑ / ↓ n more" rows it still fits in the rows it has.
+    #[test]
+    fn calendar_day_window_keeps_the_pick_in_view() {
+        for n in 0..30 {
+            for room in 0..14 {
+                for pick in 0..n.max(1) {
+                    for s in 0..n.max(1) {
+                        let (from, shown) = day_window(n, pick, room, s);
+                        assert!(from + shown <= n, "n {n} room {room} pick {pick} s {s}: {from}+{shown}");
+                        if n > 0 && room > 0 {
+                            assert!((from..from + shown).contains(&pick), "n {n} room {room} pick {pick} s {s}: {from}+{shown}");
+                        }
+                        let cut = n > room && room >= 3;
+                        let rows = shown + usize::from(cut && from > 0) + usize::from(cut && from + shown < n);
+                        assert!(rows <= room, "n {n} room {room} pick {pick} s {s}: {rows} rows");
+                    }
+                }
+            }
+        }
+        // moving the pick down a long list scrolls one step at a time, not a page
+        let (a, _) = day_window(30, 9, 10, 0);
+        let (b, _) = day_window(30, 10, 10, a);
+        assert_eq!(b, a + 1);
     }
 
     #[test]

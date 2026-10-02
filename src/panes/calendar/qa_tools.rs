@@ -29,7 +29,8 @@ fn qa_calendar_midnight_moves_the_view_only_from_today() {
     c.sel = real - 1;
     c.plans.push(Plan { day: real - 1, at: None, text: "old day".into() });
     c.plans.push(Plan { day: real, at: None, text: "new day".into() });
-    assert_eq!(c.badge().as_deref(), Some("1 today"));
+    // the badge reads the clock, not the pane's stale idea of today: it's about the new day already
+    assert_eq!(c.badge().as_deref(), Some("today: new day"));
     k.poll(&mut c);
     assert_eq!((c.today, c.sel), (real, real));
     let s = k.render(&mut c, 140, 40);
@@ -46,7 +47,6 @@ fn qa_calendar_midnight_moves_the_view_only_from_today() {
 /// Start adding a plan to today at 23:59, finish typing after midnight: the rollover moves the chosen day under
 /// the open box, and enter saves the plan on the NEW day, not the one whose heading was showing when you pressed a.
 #[test]
-#[ignore = "fails: poll moves `sel` to the new day while the add box is open, so the plan is saved a day later than the day you were adding to (calendar.rs:215-218, 373)"]
 fn qa_calendar_midnight_while_typing_keeps_the_day() {
     let mut k = Kit::new();
     let (mut c, path) = cal("cal-midnight-typing");
