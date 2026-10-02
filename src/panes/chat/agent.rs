@@ -9,8 +9,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Most body lines a tool keeps (the head and the tail survive, with "… N more lines" between).
-const BODY_CAP: usize = 400;
+/// A longer body keeps its first BODY_HEAD and last BODY_TAIL lines, with "… N more lines" between.
+const BODY_HEAD: usize = 300;
+const BODY_TAIL: usize = 100;
+/// The most lines a capped body has: head, the "… N more lines" marker, tail. Opened with ctrl+o, a call shows
+/// this many, so a capped body is always shown whole.
+pub const BODY_MAX: usize = BODY_HEAD + 1 + BODY_TAIL;
 
 // ------------------------------------------------------------------ body lines
 /// One diff/output line: a kind char (`+` added, `-` removed, ` ` context, `@` hunk gap, `>` output,
@@ -25,7 +29,8 @@ pub fn line(kind: char, num: Option<u64>, text: &str) -> String {
 
 /// (kind, line number, text) of an encoded line.
 pub fn split_line(s: &str) -> (char, &str, &str) {
-    let k = s.chars().next().unwrap_or(' ');
+    // an empty line (a hand-edited or truncated chat file) is an empty context line
+    let Some(k) = s.chars().next() else { return (' ', "", "") };
     let rest = &s[k.len_utf8()..];
     match rest.split_once('\t') {
         Some((n, t)) => (k, n, t),
@@ -73,22 +78,37 @@ fn clean(s: &str) -> String {
 }
 
 fn cap(mut v: Vec<String>) -> Vec<String> {
-    if v.len() > BODY_CAP {
-        let tail = v.split_off(v.len() - 100);
-        let dropped = v.len() - 300;
-        v.truncate(300);
+    if v.len() > BODY_HEAD + BODY_TAIL {
+        let tail = v.split_off(v.len() - BODY_TAIL);
+        let dropped = v.len() - BODY_HEAD;
+        v.truncate(BODY_HEAD);
         v.push(line('…', None, &format!("{dropped} more lines")));
         v.extend(tail);
     }
     v
 }
 
-fn output(s: &str, kind: char) -> Vec<String> {
+/// How many lines a (possibly capped) body stands for: the lines it kept plus the ones its marker says it cut.
+pub fn body_lines(body: &[String]) -> u64 {
+    body.iter()
+        .map(|l| match split_line(l) {
+            ('…', _, t) => t.strip_suffix(" more lines").and_then(|n| n.parse::<u64>().ok()).unwrap_or(1),
+            _ => 1,
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Output text as body lines, uncapped (cap once, after joining stdout and stderr).
+fn output_lines(s: &str, kind: char) -> Vec<String> {
     let s = s.trim_end_matches(['\n', '\r', ' ']);
     if s.trim().is_empty() {
         return vec![];
     }
-    cap(s.lines().map(|l| line(kind, None, l)).collect())
+    s.lines().map(|l| line(kind, None, l)).collect()
+}
+
+fn output(s: &str, kind: char) -> Vec<String> {
+    cap(output_lines(s, kind))
 }
 
 pub fn counts(body: &[String]) -> (usize, usize) {
@@ -270,8 +290,9 @@ fn strip_cd(cwd: &Path, s: &str) -> String {
     s.to_string()
 }
 
+/// The first line, cleaned for the screen (no colours, tabs or carriage returns), "…" after it when there's more.
 fn first_line(s: &str) -> String {
-    let l = s.trim().lines().next().unwrap_or("").trim().to_string();
+    let l = clean(s.trim().lines().next().unwrap_or("")).trim().to_string();
     if s.trim().lines().count() > 1 { format!("{l} …") } else { l }
 }
 
@@ -397,7 +418,7 @@ fn finish(t: &mut Tool, text: &str, r: &Value, is_error: bool) {
     if is_error {
         let msg = text.replace("<tool_use_error>", "").replace("</tool_use_error>", "");
         let mut lines = msg.trim().lines();
-        let head = lines.next().unwrap_or("error").trim().to_string();
+        let head = clean(lines.next().unwrap_or("error")).trim().to_string();
         // "Exit code 1" leads a failed command's output
         if let Some(code) = head.strip_prefix("Exit code ") {
             t.summary = format!("exit {code}");
@@ -425,7 +446,9 @@ fn finish(t: &mut Tool, text: &str, r: &Value, is_error: bool) {
                 let (a, d) = counts(&t.body);
                 t.summary = format!("+{a} -{d}");
             } else {
-                t.summary = plural(t.body.len() as u64, "line", "lines");
+                // the body is capped: count what the file really holds
+                let n = r["content"].as_str().filter(|_| r["type"] == "create").map(|c| c.lines().count() as u64).unwrap_or_else(|| body_lines(&t.body));
+                t.summary = plural(n, "line", "lines");
             }
         }
         "Edit" | "MultiEdit" => {
@@ -438,20 +461,19 @@ fn finish(t: &mut Tool, text: &str, r: &Value, is_error: bool) {
         }
         "Bash" | "PowerShell" => {
             let (so, se) = (r["stdout"].as_str(), r["stderr"].as_str());
-            let mut b = match so {
-                Some(o) => output(o, '>'),
-                None => output(text, '>'),
-            };
+            // capped once, stdout and stderr together, so the "… N more lines" marker counts every line cut
+            let mut b = output_lines(so.unwrap_or(text), '>');
             if let Some(e) = se {
-                b.extend(output(e, '!'));
+                b.extend(output_lines(e, '!'));
             }
+            let n = b.len() as u64;
             t.body = cap(b);
             t.summary = if r["interrupted"].as_bool() == Some(true) {
                 "interrupted".into()
             } else if t.body.is_empty() {
                 "no output".into()
             } else {
-                plural(t.body.len() as u64, "line", "lines")
+                plural(n, "line", "lines")
             };
         }
         "Grep" => {
@@ -579,7 +601,7 @@ impl Claude {
     /// A step's input side (fresh, cached and newly cached tokens) is how full the context is.
     fn context(&mut self, usage: &Value, send: &mut dyn FnMut(Ev)) {
         let n = |k: &str| usage[k].as_u64().unwrap_or(0);
-        let used = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+        let used = n("input_tokens").saturating_add(n("cache_read_input_tokens")).saturating_add(n("cache_creation_input_tokens"));
         if used > 0 {
             // past 200k it can only be running with the million-token window, whatever the model's name says
             let window = if used > 200_000 { context_window(&self.model).max(1_000_000) } else { context_window(&self.model) };
@@ -588,9 +610,10 @@ impl Claude {
     }
 
     fn usage(&mut self, send: &mut dyn FnMut(Ev)) {
-        let live = self.tokens_done + self.msg_tokens.max(self.msg_chars / 4 + self.think_tokens);
+        // a malformed usage block can say anything: the counters saturate rather than overflow
+        let live = self.tokens_done.saturating_add(self.msg_tokens.max((self.msg_chars / 4).saturating_add(self.think_tokens)));
         let total = live.max(self.result_tokens);
-        if total >= self.sent_tokens + 8 || (total != self.sent_tokens && self.result_tokens > 0) {
+        if total >= self.sent_tokens.saturating_add(8) || (total != self.sent_tokens && self.result_tokens > 0) {
             self.sent_tokens = total;
             send(Ev::Usage(total));
         }
@@ -681,7 +704,7 @@ impl Claude {
                 // redacted thinking still reports how long it is
                 Some("thinking_tokens") => {
                     let n = v["estimated_tokens_delta"].as_u64().unwrap_or(0);
-                    self.think_tokens += n;
+                    self.think_tokens = self.think_tokens.saturating_add(n);
                     send(Ev::Thinking { text: String::new(), tokens: n });
                     self.usage(send);
                 }
@@ -761,7 +784,7 @@ impl Claude {
                         match d["type"].as_str() {
                             Some("text_delta") if parent.is_none() => {
                                 let s = d["text"].as_str().unwrap_or("");
-                                self.msg_chars += s.len() as u64;
+                                self.msg_chars = self.msg_chars.saturating_add(s.len() as u64);
                                 send(Ev::Token(s.to_string()));
                                 self.usage(send);
                             }
@@ -775,7 +798,7 @@ impl Claude {
                             Some("input_json_delta") => {
                                 if let Some((id, name, buf)) = self.blocks.get_mut(&key) {
                                     buf.push_str(d["partial_json"].as_str().unwrap_or(""));
-                                    self.msg_chars += d["partial_json"].as_str().unwrap_or("").len() as u64;
+                                    self.msg_chars = self.msg_chars.saturating_add(d["partial_json"].as_str().unwrap_or("").len() as u64);
                                     if hidden(name) {
                                         return Ok(());
                                     }
@@ -795,7 +818,7 @@ impl Claude {
                         }
                     }
                     Some("message_delta") if parent.is_none() => {
-                        self.tokens_done += e["usage"]["output_tokens"].as_u64().unwrap_or(self.msg_tokens);
+                        self.tokens_done = self.tokens_done.saturating_add(e["usage"]["output_tokens"].as_u64().unwrap_or(self.msg_tokens));
                         self.msg_tokens = 0;
                         self.msg_chars = 0;
                         self.think_tokens = 0;
@@ -837,10 +860,15 @@ impl Claude {
             }
             Some("rate_limit_event") => {
                 let info = &v["rate_limit_info"];
-                let resets = info["resetsAt"].as_i64().map(|s| {
-                    let l = crate::panes::files::clock::local(s);
-                    format!(" · resets {:02}:{:02}", l.hour, l.min)
-                });
+                // seconds since 1970; a value that big is milliseconds, and anything past the year 9999 is garbage
+                let resets = info["resetsAt"]
+                    .as_i64()
+                    .map(|s| if s > 100_000_000_000 { s / 1000 } else { s })
+                    .filter(|s| (0..=253_402_300_799).contains(s))
+                    .map(|s| {
+                        let l = crate::panes::files::clock::local(s);
+                        format!(" · resets {:02}:{:02}", l.hour, l.min)
+                    });
                 match info["status"].as_str() {
                     Some("rejected") => {
                         send(Ev::Mark(format!("usage limit reached{}", resets.unwrap_or_default())));
@@ -881,12 +909,12 @@ impl Claude {
                 if v["is_error"].as_bool() == Some(true) {
                     return Err(v["result"].as_str().map(String::from).unwrap_or_else(|| format!("Claude Code stopped: {}", v["subtype"].as_str().unwrap_or("error"))));
                 }
-                self.result_tokens += v["usage"]["output_tokens"].as_u64().unwrap_or(0);
-                self.turns += v["num_turns"].as_u64().unwrap_or(0);
+                self.result_tokens = self.result_tokens.saturating_add(v["usage"]["output_tokens"].as_u64().unwrap_or(0));
+                self.turns = self.turns.saturating_add(v["num_turns"].as_u64().unwrap_or(0));
                 self.cost = self.cost.max(v["total_cost_usd"].as_f64().unwrap_or(0.0));
                 // a question you skipped or a plan you sent back isn't something the mode blocked
                 let blocked = |d: &&Value| !matches!(d["tool_name"].as_str(), Some("AskUserQuestion" | "ExitPlanMode"));
-                self.denied += v["permission_denials"].as_array().map(|a| a.iter().filter(blocked).count() as u64).unwrap_or(0);
+                self.denied = self.denied.saturating_add(v["permission_denials"].as_array().map(|a| a.iter().filter(blocked).count() as u64).unwrap_or(0));
                 self.usage(send);
             }
             _ => {}
@@ -1081,7 +1109,10 @@ impl Codex {
                     Some("file_change") => {
                         let changes = it["changes"].as_array().cloned().unwrap_or_default();
                         let kinds: Vec<&str> = changes.iter().filter_map(|c| c["kind"].as_str()).collect();
-                        let lbl = if kinds.iter().all(|k| *k == "add") {
+                        // (an empty change list changed nothing: it's no "Write" of "0 new files")
+                        let lbl = if kinds.is_empty() {
+                            "Update"
+                        } else if kinds.iter().all(|k| *k == "add") {
                             "Write"
                         } else if kinds.iter().all(|k| *k == "delete") {
                             "Delete"
@@ -1104,7 +1135,7 @@ impl Codex {
                         if done {
                             t.ms = t_ms.saturating_sub(start);
                             let (a, d) = counts(&t.body);
-                            t.summary = if a + d > 0 {
+                            t.summary = if a + d > 0 || changes.is_empty() {
                                 format!("+{a} -{d}")
                             } else if lbl == "Write" {
                                 if files.len() == 1 { "new file".into() } else { format!("{} new files", files.len()) }
@@ -1127,7 +1158,7 @@ impl Codex {
                         send(Ev::Tool(t));
                     }
                     Some("web_search") => {
-                        send(Ev::Tool(Tool { id, name: "web_search".into(), label: label("web_search"), target: it["query"].as_str().unwrap_or("").into(), status: status(true), ms: if done { t_ms - start } else { 0 }, ..Default::default() }));
+                        send(Ev::Tool(Tool { id, name: "web_search".into(), label: label("web_search"), target: it["query"].as_str().unwrap_or("").into(), status: status(true), ms: if done { t_ms.saturating_sub(start) } else { 0 }, ..Default::default() }));
                     }
                     Some("todo_list") => {
                         let items: Vec<&Value> = it["items"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
@@ -1156,11 +1187,18 @@ impl Codex {
             }
             "turn.completed" => {
                 self.finished = true;
-                self.tokens += v["usage"]["output_tokens"].as_u64().unwrap_or(0);
+                self.tokens = self.tokens.saturating_add(v["usage"]["output_tokens"].as_u64().unwrap_or(0));
                 send(Ev::Usage(self.tokens));
             }
             "error" | "turn.failed" => {
-                return Err(v["message"].as_str().or(v["error"]["message"].as_str()).map(String::from).unwrap_or_else(|| v["error"].to_string()));
+                // words where Codex gives some (its message, the error's message, a plain-string error), else the
+                // error object itself, else a sentence: never "null" or a quoted JSON string
+                let words = |x: &Value| x.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+                let e = &v["error"];
+                return Err(words(&v["message"])
+                    .or_else(|| words(&e["message"]))
+                    .or_else(|| words(e))
+                    .unwrap_or_else(|| if e.is_null() { "Codex stopped with an error".into() } else { e.to_string() }));
             }
             _ => {}
         }

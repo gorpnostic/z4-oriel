@@ -431,7 +431,8 @@ fn tool_lines(tool: &Tool, depth: usize, width: usize, t: &Theme, v: &View, out:
         first = false;
     }
     // ---- the body: a highlighted diff, new code, or output
-    let rows = if open { 400 } else { compact_rows(tool) };
+    // opened, a capped body shows whole: its last line (a test run's summary) is never behind a "… +1 line"
+    let rows = if open { agent::BODY_MAX } else { compact_rows(tool) };
     let shown = tool.body.len().min(rows);
     let hidden = tool.body.len() - shown;
     let body = &tool.body[..shown];
@@ -687,6 +688,7 @@ fn extent(parts: &[Part], i: usize, v: &View) -> (usize, bool, bool) {
         Part::Tool(tool) => (i + 1, true, v.live && running(tool)),
         Part::Todos { items } => (i + 1, !items.is_empty(), false),
         Part::User { .. } | Part::Mark { .. } => (i + 1, true, false),
+        Part::Other(_) => (i + 1, false, false),
     }
 }
 
@@ -715,6 +717,7 @@ fn fingerprint(p: &Part, v: &View, h: &mut impl std::hash::Hasher) {
         }
         Part::User { text } => (4u8, text).hash(h),
         Part::Mark { text } => (5u8, text).hash(h),
+        Part::Other(_) => 6u8.hash(h),
     }
 }
 
@@ -782,6 +785,7 @@ fn draw_block(parts: &[Part], i: usize, end: usize, first: bool, width: usize, t
             let side = "─".repeat(3);
             out.push(Line::from(Span::styled(format!("  {side} {text} {side}"), muted)));
         }
+        Part::Other(_) => {} // never a block of its own (extent says it shows nothing)
     }
     Block { lines: Rc::new(out), hits: Rc::new(hits) }
 }

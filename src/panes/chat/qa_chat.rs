@@ -4,9 +4,8 @@
 //!
 //! Parser and renderer tests run in this process. Tests that build a `Chat` pane (`child_*`) run in a child copy of
 //! this test binary with ORIEL_DATA_DIR under target/test-scratch/qa-chat/: a pane saves the chat when a reply ends
-//! and may `git init` a work folder, and none of that may land in the real profile. `qa_chat_pane_suite` runs the
-//! passing ones; each `qa_chat_bug_*` runs one failing one.
-//! A test marked `#[ignore = "fails: …"]` is a real problem, left in on purpose.
+//! and may `git init` a work folder, and none of that may land in the real profile. `qa_chat_pane_suite` runs most
+//! of them; each `qa_chat_bug_*` runs one that once found a bug, on its own.
 
 use super::agent::{self, Claude, Codex};
 use super::approve;
@@ -251,7 +250,6 @@ fn qa_chat_claude_streamed_input_garbage() {
 /// A rate-limit line with an out-of-range reset time (milliseconds instead of seconds, or garbage) must not bring
 /// the provider thread down: a panic there leaves the reply spinning forever with no Done and no Error.
 #[test]
-#[ignore = "fails: attempt to multiply with overflow in files::clock::local (clock.rs:48) for resetsAt in ms / i64::MAX"]
 fn qa_chat_claude_rate_limit_huge_reset_time() {
     for resets in [1_900_000_000_000i64, i64::MAX] {
         let mut p = claude();
@@ -263,7 +261,6 @@ fn qa_chat_claude_rate_limit_huge_reset_time() {
 
 /// Token counters fed absurd values (a malformed usage block) must not panic the provider thread either.
 #[test]
-#[ignore = "fails: attempt to add with overflow in Claude::feed (agent.rs:770 tokens_done += …)"]
 fn qa_chat_claude_token_counters_dont_overflow() {
     let mut p = claude();
     for i in 0..2 {
@@ -280,7 +277,6 @@ fn qa_chat_claude_token_counters_dont_overflow() {
 /// A new 5000-line file: the transcript keeps a capped body, but the line under the call must still say how long the
 /// file really is.
 #[test]
-#[ignore = "fails: Write reports the capped body length (\"Wrote 401 lines\") instead of 5000 (agent.rs:419)"]
 fn qa_chat_claude_write_5000_lines_counts_them_all() {
     let mut p = claude();
     let content: String = (1..=5000).map(|i| format!("line {i}\n")).collect();
@@ -327,7 +323,6 @@ fn qa_chat_claude_bash_5000_line_output() {
 /// ctrl+o shows a call "in full": for long output that's the capped body, and its last line (for a test run, the
 /// summary) must be on screen, not behind a "… +1 line" that nothing can expand.
 #[test]
-#[ignore = "fails: a capped body is 401 lines (300 + marker + 100, agent.rs:75-83) but the open view shows 400 (activity.rs:433), so the last output line is always hidden"]
 fn qa_chat_expanded_view_shows_the_last_line() {
     let mut p = claude();
     let stdout: String = (1..=5000).map(|i| format!("test t{i} ... ok")).chain(["test result: ok. 5000 passed".to_string()]).collect::<Vec<_>>().join("\n");
@@ -343,7 +338,6 @@ fn qa_chat_expanded_view_shows_the_last_line() {
 /// output is capped once for stdout and again for stdout+stderr, and the second cap throws the first marker away
 /// and counts only what it cut itself.
 #[test]
-#[ignore = "fails: Bash body is capped twice (agent.rs:433 then :439): 5000 lines of stdout say \"… 1 more lines\", with 3 stderr lines \"… 4 more lines\""]
 fn qa_chat_claude_bash_long_output_elision_count() {
     let stdout: String = (1..=5000).map(|i| format!("out {i}")).collect::<Vec<_>>().join("\n");
     let mut got = vec![];
@@ -387,7 +381,6 @@ fn qa_chat_tool_output_ansi_crlf_tabs_stripped() {
 /// The one-line summary under a call (MCP tools, errors) comes from the raw result text: colours and tabs must be
 /// stripped there too, or "⎿  [32mPASS[0m" shows up.
 #[test]
-#[ignore = "fails: tool summaries are built from raw result text, not clean()ed (agent.rs:397, :500, :1030)"]
 fn qa_chat_tool_summaries_strip_ansi() {
     let mut p = claude();
     let _ = feed(&mut p, json!({"type": "assistant", "message": {"content": [
@@ -451,7 +444,6 @@ fn qa_chat_codex_malformed_and_unknown_lines() {
 
 /// Codex errors reach the chat as readable words, not JSON.
 #[test]
-#[ignore = "fails: {\"type\":\"error\"} becomes the error text \"null\", a string error keeps its JSON quotes (agent.rs:1068)"]
 fn qa_chat_codex_error_messages_are_readable() {
     let cases = [
         (json!({"type": "turn.failed", "error": {"message": "quota exceeded"}}), Some("quota exceeded")),
@@ -477,7 +469,6 @@ fn qa_chat_codex_error_messages_are_readable() {
 /// A web search that "completes before it started" (clock going backwards) must not panic like everything else
 /// that uses saturating_sub.
 #[test]
-#[ignore = "fails: attempt to subtract with overflow, web_search uses t_ms - start (agent.rs:1036)"]
 fn qa_chat_codex_web_search_clock_skew() {
     let mut p = codex();
     let _ = feedx(&mut p, json!({"type": "item.started", "item": {"type": "web_search", "id": "w1", "query": "ratatui"}}), 1000);
@@ -488,7 +479,6 @@ fn qa_chat_codex_web_search_clock_skew() {
 
 /// A file change that changed nothing (an empty change list) shouldn't claim it wrote "0 new files".
 #[test]
-#[ignore = "fails: empty changes => label Write, summary \"0 new files\", drawn as \"Wrote 0 new files to\" (agent.rs:990-1016)"]
 fn qa_chat_codex_empty_file_change() {
     let mut p = codex();
     let (_, evs) = feedx(&mut p, json!({"type": "item.completed", "item": {"id": "f0", "type": "file_change", "changes": [], "status": "completed"}}), 10);
@@ -545,7 +535,6 @@ fn qa_chat_diff_crlf_and_wide_chars() {
 
 /// A nested list in a narrow pane: the continuation indent is wider than the line.
 #[test]
-#[ignore = "fails: attempt to subtract with overflow in md::wrap (md.rs:35, width - cont_indent.width())"]
 fn qa_chat_md_nested_list_in_a_narrow_pane() {
     let t = crate::theme::get("oriel");
     let text = "- top level item\n    - nested item\n        - third level item with several words\n        12. numbered deep item here";
@@ -573,7 +562,6 @@ fn qa_chat_md_crlf_emoji_wide() {
 /// Wrapping one very long unbroken line (a base64 blob, minified code outside a fence) must scale linearly: a
 /// streaming reply is re-rendered every frame.
 #[test]
-#[ignore = "fails: md::wrap's hard-break loop re-measures and re-collects the rest of the word per line (md.rs:35-56): 10k chars 50 ms, 100k chars 3.8 s per render (debug)"]
 fn qa_chat_md_long_unbroken_line_scales() {
     let t = crate::theme::get("oriel");
     let time = |n: usize, runs: usize| {
@@ -588,9 +576,11 @@ fn qa_chat_md_long_unbroken_line_scales() {
             .min()
             .unwrap()
     };
-    let (small, big) = (time(10_000, 3), time(100_000, 2));
-    println!("one render: 10k chars {small:?} · 100k chars {big:?} ({:.0}x for 10x the text)", big.as_secs_f64() / small.as_secs_f64().max(1e-9));
-    assert!(big < small * 40, "wrapping a long line is quadratic: 10k chars {small:?}, 100k chars {big:?}");
+    // 40x the text: linear is ~40x the time, quadratic ~1600x. The wide gap (and the best of several runs) keeps a
+    // busy machine from failing a linear wrap, or passing a quadratic one.
+    let (small, big) = (time(4_000, 5), time(160_000, 3));
+    println!("one render: 4k chars {small:?} · 160k chars {big:?} ({:.0}x for 40x the text)", big.as_secs_f64() / small.as_secs_f64().max(1e-9));
+    assert!(big < small * 200, "wrapping a long line is quadratic: 4k chars {small:?}, 160k chars {big:?}");
 }
 
 /// Odd parts drawn at any width: deep subagent nesting, a 10k-char target, empty labels, odd body kinds, empty todo
@@ -636,7 +626,6 @@ fn qa_chat_activity_odd_parts_any_width() {
 /// A saved chat whose call has an empty body line (a hand-edited or truncated chat file): opening it must not bring
 /// the whole app down while drawing.
 #[test]
-#[ignore = "fails: agent::split_line(\"\") slices past the end (agent.rs:29 `&s[k.len_utf8()..]`), so an empty body line in a saved chat panics the renderer"]
 fn qa_chat_saved_chat_with_an_empty_body_line() {
     let m: Msg = serde_json::from_str(
         r#"{"role":"assistant","content":"ok","parts":[{"kind":"tool","id":"t1","name":"Edit","label":"Update","target":"a.rs","status":"done","summary":"+1 -1","body":["-1\told",""]}]}"#,
@@ -710,37 +699,31 @@ fn qa_chat_pane_suite() {
 }
 
 #[test]
-#[ignore = "fails: the chat sidebar panics at width < 2 (usize underflow `r.width as usize - 2`, chat.rs:1851)"]
 fn qa_chat_bug_side_narrow() {
     run_sandboxed("side", &["child_bug_side_narrow"]);
 }
 
 #[test]
-#[ignore = "fails: /cwd stores a relative folder as typed, so the chat's agent folder moves with oriel's launch dir (chat.rs:617-619)"]
 fn qa_chat_bug_cwd_relative() {
     run_sandboxed("cwd", &["child_bug_cwd_relative"]);
 }
 
 #[test]
-#[ignore = "fails: /cwd \"C:\\some folder\" (a quoted path, as Explorer's Copy as path gives it) says \"not a folder\" (chat.rs:617)"]
 fn qa_chat_bug_cwd_quoted() {
     run_sandboxed("cwdq", &["child_bug_cwd_quoted"]);
 }
 
 #[test]
-#[ignore = "fails: /provider switch leaves old messages drawn from the render cache in the old AI's style (chat.rs:913-925)"]
 fn qa_chat_bug_provider_switch_stale_cache() {
     run_sandboxed("cache", &["child_bug_provider_switch_stale_cache"]);
 }
 
 #[test]
-#[ignore = "fails: tabs in your message vanish when drawn (pasted tab-indented code loses its indentation, chat.rs:936/947)"]
 fn qa_chat_bug_tabs_in_user_message() {
     run_sandboxed("tabs", &["child_bug_tabs_in_user_message"]);
 }
 
 #[test]
-#[ignore = "fails: a Question with no questions swallows every key, esc included (chat.rs:386-387 + 1605)"]
 fn qa_chat_bug_empty_question_traps_keys() {
     run_sandboxed("emptyq", &["child_bug_empty_question_traps_keys"]);
 }
@@ -774,6 +757,12 @@ fn deliver(k: &mut Kit, c: &mut Chat, evs: impl IntoIterator<Item = Ev>) {
         s.inbox.lock().unwrap().extend(evs);
     }
     k.poll(c);
+}
+
+/// The prompt on screen has been up long enough to take keys: a question or approval that just popped up ignores
+/// them for a moment (GRACE), so keys typed on the way in don't answer it.
+fn ripe(c: &mut Chat) {
+    c.prompt_since = Instant::now() - Duration::from_secs(1);
 }
 
 fn cmd(k: &mut Kit, c: &mut Chat, line: &str) {
@@ -846,10 +835,15 @@ fn child_question_then_stop() {
     let (tx, rx) = channel();
     deliver(&mut k, &mut c, [Ev::Question(approve::Question { qs: vec![q("First?"), q("Second?")], reply: tx })]);
     assert!(k.render(&mut c, 100, 30).contains("First?"));
+    ripe(&mut c);
     k.key(&mut c, KeyCode::Char('1'));
     assert!(k.render(&mut c, 100, 30).contains("Second?"));
     k.key(&mut c, KeyCode::Esc); // skips the question, the reply goes on
-    assert_eq!(rx.try_recv(), Ok(None));
+    // the answer already given in the set still goes back, the rest as skipped
+    let mut sent = serde_json::Map::new();
+    sent.insert("First?".into(), json!("Yes"));
+    sent.insert("Second?".into(), json!("(skipped)"));
+    assert_eq!(rx.try_recv(), Ok(Some(sent)));
     assert!(c.stream.is_some());
     k.key(&mut c, KeyCode::Esc); // now it stops
     assert!(c.stream.is_none());
@@ -998,7 +992,7 @@ fn child_slash_bad_args() {
     assert_eq!(c.info.iter().filter(|l| l.contains("(not set up here)")).count(), 3, "{:?}", c.info);
     cmd(&mut k, &mut c, "/perms sideways");
     assert_eq!(c.perms, "edits");
-    assert!(c.info[0].starts_with("permissions now: edits"), "{:?}", c.info);
+    assert!(c.info[0].starts_with("permissions in this chat: edits"), "{:?}", c.info);
     cmd(&mut k, &mut c, "/perms ask please");
     assert_eq!(c.perms, "edits");
     cmd(&mut k, &mut c, "/effort turbo");
@@ -1026,8 +1020,12 @@ fn child_slash_bad_args() {
     assert!(c.info[0].starts_with("/key openai <key>"), "{:?}", c.info);
     cmd(&mut k, &mut c, "/key banana sk-123");
     assert!(c.info[0].starts_with("/key openai <key>"), "{:?}", c.info);
-    cmd(&mut k, &mut c, "/frobnicate --now");
-    assert_eq!(c.info, vec!["unknown command /frobnicate — type / to see them".to_string()]);
+    // a /command oriel doesn't know goes to Claude Code as the message (its own commands, your skills: see
+    // chat_slash_commands_pass_through_to_claude); for any other AI it's unknown and changes nothing
+    let mut x = pane(&mut k, "codex");
+    cmd(&mut k, &mut x, "/frobnicate --now");
+    assert_eq!(x.info, vec!["unknown command /frobnicate — type / to see them".to_string()]);
+    assert!(x.chat.messages.is_empty() && x.stream.is_none());
     cmd(&mut k, &mut c, "/model 🤖 turbo max");
     assert_eq!(c.chat.model.as_deref(), Some("🤖 turbo max"));
     assert!(!c.chat.state.contains_key("claude"), "a new model drops the old session");
@@ -1206,10 +1204,14 @@ fn child_bug_cwd_relative() {
     sandboxed!();
     let mut k = Kit::new();
     let mut c = pane(&mut k, "claude");
+    // oriel started in `work` (pane() sets that), which has a src folder
+    let src = scratch("work").join("src");
+    std::fs::create_dir_all(&src).unwrap();
     cmd(&mut k, &mut c, "/cwd src");
     let cwd = c.chat.cwd.clone().unwrap();
     assert!(Path::new(&cwd).is_dir(), "{cwd}");
     assert!(Path::new(&cwd).is_absolute(), "/cwd saved {cwd:?}: a relative folder means something else the next time oriel starts elsewhere");
+    assert_eq!(Path::new(&cwd), src.as_path(), "{:?}", c.info);
 }
 
 #[test]
@@ -1256,7 +1258,8 @@ fn child_bug_tabs_in_user_message() {
         let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut k.actions, focused: true, time: k.time };
         Pane::paste(&mut c, "fn main() {\r\n\tprintln!(\"hi\");\r\n}", &mut cx);
     }
-    assert_eq!(c.input, "fn main() {\n\tprintln!(\"hi\");\n}");
+    // the composer keeps a pasted tab as spaces (the shared editor does that now)
+    assert_eq!(c.input, "fn main() {\n    println!(\"hi\");\n}");
     k.key(&mut c, KeyCode::Enter); // sends; the provider refuses to run in tests, which is fine here
     k.poll(&mut c);
     let s = k.render(&mut c, 100, 30);
@@ -1264,6 +1267,13 @@ fn child_bug_tabs_in_user_message() {
     let row = s.lines().find(|l| l.contains("println!")).expect("the message is drawn");
     let inside = row.split("│ ").nth(1).unwrap_or(row);
     assert!(inside.starts_with(' '), "the tab indent is gone: {row:?}");
+    // a message that still holds a real tab (a saved chat, one an older oriel wrote) keeps its indent on screen too
+    c.chat.messages.push(Msg { role: "user".into(), content: "loop {\n\tbreak_here();\n}".into(), ..Default::default() });
+    let s = k.render(&mut c, 100, 30);
+    println!("{s}");
+    let row = s.lines().find(|l| l.contains("break_here")).expect("the message is drawn");
+    let inside = row.split("│ ").nth(1).unwrap_or(row);
+    assert!(inside.starts_with("    break_here"), "the tab indent is gone: {row:?}");
 }
 
 #[test]

@@ -862,7 +862,9 @@ impl Chat {
             }
             // saved, and up to the top of the list like any chat that just changed
             let mut c = self.chats.remove(i);
-            store::save(&mut c);
+            if let Err(e) = store::save(&mut c) {
+                self.save_failed(&format!("\"{title}\""), &e);
+            }
             // what you queued there and it didn't read is the next message, sent right away
             let text = run.queue.drain(..).map(|q| q.text).collect::<Vec<_>>().join("\n\n");
             drop(run);
@@ -960,9 +962,20 @@ impl Chat {
         if self.chat.messages.is_empty() {
             return;
         }
-        store::save(&mut self.chat);
+        if let Err(e) = store::save(&mut self.chat) {
+            self.save_failed("this chat", &e);
+        }
         self.chats.retain(|c| c.id != self.chat.id);
         self.chats.insert(0, self.chat.clone());
+    }
+
+    /// A chat couldn't be saved (its file is read-only, the disk is full): say so, once, instead of losing the
+    /// reply without a word.
+    fn save_failed(&mut self, what: &str, e: &str) {
+        let line = format!("couldn't save {what}, so it won't be here after a restart: {e}");
+        if !self.info.contains(&line) {
+            self.info.push(line);
+        }
     }
 
     /// Stop the reply on screen (esc). Other chats' replies keep going.
@@ -1033,7 +1046,16 @@ impl Chat {
     /// allowed), enter to answer, typing (or Other) for your own words, esc to skip.
     fn question_key(&mut self, k: KeyEvent) {
         let Some(q) = self.questions.front() else { return };
-        let Some(cur) = q.qs.get(self.qs.idx).cloned() else { return };
+        let Some(cur) = q.qs.get(self.qs.idx).cloned() else {
+            // past its last question (or it had none): it's answered with what it has, and the keys come back
+            if let Some(q) = self.questions.pop_front() {
+                let answers = std::mem::take(&mut self.qs.answers);
+                let _ = q.reply.send((!answers.is_empty()).then_some(answers));
+            }
+            self.qs = QState::default();
+            self.front_changed();
+            return;
+        };
         let n = cur.options.len() + 1; // the choices, then Other
         if self.qs.ticked.len() != cur.options.len() {
             self.qs.ticked = vec![false; cur.options.len()];
@@ -1447,11 +1469,17 @@ impl Chat {
                 }
             }
             "/cwd" => {
+                // a quoted path (Explorer's "Copy as path") is the path inside the quotes
+                let arg = ["\"", "'"].iter().find_map(|q| arg.strip_prefix(q).and_then(|a| a.strip_suffix(q))).unwrap_or(&arg).trim().to_string();
                 // a completed folder ends in a separator: D:\work\ is D:\work (a root stays a root)
                 let trimmed = arg.trim_end_matches(['/', '\\']);
                 let arg = if trimmed.is_empty() || trimmed.ends_with(':') { arg.clone() } else { trimmed.to_string() };
                 let p = PathBuf::from(if arg.starts_with('~') { arg.replacen('~', &dirs::home_dir().unwrap_or_default().to_string_lossy(), 1) } else { arg.clone() });
-                if p.is_dir() {
+                // a relative folder is from where oriel started (as the / menu lists it), saved as a full path: it
+                // mustn't mean somewhere else the next time oriel starts in another folder
+                let p = if p.is_relative() && !arg.is_empty() { self.launch_dir.join(&p) } else { p };
+                let p = std::path::absolute(&p).unwrap_or(p);
+                if !arg.is_empty() && p.is_dir() {
                     self.chat.cwd = Some(p.to_string_lossy().to_string());
                     self.chat.state.clear(); // CLI sessions are per folder
                     crate::panes::agents::note_chat_dir(&p);
@@ -2177,6 +2205,8 @@ impl Chat {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             (m.content.len(), m.note.as_deref().unwrap_or(""), m.steps.len(), m.parts.len(), width, cx.theme.name.as_str()).hash(&mut h);
+            // the chat's AI decides how a message looks (a prompt band or a "you" box, a name over a reply)
+            self.provider_of().hash(&mut h);
             // the check badge: /verify's result, and the check it looks for
             (m.verified.as_deref(), self.chat.extra.get("check").and_then(|v| v["cmd"].as_str())).hash(&mut h);
             h.finish()
@@ -2209,7 +2239,8 @@ impl Chat {
                 _ => ratatui::style::Color::Rgb(14, 14, 17),
             };
             let band = crate::theme::mix(base, ratatui::style::Color::Rgb(205, 205, 212), 0.13);
-            let body = md::wrap(vec![Span::raw(m.content.clone())], width.saturating_sub(3), "", "");
+            // a tab draws as nothing: pasted tab-indented code keeps its indent as spaces
+            let body = md::wrap(vec![Span::raw(m.content.replace('\t', "    "))], width.saturating_sub(3), "", "");
             for (n, l) in body.into_iter().enumerate() {
                 let w = l.width();
                 let mut spans = vec![Span::styled(if n == 0 { "❯ " } else { "  " }, Style::default().fg(t.muted).bg(band))];
@@ -2220,7 +2251,7 @@ impl Chat {
         } else if m.role == "user" {
             // a box on the right with "you" set into its top border
             let max_w = (width * 7 / 10).max(20);
-            let body = md::wrap(vec![Span::raw(m.content.clone())], max_w.saturating_sub(4), "", "");
+            let body = md::wrap(vec![Span::raw(m.content.replace('\t', "    "))], max_w.saturating_sub(4), "", "");
             let inner_w = body.iter().map(|l| l.width()).max().unwrap_or(0).max(6);
             let box_w = inner_w + 4;
             let pad = " ".repeat(width.saturating_sub(box_w + 1));
@@ -2659,7 +2690,10 @@ impl Chat {
         if self.chat.id == id {
             self.persist();
         } else if let Some(c) = self.chats.iter_mut().find(|c| c.id == id) {
-            store::save(c);
+            if let Err(e) = store::save(c) {
+                let what = format!("\"{}\"", c.title);
+                self.save_failed(&what, &e);
+            }
         }
     }
 
@@ -3666,6 +3700,10 @@ fn absorb(chat: &mut store::Chat, run: &mut Run, evs: Vec<Ev>, always: Option<&B
             Ev::Context(used, window) => m.ctx = Some((used, window)),
             Ev::Checkpoint(Ok(sha)) => m.ckpt = Some(sha),
             Ev::Checkpoint(Err(e)) => out.ckpt_err = Some(e),
+            // a question set with nothing in it has nothing to answer: skipped at once, or it would hold every key
+            Ev::Question(q) if q.qs.is_empty() => {
+                let _ = q.reply.send(None);
+            }
             Ev::Question(q) => {
                 let head = q.qs.first().map(|x| x.question.clone()).unwrap_or_default();
                 out.waiting.push(format!("{who} is asking you: {}", ui::fit(&head, 80)));
@@ -3773,7 +3811,7 @@ impl Drop for Chat {
                 if let Some(m) = c.messages.last_mut().filter(|_| !out.finished) {
                     mark_stopped(m);
                 }
-                store::save(c);
+                let _ = store::save(c); // oriel is closing: there's no one left to tell
             }
             // dropping the run drops its questions and approvals: each answers no
         }
@@ -5507,7 +5545,7 @@ mod tests {
             store::Part::Text { .. } => 'T',
             store::Part::Tool(_) => 't',
             store::Part::Todos { .. } => 'L',
-            store::Part::Thinking { .. } | store::Part::User { .. } | store::Part::Mark { .. } => '.',
+            store::Part::Thinking { .. } | store::Part::User { .. } | store::Part::Mark { .. } | store::Part::Other(_) => '.',
         }).filter(|k| *k != '.').collect();
         println!("{kinds}");
         assert!(kinds.starts_with("TTL") || kinds.starts_with("TL") || kinds.contains("TtttttT"), "{kinds}");
@@ -6412,11 +6450,12 @@ mod tests {
 
     // ------------------------------------------------------------ checkpoints, checks, context, handoffs
 
-    /// Poll until `done` holds (background git work and checks report back through the pane's poll).
+    /// Poll until `done` holds (background git work and checks report back through the pane's poll). The limit only
+    /// catches a hang: with the whole suite running, this git work has taken over a minute.
     fn wait_until(k: &mut Kit, c: &mut Chat, what: &str, mut done: impl FnMut(&Chat) -> bool) {
         let t0 = Instant::now();
         while !done(c) {
-            assert!(t0.elapsed() < Duration::from_secs(60), "timed out waiting for {what}");
+            assert!(t0.elapsed() < Duration::from_secs(300), "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(15));
             k.poll(c);
         }
