@@ -61,6 +61,8 @@ struct Req {
     ticket: u64,
     path: PathBuf,
     size: (u16, u16),
+    /// `.` is on: a folder's preview lists hidden entries too
+    hidden: bool,
 }
 
 pub struct Files {
@@ -216,7 +218,7 @@ impl Files {
                 while let Ok(newer) = rx.try_recv() {
                     req = newer; // scrolled past: only the latest one matters
                 }
-                let p = preview::build(&req.path, req.size.0, req.size.1);
+                let p = preview::build(&req.path, req.size.0, req.size.1, req.hidden);
                 shared.lock().unwrap().preview = Some((req.ticket, p));
                 w.wake();
             }
@@ -243,7 +245,7 @@ impl Files {
         let (ticket, dir, shared) = (self.list_gen, self.dir.clone(), self.shared.clone());
         std::thread::spawn(move || {
             let r = preview::list_dir(&dir);
-            shared.lock().unwrap().listing = Some((ticket, r));
+            offer(&mut shared.lock().unwrap().listing, ticket, r);
             waker.wake();
         });
     }
@@ -389,7 +391,7 @@ impl Files {
         self.prev_gen += 1;
         self.pscroll = 0;
         if let Some(w) = &self.worker {
-            let _ = w.send(Req { ticket: self.prev_gen, path, size: self.pv_size });
+            let _ = w.send(Req { ticket: self.prev_gen, path, size: self.pv_size, hidden: self.hidden });
         }
     }
 
@@ -955,7 +957,7 @@ impl Files {
             KeyCode::Char('.') => {
                 self.hidden = !self.hidden;
                 self.refilter();
-                self.request_preview(false);
+                self.request_preview(true); // a folder's preview lists what the filter lets through
             }
             // (not F5: that's the system app everywhere)
             KeyCode::Char('r') => {
@@ -1126,6 +1128,15 @@ impl Files {
     }
 }
 
+/// Hand a background result to the pane through its slot, unless a newer one is already waiting there: two folder
+/// reads can be in flight (the watcher's and an r), and an older one finishing last must not knock out the newer
+/// result before the pane has taken it (the pane drops stale tickets, so it would wait on "loading…" for good).
+fn offer<T>(slot: &mut Option<(u64, T)>, ticket: u64, v: T) {
+    if slot.as_ref().is_none_or(|(t, _)| *t < ticket) {
+        *slot = Some((ticket, v));
+    }
+}
+
 /// A dialog wide enough for the path it names (the popup keeps it on screen).
 fn dialog_w(path: &Path) -> u16 {
     (UnicodeWidthStr::width(pretty(path).as_str()) as u16 + 6).max(72)
@@ -1293,9 +1304,16 @@ pub(crate) mod tests {
         d
     }
 
+    /// Start the workers, then wait (as long as it takes, up to 10 s) until the folder is listed, its preview is in
+    /// and the places are found: a fixed wait failed whenever the machine was busy.
     fn settle(k: &mut Kit, p: &mut Files) {
         k.render(p, 150, 44); // starts the workers
-        k.wait_wake(p, 1500); // generous: the whole suite runs in parallel
+        assert!(wait_for(k, p, |p| !p.loading && p.preview.is_some() && !p.places.is_empty()), "the folder never settled");
+    }
+
+    /// The preview on show is of `name`.
+    fn previewing(p: &Files, name: &str) -> bool {
+        p.preview.as_ref().is_some_and(|pv| pv.name == name)
     }
 
     #[test]
@@ -1318,21 +1336,21 @@ pub(crate) mod tests {
         for _ in 0..idx {
             k.key(&mut p, KeyCode::Char('j'));
         }
-        k.wait_wake(&mut p, 300);
+        assert!(wait_for(&mut k, &mut p, |p| previewing(p, "main.rs")));
         let s = snap(&mut k, &mut p, 150, 44, "target/snap/files-code.html");
         assert!(s.contains("2 fn main() {"), "numbered code preview:\n{s}");
 
         // image preview
         let idx = p.shown.iter().position(|&i| p.all[i].name == "sky.png").unwrap() + 1;
         p.select(idx);
-        k.wait_wake(&mut p, 500);
+        assert!(wait_for(&mut k, &mut p, |p| previewing(p, "sky.png")));
         let s = snap(&mut k, &mut p, 150, 44, "target/snap/files-image.html");
         assert!(s.contains("64×32") && s.contains("▀▀▀▀"), "half-block image:\n{s}");
 
         // binary
         let idx = p.shown.iter().position(|&i| p.all[i].name == "blob.bin").unwrap() + 1;
         p.select(idx);
-        k.wait_wake(&mut p, 300);
+        assert!(wait_for(&mut k, &mut p, |p| previewing(p, "blob.bin")));
         assert!(k.render(&mut p, 150, 44).contains("binary file"));
     }
 
@@ -1527,6 +1545,22 @@ pub(crate) mod tests {
         }
     }
 
+    /// Two folder reads in flight, the newer finishing first: the older one arriving after it doesn't replace it
+    /// (the pane drops the older ticket, so the newer listing would be lost and "loading…" stay up for good).
+    #[test]
+    fn files_late_old_listing_doesnt_replace_a_newer_one() {
+        let mut slot: Option<(u64, &str)> = None;
+        offer(&mut slot, 2, "newer");
+        offer(&mut slot, 1, "older, finished last");
+        assert_eq!(slot, Some((2, "newer")));
+        offer(&mut slot, 3, "newest");
+        assert_eq!(slot, Some((3, "newest")));
+        // once the pane has taken it, a late older one may sit in the empty slot: the pane compares tickets and drops it
+        slot = None;
+        offer(&mut slot, 1, "older");
+        assert_eq!(slot, Some((1, "older")));
+    }
+
     /// Stands in for the recycle bin: the scratch file is simply removed (tests never touch the real bin).
     fn fake_trash(p: &Path) -> Result<(), String> {
         if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }.map_err(|e| e.to_string())
@@ -1546,13 +1580,13 @@ pub(crate) mod tests {
         assert!(s.contains("end it with / for a folder") && s.contains("todo.txt"), "{s}");
         k.key(&mut p, KeyCode::Enter);
         assert!(d.join("todo.txt").is_file());
-        k.wait_wake(&mut p, 400);
+        wait_for(&mut k, &mut p, |p| !p.loading && p.all.iter().any(|e| e.name == "todo.txt"));
         assert_eq!(p.sel_entry().map(|e| e.name.as_str()), Some("todo.txt"), "the new file is picked");
         k.key(&mut p, KeyCode::Char('n'));
         k.typ(&mut p, "drafts/");
         k.key(&mut p, KeyCode::Enter);
         assert!(d.join("drafts").is_dir());
-        k.wait_wake(&mut p, 400);
+        assert!(wait_for(&mut k, &mut p, |p| !p.loading && p.all.iter().any(|e| e.name == "drafts")));
         // a name that leaves the folder is refused
         k.key(&mut p, KeyCode::Char('n'));
         k.typ(&mut p, "../escape.txt");
@@ -1569,7 +1603,7 @@ pub(crate) mod tests {
         k.typ(&mut p, "done.txt");
         k.key(&mut p, KeyCode::Enter);
         assert!(d.join("done.txt").is_file() && !d.join("todo.txt").exists());
-        k.wait_wake(&mut p, 400);
+        wait_for(&mut k, &mut p, |p| !p.loading && p.all.iter().any(|e| e.name == "done.txt"));
         assert_eq!(p.sel_entry().map(|e| e.name.as_str()), Some("done.txt"));
         // d asks first, naming the path; anything but y keeps it
         k.key(&mut p, KeyCode::Char('d'));

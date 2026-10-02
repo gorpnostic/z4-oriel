@@ -26,6 +26,10 @@ pub struct Themes {
     rows: Vec<(Rect, usize)>,
     side_hits: Vec<(Rect, String)>,
     files: Option<Files>,
+    /// The last nudge, exactly: (colour key, the colour it set, its hue/saturation/lightness before rounding). The
+    /// next nudge of that colour carries on from these, so a fine step that rounds back to the same RGB on a dark
+    /// colour isn't lost: steps add up until they show.
+    hsl: Option<(&'static str, Color, (f32, f32, f32))>,
 }
 
 /// What the screen shows about the theme files, kept between frames (it used to list the folder and parse the
@@ -50,7 +54,7 @@ fn row_count() -> usize {
 
 impl Themes {
     pub fn new() -> Themes {
-        Themes { sel: 0, input: None, msg: None, rows: vec![], side_hits: vec![], files: None }
+        Themes { sel: 0, input: None, msg: None, rows: vec![], side_hits: vec![], files: None, hsl: None }
     }
 
     fn files(&mut self, name: &str) -> &Files {
@@ -96,13 +100,22 @@ impl Themes {
     /// Nudge the selected colour in HSL.
     fn nudge(&mut self, cx: &mut Cx, dh: f32, ds: f32, dl: f32) {
         let Some(&(key, _)) = theme::COLOR_KEYS.get(self.sel) else { return };
-        let fallback = if key == "background" { (16, 16, 20) } else { (220, 220, 220) };
-        let (h, mut s, l) = theme::to_hsl(theme::approx_rgb(theme::field(cx.theme, key), fallback));
+        let now = theme::field(cx.theme, key);
+        let (h, mut s, l) = match self.hsl {
+            // still the colour the last nudge left: carry on from where it really was, rounding and all
+            Some((k, c, hsl)) if k == key && c == now => hsl,
+            _ => {
+                let fallback = if key == "background" { (16, 16, 20) } else { (220, 220, 220) };
+                theme::to_hsl(theme::approx_rgb(now, fallback))
+            }
+        };
         // a grey has no hue to turn: give it a little colour first
         if dh != 0.0 && s < 0.05 {
             s = 0.35;
         }
-        let c = theme::from_hsl(h + dh, s + ds, l + dl);
+        let hsl = ((h + dh).rem_euclid(360.0), (s + ds).clamp(0.0, 1.0), (l + dl).clamp(0.0, 1.0));
+        let c = theme::from_hsl(hsl.0, hsl.1, hsl.2);
+        self.hsl = Some((key, c, hsl));
         self.change(cx, |t| theme::set_field(t, key, c));
     }
 
@@ -314,9 +327,15 @@ impl Pane for Themes {
             }
             KeyCode::Char('r') => {
                 if let Some(&(key, _)) = theme::COLOR_KEYS.get(self.sel) {
-                    let orig = theme::field(&theme::get(&theme::base_of(&cx.theme.name)), key);
-                    self.change(cx, |t| theme::set_field(t, key, orig));
-                    self.msg = Some(format!("{key} is back to {}'s", theme::base_of(&cx.theme.name)));
+                    let base = theme::base_of(&cx.theme.name);
+                    let orig = theme::field(&theme::get(&base), key);
+                    if theme::field(cx.theme, key) == orig {
+                        // nothing to put back (a built-in you haven't changed): not a change, so no copy is made
+                        self.msg = Some(format!("{key} is already {base}'s"));
+                    } else {
+                        self.change(cx, |t| theme::set_field(t, key, orig));
+                        self.msg = Some(format!("{key} is back to {base}'s"));
+                    }
                 }
             }
             KeyCode::Char('n') => self.input = Some(Input::Name(theme::free_name("my-theme"))),

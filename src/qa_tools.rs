@@ -97,9 +97,11 @@ fn framed(k: &mut Kit, p: &mut dyn Pane, w: u16, h: u16) -> String {
     dump(term.backend())
 }
 
-/// Render (framed) until `pred` holds, letting background work wake the pane in between.
+/// Render (framed) until `pred` holds, letting background work wake the pane in between. It returns as soon as it
+/// holds, so the deadline is at least 10 s whatever `ms` says: on a busy machine (the whole suite in parallel) a
+/// listing or a preview can take seconds, and a short deadline made these tests fail for no reason.
 fn settle(k: &mut Kit, p: &mut dyn Pane, w: u16, h: u16, ms: u64, pred: impl Fn(&str) -> bool) -> String {
-    let deadline = Instant::now() + Duration::from_millis(ms);
+    let deadline = Instant::now() + Duration::from_millis(ms.max(10_000));
     loop {
         let s = framed(k, p, w, h);
         if pred(&s) || Instant::now() > deadline {
@@ -178,6 +180,27 @@ mod calendar {
         k.key(c, KeyCode::Char('a'));
         k.typ(c, text);
         k.key(c, KeyCode::Enter);
+    }
+
+    /// What the badge should say for today's plans in `plans` at this minute: it names what's next (the first timed
+    /// plan that started less than an hour ago or is still to come), else the day's first all-day plan.
+    fn badge_now(plans: &[Plan]) -> Option<String> {
+        let (today, mins) = now_day_min();
+        let mut on: Vec<&Plan> = plans.iter().filter(|p| p.day == today).collect();
+        on.sort_by(|a, b| (a.at.is_some(), a.at, &a.text).cmp(&(b.at.is_some(), b.at, &b.text)));
+        on.iter()
+            .find(|p| p.at.is_some_and(|a| a + 60 >= mins))
+            .map(|p| { let a = p.at.unwrap_or(0); format!("next {:02}:{:02} {}", a / 60, a % 60, p.text) })
+            .or_else(|| on.iter().find(|p| p.at.is_none()).map(|p| format!("today: {}", p.text)))
+    }
+
+    /// The calendar's badge matches `badge_now` (worked out just before and just after, so a minute turning over
+    /// in between can't fail it).
+    fn assert_badge(c: &Calendar, plans: &[Plan]) {
+        let before = badge_now(plans);
+        let got = c.badge();
+        let after = badge_now(plans);
+        assert!(got == before || got == after, "badge {got:?}, want {before:?}");
     }
 
     #[test]
@@ -288,7 +311,8 @@ mod calendar {
         let s = k.render(&mut c, 140, 40);
         let (i0, i7, i23) = (s.find("00:00").unwrap(), s.find("07:05").unwrap(), s.find("23:59").unwrap());
         assert!(i0 < i7 && i7 < i23, "time order:\n{s}");
-        assert_eq!(c.badge().as_deref(), Some("4 today"));
+        assert_badge(&c, &plans);
+        assert!(c.badge().is_some_and(|b| b.starts_with("next ")), "a timed plan is always still to come today (23:59)");
         let side = k.render_side(&mut c, 40, 10);
         assert!(side.contains("today") && side.contains("23:59") && side.contains("last train"), "{side}");
     }
@@ -296,7 +320,6 @@ mod calendar {
     /// "24:00 party" typed on a day means midnight at the END of that day; it is stored as 00:00 of the same day
     /// (its start), so it sorts first, its reminder fires ~24 hours early (or never), and editing shows "00:00".
     #[test]
-    #[ignore = "fails: parse_time accepts hour 24 and wraps it to 00:00 of the same day (calendar.rs:95-102)"]
     fn qa_calendar_24_00_is_not_the_start_of_the_day() {
         let (at, text) = parse_time("24:00 party");
         assert_ne!(at, Some(0), "24:00 became 00:00 of the same day (text {text:?})");
@@ -305,7 +328,6 @@ mod calendar {
     /// A '.' separator is accepted for times ("10.30 standup"), but with a one-digit "minute" any decimal at the
     /// start of a plan turns into a time: "1.5 hours of gym" is saved as 01:05 "hours of gym".
     #[test]
-    #[ignore = "fails: parse_time takes '1.5' as 01:05 (one-digit minutes after '.') (calendar.rs:88-89)"]
     fn qa_calendar_decimal_number_is_not_a_time() {
         assert_eq!(parse_time("1.5 hours of gym"), (None, "1.5 hours of gym".into()));
         assert_eq!(parse_time("2.5 km run"), (None, "2.5 km run".into()));
@@ -313,7 +335,6 @@ mod calendar {
 
     /// All-day plans sort as if they were at 00:00, then by text, so they land between two midnight plans.
     #[test]
-    #[ignore = "fails: all-day plans sort as 00:00 and interleave with midnight plans by text (calendar.rs:157)"]
     fn qa_calendar_all_day_plans_are_not_mixed_into_midnight() {
         let mut k = Kit::new();
         let (mut c, _) = cal("cal-allday-order");
@@ -460,19 +481,23 @@ mod calendar {
         assert!(k.render(&mut c, 140, 40).lines().any(|l| l.contains("▸") && l.contains("water plants")));
         // reopening reads it all back
         let mut c2 = Calendar::open_at(path.clone());
-        assert_eq!(c2.badge().as_deref(), Some("3 today"));
+        let plans = load(&path);
+        assert_eq!(plans.len(), 3);
+        assert_badge(&c2, &plans);
         assert!(k.render(&mut c2, 140, 40).contains("standup meeting"));
     }
 
     /// Edit a plan's time so it re-sorts: the ▸ should stay on the plan you edited (the next `x` deletes the ▸ one).
     #[test]
-    #[ignore = "fails: after an edit re-sorts the day, `pick` still points at the old index, so x deletes a different plan (calendar.rs:375-382)"]
     fn qa_calendar_edit_keeps_the_pick_on_the_edited_plan() {
         let mut k = Kit::new();
         let (mut c, path) = cal("cal-edit-pick");
         add(&mut k, &mut c, "9am alpha");
         add(&mut k, &mut c, "5pm beta");
-        // pick alpha (first), move it to the evening
+        // adding picks the plan just added (beta): k goes up to alpha, then move it to the evening
+        k.key(&mut c, KeyCode::Char('k'));
+        let s = k.render(&mut c, 140, 40);
+        assert!(s.lines().any(|l| l.contains("▸") && l.contains("alpha")), "{s}");
         k.key(&mut c, KeyCode::Char('e'));
         for _ in 0..20 {
             k.key(&mut c, KeyCode::Backspace);
@@ -490,7 +515,6 @@ mod calendar {
     /// calendar.json is documented as the place plans live; a hand edit with a typo (or a half-written file) must
     /// not be silently replaced by an empty calendar on the next change.
     #[test]
-    #[ignore = "fails: a calendar.json that doesn't parse loads as empty and the next add overwrites it (calendar.rs:140-142, 160-166)"]
     fn qa_calendar_unreadable_file_is_not_overwritten() {
         let dir = scratch("cal-corrupt");
         let path = dir.join("calendar.json");
@@ -507,7 +531,6 @@ mod calendar {
     /// More plans on a day than the day list has rows: j walks the ▸ down, and the list should follow it, or e / x
     /// act on a plan you can't see.
     #[test]
-    #[ignore = "fails: the chosen day's list never scrolls, so j moves the ▸ below the bottom and x deletes a plan that isn't on screen (calendar.rs:332-354)"]
     fn qa_calendar_picked_plan_stays_on_screen() {
         let mut k = Kit::new();
         let (mut c, path) = cal("cal-pick-offscreen");
@@ -527,11 +550,13 @@ mod calendar {
     #[test]
     fn qa_calendar_many_plans_small_sizes_and_mouse() {
         let mut k = Kit::new();
-        let (mut c, _) = cal("cal-many");
+        let (mut c, path) = cal("cal-many");
         for i in 0..40 {
             add(&mut k, &mut c, &format!("{}:{:02} plan number {i} with a long description that won't fit anywhere", i % 24, (i * 7) % 60));
         }
-        assert_eq!(c.badge().as_deref(), Some("40 today"));
+        let plans = load(&path);
+        assert_eq!(plans.len(), 40);
+        assert_badge(&c, &plans);
         let s = k.render(&mut c, 140, 40);
         assert!(s.contains("more"), "the day's cell says how many more:\n{s}");
         for (w, h) in [(1, 1), (5, 3), (12, 6), (27, 9), (28, 10), (40, 12), (60, 20), (99, 30), (100, 30), (220, 70)] {
@@ -716,7 +741,6 @@ mod notes {
     /// Notes written by Notepad and friends often start with a UTF-8 byte-order mark; the title should still be
     /// the heading text, not "\u{feff}# Title".
     #[test]
-    #[ignore = "fails: title_of doesn't strip a UTF-8 BOM, so the sidebar shows \"# Title\" (notes.rs:36-39)"]
     fn qa_notes_bom_heading_title() {
         let dir = scratch("notes-bom");
         std::fs::write(dir.join("bom.md"), "\u{feff}# Shopping\n\n- eggs\n").unwrap();
@@ -727,7 +751,6 @@ mod notes {
     /// A note that isn't UTF-8 (a legacy-encoded file) can't be opened; the editor still takes typing and shows
     /// "editing…", but nothing is ever saved: ctrl+s, the autosave and closing all drop it.
     #[test]
-    #[ignore = "fails: when the open note couldn't be read, typing is accepted but silently never saved (notes.rs:175-192)"]
     fn qa_notes_typing_after_an_unreadable_note_is_not_lost() {
         let dir = scratch("notes-latin1");
         std::fs::write(dir.join("old.md"), b"# caf\xe9 notes\n\nwritten in latin-1\n").unwrap();
@@ -745,7 +768,6 @@ mod notes {
     /// 60 notes and a sidebar with room for 10: the wheel should scroll the list so an old note can be clicked.
     /// (There is no key for switching notes, so the sidebar is the only way to reach one.)
     #[test]
-    #[ignore = "fails: every sidebar render snaps side_scroll back to keep the open note visible, so the wheel can't reach notes below the fold (notes.rs:508-513, 543)"]
     fn qa_notes_sidebar_scrolls_to_old_notes() {
         let dir = scratch("notes-many");
         let now = std::time::SystemTime::now();
@@ -861,7 +883,9 @@ mod files {
         let s = settle(&mut k, &mut p, 150, 40, 2000, |s| s.contains("esc back to the list"));
         assert!(s.contains("esc back to the list"), "{s}");
         k.key(&mut p, KeyCode::Char('q'));
-        assert!(framed(&mut k, &mut p, 150, 40).contains("backspace up"));
+        // the list's hints are back (there are more of them than fit at 150 columns, so check the first ones)
+        let s = framed(&mut k, &mut p, 150, 40);
+        assert!(s.contains("enter open · / filter") && !s.contains("esc back to the list"), "{s}");
     }
 
     #[test]
@@ -907,7 +931,6 @@ mod files {
     /// With hidden files off, the list hides dotfiles and build folders, but the preview of a folder (the folder
     /// row, or any subfolder you highlight) lists them all anyway.
     #[test]
-    #[ignore = "fails: the folder preview ignores the hidden filter and lists dotfiles / node_modules (files/preview.rs:143-148)"]
     fn qa_files_folder_preview_respects_hidden() {
         let d = scratch("files-hidden-preview");
         std::fs::create_dir_all(d.join("proj").join("node_modules")).unwrap();
@@ -956,7 +979,7 @@ mod files {
     fn qa_files_refresh_and_files_that_vanish() {
         let d = scratch("files-vanish");
         for n in ["a.txt", "b.txt", "c.txt"] {
-            std::fs::write(d.join(n), n).unwrap();
+            std::fs::write(d.join(n), format!("contents of {n}")).unwrap();
         }
         let mut k = Kit::new();
         let mut p = Files::new(Some(d.clone()));
@@ -967,16 +990,23 @@ mod files {
         k.key(&mut p, KeyCode::Char('r'));
         let s = settle(&mut k, &mut p, 150, 40, 3000, |s| !s.contains("c.txt"));
         assert!(!s.contains("c.txt") && s.contains("0 folders · 2 files"), "{s}");
-        // a file deleted between the listing and its preview: the preview says so
+        // a file deleted between the listing and its preview: the preview says so. (Under load the folder watcher
+        // can read the folder again first, and then b.txt is simply gone from the list.) Never its old contents.
+        let gone = |s: &str| s.to_lowercase().contains("cannot find") || s.contains("No such file");
         std::fs::remove_file(d.join("b.txt")).unwrap();
         k.key(&mut p, KeyCode::Char('g'));
         k.key(&mut p, KeyCode::Char('j'));
         k.key(&mut p, KeyCode::Char('j')); // b.txt, still listed
-        let s = settle(&mut k, &mut p, 150, 40, 2000, |s| s.to_lowercase().contains("cannot find") || s.contains("No such file"));
-        assert!(s.to_lowercase().contains("cannot find") || s.contains("No such file"), "preview of a vanished file:\n{s}");
-        // new files show up on F5
+        let s = settle(&mut k, &mut p, 150, 40, 2000, |s| gone(s) || !left(s, 60).contains("b.txt"));
+        assert!(gone(&s) || !left(&s, 60).contains("b.txt"), "preview of a vanished file:\n{s}");
+        assert!(!s.contains("contents of b.txt"), "the old contents of a file that's gone:\n{s}");
+        // and the preview of a path that's gone, built directly (no race with the watcher): it says so
+        let pv = crate::panes::files::preview::build(&d.join("b.txt"), 60, 20, false);
+        assert!(matches!(&pv.body, crate::panes::files::preview::Body::Error(e) if gone(e)), "the preview of a missing file isn't an error saying so");
+        // new files show up on r (F5 is the system app's key now; the folder watcher would also catch it, but the
+        // testkit doesn't tick, so only r is deterministic here)
         std::fs::write(d.join("new.txt"), "fresh").unwrap();
-        k.key(&mut p, KeyCode::F(5));
+        k.key(&mut p, KeyCode::Char('r'));
         let s = settle(&mut k, &mut p, 150, 40, 3000, |s| s.contains("new.txt"));
         assert!(s.contains("new.txt"), "{s}");
         // the folder itself disappearing
@@ -993,7 +1023,6 @@ mod files {
     /// Select the last file, delete it outside oriel, press r (or F5): the new, shorter listing arrives and
     /// `refilter` looks up the old selection through the OLD `shown` indices into the NEW `all` list.
     #[test]
-    #[ignore = "fails: panics 'index out of bounds: the len is 2 but the index is 2' in sel_entry during refilter after r/F5 (files.rs:217-219, 228)"]
     fn qa_files_refresh_after_the_selected_file_was_deleted() {
         let d = scratch("files-refresh-crash");
         for n in ["a.txt", "b.txt", "c.txt"] {
@@ -1013,7 +1042,6 @@ mod files {
     /// oriel, press r. The listing comes back as an error, `all` is cleared, and `refilter` still reads the old
     /// selection through the old `shown` indices.
     #[test]
-    #[ignore = "fails: panics 'index out of bounds: the len is 0 but the index is 0' when the open folder is deleted and r is pressed with a file selected (files.rs:527-532, 217, 228)"]
     fn qa_files_refresh_after_the_folder_was_deleted() {
         let d = scratch("files-folder-gone");
         let sub = d.join("doomed");
@@ -1113,7 +1141,10 @@ mod help {
         let side = k.render_side(&mut h, 40, 30);
         assert!(side.contains("keys & tabs"), "{side}");
         k.key(&mut h, KeyCode::Enter);
-        assert!(k.render(&mut h, 150, 44).contains("keys & tabs"));
+        // the topic opens scrolled to the hit (its heading may be above the fold)
+        let s = k.render(&mut h, 150, 44);
+        assert_eq!(h.title(), "help · keys & tabs");
+        assert!(s.contains("paste a clipboard image"), "{s}");
         k.key(&mut h, KeyCode::Esc); // esc outside the box clears the query
         assert!(k.render_side(&mut h, 40, 30).contains("music"));
     }
@@ -1121,7 +1152,7 @@ mod help {
     #[test]
     fn qa_help_opens_on_the_topic_of_every_app() {
         let mut k = Kit::new();
-        for (app, want) in [("ai", "chat"), ("agents", "agents & lead mode"), ("ais", "your AIs"), ("music", "music"), ("system", "system"), ("files", "files"), ("notes", "notes"), ("calendar", "calendar"), ("storage", "storage"), ("terminal", "terminal"), ("alerts", "alerts"), ("themes", "themes & config"), ("home", "getting started")] {
+        for (app, want) in [("ai", "chat"), ("agents", "agents & lead mode"), ("ais", "your AIs"), ("music", "music"), ("system", "system"), ("files", "files"), ("notes", "notes"), ("calendar", "calendar"), ("storage", "storage"), ("terminal", "terminal"), ("alerts", "alerts"), ("themes", "settings & themes"), ("settings", "settings & themes"), ("search", "search"), ("updates", "updates"), ("home", "getting started")] {
             let mut h = Help::new();
             k.key(&mut h, KeyCode::Down); // away from the first topic
             set_context(app);
@@ -1143,7 +1174,6 @@ mod help {
 
     /// Search for something no topic has, press enter (the query stays), then ↓ / ↑: index out of bounds.
     #[test]
-    #[ignore = "fails: panics (index out of bounds) on ↓/↑/j/k after a search with no results (help.rs:410-419)"]
     fn qa_help_arrow_keys_after_a_search_with_no_results() {
         let mut k = Kit::new();
         let mut h = Help::new();
@@ -1281,7 +1311,6 @@ mod themes {
     /// The fine hue step (shift+← →, 2°) goes through 8-bit RGB on every press, so on a dark or greyish colour
     /// (a background, a frame) the rounding eats it: pressing it any number of times changes nothing.
     #[test]
-    #[ignore = "fails: shift+←/→ (2° hue) on a dark colour rounds back to the same RGB every press, so it never moves (themes.rs:59-69)"]
     fn qa_themes_fine_hue_step_moves_dark_colours() {
         let _d = with_dir("fine-hue");
         let _r = Reset;
@@ -1393,7 +1422,6 @@ mod themes {
     /// Resetting a colour of a built-in you never changed is not a change; it still makes "my-ultra" (a new
     /// theme file, applied, listed as yours).
     #[test]
-    #[ignore = "fails: r on an untouched built-in theme saves and applies a copy (my-ultra) (themes.rs:274-279, 41-56)"]
     fn qa_themes_reset_on_an_untouched_builtin_makes_no_copy() {
         let d = with_dir("reset-builtin");
         let _r = Reset;
@@ -1645,7 +1673,8 @@ mod alerts {
         k.key(&mut p, KeyCode::Char('j'));
         clean()?;
         k.key(&mut p, KeyCode::Enter);
-        check!(k.actions.iter().any(|a| matches!(a, Action::FocusPane(42))), "enter on the pane's alert");
+        // its pane, or its app if that pane has closed since
+        check!(k.actions.iter().any(|a| matches!(a, Action::FocusPaneOr(42, "agents"))), "enter on the pane's alert");
         // mouse: click a row picks it; the wheel past the end is clamped by the next render
         let s = k.render(&mut p, 120, 12);
         let Some(row) = s.lines().position(|l| l.contains("from the calendar")) else { return Err(if foreign() { Fail::Interfered } else { Fail::Bug(format!("no calendar row:\n{s}")) }) };
@@ -1676,7 +1705,6 @@ mod alerts {
     /// Pick an alert, then a new one arrives (an agent finishes while you're reading): the ▸ is a row number, so
     /// it now sits on a different alert, and x dismisses that one instead of the one you picked.
     #[test]
-    #[ignore = "fails: the pick is a row index into a newest-first list, so a new alert shifts it and x / enter act on a different alert (panes/alerts.rs:69-75, 108, 124-126)"]
     fn qa_alerts_pick_survives_a_new_alert() {
         let _g = CENTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
