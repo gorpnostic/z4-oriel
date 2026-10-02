@@ -78,13 +78,10 @@ pub(crate) fn app_pane() -> Box<dyn crate::pane::Pane> {
     Box::new(fixture(&scratch("ais-app"), View::Overview))
 }
 
-/// Bugs found by this sweep (each has its own ignored test below). The sweep still fails on anything else.
-const KNOWN: &[Known] = &[
-    ("install view: `dw - 10` underflows (attempt to subtract with overflow) when the detail card is under 10 columns, i.e. a pane under ~14 columns or with no room (panes/ais/draw.rs:436)", |p| p.pane.starts_with("ais") && p.msg.contains("draw.rs:436")),
-    ("overview: `inner.width as usize - 9` underflows in the Ollama card under 9 columns (panes/ais/draw.rs:230)", |p| p.pane.starts_with("ais") && p.msg.contains("draw.rs:230")),
-    ("usage view: `rest - ph` underflows (ph = max(rest/2, 4)) on a pane >= ~124 columns wide and <= ~17 rows tall (panes/ais/draw.rs:552-558)", |p| p.pane.starts_with("ais") && p.msg.contains("draw.rs:558")),
-    ("usage view: draws a line into a 0-row pane (draw_usage/draw_daily, panes/ais/draw.rs:458-500)", |p| p.pane == "ais(Usage)" && p.msg.contains("outside its") && p.h == 0),
-];
+/// Bugs found by this sweep that are still open (each with its own test below). The four it found (the install
+/// view's `dw - 10`, the Ollama card's `width - 9`, the usage view's `rest - ph` and its rule in a 0-row pane)
+/// are fixed, so the sweep fails on any problem at all.
+const KNOWN: &[Known] = &[];
 
 fn loaded(k: &mut Kit, view: View, name: &str) -> Ais {
     let mut a = fixture(&scratch(name), view);
@@ -97,7 +94,6 @@ fn loaded(k: &mut Kit, view: View, name: &str) -> Ais {
 }
 
 #[test]
-#[ignore = "fails: 'your AIs' install view panics (attempt to subtract with overflow) in a 12-column pane: `dw - 10` (src/panes/ais/draw.rs:436)"]
 fn qa_sizes_bug_ais_install_narrow_panics() {
     let mut k = Kit::new();
     let mut a = loaded(&mut k, View::Install, "ais-bug-install");
@@ -105,7 +101,6 @@ fn qa_sizes_bug_ais_install_narrow_panics() {
 }
 
 #[test]
-#[ignore = "fails: 'your AIs' overview panics in a 10-column pane when Ollama is installed: `inner.width as usize - 9` (src/panes/ais/draw.rs:230)"]
 fn qa_sizes_bug_ais_ollama_card_narrow_panics() {
     let mut k = Kit::new();
     let mut a = loaded(&mut k, View::Overview, "ais-bug-ollama");
@@ -113,7 +108,6 @@ fn qa_sizes_bug_ais_ollama_card_narrow_panics() {
 }
 
 #[test]
-#[ignore = "fails: 'your AIs' usage view panics on a wide, short pane (140x16): `rest - ph` where ph = max(rest/2, 4) (src/panes/ais/draw.rs:552-558)"]
 fn qa_sizes_bug_ais_usage_wide_short_panics() {
     let mut k = Kit::new();
     let mut a = loaded(&mut k, View::Usage, "ais-bug-usage");
@@ -122,7 +116,6 @@ fn qa_sizes_bug_ais_usage_wide_short_panics() {
 }
 
 #[test]
-#[ignore = "fails: 'your AIs' usage view draws a line into a 0-row pane (src/panes/ais/draw.rs:458-500)"]
 fn qa_sizes_bug_ais_usage_zero_rows() {
     let mut k = Kit::new();
     let mut a = loaded(&mut k, View::Usage, "ais-bug-usage0");

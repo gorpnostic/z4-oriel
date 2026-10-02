@@ -1,5 +1,5 @@
 //! QA: the updates screen in every state, with fake releases and fake kept versions (no network, no install).
-//! Kept versions are dummy files in target/test-scratch/update/previous (where update.rs looks under test).
+//! Kept versions are dummy files in a scratch state folder (update::TEST_STATE points update.rs at it).
 
 use super::*;
 use crate::testkit::Kit;
@@ -88,7 +88,12 @@ fn qa_updates_enter_runs_the_update_and_reports() {
 
 #[test]
 fn qa_updates_rollback_asks_twice() {
-    let dir = std::path::absolute("target/test-scratch/update/previous").unwrap();
+    // a state folder of its own (update.rs looks there from this thread): the shared one is emptied and filled
+    // by the update tests running beside this one
+    let state = std::path::absolute("target/test-scratch/qa-updates-rollback").unwrap();
+    let _ = std::fs::remove_dir_all(&state);
+    update::TEST_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
+    let dir = state.join("previous");
     std::fs::create_dir_all(&dir).unwrap();
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let fakes = [format!("oriel-0.6.9{ext}"), format!("oriel-0.6.10{ext}"), format!("oriel-{}{ext}", update::VERSION)];
@@ -107,11 +112,15 @@ fn qa_updates_rollback_asks_twice() {
     assert!(!k.render(&mut p, 110, 30).contains("press r again"));
     k.key(&mut p, KeyCode::Char('r'));
     k.key(&mut p, KeyCode::Char('r'));
+    // the rollback runs on a worker thread: wait for its answer
+    let t0 = std::time::Instant::now();
+    while p.st.lock().unwrap().result.is_none() && t0.elapsed() < std::time::Duration::from_secs(10) {
+        k.wait_wake(&mut p, 50);
+    }
     let s = k.render(&mut p, 110, 30);
     assert!(s.contains("✗ no rollback in tests"), "{s}");
-    for f in &fakes {
-        let _ = std::fs::remove_file(dir.join(f));
-    }
+    update::TEST_STATE.with(|s| *s.borrow_mut() = None);
+    let _ = std::fs::remove_dir_all(&state);
 }
 
 #[test]

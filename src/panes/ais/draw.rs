@@ -227,7 +227,7 @@ impl Ais {
                 put(f, inner, y, vec![s(pad("models", 9), ui::muted(t)), s(format!("{} installed", o.models.len()), Style::default().add_modifier(Modifier::BOLD)), s(format!(" · {} on disk", ui::human_bytes(disk)), ui::muted(t))]);
                 y += 1;
                 let loaded = if o.loaded.is_empty() { "nothing loaded right now".to_string() } else { o.loaded.iter().map(|(n, v)| format!("{n} ({})", ui::human_bytes(*v))).collect::<Vec<_>>().join(", ") };
-                put(f, inner, y, vec![s(pad("loaded", 9), ui::muted(t)), s(ui::fit(&loaded, inner.width as usize - 9), if o.loaded.is_empty() { ui::muted(t) } else { ui::accent(t) })]);
+                put(f, inner, y, vec![s(pad("loaded", 9), ui::muted(t)), s(ui::fit(&loaded, (inner.width as usize).saturating_sub(9)), if o.loaded.is_empty() { ui::muted(t) } else { ui::accent(t) })]);
                 y += 1;
                 for m in o.models.iter().take((inner.bottom().saturating_sub(y)) as usize) {
                     put(f, inner, y, vec![s(" ".repeat(9), Style::default()), s(pad(&m.name, 28), Style::default()), s(format!("{} {}  {}", m.params, m.quant, ui::human_bytes(m.size)), ui::muted(t))]);
@@ -433,7 +433,7 @@ impl Ais {
             Some(_) => "not installed".into(),
             None => "checking…".into(),
         };
-        put(f, di, di.y, vec![lab("status"), s(ui::fit(&status, dw - 10), Style::default())]);
+        put(f, di, di.y, vec![lab("status"), s(ui::fit(&status, dw.saturating_sub(10)), Style::default())]);
         let inst_line = match &self.picks[sel] {
             Some((cmd, ready)) => vec![lab("install"), s(ui::fit(cmd, dw.saturating_sub(40)), ui::accent(t)), s(if *ready { "   enter runs it in a terminal pane (asks first)".to_string() } else { format!("   needs {} first", cmd.split_whitespace().find(|w| *w != "sudo").unwrap_or("?")) }, if *ready { ui::muted(t) } else { Style::default().fg(AMBER) })],
             None => vec![lab("install"), s(format!("nothing for {} — {}", self.os.label(), if c.note.is_empty() { "see the docs" } else { c.note }), ui::muted(t))],
@@ -449,7 +449,7 @@ impl Ais {
         let picked = self.picks[sel].as_ref().map(|p| p.0.as_str());
         let others: Vec<&str> = super::catalog::options(c, self.os).into_iter().filter(|o| Some(*o) != picked).collect();
         for (k, o) in others.iter().enumerate() {
-            put(f, di, di.y + 5 + k as u16, vec![lab(if k == 0 { "or" } else { "" }), s(ui::fit(o, dw - 10), ui::muted(t))]);
+            put(f, di, di.y + 5 + k as u16, vec![lab(if k == 0 { "or" } else { "" }), s(ui::fit(o, dw.saturating_sub(10)), ui::muted(t))]);
         }
     }
 
@@ -517,8 +517,11 @@ impl Ais {
                 s("▆".repeat(n.min(bw)), Style::default().fg(crate::theme::mix(t.frame, t.accent, 0.55))),
             ]);
         }
-        // totals
-        let y = inner.bottom().saturating_sub(1);
+        // totals, under a rule: only when there's room for the header, the rule and the totals
+        if inner.height < 3 {
+            return;
+        }
+        let y = inner.bottom() - 1;
         ui::rule(f, Rect { y: y - 1, height: 1, ..inner }, t);
         let a = &su.all;
         let hit = a.cache_hit().map(|h| format!("  {h:.0}% cached")).unwrap_or_default();
@@ -539,7 +542,8 @@ impl Ais {
         let val = |x: &Tot| if priced { money(x.cost) } else { tok(x.tokens()) };
         let blocks_h = if su.src == Src::Claude { 9u16 } else { (su.models.len() as u16 + 2).clamp(3, 9) };
         let rest = r.height.saturating_sub(blocks_h + if blocks_h > 0 { 1 } else { 0 });
-        let ph = (rest / 2).max(4);
+        // projects get half (at least 4 rows when there are 4 to give), sessions the rest
+        let ph = (rest / 2).max(4).min(rest);
         // projects
         let pr = Rect { height: ph, ..r };
         let pi = card(f, pr, "top projects", Some(if priced { "by cost" } else { "by tokens" }), true, false, t);
@@ -555,7 +559,7 @@ impl Ais {
             ]);
         }
         // sessions
-        let sr = Rect { y: pr.bottom(), height: rest - ph, ..r };
+        let sr = Rect { y: pr.bottom(), height: rest - ph, ..r }; // ph <= rest
         let si = card(f, sr, "top sessions", Some(if priced { "by cost" } else { "by tokens" }), true, false, t);
         let w = si.width as usize;
         for (k, x) in su.sessions.iter().take(si.height as usize).enumerate() {
@@ -568,13 +572,13 @@ impl Ais {
             ]);
         }
         if su.src != Src::Claude {
-            let br = Rect { y: sr.bottom(), height: blocks_h, ..r };
+            let br = Rect { y: sr.bottom(), height: blocks_h.min(r.bottom().saturating_sub(sr.bottom())), ..r };
             let bi = card(f, br, "models", None, true, false, t);
             for (k, (m, x)) in su.models.iter().take(bi.height as usize).enumerate() {
-                put(f, bi, bi.y + k as u16, vec![s(pad(m, bi.width as usize - 30), Style::default()), s(rpad(&format!("{} req", x.n), 10), ui::muted(t)), s(rpad(&tok(x.tokens()), 9), ui::muted(t)), s(rpad(&val(x), 10), ui::accent(t))]);
+                put(f, bi, bi.y + k as u16, vec![s(pad(m, (bi.width as usize).saturating_sub(30)), Style::default()), s(rpad(&format!("{} req", x.n), 10), ui::muted(t)), s(rpad(&tok(x.tokens()), 9), ui::muted(t)), s(rpad(&val(x), 10), ui::accent(t))]);
             }
         } else {
-            let br = Rect { y: sr.bottom(), height: blocks_h, ..r };
+            let br = Rect { y: sr.bottom(), height: blocks_h.min(r.bottom().saturating_sub(sr.bottom())), ..r };
             let bi = card(f, br, "5-hour blocks", Some("estimate: this machine only"), true, false, t);
             let n = now();
             for (k, b) in su.blocks.iter().take(bi.height as usize).enumerate() {
@@ -809,7 +813,8 @@ impl Ais {
 
     fn popup(&self, f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, scroll: usize, t: &Theme) {
         let longest = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
-        let w = (longest + 4).clamp(60, area.width.saturating_sub(4).max(20)).min(area.width);
+        // 60 wide when it fits (wider for long lines); a narrow pane gets what it has (clamp would panic: 60 > max)
+        let w = (longest + 4).max(60).min(area.width.saturating_sub(4).max(20)).min(area.width);
         let iw = w.saturating_sub(4).max(1) as usize;
         // rows after wrapping long lines (commands, paths)
         let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(iw)).sum();

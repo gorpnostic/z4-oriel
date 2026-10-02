@@ -37,17 +37,10 @@ pub(crate) fn safe(root: &Path) -> Ais {
     Ais::with(Paths::under(root), false)
 }
 
-/// Steps around the three size crashes below (a popup under 64 columns, the install view under ~14, the usage
-/// view when wide but short), so the mash keeps exploring everything else at every size.
-fn guard(p: &mut Ais, ev: &mut Ev) -> bool {
-    match ev {
-        Ev::Render(w, h) => {
-            !((p.ask.is_some() || p.note.is_some()) && *w < 64)
-                && !(p.view == View::Install && *w < 16)
-                && !(p.view == View::Usage && *w >= 120 && *h < 20)
-        }
-        _ => true,
-    }
+/// Nothing to step around: the size crashes below (a popup under 64 columns, the install view under ~14, the
+/// usage view when wide but short) are fixed, so the mash draws every size in every state.
+fn guard(_p: &mut Ais, _ev: &mut Ev) -> bool {
+    true
 }
 
 #[test]
@@ -66,7 +59,6 @@ fn qa_keys_ais_nothing_installed() {
 /// Found by qa_keys_ais_nothing_installed. In the app on an 80-column terminal (the pane is ~52 wide): F3, c —
 /// the "connect" answer pops up and oriel exits. Any of its popups (asks, notes) does it below 64 columns.
 #[test]
-#[ignore = "fails: ais popup panics (clamp min > max, ais/draw.rs:804) when the pane is narrower than 64 columns"]
 fn qa_keys_ais_bug_popup_in_a_narrow_pane() {
     let root = scratch("ais-bug-popup");
     let mut k = crate::testkit::Kit::new();
@@ -83,7 +75,6 @@ fn qa_keys_ais_bug_popup_in_a_narrow_pane() {
 
 /// Found by qa_keys_ais. The install view's detail card does `width - 10` on a card narrower than 10 columns.
 #[test]
-#[ignore = "fails: ais install view panics (subtract with overflow, ais/draw.rs:436) when the pane is under ~14 columns"]
 fn qa_keys_ais_bug_install_view_very_narrow() {
     let root = scratch("ais-bug-narrow");
     fixture(&root);
@@ -97,7 +88,6 @@ fn qa_keys_ais_bug_install_view_very_narrow() {
 /// as max(rest / 2, 4) and "top sessions" as rest - that, so with fewer than 4 rows to spare it underflows. In
 /// the app: a 150-column terminal, split the screen top/bottom (ctrl+space -), F3, 3 — oriel exits.
 #[test]
-#[ignore = "fails: ais usage view panics (subtract with overflow, ais/draw.rs:558) when the pane is 120+ wide and under ~16 rows"]
 fn qa_keys_ais_bug_usage_view_wide_and_short() {
     let root = scratch("ais-bug-usage");
     fixture(&root);
