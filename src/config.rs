@@ -257,47 +257,78 @@ pub fn path() -> PathBuf {
     profile().unwrap_or_else(dir).join("config.toml")
 }
 
-/// The config to run with: config.toml; the defaults if it's missing; if it doesn't parse, every setting in it that
-/// does (`load_checked` says what's wrong).
+/// The config to run with: config.toml; the defaults if it's missing; and if it doesn't parse, every setting in it
+/// that still reads, the rest at their defaults (`load_checked` says what's wrong; such a file is never written over).
 pub fn load() -> Config {
-    match std::fs::read_to_string(path()) {
-        Ok(s) => from_text(&s),
-        Err(_) => defaults(),
-    }
+    load_at(&path())
 }
 
-/// config.toml's text as the config to run with: all of it, or when a value is wrong (a hand edit like
-/// `max_parallel = "3"`), the rest of it. Text that isn't TOML at all gives the defaults.
-pub fn from_text(s: &str) -> Config {
-    with_theme(migrate(parse(s).ok().or_else(|| salvage(s)).unwrap_or_default()))
+/// `load` for the config file at `path`.
+pub fn load_at(path: &Path) -> Config {
+    load_from(path).unwrap_or_else(|_| std::fs::read(path).map(|b| salvage(&String::from_utf8_lossy(&b))).unwrap_or_else(|_| defaults()))
 }
 
-/// Every setting in `s` that fits, dropping the ones that don't: top-level values, and values inside a section
-/// ([ai], [lead]...) one by one. None = not TOML.
-fn salvage(s: &str) -> Option<Config> {
-    let all: toml::Table = s.parse().ok()?;
-    let fits = |t: &toml::Table| toml::Value::Table(t.clone()).try_into::<Config>().is_ok();
-    let mut good = toml::Table::new();
-    for (k, v) in all {
-        let mut with = good.clone();
-        with.insert(k.clone(), v.clone());
-        if fits(&with) {
-            good = with;
-        } else if let toml::Value::Table(section) = v {
-            let mut kept = toml::Table::new();
-            for (k2, v2) in section {
-                let mut sec = kept.clone();
-                sec.insert(k2, v2);
-                let mut with = good.clone();
-                with.insert(k.clone(), toml::Value::Table(sec.clone()));
-                if fits(&with) {
-                    kept = sec;
+/// What can be read from a config.toml that doesn't parse: a line that isn't TOML at all is left out, and every
+/// setting (inside [sections] too) is tried on its own, so one mistyped value keeps its default instead of
+/// taking the prefix, the theme and the AI keys with it.
+pub fn salvage(text: &str) -> Config {
+    // drop the lines TOML itself can't read, one at a time (each error points at its line)
+    let mut lines: Vec<&str> = text.lines().collect();
+    let table = loop {
+        let joined = lines.join("\n");
+        match joined.parse::<toml::Table>() {
+            Ok(t) => break t,
+            Err(e) => {
+                let Some(at) = e.span().map(|r| joined.get(..r.start).unwrap_or(&joined).matches('\n').count()) else { break toml::Table::new() };
+                if at >= lines.len() {
+                    break toml::Table::new();
                 }
+                lines.remove(at);
             }
-            good.insert(k, toml::Value::Table(kept));
+        }
+    };
+    // then every setting on top of the defaults, kept only if the whole still reads
+    let fits = |t: &toml::Table| Config::deserialize(toml::Value::Table(t.clone())).is_ok();
+    let mut ok = toml::Table::try_from(Config::default()).unwrap_or_default();
+    let mut leaves = vec![];
+    fn leaves_of(t: &toml::Table, at: &mut Vec<String>, out: &mut Vec<(Vec<String>, toml::Value)>) {
+        for (k, v) in t {
+            at.push(k.clone());
+            match v {
+                toml::Value::Table(sub) if !sub.is_empty() => leaves_of(sub, at, out),
+                v => out.push((at.clone(), v.clone())),
+            }
+            at.pop();
         }
     }
-    toml::Value::Table(good).try_into().ok()
+    leaves_of(&table, &mut vec![], &mut leaves);
+    for (keys, v) in leaves {
+        let mut t = ok.clone();
+        let mut here = &mut t;
+        for k in &keys[..keys.len() - 1] {
+            let slot = here.entry(k.clone()).or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if !slot.is_table() {
+                *slot = toml::Value::Table(toml::Table::new());
+            }
+            let toml::Value::Table(next) = slot else { unreachable!() };
+            here = next;
+        }
+        here.insert(keys[keys.len() - 1].clone(), v);
+        if fits(&t) {
+            ok = t;
+        }
+    }
+    let c = Config::deserialize(toml::Value::Table(ok)).unwrap_or_default();
+    with_theme(migrate(c))
+}
+
+/// config.toml's text as the config to run with: all of it, or when it doesn't parse, every setting that still
+/// reads (see `salvage`).
+pub fn from_text(s: &str) -> Config {
+    match parse(s) {
+        Ok(c) => with_theme(migrate(c)),
+        Err(_) => salvage(s),
+    }
 }
 
 /// What a missing config.toml means: the defaults, theme filled in.

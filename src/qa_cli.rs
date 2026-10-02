@@ -38,11 +38,43 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-/// The binary `cargo build` made, copied once into scratch so a parallel build can't swap it mid-test.
+/// `cargo build` the binary into this test binary's own target folder and profile, so the tests below never run
+/// a stale build (a version check alone can't tell: every build of this version says the same).
+fn build_bin(profile_dir: &Path) {
+    let Some(target) = profile_dir.parent() else { return };
+    let mut c = Command::new(env!("CARGO"));
+    c.args(["build", "--quiet", "--offline", "--bin", "oriel", "--manifest-path"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(target)
+        .stdin(Stdio::null());
+    match profile_dir.file_name().and_then(|n| n.to_str()) {
+        Some("debug") | None => {}
+        Some("release") => {
+            c.arg("--release");
+        }
+        Some(p) => {
+            c.args(["--profile", p]);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // no console window
+    }
+    // no cargo here (the test binary was copied elsewhere): fall back to whatever was built
+    if let Ok(o) = c.output() {
+        assert!(o.status.success(), "cargo build failed:\n{}", String::from_utf8_lossy(&o.stderr));
+    }
+}
+
+/// The binary, freshly built, copied once into scratch so a parallel build can't swap it mid-test.
 fn bin() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
-        let built = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(exe_name());
+        let profile_dir = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
+        build_bin(&profile_dir);
+        let built = profile_dir.join(exe_name());
         assert!(built.is_file(), "no {} - run `cargo build` before these tests", built.display());
         let copy = scratch("bin").join(exe_name());
         std::fs::copy(&built, &copy).unwrap();
@@ -194,13 +226,15 @@ fn qa_cli_help_names_real_commands_and_apps() {
         texts.push(o.stdout);
     }
     assert_eq!(texts[0], texts[1], "-h and --help differ");
-    // every app the help offers as `oriel <app>` is one the app actually opens (not the home-screen fallback)
-    let line = texts[0].lines().find(|l| l.contains("open straight into an app:")).expect("no app list in --help");
-    let apps: Vec<&str> = line.split(':').nth(1).unwrap().split_whitespace().collect();
+    // every app the help offers as `oriel <app>` is one the app actually opens (not the home screen, not the
+    // "no app called" error); the line reads "open straight into an app, this time only: ai agents …"
+    let line = texts[0].lines().find(|l| l.contains("open straight into an app")).expect("no app list in --help");
+    let apps: Vec<&str> = line.split(':').nth(1).expect("no ':' before the app list").split_whitespace().collect();
     assert!(apps.len() >= 10, "{apps:?}");
     for a in &apps {
-        let known = crate::app::SIDEBAR.iter().any(|s| s.0 == *a) || crate::panes::APPS.iter().any(|s| s.0 == *a);
-        assert!(known, "--help offers `oriel {a}`, which only opens the home screen");
+        // the sidebar, the home screen's grid, or an app only reachable by name (search: alt r, /recall)
+        let known = crate::app::SIDEBAR.iter().any(|s| s.0 == *a) || crate::panes::APPS.iter().any(|s| s.0 == *a) || (crate::panes::known(a) && *a != "home");
+        assert!(known, "--help offers `oriel {a}`, which doesn't open an app");
     }
     // and every sidebar app can be opened that way
     for s in crate::app::SIDEBAR {
@@ -225,21 +259,31 @@ fn qa_cli_config_prints_the_config_path() {
     assert_eq!(names(&d), vec!["tmp"], "--config wrote into the data folder");
 }
 
-/// One mistyped field in config.toml silently throws away every other setting (prefix, theme, AI keys…):
-/// `config::load` parses all-or-nothing and falls back to defaults without a word, and `oriel --config` only
-/// prints the path, so there is nowhere to find out why settings "reset".
+/// One mistyped field in config.toml must not throw away every other setting (prefix, theme, AI keys…): oriel
+/// still says the file is broken (and never writes over it), but starts with everything in it that reads.
 #[test]
-#[ignore = "fails: one bad field in config.toml silently resets every setting to defaults (config.rs:182)"]
 fn qa_cli_config_one_bad_field_keeps_the_rest() {
     let good = "prefix = \"ctrl+b\"\ntheme = \"nord\"\n";
     let c: crate::config::Config = toml::from_str(good).unwrap();
     assert_eq!(c.prefix, "ctrl+b");
+    let d = scratch("config-one-bad");
+    let p = d.join("config.toml");
     // the same file with one value of the wrong type (a very common hand-edit slip)
     let typo = format!("{good}plain_icons = \"yes\"\n");
-    let parsed = toml::from_str::<crate::config::Config>(&typo).ok();
-    // what load() does with it: `.ok()...unwrap_or_default()`
-    let loaded = parsed.unwrap_or_default();
+    std::fs::write(&p, &typo).unwrap();
+    assert!(crate::config::load_from(&p).unwrap_err().contains("line 3"), "the broken file isn't reported");
+    // what oriel starts with (main.rs: config::load)
+    let loaded = crate::config::load_at(&p);
     assert_eq!(loaded.prefix, "ctrl+b", "a typo in plain_icons also reset the prefix key (and everything else)");
+    assert_eq!(loaded.theme, "nord");
+    assert!(!loaded.plain_icons, "the bad value keeps its default");
+    // a line that isn't TOML at all, and a bad value inside a section
+    let worse = "prefix = \"ctrl+a\"\ntheme = \"nord\n[ai]\nprovider = \"ollama\"\nollama_url = 5\n";
+    std::fs::write(&p, worse).unwrap();
+    let loaded = crate::config::load_at(&p);
+    assert_eq!((loaded.prefix.as_str(), loaded.ai.provider.as_str()), ("ctrl+a", "ollama"), "{loaded:?}");
+    assert_eq!(loaded.ai.ollama_url, crate::config::Config::default().ai.ollama_url, "the bad value keeps its default");
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), worse, "loading wrote over the file");
 }
 
 // ====================================================================== changelog / update / rollback via the binary
@@ -256,7 +300,6 @@ fn qa_cli_changelog_offline_reports_the_error() {
 }
 
 #[test]
-#[ignore = "fails: `oriel changelog` exits 0 when it couldn't reach GitHub (main.rs:64 prints the error, then returns Ok)"]
 fn qa_cli_changelog_offline_exits_nonzero() {
     let d = scratch("changelog-offline-code");
     let o = run(&bin(), &["changelog"], In::Null, &d, OFFLINE, secs(60));
@@ -286,8 +329,10 @@ fn qa_cli_update_offline_no_fallback_fails_cleanly() {
     let before = std::fs::read(&exe).unwrap();
     for cmd in ["update", "--update"] {
         let o = run(&exe, &[cmd, "--no-fallback"], In::Null, &d.join("data"), OFFLINE, secs(60));
-        assert_eq!(o.code, Some(1), "{cmd}: {o:?}");
-        assert!(o.stdout.contains(&format!("oriel {V}: checking for updates")), "{cmd}: {o:?}");
+        // 2 is `oriel update`'s "GitHub couldn't be reached" (1 = bad download, 3 = folder not writable)
+        assert_eq!(o.code, Some(2), "{cmd}: {o:?}");
+        // it says which file it would update
+        assert!(o.stdout.contains(&format!("oriel {V} ({}): checking for updates", exe.display())), "{cmd}: {o:?}");
         assert!(o.stderr.contains("couldn't reach GitHub"), "{cmd}: {o:?}");
         assert!(!o.stdout.contains("install script"), "{cmd}: --no-fallback still tried the install script: {o:?}");
     }
@@ -327,39 +372,35 @@ fn qa_cli_rollback_with_nothing_kept() {
         let o = run(&exe, &[cmd], In::Null, &d.join("data"), &[], secs(30));
         assert_eq!(o.code, Some(1), "{cmd}: {o:?}");
         assert!(o.stdout.is_empty(), "{cmd}: {o:?}");
-        assert!(o.stderr.contains("no earlier version kept yet"), "{cmd}: {o:?}");
+        assert!(o.stderr.contains("no older version kept yet"), "{cmd}: {o:?}");
     }
     assert_eq!(std::fs::read(&exe).unwrap(), before);
     assert_eq!(names(&d.join("app")), vec![exe_name()]);
 }
 
-/// A real rollback by the binary, on a scratch copy: the kept version comes back, the running one steps aside and
-/// is kept in turn, the kept file itself survives.
+/// `oriel rollback` by the binary, on a scratch copy, with a kept file that isn't the version its name says (here
+/// this very build, filed as 0.0.1): it's run and refused before anything moves, and the kept file stays. (A
+/// rollback that goes through needs a real older build, which one `cargo build` can't make: the success path is
+/// `qa_update_rollback_to_puts_the_kept_version_back`, in-process with stand-in builds.)
 #[test]
-fn qa_cli_rollback_puts_the_kept_version_back() {
+fn qa_cli_rollback_refuses_a_kept_copy_that_isnt_its_version() {
     let d = scratch("rollback-kept");
     let data = d.join("data");
     let exe = exe_copy(&d.join("app"), NEW_MARK);
+    let before = std::fs::read(&exe).unwrap();
     let prev = data.join("update").join("previous");
     let kept = exe_copy(&prev, OLD_MARK);
     std::fs::rename(&kept, prev.join("oriel-0.0.1.exe")).unwrap();
     let o = run(&exe, &["rollback"], In::Null, &data, &[], secs(60));
-    assert_eq!(o.code, Some(0), "{o:?}");
-    assert_eq!(o.stdout.trim(), ":: back to oriel 0.0.1 — start oriel again to use it", "{o:?}");
-    assert!(ends_with(&exe, OLD_MARK), "the kept build isn't in place");
-    let app = names(&d.join("app"));
-    assert_eq!(app.len(), 2, "{app:?}");
-    assert!(app[1].starts_with("oriel.exe.old-"), "the running binary wasn't moved aside: {app:?}");
-    assert!(ends_with(&d.join("app").join(&app[1]), NEW_MARK));
-    assert_eq!(names(&prev), vec!["oriel-0.0.1.exe".to_string(), format!("oriel-{V}.exe")], "both versions stay kept");
-    assert!(ends_with(&prev.join(format!("oriel-{V}.exe")), NEW_MARK), "the version rolled back from wasn't kept");
-    assert!(ends_with(&prev.join("oriel-0.0.1.exe"), OLD_MARK), "rolling back consumed the kept file");
-    let u: Value = serde_json::from_str(&std::fs::read_to_string(data.join("update").join("updated.json")).unwrap()).unwrap();
-    assert_eq!((u["from"].as_str(), u["to"].as_str(), u["rollback"].as_bool()), (Some(V), Some("0.0.1"), Some(true)));
+    assert_eq!(o.code, Some(1), "{o:?}");
+    assert!(o.stdout.is_empty(), "{o:?}");
+    assert!(o.stderr.contains("the kept copy of 0.0.1 is damaged") && o.stderr.contains(&format!("oriel {V}")) && o.stderr.contains("nothing changed"), "{o:?}");
+    assert_eq!(std::fs::read(&exe).unwrap(), before, "the binary changed");
+    assert_eq!(names(&d.join("app")), vec![exe_name()], "something was moved aside");
+    assert_eq!(names(&prev), vec!["oriel-0.0.1.exe".to_string()], "a refused rollback kept a copy anyway");
+    assert!(ends_with(&prev.join("oriel-0.0.1.exe"), OLD_MARK), "the kept file was touched");
+    assert!(!data.join("update").join("updated.json").exists(), "recorded as rolled back");
     assert!(names(&data.join("tmp")).is_empty(), "staged copy left in TEMP: {:?}", names(&data.join("tmp")));
-    // what came back still runs
-    let o = run(&exe, &["--version"], In::Null, &data, &[], secs(30));
-    assert_eq!(o.stdout, format!("oriel {V}\n"));
 }
 
 // ====================================================================== update.rs install_to / rollback_to in-process
@@ -381,6 +422,19 @@ fn kept() -> Vec<String> {
     let mut v: Vec<String> = crate::update::backups().into_iter().map(|(v, _)| v).collect();
     v.sort();
     v
+}
+
+/// A stand-in for another version's build at `path`: under cfg(test) update.rs reads "fake oriel X" out of the
+/// file instead of running it. Updating and rolling back check that a binary says the version it's filed under,
+/// and the real build can only ever say it's this one.
+fn fake_build(path: &Path, v: &str) -> PathBuf {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, format!("fake oriel {v}")).unwrap();
+    path.to_path_buf()
+}
+
+fn is_fake(path: &Path, v: &str) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|s| s == format!("fake oriel {v}"))
 }
 
 /// A release archive as the release workflow makes it (the binary at the root), built with the system tar.
@@ -438,7 +492,8 @@ fn qa_update_install_to_swaps_and_rolls_back() {
     fresh_update_state();
     let d = scratch("install-ok");
     let app = d.join("app");
-    let exe = exe_copy(&app, OLD_MARK);
+    // the installed 0.0.1 (a stand-in: it has to say it's 0.0.1 to be kept for rollback)
+    let exe = fake_build(&app.join(exe_name()), "0.0.1");
     std::fs::write(app.join("oriel.exe.old-123"), b"leftover from an earlier update").unwrap();
     let mut new = bin_bytes();
     new.extend_from_slice(NEW_MARK);
@@ -451,8 +506,10 @@ fn qa_update_install_to_swaps_and_rolls_back() {
     let left = names(&app);
     assert_eq!(left.len(), 2, "{left:?}");
     assert!(!left.contains(&"oriel.exe.old-123".to_string()), "the earlier leftover wasn't cleared: {left:?}");
-    assert!(ends_with(&app.join(&left[1]), OLD_MARK), "the old build wasn't moved aside: {left:?}");
+    assert!(is_fake(&app.join(&left[1]), "0.0.1"), "the old build wasn't moved aside: {left:?}");
     assert_eq!(kept(), vec!["0.0.1"]);
+    let old = crate::update::backups().into_iter().find(|(v, _)| v == "0.0.1").unwrap().1;
+    assert!(is_fake(&old, "0.0.1"), "what's kept as 0.0.1 isn't the old build");
     let u: Value = serde_json::from_str(&std::fs::read_to_string(update_state().join("updated.json")).unwrap()).unwrap();
     assert_eq!((u["from"].as_str(), u["to"].as_str()), (Some("0.0.1"), Some(V)));
     // the first start of the new version says so, once
@@ -460,7 +517,8 @@ fn qa_update_install_to_swaps_and_rolls_back() {
     assert_eq!(crate::update::just_updated(), None);
     // and back
     assert_eq!(crate::update::rollback_to(&exe, V), Ok("0.0.1".to_string()));
-    assert!(ends_with(&exe, OLD_MARK), "rollback didn't put the old build back");
+    assert!(is_fake(&exe, "0.0.1"), "rollback didn't put the old build back");
+    assert!(is_fake(&old, "0.0.1"), "rolling back consumed the kept file");
     assert_eq!(kept(), vec!["0.0.1".to_string(), V.to_string()]);
     let back = crate::update::backups().into_iter().find(|(v, _)| v == V).unwrap().1;
     assert!(ends_with(&back, NEW_MARK), "the version rolled back from wasn't kept");
@@ -481,12 +539,13 @@ fn qa_update_install_to_refuses_bad_downloads() {
         b.extend_from_slice(NEW_MARK);
         archive(&d, &[(exe_name(), b)])
     };
+    let says = format!("it says it's 'oriel {V}', not oriel 9.9.9");
     let cases: Vec<(&str, crate::update::Release, &str)> = vec![
         ("no build for this machine", release("0.9.0", String::new()), "has no build for this machine"),
         ("404", release("0.9.0", serve_once(None)), "download failed"),
         ("not an archive", release("0.9.0", serve_once(Some(b"PK\x03\x04 this is not really a zip".repeat(50)))), "couldn't unpack it"),
         ("no oriel inside", release("0.9.0", serve_once(Some(archive(&d, &[("README.txt", b"hi".to_vec())])))), "had no oriel in it"),
-        ("wrong version inside", release("9.9.9", serve_once(Some(good))), "not 9.9.9"),
+        ("wrong version inside", release("9.9.9", serve_once(Some(good))), &says),
     ];
     for (what, r, want) in cases {
         let e = crate::update::install_to(&r, &exe, "0.0.1", &|_| {}).expect_err(what);
@@ -515,20 +574,40 @@ fn qa_update_rollback_to_refuses_a_broken_backup() {
     assert_eq!(kept(), vec!["0.6.2"]);
 }
 
-/// `oriel rollback` twice: the second one should go further back (or refuse), never forward. It goes forward:
-/// the first rollback keeps the version it left (0.7.0), and rollback_to picks the *highest* kept version other
-/// than the running one, so the second "rollback" reinstalls 0.7.0 and prints ":: back to oriel 0.7.0".
+/// A rollback on a scratch copy: the kept version comes back, the running one steps aside and is kept in turn,
+/// the kept file itself survives, and the next start says "rolled back".
 #[test]
-#[ignore = "fails: a second `oriel rollback` goes forward to the version just rolled back from (update.rs:260-262)"]
+fn qa_update_rollback_to_puts_the_kept_version_back() {
+    let _g = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fresh_update_state();
+    let d = scratch("rollback-to-kept");
+    let app = d.join("app");
+    let exe = exe_copy(&app, NEW_MARK);
+    let prev = update_state().join("previous");
+    let kept_file = fake_build(&prev.join("oriel-0.0.1.exe"), "0.0.1");
+    assert_eq!(crate::update::rollback_to(&exe, V), Ok("0.0.1".to_string()));
+    assert!(is_fake(&exe, "0.0.1"), "the kept build isn't in place");
+    let left = names(&app);
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(left[1].starts_with("oriel.exe.old-"), "the running binary wasn't moved aside: {left:?}");
+    assert!(ends_with(&app.join(&left[1]), NEW_MARK));
+    assert_eq!(names(&prev), vec!["oriel-0.0.1.exe".to_string(), format!("oriel-{V}.exe")], "both versions stay kept");
+    assert!(ends_with(&prev.join(format!("oriel-{V}.exe")), NEW_MARK), "the version rolled back from wasn't kept");
+    assert!(is_fake(&kept_file, "0.0.1"), "rolling back consumed the kept file");
+    let u: Value = serde_json::from_str(&std::fs::read_to_string(update_state().join("updated.json")).unwrap()).unwrap();
+    assert_eq!((u["from"].as_str(), u["to"].as_str(), u["rollback"].as_bool()), (Some(V), Some("0.0.1"), Some(true)));
+}
+
+/// `oriel rollback` twice: the second one should go further back (or refuse), never forward.
+#[test]
 fn qa_update_rollback_twice_never_goes_forward() {
     let _g = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     fresh_update_state();
     let d = scratch("rollback-twice");
-    let exe = exe_copy(&d.join("app"), b"\nQA-0.7.0");
+    let exe = fake_build(&d.join("app").join(exe_name()), "0.7.0");
     let prev = update_state().join("previous");
     for v in ["0.6.1", "0.6.2"] {
-        let p = exe_copy(&prev, format!("\nQA-{v}").as_bytes());
-        std::fs::rename(&p, prev.join(format!("oriel-{v}.exe"))).unwrap();
+        fake_build(&prev.join(format!("oriel-{v}.exe")), v);
     }
     assert_eq!(crate::update::rollback_to(&exe, "0.7.0"), Ok("0.6.2".to_string()));
     let second = crate::update::rollback_to(&exe, "0.6.2");
@@ -538,26 +617,26 @@ fn qa_update_rollback_twice_never_goes_forward() {
     );
 }
 
-/// "keeping this version for rollback" should keep it. back_up_current prunes to the three *highest* version
-/// numbers, so the copy of the version you're updating from is deleted right after it's made whenever three
-/// newer ones are already kept (e.g. after installing an older build by hand to bisect a regression).
+/// "keeping this version for rollback" should keep it, even when three newer ones are already kept (e.g. after
+/// installing an older build by hand to bisect a regression).
 #[test]
-#[ignore = "fails: the backup of the version being updated from is pruned at once if 3 newer are kept (update.rs:158-162)"]
 fn qa_update_install_keeps_the_version_it_replaced() {
     let _g = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     fresh_update_state();
     let d = scratch("install-prune");
-    let exe = exe_copy(&d.join("app"), OLD_MARK);
+    let exe = fake_build(&d.join("app").join(exe_name()), "0.5.0");
     let prev = update_state().join("previous");
     for v in ["0.6.0", "0.6.1", "0.6.2"] {
-        let p = exe_copy(&prev, format!("\nQA-{v}").as_bytes());
-        std::fs::rename(&p, prev.join(format!("oriel-{v}.exe"))).unwrap();
+        fake_build(&prev.join(format!("oriel-{v}.exe")), v);
     }
     let mut new = bin_bytes();
     new.extend_from_slice(NEW_MARK);
     let zip = archive(&d, &[(exe_name(), new)]);
     crate::update::install_to(&release(V, serve_once(Some(zip))), &exe, "0.5.0", &|_| {}).unwrap();
     assert!(kept().contains(&"0.5.0".to_string()), "the version just replaced isn't kept: {:?}", kept());
+    let k = crate::update::backups().into_iter().find(|(v, _)| v == "0.5.0").unwrap().1;
+    assert!(is_fake(&k, "0.5.0"), "what's kept as 0.5.0 isn't the build it replaced");
+    assert_eq!(kept().len(), 3, "still the three saved last: {:?}", kept());
 }
 
 // ====================================================================== report (agent hooks)
@@ -685,7 +764,6 @@ fn qa_cli_usage_sink_then_chains_a_command() {
 /// The chained statusLine is the user's old one (the token saver sets it up). When it's broken (script moved,
 /// command gone) Claude Code shows an empty status line: its empty output is printed instead of oriel's.
 #[test]
-#[ignore = "fails: a failing `usage-sink --then` command blanks the status line instead of falling back (limits.rs:162, 216)"]
 fn qa_cli_usage_sink_broken_then_falls_back() {
     let d = scratch("sink-then-broken");
     let o = run(&bin(), &["usage-sink", "--then", "exit", "3"], In::Bytes(STATUS_JSON.as_bytes()), &d, &[], secs(30));
@@ -698,7 +776,6 @@ fn qa_cli_usage_sink_broken_then_falls_back() {
 /// ais app and the event center until the next update that has them. `updated` already dates the numbers, so
 /// keeping the old ones would be safe.
 #[test]
-#[ignore = "fails: a statusLine update without rate_limits erases the saved plan limits (limits.rs:143-148)"]
 fn qa_cli_usage_sink_keeps_the_last_limits() {
     let d = scratch("sink-keep-limits");
     let file = d.join("usage").join("claude.json");
@@ -713,7 +790,6 @@ fn qa_cli_usage_sink_keeps_the_last_limits() {
 /// `report` gives up on a stdin that never closes (read_stdin_quick); `usage-sink` reads it with no limit, so a
 /// statusLine host that keeps the pipe open, or a person running it by hand, hangs it for good.
 #[test]
-#[ignore = "fails: `usage-sink` blocks forever on a stdin that is never closed (limits.rs:155)"]
 fn qa_cli_usage_sink_never_hangs_on_an_open_stdin() {
     let d = scratch("sink-open-stdin");
     let o = run(&bin(), &["usage-sink"], In::Open, &d, &[], secs(8));
@@ -770,10 +846,13 @@ fn qa_cli_mcp_approve_over_stdio_to_a_live_broker() {
     let o = run(&bin(), &["--mcp-approve", &b.port.to_string(), &b.token], In::Bytes(&input), &d, &[], secs(60));
     assert_eq!(o.code, Some(0), "{o:?}");
     assert!(o.stderr.is_empty(), "{o:?}");
-    let r = jsonl(&o.stdout);
+    let mut r = jsonl(&o.stdout);
     let ids: Vec<Value> = r.iter().map(|v| v["id"].clone()).collect();
-    assert_eq!(ids, vec![json!(1), json!(2), json!(3), json!(4), json!(5), json!(6), json!("seven")], "{r:?}");
+    // the line that isn't JSON gets a parse error (id null) in its place
+    assert_eq!(ids, vec![json!(1), json!(2), Value::Null, json!(3), json!(4), json!(5), json!(6), json!("seven")], "{r:?}");
     assert!(r.iter().all(|v| v["jsonrpc"] == "2.0"), "{r:?}");
+    assert_eq!(r[2]["error"]["code"], -32700, "{r:?}");
+    r.remove(2);
     assert_eq!(r[0]["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(r[0]["result"]["serverInfo"], json!({"name": "oriel", "version": V}));
     assert_eq!(r[1]["result"]["tools"][0]["name"], "approve");
@@ -820,7 +899,6 @@ fn qa_cli_mcp_approve_denies_when_it_cant_ask() {
 /// JSON-RPC 2.0: a line that isn't JSON gets a -32700 parse error (id null). Both MCP servers skip it silently,
 /// so a client that sent a malformed request waits for an answer that never comes.
 #[test]
-#[ignore = "fails: --mcp-approve and mcp-lead drop unparsable lines without a -32700 reply (approve.rs:198, mcp.rs:169)"]
 fn qa_cli_mcp_servers_answer_parse_errors() {
     let d = scratch("mcp-parse-error");
     for args in [vec!["--mcp-approve", "1", "x"], vec!["mcp-lead", "1", "x"]] {
@@ -884,19 +962,28 @@ fn qa_cli_mcp_lead_over_stdio() {
     let o = run(&bin(), &["mcp-lead", &port.to_string(), "tok123"], In::Bytes(&input), &d, &[], secs(60));
     assert_eq!(o.code, Some(0), "{o:?}");
     assert!(o.stderr.is_empty(), "{o:?}");
-    let r = jsonl(&o.stdout);
+    let mut r = jsonl(&o.stdout);
     let ids: Vec<Value> = r.iter().map(|v| v["id"].clone()).collect();
-    assert_eq!(ids, (1..=8).map(|i| json!(i)).collect::<Vec<_>>(), "{r:?}");
+    // the garbage line gets a parse error (id null) in its place
+    let mut want: Vec<Value> = (1..=8).map(|i| json!(i)).collect();
+    want.insert(1, Value::Null);
+    assert_eq!(ids, want, "{r:?}");
+    assert_eq!((r[1]["jsonrpc"].as_str(), r[1]["error"]["code"].as_i64()), (Some("2.0"), Some(-32700)), "{r:?}");
+    r.remove(1);
     assert_eq!(r[0]["result"]["protocolVersion"], "2024-11-05", "no params: the default version");
     assert_eq!(r[0]["result"]["serverInfo"]["version"], V);
     assert!(r[0]["result"]["instructions"].as_str().is_some_and(|s| !s.is_empty()));
     let tools = r[1]["result"]["tools"].as_array().unwrap();
     let mut tn: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(tn.len(), 12, "{tn:?}");
+    // the lead's 13 tools (`review`, the second opinion, is the newest)
+    assert_eq!(tn.len(), 13, "{tn:?}");
+    for want in ["roster", "spawn_task", "wait", "merge", "review", "note", "done"] {
+        assert!(tn.contains(&want), "no {want} tool: {tn:?}");
+    }
     assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object" && t["description"].as_str().is_some_and(|s| s.len() > 20)), "a tool without a schema or description");
     tn.sort();
     tn.dedup();
-    assert_eq!(tn.len(), 12, "duplicate tool names");
+    assert_eq!(tn.len(), 13, "duplicate tool names");
     assert_eq!(r[2]["result"]["content"][0]["text"], "codex: mid");
     assert!(r[2]["result"]["isError"].is_null());
     assert_eq!((r[3]["result"]["isError"].as_bool(), r[3]["result"]["content"][0]["text"].as_str()), (Some(true), Some("conflicts in a.txt")));

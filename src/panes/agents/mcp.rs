@@ -167,7 +167,14 @@ pub fn serve_with<W: Write + Send>(input: impl BufRead, out: W, call: impl Fn(&s
     };
     for line in input.lines() {
         let Ok(line) = line else { break };
-        let Ok(req) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(req) = serde_json::from_str::<Value>(line.trim()) else {
+            // JSON-RPC: a line that isn't JSON still gets an answer (id null), or the client waits forever
+            write(&json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}}));
+            continue;
+        };
         let id = req.get("id").cloned();
         let method = req["method"].as_str().unwrap_or("");
         let result = match method {

@@ -64,7 +64,8 @@ pub fn claude_from(v: &Value) -> Option<Limits> {
     }
     Some(Limits {
         windows,
-        updated: v.get("received_at").and_then(|x| x.as_i64()).unwrap_or(0),
+        // limits carried over from an earlier update are dated when they were seen
+        updated: v.get("rate_limits_at").or_else(|| v.get("received_at")).and_then(|x| x.as_i64()).unwrap_or(0),
         plan: None,
         session_cost: v.get("cost").and_then(|c| c.get("total_cost_usd")).and_then(|x| x.as_f64()),
     })
@@ -143,7 +144,16 @@ pub fn status_line(v: &Value) -> String {
 /// The sink's work, minus stdin/stdout: save the filtered JSON, return the line to print.
 pub fn sink(input: &str, file: &Path, at: i64) -> String {
     let Ok(v) = serde_json::from_str::<Value>(input) else { return "oriel: no status".into() };
-    let keep = filter_status(&v, at);
+    let mut keep = filter_status(&v, at);
+    // an update without plan limits (a session before its first reply, an API-key session next to a subscription
+    // one) keeps the last known ones, dated when they were seen, rather than erasing them
+    if keep.get("rate_limits").is_none_or(|r| r.is_null()) {
+        let old = std::fs::read(file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+        if let Some(old) = old.filter(|o| o.get("rate_limits").is_some_and(|r| r.is_object())) {
+            keep["rate_limits"] = old["rate_limits"].clone();
+            keep["rate_limits_at"] = old.get("rate_limits_at").or_else(|| old.get("received_at")).cloned().unwrap_or(json!(0));
+        }
+    }
     if let Ok(b) = serde_json::to_vec_pretty(&keep) {
         let _ = write_atomic(file, &b);
     }
@@ -153,10 +163,48 @@ pub fn sink(input: &str, file: &Path, at: i64) -> String {
 /// How long the user's own status line command gets before oriel prints its own line instead.
 const CHAIN_LIMIT: Duration = Duration::from_secs(2);
 
+/// How long the sink waits for its input: the host writes one JSON object and closes the pipe, but one that keeps
+/// it open (or a person running it by hand) must not hang it.
+const STDIN_LIMIT: Duration = Duration::from_millis(1500);
+
+/// Read `r` until it ends, a whole JSON value has arrived, or `limit` passes; whatever came by then.
+fn read_bounded(mut r: impl Read + Send + 'static, limit: Duration) -> String {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        let mut total = 0usize;
+        while let Ok(n) = r.read(&mut buf) {
+            // EOF, the 4 MB cap, or nobody listening any more
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+            total += n;
+            if total >= 4 << 20 {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let mut got = vec![];
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(chunk) => {
+                got.extend_from_slice(&chunk);
+                if serde_json::from_slice::<serde::de::IgnoredAny>(&got).is_ok() {
+                    break;
+                }
+            }
+            // ended, or out of time
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&got).into_owned()
+}
+
 /// `oriel usage-sink [--then <command…>]`. Always exits 0: a status line must never break Claude Code.
 pub fn cli(args: &[String]) -> i32 {
-    let mut input = String::new();
-    let _ = std::io::stdin().take(4 << 20).read_to_string(&mut input);
+    let input = read_bounded(std::io::stdin(), STDIN_LIMIT);
     let file = crate::config::data_dir().join("usage").join("claude.json");
     let line = sink(&input, &file, now());
     // chaining: hand the same JSON to the user's own statusLine command and print its output instead (the
