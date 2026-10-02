@@ -38,6 +38,7 @@ const ICONS: &[(&str, &str, &str)] = &[
     ("repeat", "\u{F0456}", "rep"),
     ("volume", "\u{F057E}", "vol"),
     ("search", "\u{F0349}", "?"),
+    ("history", "\u{F02DA}", "~"), // md-history
     ("gauge", "\u{F029A}", "#"),
     ("chart", "\u{F0128}", "#"),
     ("clock", "\u{F0150}", ""),
@@ -207,7 +208,7 @@ pub fn key_hint<'a>(key: &'a str, what: &'a str, t: &Theme) -> Vec<Span<'a>> {
     ]
 }
 
-/// nest's hint line: "esc stop · ctrl+r regenerate · F1 ai" in the muted colour, keys a touch brighter.
+/// The hint line: "esc stop · ctrl+g regenerate · F1 ai" in the muted colour, keys a touch brighter.
 /// Draws on the last row of `area` and returns the rect above it.
 pub fn hint_line(f: &mut Frame, area: Rect, hints: &[(&str, &str)], t: &Theme) -> Rect {
     if area.height < 2 {

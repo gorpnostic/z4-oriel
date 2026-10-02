@@ -19,8 +19,8 @@ mod ollama;
 mod saver;
 #[cfg(test)]
 mod tests;
-mod usage;
-mod util;
+pub(crate) mod usage;
+pub(crate) mod util;
 
 #[cfg(not(test))]
 use crate::pane::{Action, Place};
@@ -564,6 +564,7 @@ impl Ais {
             let r = match what {
                 "claude" => saver::plan_claude(&paths, p).map(saver::Connect::Plan),
                 "codex" => saver::plan_codex(&paths, p).map(saver::Connect::Plan),
+                "history" => saver::plan_history(&paths).map(saver::Connect::Plan),
                 _ => saver::plan_connect(&paths),
             };
             Ais::send(&tx, &waker, Msg::Plan(r));

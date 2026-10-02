@@ -31,6 +31,10 @@ enum It {
 }
 use It::*;
 
+/// The search app has no topic of its own (the topic list is full at common heights): its keys are a section of
+/// the chat topic, and help from the search app opens there.
+const SEARCH_HEAD: &str = "search every AI session (alt r)";
+
 struct Topic {
     icon: &'static str,
     title: &'static str,
@@ -56,8 +60,9 @@ fn topics() -> Vec<Topic> {
             K("F4–F9", "music · system · files · notes · storage · terminal (and calendar, no key)"),
             K("F10  help", "this screen"),
             Gap,
-            H("five things worth knowing"),
+            H("six things worth knowing"),
             K("alt p", "the palette: search every app, action and theme"),
+            K("alt r", "search every AI session you've had: these chats, agent runs, Claude Code, Codex, Kimi"),
             K("alt n", "a terminal beside whatever you're looking at"),
             K("drag", "select text anywhere — it's copied when you let go"),
             K("alt v", "paste a screenshot into Claude Code, Codex or the chat"),
@@ -72,6 +77,7 @@ fn topics() -> Vec<Topic> {
             K("alt t", "a new tab of your own (it starts on a launcher)"),
             K("on the launcher", "a letter opens that app (its F-key is shown too); sidebar apps go to their tab, t c x open here"),
             K("alt 1–9", "go to one of your tabs (ctrl+space then 1–9 too; alt p finds the rest by name)"),
+            K("alt r", "search every AI session: chats, agent runs, Claude Code, Codex, Kimi"),
             K("alt j", "jump to what needs you: the newest agent waiting on you, then tabs with a red ●, then a green ● (again for the next)"),
             K("alt 0", "the next tab that needs you or finished; when none do, back to the tab you were on"),
             K("ctrl+space ;", "back to the tab you were on before"),
@@ -132,9 +138,12 @@ fn topics() -> Vec<Topic> {
             K("enter while it works", "queue a message: Claude Code reads it at its next step, others get it when the reply ends"),
             K("ctrl+x then s", "send now: stop the reply and send what you queued"),
             K("↑ on a queued message", "take it back to edit (until the AI has read it)"),
-            K("ctrl+r", "regenerate the last reply (a coding agent starts again from before it; files it changed stay changed)"),
+            K("ctrl+g", "regenerate the last reply (a coding agent starts again from before it; files it changed stay changed)"),
             K("ctrl+n  ·  ctrl+d", "new chat · delete this chat (stops its reply first)"),
             K("↑ ↓", "between your lines; from the first one, your earlier prompts (then other chats')"),
+            K("ctrl+r", "search every prompt you've sent, in any chat (/prompts): type, ↓ older, enter puts it in the box"),
+            K("ctrl+f", "the sidebar lists only chats from this chat's folder (again: all of them)"),
+            K("/recall <words>", "search every AI session on this computer (the search app, alt r)"),
             K("pgup / pgdn / wheel", "scroll: scrolled up, what you're reading stays put while the reply goes on below"),
             K("ctrl+end  ·  ctrl+home", "back to the end (end does it too with an empty box) · the top"),
             K("ctrl+o", "expand every tool call (diffs, command output)"),
@@ -192,6 +201,25 @@ fn topics() -> Vec<Topic> {
             K("/lead  ·  /tasks  ·  /task", "hand what you planned here to agents (F2): a lead run with the goal (or the last reply), the planner to split it into cards, or one card"),
             P("A new Claude Code or Codex chat started in your home folder, a drive root or a system folder asks where to work first (/cwd completes paths with tab)."),
             P("The box's bottom edge shows what the chat has cost and how full the AI's plan window is ($0.84 this chat · 5h 72%, red past 85%); sending at effort max that close to the limit warns you."),
+        ]},
+        Topic { icon: "history", title: "search", app: "search", items: vec![
+            H(SEARCH_HEAD),
+            P("alt r (or /recall <words> in the chat, or palette → search chats) searches oriel's own chats, agent runs, and every Claude Code, Codex and Kimi session on this computer. No AI is asked: it's a plain word search over a local index, so it's quick and nothing leaves your machine."),
+            Gap,
+            K("type", "words to find — every one must match · \"quotes\" for a phrase"),
+            K("p:<project>", "only sessions from that project folder"),
+            K("ai:<name>", "claude · codex · kimi · oriel · agent"),
+            K("since:30d", "only recent ones (12h, 30d, 2w, 6m, 1y)"),
+            K("↑ ↓  ·  enter", "pick · read it right here, drawn like a chat"),
+            K("tab", "to the results, where the keys below work (typing goes back to the box)"),
+            K("r", "resume it in the chat: your next message carries that session on"),
+            K("a", "attach the part that matched to your chat's box"),
+            K("esc", "back from reading · clear the search"),
+            K("click", "pick · double-click reads it"),
+            P("The sidebar counts sessions per AI and per project; click one to filter by it."),
+            Gap,
+            H("what search keeps"),
+            P("oriel keeps a text copy of each session in its data folder (index/): your prompts, the replies, one line per tool call. Tool output and file contents aren't copied, and anything between <private> and </private> is never kept. So a session Claude Code cleans up after 30 days stays searchable (marked archived); r then carries it on as context in a fresh session. Your AIs → token saver → h keeps Claude's own copies for a year too."),
         ]},
         Topic { icon: "ai", title: "chat commands", app: "", items: chat_cmds },
         Topic { icon: "robot", title: "agents & lead mode", app: "agents", items: vec![
@@ -265,6 +293,7 @@ fn topics() -> Vec<Topic> {
             K("← →  ·  ↑ ↓", "which AI · scroll the days"),
             H("token saver (4)"),
             P("Frugal / Balanced / Max presets for Claude Code and Codex. Shows exactly what changes and asks first; only its own settings are touched, with a backup."),
+            K("h", "keep Claude Code's session history for a year instead of 30 days (cleanupPeriodDays; asks first)"),
         ]},
         Topic { icon: "music", title: "music", app: "music", items: vec![
             P("Plays your music folders (settings › folders: add several, and pick whether the audio-player library comes first): cover art, a spectrum, synced lyrics, playlists."),
@@ -732,15 +761,22 @@ impl Pane for Help {
         if shown.is_empty() && y < area.bottom() {
             f.render_widget(Paragraph::new(Span::styled("no matches", ui::muted(t))), Rect { y, height: 1, ..area });
         }
-        for i in shown {
-            if y >= area.bottom() {
-                break;
-            }
+        // more topics than rows: the list follows the selected one, and the last row says how many are below
+        let rows = area.bottom().saturating_sub(y) as usize;
+        let cut = shown.len() > rows;
+        let fit = if cut { rows.saturating_sub(1) } else { rows };
+        let pos = shown.iter().position(|&i| i == self.sel).unwrap_or(0);
+        let start = if cut { pos.saturating_sub(fit.saturating_sub(1)).min(shown.len() - fit) } else { 0 };
+        for &i in shown.iter().skip(start).take(fit) {
             let tp = &self.topics[i];
             let r = Rect { y, height: 1, ..area };
             ui::side_row(f, r, tp.icon, tp.title, "", i == self.sel, t);
             self.hits.push((r, i));
             y += 1;
+        }
+        let below = shown.len().saturating_sub(start + fit);
+        if cut && below > 0 && y < area.bottom() {
+            f.render_widget(Paragraph::new(Span::styled(format!("  ↓ {below} more"), ui::muted(t))), Rect { y, height: 1, ..area });
         }
     }
 
@@ -932,5 +968,17 @@ mod tests {
         // and search finds it by the name you use
         h.query = "ctrl+b".into();
         assert!(h.shown().contains(&h.sel));
+    }
+
+    /// Help from the search app opens on its own topic.
+    #[test]
+    fn help_from_search_opens_its_topic() {
+        let mut k = Kit::new();
+        set_context("search");
+        let mut h = Help::new();
+        assert_eq!(h.title(), "help · search");
+        let s = k.render_html(&mut h, 120, 40, "target/snap/help-search-app.html");
+        assert!(s.contains("search every AI session (alt r)"), "{s}");
+        assert!(s.contains("p:<project>") && s.contains("attach the part that matched"), "{s}");
     }
 }

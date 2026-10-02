@@ -354,6 +354,40 @@ pub fn plan_claude(paths: &Paths, p: &Preset) -> Result<Plan, String> {
     Ok(Plan { title: format!("apply {} to Claude Code?", p.name), target, original, new_text, diff, notes, done: format!("Claude Code set to {}", p.name) })
 }
 
+/// How long `h` asks Claude Code to keep session transcripts (its own default is 30 days).
+pub const KEEP_DAYS: i64 = 365;
+
+/// cleanupPeriodDays as a number of days (written as 400 or 400.0).
+fn days(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+}
+
+/// Keep Claude Code's session transcripts for a year instead of a month (`cleanupPeriodDays`). A higher setting
+/// already in place is left alone (the plan then changes nothing).
+pub fn plan_history(paths: &Paths) -> Result<Plan, String> {
+    let target = paths.claude_settings();
+    let original = std::fs::read_to_string(&target).ok();
+    let had = original.as_deref().and_then(|t| serde_json::from_str::<Value>(t).ok()).and_then(|v| v.get("cleanupPeriodDays").cloned());
+    let cur = had.as_ref().and_then(days);
+    let want = cur.filter(|d| *d >= KEEP_DAYS).unwrap_or(KEEP_DAYS);
+    // a longer setting is written back as it was (400.0 stays 400.0), so the plan changes nothing
+    let set = had.filter(|_| cur.is_some_and(|d| d >= KEEP_DAYS)).unwrap_or(json!(KEEP_DAYS));
+    let (new_text, diff) = edit_settings(original.as_deref(), &[("cleanupPeriodDays", Some(set))], &[])?;
+    Ok(Plan {
+        title: "keep Claude Code's history for a year?".into(),
+        target,
+        original,
+        new_text,
+        diff,
+        notes: vec![
+            format!("Claude Code deletes a session's transcript {} days after you last used it", cur.unwrap_or(30)),
+            "oriel's search keeps a text copy of every session anyway; this keeps the originals too, so they can be resumed".into(),
+            "only this key changes — every other key stays byte-for-byte, and a backup is kept next to it".into(),
+        ],
+        done: format!("Claude Code now keeps {want} days of history"),
+    })
+}
+
 /// The command Claude Code should run as its statusLine: this oriel's file, which has to exist (Linux calls a
 /// replaced binary "…/oriel (deleted)", and a status line pointing there would just break).
 pub fn sink_command() -> Result<String, String> {
@@ -508,6 +542,8 @@ pub struct Readouts {
     pub codex_profiles: Vec<String>,
     pub status_line: Option<String>,
     pub settings_error: Option<String>,
+    /// cleanupPeriodDays (None = Claude's default, 30)
+    pub history_days: Option<i64>,
 }
 
 pub fn readouts(paths: &Paths) -> Readouts {
@@ -555,6 +591,7 @@ pub fn readouts(paths: &Paths) -> Readouts {
             }
         }
         r.status_line = s.get("statusLine").map(|sl| sl.get("command").and_then(|c| c.as_str()).map(String::from).unwrap_or_else(|| sl.to_string()));
+        r.history_days = s.get("cleanupPeriodDays").and_then(days);
         r.matches = PRESETS.iter().find(|p| preset_matches(p, &obj, &env)).map(|p| p.name);
     }
     names.sort();
@@ -668,6 +705,29 @@ mod tests {
         // one shell word, each ' spelled '\'' — the shell hands usage-sink the command exactly as it was
         assert!(suggestion.ends_with(r#" usage-sink --then 'jq -r '\''"[\(.model.display_name)]"'\'' | head -c 40'"#), "{suggestion}");
         assert_eq!(sh_quote("a"), "'a'");
+    }
+
+    /// h in the token saver: Claude keeps a year of transcripts; a longer setting is never shortened.
+    #[test]
+    fn ais_history_plan_keeps_a_year() {
+        let root = std::path::absolute("target/test-scratch/search/ais-history").unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths::under(&root);
+        std::fs::create_dir_all(&paths.claude).unwrap();
+        std::fs::write(paths.claude_settings(), USER).unwrap();
+        let p = plan_history(&paths).unwrap();
+        assert_eq!(p.diff, vec![('+', "\"cleanupPeriodDays\": 365".to_string())]);
+        assert!(p.notes[0].contains("30 days"), "{:?}", p.notes);
+        apply(&p, "t1").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(paths.claude_settings()).unwrap()).unwrap();
+        assert_eq!((v["cleanupPeriodDays"].as_i64(), v["model"].as_str()), (Some(365), Some("opus")), "only that key changed");
+        assert_eq!(readouts(&paths).history_days, Some(365));
+        assert!(plan_history(&paths).unwrap().diff.iter().all(|d| d.0 == ' '), "already set: nothing to change");
+        std::fs::write(paths.claude_settings(), "{ \"cleanupPeriodDays\": 1000 }").unwrap();
+        assert!(plan_history(&paths).unwrap().diff.iter().all(|d| d.0 == ' '), "longer than a year: left alone");
+        std::fs::write(paths.claude_settings(), "{ \"cleanupPeriodDays\": 1000.0 }").unwrap();
+        assert!(plan_history(&paths).unwrap().diff.iter().all(|d| d.0 == ' '), "written as a float, still longer");
+        assert_eq!(readouts(&paths).history_days, Some(1000));
     }
 
     #[test]

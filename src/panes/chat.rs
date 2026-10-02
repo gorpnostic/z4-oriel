@@ -10,7 +10,7 @@ mod inbox;
 mod md;
 pub mod providers;
 mod review;
-mod store;
+pub(crate) mod store;
 
 /// A diff line's background for a theme (line tint, changed-word tint): the themes app previews with it.
 pub(crate) use activity::band as diff_band;
@@ -21,6 +21,42 @@ pub(crate) fn render_markdown(text: &str, width: usize, t: &crate::theme::Theme)
 }
 
 use crate::editor::Editor;
+
+/// A tool call as the transcript names it ("Update", "src/app.rs"), or None for the todo-list plumbing. The
+/// search index keeps one such line per call.
+pub(crate) fn tool_brief(name: &str, input: &serde_json::Value, cwd: &std::path::Path) -> Option<(String, String)> {
+    (!agent::hidden(name)).then(|| (agent::label(name), agent::target(name, input, cwd)))
+}
+
+/// What the chat app should show next time it draws (the search app's `r`): a saved chat by id, or a session from
+/// elsewhere to carry on, with the line that says what happened.
+pub(crate) enum Open {
+    Chat(String),
+    Resume(store::Chat, String),
+}
+
+thread_local! {
+    /// Set just before switching to the chat app (the UI is single-threaded; thread-local keeps tests apart).
+    static OPEN: std::cell::RefCell<Option<Open>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn request_open(o: Open) {
+    OPEN.with(|c| *c.borrow_mut() = Some(o));
+}
+
+/// The chat sidebar's "this folder only" switch, kept in a small file of its own.
+fn folder_pref_path() -> PathBuf {
+    crate::config::data_dir().join("chat-sidebar.json")
+}
+
+/// Same folder? (Windows paths compare without case and with either slash.)
+fn same_dir(a: &str, b: &str) -> bool {
+    let n = |s: &str| {
+        let s = s.trim_end_matches(['/', '\\']);
+        if cfg!(windows) { s.replace('\\', "/").to_lowercase() } else { s.to_string() }
+    };
+    n(a) == n(b)
+}
 use crate::pane::{Action, Cx, Pane};
 use crate::panes::agents::git;
 use crate::ui;
@@ -69,6 +105,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
     ("/key", "<openai|anthropic> <key>", "save an API key"),
     ("/note", "", "save the last reply to notes"),
     ("/save", "", "export this chat as a markdown file (tool calls folded in; never over an earlier export)"),
+    ("/recall", "<words>", "search every AI chat and session on this computer (alt r)"),
     ("/theme", "<name|edit|new>", "switch theme · edit opens the theme editor · new <name> makes your own"),
     ("/play", "", "music: play / pause"),
     ("/next", "", "music: next song"),
@@ -286,6 +323,8 @@ enum HeroHit {
 #[derive(Clone)]
 enum SideItem {
     New,
+    /// the "all folders / this folder only" switch
+    Folder,
     /// by id: a reply finishing in the background can reorder the list between a draw and a click
     Chat(String),
 }
@@ -463,18 +502,22 @@ pub struct Chat {
     handoffs: HashMap<String, Handoff>,
     /// Chats already told why they have no checkpoints (said once, not every turn).
     ckpt_warned: HashSet<String>,
+    /// A transcript to read, not a chat to type in (the search app shows sessions with it).
+    readonly: bool,
+    /// Scroll so this message is at the top, on the next draw.
+    focus_msg: Option<usize>,
+    /// Where each message starts in the last transcript laid out (focus_msg scrolls with it).
+    msg_starts: Vec<usize>,
+    /// A session carried on from elsewhere (search's `r`): only saved once you send something in it.
+    draft: bool,
+    /// The sidebar lists only chats from the current chat's folder (ctrl+f).
+    this_folder: bool,
 }
 
 impl Chat {
     pub fn new(cfg: &crate::config::Config) -> Self {
         let chats = store::load_all();
         let avail = providers::available(&cfg.ai);
-        // the configured AI if this machine has it, else the first one it does have
-        let provider = if !cfg.ai.provider.is_empty() && avail.contains(&cfg.ai.provider.as_str()) {
-            cfg.ai.provider.clone()
-        } else {
-            avail.first().map(|s| s.to_string()).unwrap_or_else(|| "none".into())
-        };
         let ollama_models: Arc<Mutex<Vec<String>>> = Arc::default();
         if avail.contains(&"ollama") && !cfg!(test) {
             let (url, into) = (cfg.ai.ollama_url.clone(), ollama_models.clone());
@@ -488,6 +531,31 @@ impl Chat {
                 }
             });
         }
+        let mut c = Self::make(cfg, chats, avail, ollama_models);
+        if !cfg!(test) {
+            c.this_folder = std::fs::read_to_string(folder_pref_path()).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).is_some_and(|v| v["this_folder"] == true);
+        }
+        c
+    }
+
+    /// A read-only view of a transcript (a session from the search app), scrolled to message `focus`. No saved chats
+    /// are loaded and no AI is asked about: it only draws.
+    pub(crate) fn viewer(cfg: &crate::config::Config, chat: store::Chat, focus: usize) -> Self {
+        let mut c = Self::make(cfg, vec![], vec![], Arc::default());
+        c.provider = chat.provider.clone().filter(|p| providers::is_known(p)).unwrap_or_else(|| "claude".into());
+        c.chat = chat;
+        c.readonly = true;
+        c.focus_msg = Some(focus);
+        c
+    }
+
+    fn make(cfg: &crate::config::Config, chats: Vec<store::Chat>, avail: Vec<&'static str>, ollama_models: Arc<Mutex<Vec<String>>>) -> Self {
+        // the configured AI if this machine has it, else the first one it does have
+        let provider = if !cfg.ai.provider.is_empty() && avail.contains(&cfg.ai.provider.as_str()) {
+            cfg.ai.provider.clone()
+        } else {
+            avail.first().map(|s| s.to_string()).unwrap_or_else(|| "none".into())
+        };
         let mut first = store::Chat::new(&provider);
         first.model = cfg.ai.models.get(&provider).cloned().filter(|m| !m.is_empty());
         Chat {
@@ -547,7 +615,57 @@ impl Chat {
             checking: HashSet::new(),
             handoffs: HashMap::new(),
             ckpt_warned: HashSet::new(),
+            readonly: false,
+            focus_msg: None,
+            msg_starts: vec![],
+            draft: false,
+            this_folder: false,
         }
+    }
+
+    /// The search app asked for a chat (or a session to carry on): show it.
+    fn take_open(&mut self) {
+        let Some(o) = OPEN.with(|c| c.borrow_mut().take()) else { return };
+        match o {
+            Open::Chat(id) => {
+                if !self.chats.iter().any(|c| c.id == id) {
+                    self.chats = store::load_all();
+                }
+                if self.chats.iter().any(|c| c.id == id) {
+                    self.open_chat(&id);
+                } else {
+                    self.info = vec!["that chat isn't there any more".into()];
+                }
+            }
+            Open::Resume(c, note) => {
+                self.stop();
+                self.persist_if_changed();
+                self.chat = c;
+                self.draft = true;
+                self.cache.clear();
+                self.scroll = 0;
+                self.info = vec![note];
+            }
+        }
+    }
+
+    /// The folder the sidebar's "this folder" switch means: the current chat's.
+    fn folder(&self) -> String {
+        self.chat.cwd.clone().unwrap_or_else(|| self.launch_dir.to_string_lossy().to_string())
+    }
+
+    fn toggle_folder(&mut self) {
+        self.this_folder = !self.this_folder;
+        self.side_scroll = 0;
+        if !cfg!(test) {
+            let _ = std::fs::write(folder_pref_path(), serde_json::json!({ "this_folder": self.this_folder }).to_string());
+        }
+    }
+
+    /// For other panes' tests: the chat's CLI state (JSON), its info lines, and whether it's still a draft.
+    #[cfg(test)]
+    pub(crate) fn test_view(&self) -> (String, Vec<String>, bool) {
+        (serde_json::to_string(&self.chat.state).unwrap_or_default(), self.info.clone(), self.draft)
     }
 
     /// The chat's AI, or the current default when it used one oriel doesn't have (an old chat).
@@ -594,6 +712,7 @@ impl Chat {
         // a reply that's still running keeps going in the background: switching chats never stops anything
         self.park();
         self.persist_if_changed();
+        self.draft = false; // a session carried on but never answered is let go
         let p = self.provider_of();
         self.chat = store::Chat::new(&p);
         self.chat.model = self.models.get(&p).cloned().filter(|m| !m.is_empty());
@@ -609,6 +728,7 @@ impl Chat {
         self.persist_if_changed();
         // by id: saving the chat we're leaving can reorder the list under us
         let Some(c) = self.chats.iter().find(|c| c.id == id).cloned() else { return };
+        self.draft = false;
         self.chat = c;
         self.perms = self.default_perms.clone();
         self.fresh_view();
@@ -766,6 +886,9 @@ impl Chat {
 
     /// Save only if it differs from the saved copy — just looking at a chat mustn't bump it to the top.
     fn persist_if_changed(&mut self) {
+        if self.draft || self.readonly {
+            return; // a session carried on from elsewhere becomes a chat of yours once you say something in it
+        }
         if let Some(old) = self.chats.iter().find(|c| c.id == self.chat.id) {
             if serde_json::to_value(old).ok() == serde_json::to_value(&self.chat).ok() {
                 return;
@@ -993,6 +1116,7 @@ impl Chat {
 
     /// Ask the provider for a reply to the conversation as it stands (last message = the user's).
     fn start_reply(&mut self, cx: &mut Cx) {
+        self.draft = false; // you've said something (or regenerated): it's a chat of yours now
         let (stream, msg) = self.launch(&self.chat, cx);
         self.chat.messages.push(msg);
         self.stream = Some(stream);
@@ -1401,6 +1525,10 @@ impl Chat {
                     }
                 }
             }
+            "/recall" => {
+                crate::panes::search::request_query(&arg);
+                cx.act(Action::GotoApp("search"));
+            }
             "/play" => cx.act(Action::AppKey("music", ' ')),
             "/next" => cx.act(Action::AppKey("music", 'n')),
             "/prev" => cx.act(Action::AppKey("music", 'p')),
@@ -1428,12 +1556,13 @@ impl Chat {
             "/help" => {
                 self.info.extend(
                     [
-                        "enter send · esc clears the box, then stops the reply · ctrl+r regenerate · ctrl+n new chat · ctrl+d delete chat",
+                        "enter send · esc clears the box, then stops the reply · ctrl+g regenerate · ctrl+n new chat · ctrl+d delete chat",
                         "switching chats never stops a reply: it keeps going in the background (a spinner in the list, ? when it needs you)",
-                        "pgup/pgdn or the wheel scroll · ctrl+end back to the end · ctrl+home the top · ↑ in an empty box recalls your earlier prompts (then other chats')",
+                        "pgup/pgdn or the wheel scroll · ctrl+end back to the end · ctrl+home the top · ↑ in an empty box recalls your earlier prompts (then other chats') · ctrl+r searches them",
                         "ctrl+j or shift+enter new line · ↑↓ move between lines · ctrl+←/→ a word · ctrl+w or ctrl+backspace delete a word · ctrl+z undo",
                         "ctrl+y copies the last reply's last code block (or the reply) · click a code block's ┌─ header to copy it · /copy for more",
-                        "ctrl+pgup / ctrl+pgdn the previous / next chat · /open searches them · /rename",
+                        "ctrl+pgup / ctrl+pgdn the previous / next chat · /open searches them · /rename · ctrl+f: the sidebar lists only this folder's chats",
+                        "/recall <words> or alt r searches every AI session on this computer",
                         "ctrl+o shows every tool call in full (diffs, output) · click a tool line to open just that one",
                         "/perms ask: Claude Code asks first · y allow · n deny · a always allow that command in this chat",
                         "F1-F9 apps · F12 play/pause · alt p palette · alt n terminal beside this",
@@ -1957,7 +2086,9 @@ impl Chat {
     /// block at a time), then the info lines. Only the lines on screen ever get copied out of them.
     fn transcript(&mut self, width: usize, cx: &Cx) -> Vec<Block> {
         let mut out = vec![lines_block(vec![Line::raw("")], vec![])];
+        self.msg_starts.clear();
         for i in 0..self.chat.messages.len() {
+            self.msg_starts.push(out.iter().map(|b| b.lines.len()).sum());
             self.msg_blocks(i, width, cx, &mut out);
         }
         let mut info = vec![];
@@ -3753,6 +3884,9 @@ impl Pane for Chat {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, cx: &mut Cx) {
+        if !self.readonly {
+            self.take_open();
+        }
         let t = cx.theme;
         let has_activity = self.chat.messages.iter().any(|m| !m.parts.is_empty());
         let expand_hint = if self.expanded { "collapse" } else { "expand tools" };
@@ -3762,7 +3896,9 @@ impl Pane for Chat {
         }
         let prompt = !self.asks.is_empty() || !self.questions.is_empty();
         let restoring = self.restore.as_ref().is_some_and(|r| r.chat == self.chat.id && matches!(r.plan, Some(Ok(_))) && !r.busy);
-        let hints: Vec<(&str, &str)> = if self.confirm_delete {
+        let hints: Vec<(&str, &str)> = if self.readonly {
+            vec![("esc", "back"), ("r", "resume in chat"), ("a", "attach to chat"), ("ctrl+o", expand_hint), ("↑↓ pgup/pgdn", "scroll")]
+        } else if self.confirm_delete {
             vec![("y", "delete this chat"), ("esc", "keep it")]
         } else if restoring && self.input.is_empty() {
             vec![("y", "put the folder back"), ("d", "show the diff"), ("esc", "leave it")]
@@ -3782,7 +3918,7 @@ impl Pane for Chat {
             v.extend([("F10", "help"), ("alt p", "palette")]);
             v
         } else {
-            let mut v = vec![("enter", "send"), ("ctrl+r", "regenerate"), ("ctrl+n", "new chat"), ("/", "commands")];
+            let mut v = vec![("enter", "send"), ("ctrl+g", "regenerate"), ("ctrl+r", "past prompts"), ("ctrl+n", "new chat"), ("/", "commands")];
             if self.last_reply().is_some() {
                 v.push(("ctrl+y", "copy"));
             }
@@ -3797,14 +3933,15 @@ impl Pane for Chat {
             return;
         }
         self.refresh_usage(cx.waker());
-        // ---- the composer grows with what you type (up to COMPOSER_ROWS rows, then it scrolls)
+        // ---- the composer grows with what you type (up to COMPOSER_ROWS rows, then it scrolls); a read-only
+        // transcript has none: all of it is the conversation
         let text_w = (area.width as usize).saturating_sub(5).max(4); // the borders, "› ", a column for the cursor
         self.comp_w = text_w;
         self.ed.load(&self.input, self.cursor);
         let segs = self.ed.layout(text_w);
         let rows = if self.input.is_empty() { 1 } else { segs.len() };
         let shown = rows.min(COMPOSER_ROWS.min((area.height as usize).saturating_sub(7).max(1)));
-        let comp_h = shown as u16 + 2;
+        let comp_h = if self.readonly { 0 } else { shown as u16 + 2 };
         let comp = Rect { y: area.bottom() - comp_h, height: comp_h, ..area };
         let above = Rect { height: area.height - comp_h, ..area };
         let above = Rect { x: above.x + 1, width: above.width.saturating_sub(2), ..above };
@@ -3860,6 +3997,11 @@ impl Pane for Chat {
                     self.scroll = self.scroll.saturating_sub(prev_max - max_scroll).max(1);
                 }
             }
+            if let Some(i) = self.focus_msg.take() {
+                // open at a given message (the one a search matched), a line of the one before showing
+                let at = self.msg_starts.get(i).copied().unwrap_or(0).saturating_sub(1);
+                self.scroll = max_scroll - at.min(max_scroll);
+            }
             self.anchor = Some((self.chat.id.clone(), body.width, max_scroll, total));
             self.scroll = self.scroll.min(max_scroll);
             let start = max_scroll - self.scroll;
@@ -3888,6 +4030,10 @@ impl Pane for Chat {
                     f.render_widget(Paragraph::new(Span::styled("▐", Style::default().fg(t.frame))), Rect { x: body.right(), y: body.y + (pos + r) as u16, width: 1, height: 1 });
                 }
             }
+        }
+
+        if self.readonly {
+            return;
         }
 
         // ---- the / command menu, above the composer
@@ -4101,6 +4247,24 @@ impl Pane for Chat {
         if k.modifiers.contains(KeyModifiers::ALT) {
             return false;
         }
+        if self.readonly {
+            // only scrolling and ctrl+o; the rest is for whoever shows the transcript (the search app)
+            match k.code {
+                KeyCode::Up | KeyCode::Char('k') => self.scroll += 1,
+                KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_sub(1),
+                KeyCode::PageUp => self.scroll += 10,
+                KeyCode::PageDown | KeyCode::Char(' ') => self.scroll = self.scroll.saturating_sub(10),
+                KeyCode::Home | KeyCode::Char('g') => self.scroll = usize::MAX / 2,
+                KeyCode::End | KeyCode::Char('G') => self.scroll = 0,
+                KeyCode::Char('o') if ctrl => {
+                    self.expanded = !self.expanded;
+                    self.open.clear();
+                    self.cache.clear();
+                }
+                _ => return false,
+            }
+            return true;
+        }
         if self.confirm_delete {
             self.confirm_delete = false;
             if k.code == KeyCode::Char('y') {
@@ -4235,7 +4399,15 @@ impl Pane for Chat {
                 self.menu_sel = 0;
             }
             KeyCode::Char('n') if ctrl => self.new_chat(),
-            KeyCode::Char('r') if ctrl => self.retry(cx),
+            KeyCode::Char('g') if ctrl => self.retry(cx),
+            // like a shell's reverse search: /prompts, every prompt you've sent from any chat, as you type
+            KeyCode::Char('r') if ctrl => {
+                if !self.input.starts_with("/prompts") {
+                    self.set_input("/prompts ".into());
+                }
+                self.menu_sel = 0;
+            }
+            KeyCode::Char('f') if ctrl => self.toggle_folder(),
             KeyCode::Char('d') if ctrl => {
                 if !self.chat.messages.is_empty() {
                     self.confirm_delete = true;
@@ -4426,10 +4598,21 @@ impl Pane for Chat {
         let r = Rect { height: 1, ..area };
         ui::side_row(f, r, "new", "new chat", "ctrl+n", false, t);
         self.side_hits.push((r, SideItem::New));
+        // all folders, or only the chats that worked in this chat's folder
+        let folder = self.folder();
+        let r = Rect { y: area.y + 1, height: 1, ..area };
+        if r.bottom() <= area.bottom() {
+            let label = if self.this_folder { format!("{} only", crate::panes::ais::usage::project_name(&folder)) } else { "all folders".to_string() };
+            ui::side_row(f, r, "files", &label, "ctrl+f", self.this_folder, t);
+            self.side_hits.push((r, SideItem::Folder));
+        }
         let mut rows: Vec<(Option<&'static str>, usize)> = vec![];
         let now = store::now();
         let mut last = "";
         for (i, c) in self.chats.iter().enumerate() {
+            if self.this_folder && !c.cwd.as_deref().is_some_and(|d| same_dir(d, &folder)) {
+                continue;
+            }
             let b = store::bucket(c.updated, now, self.offset);
             if b != last {
                 rows.push((Some(b), 0));
@@ -4437,7 +4620,7 @@ impl Pane for Chat {
             }
             rows.push((None, i));
         }
-        let list = Rect { y: area.y + 2, height: area.height.saturating_sub(2), ..area };
+        let list = Rect { y: area.y + 3, height: area.height.saturating_sub(3), ..area };
         let h = list.height as usize;
         // a chat just opened (a click, /open, ctrl+pgdn) scrolls into view; the wheel is free the rest of the time
         if self.side_follow != self.chat.id && h > 0 {
@@ -4488,6 +4671,7 @@ impl Pane for Chat {
                 if let Some((_, item)) = self.side_hits.iter().find(|(r, _)| r.contains(pos)).cloned() {
                     match item {
                         SideItem::New => self.new_chat(),
+                        SideItem::Folder => self.toggle_folder(),
                         SideItem::Chat(id) => self.open_chat(&id),
                     }
                 }
@@ -4563,6 +4747,105 @@ mod tests {
         c.open_chat("t0");
         k.key(&mut c, KeyCode::Char('y'));
         assert!(c.chats.iter().any(|x| x.id == "t0") && c.chat.id == "t0" && c.input == "y");
+    }
+
+    /// ctrl+r searches every prompt you've sent (any chat, newest first); ctrl+g regenerates now; ctrl+f narrows the
+    /// sidebar to this chat's folder.
+    #[test]
+    fn chat_prompt_search_and_folder_filter() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        let mk = |id: &str, title: &str, cwd: &str, prompts: &[&str], updated: f64| {
+            let mut ch = store::Chat::new("claude");
+            ch.id = id.into();
+            ch.title = title.into();
+            ch.cwd = Some(cwd.into());
+            ch.updated = updated;
+            for p in prompts {
+                ch.messages.push(store::Msg { role: "user".into(), content: p.to_string(), ..Default::default() });
+                ch.messages.push(store::Msg { role: "assistant".into(), content: "ok".into(), ..Default::default() });
+            }
+            ch
+        };
+        let (app, app2, site, here) =
+            if cfg!(windows) { ("C:\\work\\app", "C:\\work\\app\\", "C:\\work\\site", "c:/work/app") } else { ("/work/app", "/work/app/", "/work/site", "/work/app") };
+        c.chats = vec![
+            mk("pa", "login work", app, &["fix the flaky login test", "now the logout test"], 300.0),
+            mk("pb", "docs", site, &["write the flaky-test docs", "/model opus"], 200.0),
+            mk("pc", "older login", app2, &["fix the flaky login test"], 100.0),
+        ];
+        c.chat.cwd = Some(here.into());
+        k.key_mod(&mut c, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(c.input, "/prompts ", "ctrl+r searches prompts now, it doesn't regenerate");
+        k.typ(&mut c, "flaky");
+        let s = k.render_html(&mut c, 120, 30, "target/snap/chat-prompt-search.html");
+        assert!(s.contains("fix the flaky login test") && s.contains("write the flaky-test docs"), "{s}");
+        let items: Vec<String> = c.menu().into_iter().filter_map(|i| i.put).collect();
+        assert_eq!(items, vec!["fix the flaky login test", "write the flaky-test docs"], "newest first, each once");
+        k.key(&mut c, KeyCode::Down); // older
+        k.key(&mut c, KeyCode::Enter);
+        assert_eq!(c.input, "write the flaky-test docs", "in the box, not sent");
+        assert!(c.stream.is_none());
+        // ctrl+r again from there starts a fresh search; esc leaves an empty box
+        k.key_mod(&mut c, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        k.key_mod(&mut c, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        k.typ(&mut c, "zzz");
+        assert!(c.menu().is_empty() || c.menu().iter().all(|i| i.put.is_none()));
+        k.key(&mut c, KeyCode::Esc);
+        assert!(c.input.is_empty(), "esc clears it");
+
+        // the sidebar: every chat, or only this folder's (either slash, any case, a trailing one)
+        let side = k.render_side(&mut c, 34, 20);
+        assert!(side.contains("all folders") && side.contains("docs"), "{side}");
+        k.key_mod(&mut c, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        let side = k.render_side(&mut c, 34, 20);
+        assert!(side.contains("app only") && side.contains("login work") && side.contains("older login") && !side.contains("docs"), "{side}");
+        k.key_mod(&mut c, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(k.render_side(&mut c, 34, 20).contains("docs"));
+    }
+
+    /// A session carried on from the search app stays a draft only until you leave it: the chat you open next
+    /// saves as usual again.
+    #[test]
+    fn chat_resumed_draft_is_let_go() {
+        let mut k = Kit::new();
+        let mut c = Chat::new(&k.config);
+        let mut other = store::Chat::new("claude");
+        other.id = "other".into();
+        other.messages.push(store::Msg { role: "user".into(), content: "hello".into(), ..Default::default() });
+        c.chats = vec![other];
+        let mut s = store::Chat::new("claude");
+        s.messages.push(store::Msg { role: "user".into(), content: "from elsewhere".into(), ..Default::default() });
+        request_open(Open::Resume(s, "carrying on".into()));
+        k.render(&mut c, 100, 24);
+        assert!(c.draft && c.info == ["carrying on"]);
+        c.open_chat("other");
+        assert!(!c.draft && c.chat.id == "other", "the draft went; this chat is yours");
+        request_open(Open::Resume(store::Chat::new("claude"), "again".into()));
+        k.render(&mut c, 100, 24);
+        assert!(c.draft);
+        c.new_chat();
+        assert!(!c.draft);
+    }
+
+    /// The search app's reader: the chat's renderer with no composer, keys only scroll.
+    #[test]
+    fn chat_viewer_is_read_only() {
+        let mut k = Kit::new();
+        let mut ch = store::Chat::new("codex");
+        ch.title = "rate limits".into();
+        for i in 0..30 {
+            ch.messages.push(store::Msg { role: "user".into(), content: format!("question {i}"), ..Default::default() });
+            ch.messages.push(store::Msg { role: "assistant".into(), model: Some("codex".into()), content: format!("answer {i}"), ..Default::default() });
+        }
+        let mut v = Chat::viewer(&k.config, ch, 20);
+        let s = k.render_html(&mut v, 100, 24, "target/snap/chat-viewer.html");
+        assert!(s.contains("question 10") && !s.contains("question 3\n"), "opens at the message asked for\n{s}");
+        assert!(s.contains("resume in chat") && !s.contains("message codex"), "{s}");
+        assert!(!k.key(&mut v, KeyCode::Char('r')), "r is for whoever shows it");
+        assert!(k.key(&mut v, KeyCode::End));
+        assert!(k.render(&mut v, 100, 24).contains("answer 29"));
+        assert!(v.input.is_empty());
     }
 
     #[test]
@@ -5990,8 +6273,8 @@ mod tests {
         // first reply: it made the session and edited a file
         deliver(&mut k, &mut c, [Ev::State("claude.session".into(), "s1".into()), Ev::Tool(store::Tool { id: "t1".into(), name: "Edit".into(), label: "Update".into(), target: "a.rs".into(), status: "done".into(), ..Default::default() }), Ev::Done { note: None }]);
         assert_eq!(c.chat.state["claude"]["upto"], 2, "the session has seen the chat up to here");
-        let ctrl_r = |k: &mut Kit, c: &mut Chat| k.key_mod(c, KeyCode::Char('r'), KeyModifiers::CONTROL);
-        ctrl_r(&mut k, &mut c);
+        let regen = |k: &mut Kit, c: &mut Chat| k.key_mod(c, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        regen(&mut k, &mut c);
         assert!(!c.chat.state.contains_key("claude"), "the session only knew the thrown-away reply: start afresh");
         assert!(c.info.iter().any(|l| l.contains("still changed")), "{:?}", c.info);
         assert_eq!(c.chat.messages.len(), 2);
@@ -6003,14 +6286,14 @@ mod tests {
         c.chat.messages.push(store::Msg { role: "user".into(), content: "and the other one".into(), ..Default::default() });
         let before = c.chat.state.clone();
         c.chat.messages.push(store::Msg { role: "assistant".into(), content: "bad".into(), model: Some("claude".into()), state_before: Some(before), ..Default::default() });
-        ctrl_r(&mut k, &mut c);
+        regen(&mut k, &mut c);
         assert!(!c.chat.state.contains_key("claude"));
         c.stop();
         // a CLI that forks sessions: the one from before is intact, so it goes back to it
         c.chat.messages.truncate(1);
         c.chat.state = serde_json::from_value(serde_json::json!({"claude": {"session": "s2"}})).unwrap();
         c.chat.messages.push(store::Msg { role: "assistant".into(), content: "bad".into(), model: Some("claude".into()), state_before: Some(serde_json::from_value(serde_json::json!({"claude": {"session": "s1"}})).unwrap()), ..Default::default() });
-        ctrl_r(&mut k, &mut c);
+        regen(&mut k, &mut c);
         assert_eq!(c.chat.state["claude"]["session"], "s1");
         c.stop();
 

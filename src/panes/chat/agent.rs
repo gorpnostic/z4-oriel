@@ -530,7 +530,7 @@ pub fn human_ms(ms: u64) -> String {
 
 // ------------------------------------------------------------------ Claude Code
 /// Tools that only manage the todo list (shown as the list, not as calls) or are plumbing.
-fn hidden(name: &str) -> bool {
+pub fn hidden(name: &str) -> bool {
     matches!(name, "TodoWrite" | "TaskCreate" | "TaskUpdate" | "TaskList" | "TaskGet" | "ToolSearch")
 }
 

@@ -11,6 +11,7 @@ pub mod home;
 pub mod music;
 pub mod notes;
 pub mod settings;
+pub mod search;
 pub mod storage;
 pub mod system;
 pub mod term;
@@ -63,7 +64,7 @@ pub fn available(name: &str) -> bool {
 
 /// Every name `open` takes (`oriel <app>` checks against it). A CLI agent counts even when it isn't installed:
 /// the app says so then.
-const NAMES: &[&str] = &["terminal", "shell", "ai", "chat", "music", "system", "files", "notes", "calendar", "storage", "agents", "ais", "home", "help", "themes", "alerts", "updates", "settings"];
+const NAMES: &[&str] = &["terminal", "shell", "ai", "chat", "music", "system", "files", "notes", "calendar", "storage", "agents", "ais", "home", "help", "themes", "alerts", "updates", "settings", "search"];
 
 pub fn known(name: &str) -> bool {
     NAMES.contains(&name) || AGENTS.iter().any(|a| a.0 == name)
@@ -140,6 +141,7 @@ pub fn open_in(name: &str, cfg: &Config, cwd: Option<std::path::PathBuf>) -> Opt
         "storage" => Box::new(storage::Storage::new()),
         "agents" => Box::new(agents::Agents::new(cfg)),
         "ais" => Box::new(ais::Ais::new(cfg)),
+        "search" => Box::new(search::Search::new(cfg)),
         "home" => Box::new(home::Home::new()),
         "help" => Box::new(help::Help::new().prefix(&crate::config::prefix(cfg))),
         "themes" => Box::new(themes::Themes::new()),
