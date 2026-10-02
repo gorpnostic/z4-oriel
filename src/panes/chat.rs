@@ -609,7 +609,7 @@ impl Chat {
             side_scroll: 0,
             side_follow: String::new(),
             hero_hits: vec![],
-            launch_dir: std::env::current_dir().unwrap_or_default(),
+            launch_dir: demo_cwd().unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
             risky_ok: false,
             risky_armed: false,
             repos: Arc::default(),
@@ -3345,6 +3345,11 @@ fn exit_of(e: &str) -> String {
 }
 
 /// How the check loop's messages and a handoff's first message start.
+/// The README screenshots show a made-up folder, not the one the tests happen to run in (ORIEL_DEMO_CWD).
+fn demo_cwd() -> Option<PathBuf> {
+    if cfg!(test) { std::env::var_os("ORIEL_DEMO_CWD").map(PathBuf::from) } else { None }
+}
+
 const CHECK_SAYS: &str = "◎ check ";
 /// After a usage limit resets, wait this much longer before carrying on (the reset time is rounded).
 const LIMIT_GRACE: i64 = 30;
@@ -4820,7 +4825,7 @@ mod tests {
         c.chat.messages.push(store::Msg { role: "user".into(), content: "what's a good name for a terminal app?".into(), ..Default::default() });
         c.chat.messages.push(store::Msg {
             role: "assistant".into(),
-            content: "A few ideas:\n\n- **oriel** — a window that juts out\n- `nest`, but taken\n\n```rust\nfn main() { println!(\"hi\"); }\n```\nPick the one you like.".into(),
+            content: "A few ideas:\n\n- **oriel** — a window that juts out\n- `bay`, but taken\n\n```rust\nfn main() { println!(\"hi\"); }\n```\nPick the one you like.".into(),
             model: Some("ollama".into()),
             note: Some("34 tokens · 171 tok/s · llama3.2".into()),
             ..Default::default()

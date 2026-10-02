@@ -1,7 +1,7 @@
 //! Filesystem side of the storage app: link-safe folder sizes, the cleanup list (per OS), drives, and emptying a
 //! cache folder. Everything here runs on background threads; the pane never calls it from render.
 //!
-//! Safety rules (ported from nest):
+//! Safety rules:
 //!   * the walker never follows symlinks, junctions or any other reparse point. Windows'
 //!     `AppData\Local\Application Data` is a junction back to `AppData\Local`; following it double-counts ~150 GB
 //!   * on Linux a walk never crosses into another filesystem (like `du -x`), and /proc /sys /dev /run are skipped

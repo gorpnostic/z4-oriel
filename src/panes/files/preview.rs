@@ -14,7 +14,7 @@ const AUDIO_EXT: &[&str] = &["mp3", "flac", "wav", "ogg", "opus", "m4a", "aac", 
 const VIDEO_EXT: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "wmv", "m4v"];
 const ARCHIVE_EXT: &[&str] = &["zip", "7z", "rar", "tar", "gz", "xz", "zst", "bz2", "tgz", "iso"];
 const DOC_EXT: &[&str] = &["md", "txt", "pdf", "doc", "docx", "rtf", "odt", "log", "csv", "xls", "xlsx", "ppt", "pptx", "epub"];
-/// Build/cache folders nest never showed; they count as hidden (`.` shows them).
+/// Build/cache folders that are never worth showing; they count as hidden (`.` shows them).
 pub const SKIP: &[&str] = &["node_modules", "__pycache__", ".git", ".venv", "venv", "dist", "build", ".next", ".gradle", "target"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -220,7 +220,7 @@ fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 { one } else { many }
 }
 
-/// nest's size format: "12 B", "3.4 KB".
+/// The size format: "12 B", "3.4 KB".
 pub fn human(n: u64) -> String {
     let mut v = n as f64;
     for u in ["B", "KB", "MB", "GB", "TB"] {

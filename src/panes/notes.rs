@@ -31,8 +31,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 const WELCOME: &str = "# welcome to notes\n\nType anything. It saves itself.\n";
-/// Written after nest's notes have been imported, so deleting every note later doesn't bring them back.
-const IMPORTED: &str = ".imported-from-nest";
+/// Written after an old notes folder has been imported, so deleting every note later doesn't bring them back.
+const IMPORTED: &str = ".imported";
 
 #[derive(Clone, Debug)]
 struct Meta {
@@ -112,7 +112,7 @@ pub struct Notes {
 
 impl Notes {
     pub fn new(cfg: &crate::config::Config) -> Self {
-        // tests (the app's own snapshot test opens every app) never touch the real notes or nest's
+        // tests (the app's own snapshot test opens every app) never touch the real notes
         #[cfg(test)]
         {
             let _ = cfg;
@@ -126,7 +126,7 @@ impl Notes {
         }
     }
 
-    /// Notes kept in `dir`; `import_from` is nest's folder to copy from on first run (tests pass their own).
+    /// Notes kept in `dir`; `import_from` is an old notes folder to copy from on first run (tests pass their own).
     pub(crate) fn open_in(dir: PathBuf, import_from: Option<PathBuf>) -> Self {
         let _ = std::fs::create_dir_all(&dir);
         let mut n = Notes {
@@ -181,7 +181,7 @@ impl Notes {
         rd.flatten().map(|e| e.path()).filter(|p| p.is_file() && p.extension().map(|e| e.eq_ignore_ascii_case("md")).unwrap_or(false)).collect()
     }
 
-    /// Copy (never move) nest's notes in, once, and only into an empty folder.
+    /// Copy (never move) the old folder's notes in, once, and only into an empty folder.
     fn import(&mut self, src: &Path) {
         if !Self::md_files(&self.dir).is_empty() || self.dir.join(IMPORTED).exists() || !src.is_dir() {
             return;
@@ -191,7 +191,7 @@ impl Notes {
             let Some(name) = p.file_name() else { continue };
             let to = self.dir.join(name);
             if !to.exists() && std::fs::copy(&p, &to).is_ok() {
-                // keep nest's modified times so the order in the sidebar survives
+                // keep their modified times so the order in the sidebar survives
                 if let Ok(m) = std::fs::metadata(&p).and_then(|m| m.modified()) {
                     let _ = std::fs::File::options().write(true).open(&to).and_then(|f| f.set_modified(m));
                 }
@@ -673,7 +673,7 @@ impl Pane for Notes {
             self.watch = self.watch_dir(cx.waker());
         }
         let t = cx.theme;
-        // the bottom line: a delete confirmation, an error, or nest's hints
+        // the bottom line: a delete confirmation, an error, or the hints
         let body = if self.confirm_delete {
             let title = self.title();
             let line = Line::from(vec![
@@ -715,7 +715,7 @@ impl Pane for Notes {
             };
             ui::hint_line(f, area, &hints, t)
         };
-        // nest: one row of air at the top and above the hints, a column of padding each side
+        // one row of air at the top and above the hints, a column of padding each side
         let r = Rect { x: body.x + 1, y: body.y + 1, width: body.width.saturating_sub(2), height: body.height.saturating_sub(2) };
         self.text_rect = r;
         if r.width == 0 || r.height == 0 {
@@ -962,11 +962,11 @@ mod tests {
         let dir = scratch("notes-import");
         let p = Notes::open_in(dir.clone(), Some(src.clone()));
         assert_eq!(p.list.len(), 2);
-        assert!(src.join("ideas.md").exists(), "nest's notes are copied, not moved");
+        assert!(src.join("ideas.md").exists(), "the old notes are copied, not moved");
         assert!(dir.join("ideas.md").exists());
         assert!(dir.join(IMPORTED).exists());
         drop(p);
-        // delete everything: nest's notes don't come back, a fresh note appears instead
+        // delete everything: the old notes don't come back, a fresh note appears instead
         for f in Notes::md_files(&dir) {
             std::fs::remove_file(f).unwrap();
         }
@@ -992,7 +992,7 @@ mod tests {
         assert!(s.contains("welcome to notes"), "sidebar: other notes");
         assert!(s.contains("autosaves · ctrl+e edit/preview · ctrl+d delete · ctrl+n new note"));
 
-        // type at the end (the cursor starts there, like nest)
+        // type at the end (the cursor starts there)
         k.key(&mut p, KeyCode::Enter);
         k.typ(&mut p, "- Likes **fast** tools and `rust`");
         assert!(p.dirty_at.is_some());

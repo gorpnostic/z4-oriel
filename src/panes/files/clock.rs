@@ -86,7 +86,7 @@ pub fn local(secs: i64) -> Local {
 
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-/// "Sep 23 2026 18:23" (nest's modified-time format).
+/// "Sep 23 2026 18:23" (the modified-time format).
 pub fn stamp(secs: i64) -> String {
     let l = local(secs);
     format!("{} {:02} {} {:02}:{:02}", MONTHS[(l.month.clamp(1, 12) - 1) as usize], l.day, l.year, l.hour, l.min)
@@ -98,7 +98,7 @@ pub fn hms(secs: i64) -> String {
     format!("{:02}:{:02}:{:02}", l.hour, l.min, l.sec)
 }
 
-/// "20260923-184214" (nest's note id prefix).
+/// "20260923-184214" (a note id prefix).
 pub fn compact(secs: i64) -> String {
     let l = local(secs);
     format!("{:04}{:02}{:02}-{:02}{:02}{:02}", l.year, l.month, l.day, l.hour, l.min, l.sec)

@@ -1,4 +1,4 @@
-//! music: nest's music app. Your audio-player library (or a folder scan), playlists and "most played" in the
+//! music: the music app. Your audio-player library (or a folder scan), playlists and "most played" in the
 //! sidebar, a now-playing column with the cover in half-block pixels, a live spectrum and synced lyrics, and the
 //! track table with search. Playback runs on its own thread (engine.rs) and keeps going in the background.
 
@@ -34,7 +34,7 @@ const COVER_ROWS: u32 = 18;
 const BANDS: usize = 18;
 const SPARK: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
-/// nest's music icons that ui.rs doesn't carry: (nerd glyph, plain fallback).
+/// Music icons that ui.rs doesn't carry: (nerd glyph, plain fallback).
 fn glyph(name: &str) -> &'static str {
     let nerd = ui::NERD.load(std::sync::atomic::Ordering::Relaxed);
     let (n, p) = match name {

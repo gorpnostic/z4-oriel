@@ -192,7 +192,7 @@ pub trait Pane {
     fn hover(&self) -> usize {
         0
     }
-    /// This app's own section of the left sidebar, under the app list (nest style): the chat list, playlists,
+    /// This app's own section of the left sidebar, under the app list: the chat list, playlists,
     /// places, sort options... `area` is the space left in the sidebar. Only called for app tabs.
     fn side(&mut self, _f: &mut Frame, _area: Rect, _cx: &mut Cx) {}
     /// Mouse event inside the side section (screen coordinates; `area` is the side section's rect).

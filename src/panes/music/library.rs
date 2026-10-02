@@ -1,7 +1,7 @@
 //! Where the songs come from, and what oriel remembers about them.
 //!
 //! * Windows with the audio-player app: `%APPDATA%\audio-player\library.json` (+ its playlists, covers\ and
-//!   lyrics\). That app owns the file and rewrites it, so oriel only ever *reads* it — exactly like nest did.
+//!   lyrics\). That app owns the file and rewrites it, so oriel only ever *reads* it.
 //! * Anywhere else: scan `[music] folders` from the config, or the OS music folder, for audio files.
 //!
 //! oriel's own play counts, volume, shuffle and repeat live in `data_dir()/music.json`; tags read from scanned
@@ -458,7 +458,7 @@ pub fn parse_lrc(text: &str) -> Lyrics {
 }
 
 /// YouTube-style titles ("Artist - Song (Official Video)") -> (song, artist), for display and lyrics search.
-/// Same rules as nest's clean_title.
+/// Tidies a song title (the same rules everywhere titles are shown).
 pub fn clean_title(t: &Track) -> (String, String) {
     let mut title = t.title.clone();
     let mut artist = t.artist.clone();

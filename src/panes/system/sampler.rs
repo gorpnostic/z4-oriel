@@ -438,8 +438,8 @@ fn disk_label(mount: &Path) -> String {
 }
 
 // ------------------------------------------------------------------ Windows process snapshot
-// NtQuerySystemInformation(SystemProcessInformation): every process in one call, what Task Manager does (and what
-// nest's procsnap.py did). No extra crate: ntdll is always there.
+// NtQuerySystemInformation(SystemProcessInformation): every process in one call, what Task Manager does.
+// No extra crate: ntdll is always there.
 
 #[cfg(windows)]
 mod nt {

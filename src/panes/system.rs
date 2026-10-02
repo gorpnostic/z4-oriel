@@ -640,7 +640,7 @@ impl System {
             Line::from(vec![Span::styled(format!("{cur:5.1}% "), ui::bold_accent(t)), Span::styled(info, ui::muted(t))]),
             Line::styled(spark(s.cpu_hist.iter().copied(), w, Some(100.0)), ui::accent(t)),
         ];
-        // per-core mini bars, two rows like nest (more if the card is narrow)
+        // per-core mini bars, two rows (more if the card is narrow)
         let per_row = (w / 2).max(1);
         let rows = s.cores.len().div_ceil(2).min(per_row).max(1);
         for chunk in s.cores.chunks(rows).take(2) {

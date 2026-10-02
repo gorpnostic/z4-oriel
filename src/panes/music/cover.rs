@@ -1,5 +1,5 @@
 //! Cover art, drawn in half-block pixels (each cell a ▀ with fg = top pixel, bg = bottom pixel), and the cover's
-//! most vivid colour, which tints the player the way nest and the audio-player app do.
+//! most vivid colour, which tints the player the way the audio-player app does.
 
 use super::library::{self, Track};
 use image::{DynamicImage, imageops::FilterType};
@@ -60,7 +60,7 @@ fn pixels(img: &DynamicImage, w: u32, h: u32) -> Vec<[u8; 3]> {
     small.pixels().map(|p| p.0).collect()
 }
 
-/// nest's cover_accent: the most vivid colour, pushed bright enough to read on a dark terminal.
+/// The cover accent: the most vivid colour, pushed bright enough to read on a dark terminal.
 fn accent(img: &DynamicImage) -> Option<Color> {
     let small = img.resize_exact(24, 24, FilterType::Triangle).to_rgb8();
     let mut best: Option<(f32, f32, f32)> = None;

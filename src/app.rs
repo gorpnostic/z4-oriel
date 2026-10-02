@@ -32,7 +32,7 @@ struct Tab {
     zoom: bool,
 }
 
-/// The sidebar's app list, nest style: (app, icon, label, key).
+/// The sidebar's app list: (app, icon, label, key).
 pub const SIDEBAR: &[(&str, &str, &str, &str)] = &[
     // ── ai
     ("ai", "ai", "chat", "F1"),
@@ -583,7 +583,7 @@ impl App {
         self.tabs.iter().position(|t| t.id == id)
     }
 
-    /// Show an app's tab, creating it the first time (like nest's F1-F6).
+    /// Show an app's tab, creating it the first time (F1-F9).
     fn goto_app(&mut self, name: &'static str) {
         if let (true, Some(t)) = (name == "help", self.tabs.get(self.cur)) {
             let ctx = match t.app {
@@ -3309,6 +3309,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(demo);
         std::fs::create_dir_all(demo.join("chats")).unwrap();
         unsafe { std::env::set_var("ORIEL_DATA_DIR", std::path::absolute(demo).unwrap()) };
+        unsafe { std::env::set_var("ORIEL_DEMO_CWD", "~/projects/my-app") };
         let now = crate::panes::chat::demo_now();
         for (i, (title, ago)) in [("debounce a search box", 60.0), ("plan a 3 day trip to lisbon", 18000.0), ("explain rust lifetimes simply", 100000.0),
             ("regex for a uk postcode", 260000.0), ("fix the flaky login test", 300000.0), ("what should I name my cat", 800000.0)].iter().enumerate() {

@@ -1,4 +1,4 @@
-//! Shared drawing: the rounded frame with its title set into the border (the nest look), icons, the logo,
+//! Shared drawing: the rounded frame with its title set into the border, icons, the logo,
 //! and small helpers every pane uses.
 
 use crate::theme::Theme;
@@ -23,7 +23,7 @@ const ICONS: &[(&str, &str, &str)] = &[
     ("music", "\u{F075A}", "~"),   // md-music
     ("system", "\u{F061A}", "#"),  // md-chip
     ("files", "\u{F0256}", "/"),   // md-folder_outline
-    ("notes", "\u{F0387}", "="),   // md-note... (music_note in nest; notebook here)
+    ("notes", "\u{F0387}", "="),   // md-note (a notebook)
     ("storage", "\u{F02CA}", "%"), // md-harddisk
     ("home", "\u{F02DC}", "@"),    // md-home
     ("theme", "\u{F03D8}", "&"),   // md-palette
@@ -81,7 +81,7 @@ pub fn lead(name: &str) -> String {
     if g.is_empty() { String::new() } else { format!("{g} ") }
 }
 
-/// The nest-style frame: rounded hairline border, bold title set into the top edge, optional subtitle in the
+/// The frame: rounded hairline border, bold title set into the top edge, optional subtitle in the
 /// bottom-right. Returns the inner rect.
 pub fn frame(f: &mut Frame, area: Rect, title: &str, subtitle: Option<&str>, focused: bool, t: &Theme) -> Rect {
     let border = if focused { t.accent } else { t.frame };
@@ -181,7 +181,7 @@ pub fn human_bytes(n: u64) -> String {
 }
 
 // ------------------------------------------------------------------ logo
-// Omarchy-style block letters (from nest's font.py: 8 rows, 3-wide stems).
+// Omarchy-style block letters (8 rows, 3-wide stems).
 const O: [&str; 8] = ["  ▄█████▄ ", " ███   ███", " ███   ███", " ███   ███", " ███   ███", " ███   ███", " ███   ███", "  ▀█████▀ "];
 const R: [&str; 8] = ["  ▄███████", " ███   ███", " ███   ███", "▄███▄▄▄██▀", "▀███▀▀▀▀  ", "██████████", " ███   ███", " ███   █▀ "];
 const I: [&str; 8] = [" ▄█▄", " ███", " ███", " ███", " ███", " ███", " ███", " █▀ "];

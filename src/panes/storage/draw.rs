@@ -36,7 +36,7 @@ fn col(title: &'static str, w: u16) -> Col {
     Col { title, w, right: false }
 }
 
-/// A nest DataTable: bold header, one line per row, the selected row highlighted, scrolled to keep it in view.
+/// A data table: bold header, one line per row, the selected row highlighted, scrolled to keep it in view.
 /// Returns the body rect (for mouse hits).
 fn table(f: &mut Frame, r: Rect, cols: &[Col], rows: &[Row], sel: Option<usize>, off: &mut usize, focused: bool, t: &Theme) -> Rect {
     if r.height < 2 || r.width < 4 {

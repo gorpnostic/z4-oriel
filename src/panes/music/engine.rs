@@ -31,7 +31,7 @@ impl Repeat {
             Repeat::All => "all",
         }
     }
-    /// nest's order: off -> this song -> whole list -> off.
+    /// The order: off -> this song -> whole list -> off.
     pub fn next(self) -> Repeat {
         match self {
             Repeat::Off => Repeat::One,
@@ -484,7 +484,7 @@ fn open(t: &Track) -> Result<(Dec, f64), String> {
     Ok((dec, dur))
 }
 
-/// Perceptual-ish volume curve (nest used volume ** 1.6).
+/// Perceptual-ish volume curve (volume ** 1.6).
 fn curve(v: f32) -> f32 {
     v.clamp(0.0, 1.0).powf(1.6)
 }
@@ -556,7 +556,7 @@ impl<S: Source> Source for Tap<S> {
 }
 
 // ---------------------------------------------------------------- spectrum
-/// 0..1 levels per band (log-spaced 40 Hz – 16 kHz) of the last 1024 samples, nest's scaling.
+/// 0..1 levels per band (log-spaced 40 Hz – 16 kHz) of the last 1024 samples.
 pub fn spectrum(samples: &[f32], rate: u32, bands: usize) -> Vec<f32> {
     const N: usize = 1024;
     if samples.len() < N {

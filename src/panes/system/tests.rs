@@ -11,7 +11,7 @@ const NAMES: [&str; 14] = ["System", "Registry", "smss.exe", "csrss.exe", "winin
 /// Parent (index into the process list) of each of the first 14 processes.
 const PARENT: [Option<usize>; 14] = [None, Some(0), Some(0), None, None, Some(4), Some(4), Some(5), Some(3), Some(12), Some(13), Some(13), None, Some(12)];
 
-/// A fixed, nest-like machine so snapshots are deterministic.
+/// A fixed, made-up machine so snapshots are deterministic.
 fn fake_snap() -> Snap {
     let wave = |n: usize, f: &dyn Fn(usize) -> f64| -> VecDeque<f64> { (0..n).map(f).collect() };
     let pid = |i: usize| 4 + i as u32 * 4;

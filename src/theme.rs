@@ -1,6 +1,6 @@
 //! Colour themes. A theme sets a handful of colours; background and body text come from the terminal itself
 //! (Color::Reset), so oriel looks native in any terminal. Three kinds:
-//!   * built-in palettes (ported from nest)
+//!   * built-in palettes
 //!   * "terminal": ANSI colours only, so it follows whatever theme the terminal has
 //!   * "omarchy": read from ~/.config/omarchy/current/theme and live-reloaded when you switch Omarchy themes
 //!   * your own: `themes/<name>.toml` next to config.toml, made in the themes app (or by hand), live-reloaded

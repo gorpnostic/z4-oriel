@@ -1,4 +1,4 @@
-//! files: nest's files app. The folder on the left (folders first, icons by type), a live preview of whatever is
+//! files: the files app. The folder on the left (folders first, icons by type), a live preview of whatever is
 //! highlighted on the right: folders get a summary + their README, text/code its contents with light syntax
 //! colouring, images a half-block pixel picture. Places (home, desktop, ..., drives) live in the sidebar.
 //!
@@ -507,7 +507,7 @@ impl Files {
                 f.render_widget(Paragraph::new(Span::styled(right, ui::muted(t))), Rect { x: r.right().saturating_sub(rw), width: rw, ..rr });
             }
             if on {
-                // highlight just the name, like nest's tree cursor
+                // highlight just the name, like a tree cursor
                 let x0 = if n == 0 { r.x + 2 } else { r.x + 6 };
                 let x1 = (x0 + hl_w as u16 + 1).min(r.right());
                 let buf = f.buffer_mut();
@@ -749,7 +749,7 @@ impl Pane for Files {
             vec![("enter", "open"), ("/", "filter"), ("e", "edit"), ("n", "new"), ("R", "rename"), ("d", "delete"), ("c/x", "claude/codex here"), ("t", "terminal here"), ("a", "ask chat"), ("o", &os), ("p", "copy path"), (".", "hidden"), ("backspace", "up")]
         };
         let body = ui::hint_line(f, area, &hints, t);
-        let body = Rect { height: body.height.saturating_sub(1), ..body }; // a gap above the hints, like nest
+        let body = Rect { height: body.height.saturating_sub(1), ..body }; // a gap above the hints
         if body.width < 50 {
             // narrow: one or the other
             if self.focus_preview {
