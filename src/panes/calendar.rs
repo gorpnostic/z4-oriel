@@ -552,6 +552,9 @@ impl Pane for Calendar {
 }
 
 #[cfg(test)]
+mod qa_tools;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::testkit::Kit;

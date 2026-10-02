@@ -1208,4 +1208,6 @@ impl Pane for System {
 }
 
 #[cfg(test)]
+mod qa_tools;
+#[cfg(test)]
 mod tests;

@@ -15,6 +15,8 @@ mod qa_keys;
 mod scan;
 mod sys;
 #[cfg(test)]
+mod qa_tools;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 pub(crate) mod qa_sizes;

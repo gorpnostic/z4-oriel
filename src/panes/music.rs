@@ -1127,6 +1127,9 @@ impl Pane for Music {
 }
 
 #[cfg(test)]
+mod qa_tools;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::testkit::Kit;
