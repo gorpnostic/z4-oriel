@@ -31,6 +31,8 @@ mod review;
 mod qa_keys;
 #[cfg(test)]
 mod qa_data;
+#[cfg(test)]
+mod qa_agents;
 mod roster;
 mod run;
 mod store;
