@@ -48,6 +48,9 @@ switch to plain ones.
    the work between worker AIs. Press `w` to watch them, then `d` to review the result and `m` to merge it.
    [More on lead mode ↓](#lead-mode-a-team-of-agents)
 5. **Stuck? Press `F10`.** The help screen lists every key and command by topic. It opens on the app you were in.
+   Every setting is in one place too: `alt ,` opens **settings**.
+
+Next time, `oriel` opens where you left off: your tabs, splits and chats come back.
 
 <p align="center">
   <img src="docs/screenshot-welcome.png" width="49%" alt="the first-run setup">
@@ -61,8 +64,8 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | | App | What it does |
 |---|---|---|
 | | **ai** | |
-| F1 | **chat** | Chat with Claude Code, Codex, Ollama, any OpenAI-compatible server, or the Anthropic API. With coding agents you see everything as it happens: what they say and think, every file read, edit (as a diff) and command with its output and running time, and their todo list ticking off. Type while they work to queue a message. Chats are saved in the sidebar. |
-| F2 | **agents** | Run a team of coding agents on one goal (**lead mode**), or your own tasks: mark several and run them together, all at once or one after another, with priorities, dependencies and budgets. Each agent works in its own copy of the repo, and finished work is merged safely one piece at a time. |
+| F1 | **chat** | Chat with Claude Code, Codex, Ollama, any OpenAI-compatible server, or the Anthropic API. With coding agents you see everything as it happens: what they say and think, every file read, edit (as a diff) and command with its output and running time, and their todo list ticking off. Type while they work to queue a message. Before each turn oriel snapshots the folder, so `/diff` shows what a turn changed and `/undo` or `/rewind` puts it back. `/check cargo test` runs your check after every turn and sends failures back until it passes. Chats are saved in the sidebar. |
+| F2 | **agents** | Run a team of coding agents on one goal (**lead mode**), or your own tasks: mark several and run them together, all at once or one after another, with priorities, dependencies and budgets. Each agent works in its own copy of the repo, and finished work is merged safely one piece at a time. Review diffs line by line, ask another vendor's AI for a second opinion, approve the lead's plan before it starts, and save a run as a template. |
 | F3 | **your AIs** | Installs and signs in to 12 coding CLIs with one key: Claude Code, Codex, Kimi, OpenCode, Aider, Copilot, Cursor, Qwen, Amp, Droid, Crush and Goose. It also shows your real plan limits with reset countdowns, tokens and cost per day, and has token-saver presets. |
 | | **tools** | |
 | F4 | **music** | Plays your music folder: cover art, a live spectrum, synced lyrics, playlists, shuffle and repeat. `F12` plays/pauses from any app. |
@@ -72,7 +75,9 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | | **calendar** | A month at a glance and the day's plans. `a` adds one ("2pm dentist"); plans with a time pop up as a reminder from any app. |
 | F8 | **storage** | Frees up space. It finds what's safe to clean (caches, temp files, trash), shows the biggest folders, and uninstalls apps. It also has a catalog of 60+ popular apps (OBS, Steam, Minecraft launchers, VPNs, AI apps, dev tools, browsers…) that install with one key, using whichever package manager your system has: winget, pacman/AUR, apt, flatpak or npm. Nothing is deleted or installed without asking. |
 | F9 | **terminal** | A real shell. Split it next to anything. |
+| | **search** | `alt r` searches every AI session on your computer: oriel's chats and agent runs, Claude Code, Codex and Kimi. It's a plain local word search, so it's instant and nothing leaves your machine. `r` carries a session on in chat. |
 | | **alerts** | The event center: agents finishing or needing you, approvals, failed builds, calendar reminders, finished installs, memory and AI-usage warnings, new versions. The bell at the bottom of the sidebar counts the new ones, and you get a desktop notification when oriel isn't the window you're in. |
+| | **settings** | Every setting in one place (`alt ,`), by section, each with its default and what it does. Changes apply at once. |
 | | **themes** | Make your own theme: every colour with a live preview. (Bottom of the sidebar, with help.) |
 | F10 | **help** | Every key, command and how-to, by topic. |
 
@@ -101,11 +106,17 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | use the real Claude Code or Codex screen | run `claude` or `codex` in a terminal pane. Its tab gets status dots (below) |
 | work in another folder | start oriel there, or `/cwd <folder>` for one chat, or `o` in agents to pick a repo |
 | run several coding tasks at once and merge them | in agents (`F2`), add tasks with `n`, mark them with `space`, press `enter`, then `p` (all at once) or `s` (one after another). Their work lands in one new branch; `d` reviews it, `m` merges it. `+`/`-` sets a task's priority, and the task form takes "after" (what it waits for) and a budget |
-| see what happened while I was away | the bell (**alerts**) at the bottom of the sidebar |
+| see what happened while I was away | the bell (**alerts**) at the bottom of the sidebar, or `alt j` to jump straight to what needs you |
+| see or undo what the AI changed | `/diff` (everything this chat changed), `/diff last` (the last turn), `/undo` (put the folder back before the last turn), `/rewind` (pick a turn). Only files change back; the chat stays |
+| make the AI keep going until the tests pass | `/check cargo test` (or any command). After each turn oriel runs it and sends a failure back, until it passes or stops making progress. `/verify` runs it once |
+| carry on in a fresh chat when this one is long | `/handoff`. The AI writes a handoff card and a new chat starts from it; `/handoff codex` hands it to another AI. The box shows how full the context is (`ctx 38%`) |
+| find something from an old session | `alt r`, or `/recall <words>` in chat. `p:<project>`, `ai:codex` and `since:30d` narrow it down |
+| reuse a prompt | `ctrl+r` in chat searches every prompt you've sent. In agents, `ctrl+t` saves and inserts prompts (`/p <name>` in chat) |
+| change a setting | `alt ,` (or `/settings perms` to jump to one). `r` resets a setting to its default |
 | update oriel, or undo an update | `oriel update` (or the **update to …** row at the bottom of the sidebar, or `alt p` → updates) shows what's new and updates in place. `oriel rollback` goes back to the version before |
 | install another AI tool | `F3` → `2` → `enter` on it |
 | save tokens | `F3` → `4` (token saver) → pick a preset → `enter` |
-| change the theme | `alt p` → type `theme`, or `/theme` in chat. Make your own in **themes** (`/theme edit`) |
+| change the theme | `alt p` → type `theme`, `/theme` in chat, or settings. Make your own in **themes** (`/theme edit`) |
 | find anything else | `alt p` searches every app, action and theme, and `F10` explains them |
 
 ## Keys
@@ -116,6 +127,9 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | `alt p` | the palette: every app, action and theme, searchable |
 | `alt n` | a terminal beside the current pane |
 | `alt t` · `alt 1-9` | new tab · go to one of your tabs |
+| `alt j` · `alt 0` | jump to what needs you · the next tab that needs you or finished |
+| `alt r` | search every AI session |
+| `alt ,` | settings |
 | `alt ←↑↓→` | move between panes (`alt shift ←↑↓→` resizes, or drag a divider) |
 | `alt z` · `alt w` · `alt s` | zoom a pane · close it · hide the sidebar |
 | double-click a tab | rename it (or right-click → rename) |
@@ -151,7 +165,13 @@ supported agent. It splits the goal into small tasks and hands them to **workers
    starts the run.
 3. `w` watches the lead and every worker live, side by side. `enter` on a card opens that agent's full
    transcript, and `t` takes a worker over in a real terminal.
-4. When it's done, `d` shows the combined diff and `m` merges it into your branch. oriel never pushes.
+4. When it's done, `d` shows the combined diff and `m` merges it into your branch. oriel never pushes. In the diff,
+   `c` comments on a line (the comments go back to the lead), and `V` asks another vendor's AI for a second
+   opinion. `c` on the lead panel gives feedback on a finished run, and the lead carries on.
+
+Turn on **approve the plan first** in the form to see the lead's tasks as cards before any worker starts. `T`
+("try it") opens a terminal in the run's checkout, ready to start your dev server. `S` saves a run as a template
+and `W` runs one again.
 
 Tasks can have a priority (low, normal, high, urgent) and wait for other tasks; when several are ready, the
 highest starts first. You can also skip the lead: mark your own tasks with `space` and press `enter` to run them
@@ -165,6 +185,11 @@ How it keeps workers from breaking each other:
 - A watchdog notices a worker that's stuck or looping, nudges it, and restarts or reassigns the task if needed.
 - The lead sees your plan limits and sends simple work to cheaper models. The run stops starting new work when its
   budget is spent.
+
+A repo can describe its own setup in `.oriel/project.toml`: `setup = "pnpm install"` runs in every new worktree,
+`copy = [".env"]` brings untracked files along, and `run = "pnpm dev --port $ORIEL_PORT"` is what "try it" starts.
+Before merging, oriel also checks whether a worker switched tests off (`#[ignore]`, skip, removed asserts) and
+parks that task until you decide.
 
 **The roster** is the list of workers the lead can use. Press `R` in agents to edit it. By default it's built from
 the AIs you have installed. Each worker has an AI, a model, a cost tier (cheap, mid or premium), what it's good at,
@@ -232,14 +257,15 @@ hand works too: save it and oriel recolours. To share a theme, send the file.
 
 ## Configuration
 
-`oriel --config` prints where the config file is: `~/.config/oriel/config.toml`, or `%APPDATA%\oriel\config.toml`
-on Windows. The setup and the in-app commands write it for you, and every setting is optional:
+The **settings** app (`alt ,`) changes all of it. `oriel --config` prints where the file is:
+`~/.config/oriel/config.toml`, or `%APPDATA%\oriel\config.toml` on Windows. Editing it by hand works too (oriel
+picks the change up), and every setting is optional:
 
 ```toml
 theme = "ultra"
 shell = "zsh"                 # terminal panes; default: $SHELL / PowerShell
 prefix = "ctrl+space"         # tmux-style prefix key
-startup = "ai"                # app to open on start (also: oriel music, oriel agents…)
+startup = "last"              # where you left off; or an app: "ai", "agents"… (oriel music opens one just once)
 notes_folder = "~/notes"
 
 [ai]
