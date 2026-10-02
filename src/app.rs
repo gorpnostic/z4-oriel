@@ -431,7 +431,8 @@ impl App {
             app.goto_app("search"); // `oriel search`: the same tab alt r goes to, not a second one
         } else {
             let first = panes::open(&startup, &app.config);
-            if first.is_none() {
+            // an empty startup is unset: the home screen, nothing to say about it
+            if first.is_none() && !startup.trim().is_empty() {
                 let why = if panes::known(&startup) { "isn't installed" } else { "isn't an app oriel has" };
                 app.notify(format!("{startup} {why}: the home screen instead"));
             }
@@ -444,7 +445,7 @@ impl App {
     /// config.toml didn't parse at start (main.rs): say so. Settings still change for this session, but nothing
     /// is written over the file until it's fixed (it's re-read as soon as it is).
     pub fn config_error(&mut self, e: String) {
-        self.notify(format!("⚠ {e} · running on defaults, and not saving over it"));
+        self.notify(format!("⚠ {e} · running on the rest of it, and not saving over it"));
         config::set_broken(Some(e)); // nothing is written until it parses; settings shows why
     }
 
@@ -3203,7 +3204,7 @@ fn watch_config(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
     if cfg!(test) {
         return None;
     }
-    let dir = config::dir();
+    let dir = config::path().parent()?.to_path_buf(); // a profile (ORIEL_DATA_DIR) keeps its own
     std::fs::create_dir_all(&dir).ok()?;
     let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         // config.toml itself (a save lands as config.toml.tmp renamed over it), not the themes folder beside it

@@ -83,6 +83,25 @@ fn stage(app: &App) -> String {
     }
 }
 
+/// The first-run screens as App::with_start puts them up when the first-run marker is missing (gated off under
+/// test): the welcome, then the setup pages from the current config. `start_tour` (palette "take the tour",
+/// `oriel --tour`) replays only the tour.
+fn first_run(app: &mut App) {
+    app.onboard = Some(crate::onboard::Onboard::new(&app.theme.name, &app.config));
+}
+
+/// Walk the setup with enter (y on icons) until `page` is up; panics rather than spin if it never comes.
+fn walk_to(app: &mut App, page: &str) {
+    for _ in 0..10 {
+        if stage(app) == page {
+            return;
+        }
+        let code = if stage(app) == "icons" { KeyCode::Char('y') } else { KeyCode::Enter };
+        key(app, code);
+    }
+    panic!("never reached the {page} page: on {}", stage(app));
+}
+
 /// Enter through the setup pages (y on icons) until the tour starts.
 fn to_tour(app: &mut App) {
     for _ in 0..10 {
@@ -99,10 +118,16 @@ fn to_tour(app: &mut App) {
 // ------------------------------------------------------------------ construction
 
 /// App::new opens whatever `startup` names: an app from the sidebar, the home screen, or home for anything it
-/// doesn't know. Tests never get the first-run screen by themselves (it's gated off under cfg(test)).
+/// doesn't know (saying so: a typo in config.toml shouldn't look like a broken app). Tests never get the first-run
+/// screen by themselves (it's gated off under cfg(test)).
 #[test]
 fn app_new_opens_the_startup_choice() {
-    for (startup, app_tab, title) in [("home", None, "home"), ("", None, "home"), ("no-such-app", None, "home"), ("help", Some("help"), "")] {
+    for (startup, app_tab, title, notice) in [
+        ("home", None, "home", None),
+        ("", None, "home", None),
+        ("no-such-app", None, "home", Some("no-such-app isn't an app oriel has: the home screen instead")),
+        ("help", Some("help"), "", None),
+    ] {
         let mut t = new_app("new-startup", |c| c.startup = startup.into());
         let a = &mut t.app;
         assert_eq!(a.tabs.len(), 1, "startup {startup:?}: one tab");
@@ -112,7 +137,12 @@ fn app_new_opens_the_startup_choice() {
             assert_eq!(a.panes[&id].title(), title, "startup {startup:?} opens the home screen");
         }
         assert!(a.onboard.is_none(), "no first-run screen under test");
-        assert!(a.notices.is_empty() && a.palette.is_none() && !a.quit);
+        let notices: Vec<&str> = a.notices.iter().map(|n| n.text.as_str()).collect();
+        match notice {
+            Some(want) => assert!(notices.len() == 1 && notices[0].contains(want), "startup {startup:?}: {notices:?}"),
+            None => assert!(notices.is_empty(), "startup {startup:?}: {notices:?}"),
+        }
+        assert!(a.palette.is_none() && !a.quit);
         assert_eq!(a.theme.name, "ultra");
         let (s, _) = shot(a, 120, 36);
         assert!(s.contains("oriel"), "startup {startup:?} draws:\n{s}");
@@ -126,15 +156,16 @@ fn app_new_opens_the_startup_choice() {
 
 // ------------------------------------------------------------------ the setup through the app
 
-/// Each setup page writes its choice into the app's config (what config::save would write), the theme page
-/// previews live, and finishing leaves the welcome notice. The app itself stays where it was.
+/// Each setup page writes the choice you change into the app's config (what config::save would write) and leaves
+/// the rest as it was, the theme page previews live, and finishing leaves the welcome notice. The app itself stays
+/// where it was.
 #[test]
 fn app_setup_saves_each_choice() {
     let mut t = new_app("app-setup", |_| {});
     let music = t.cfg.music.folders[0].clone();
     let a = &mut t.app;
     let tabs_before = a.tabs.len();
-    a.start_tour();
+    first_run(a);
     assert_eq!(stage(a), "welcome");
     let (s, _) = shot(a, 150, 42);
     assert!(s.contains("take the tour") && s.contains("a window onto everything"), "{s}");
@@ -166,11 +197,11 @@ fn app_setup_saves_each_choice() {
     assert_eq!(a.config.notes_folder, notes);
 
     assert_eq!(stage(a), "defaults");
-    key(a, KeyCode::Right); // chat -> agents
+    key(a, KeyCode::Right); // home (what cfg_in saved) -> terminal
+    key(a, KeyCode::Down);
+    key(a, KeyCode::Right); // OpenAI (the first AI with a key; nothing saved) -> Anthropic
     key(a, KeyCode::Enter);
-    assert_eq!(a.config.startup, "agents");
-    let avail = crate::panes::chat::providers::available(&t.cfg.ai);
-    assert_eq!(a.config.ai.provider, avail.first().map(|s| s.to_string()).unwrap_or_default());
+    assert_eq!((a.config.startup.as_str(), a.config.ai.provider.as_str()), ("terminal", "anthropic"));
 
     assert_eq!(stage(a), "ais");
     key(a, KeyCode::Enter);
@@ -186,7 +217,7 @@ fn app_setup_saves_each_choice() {
 fn app_esc_on_theme_page_restores_the_look() {
     let mut t = new_app("app-theme-esc", |c| c.theme = "ocean".into());
     let a = &mut t.app;
-    a.start_tour();
+    first_run(a);
     key(a, KeyCode::Enter);
     key(a, KeyCode::Down);
     key(a, KeyCode::Down);
@@ -202,14 +233,11 @@ fn app_esc_on_theme_page_restores_the_look() {
 fn app_setup_pages_are_modal() {
     let mut t = new_app("app-modal", |_| {});
     let a = &mut t.app;
-    a.start_tour();
+    first_run(a);
     let (tabs, cur) = (a.tabs.len(), a.cur);
     for page in ["welcome", "theme", "icons", "music", "notes", "defaults", "ais"] {
         // walk to the page (from the welcome: enter, then y/enter)
-        while stage(a) != page {
-            let code = if stage(a) == "icons" { KeyCode::Char('y') } else { KeyCode::Enter };
-            key(a, code);
-        }
+        walk_to(a, page);
         let _ = shot(a, 150, 42);
         key_mod(a, KeyCode::Char('p'), KeyModifiers::ALT);
         key_mod(a, KeyCode::Char('t'), KeyModifiers::ALT);
@@ -231,10 +259,10 @@ fn app_setup_pages_are_modal() {
     }
 }
 
-/// Replaying the setup (palette → take the tour, oriel --tour) and pressing enter on the music page must not
-/// throw away the other music folders in config (the page only shows the first).
+/// The setup over a config that has it set already (a new profile, a deleted first-run marker): pressing enter
+/// on the music page must not throw away the other music folders in config (the page only shows the first), and
+/// a new folder replaces only the first.
 #[test]
-#[ignore = "fails: onboard.rs:283 shows only folders[0] and app.rs:340-342 replaces the whole list with it on enter"]
 fn app_replaying_setup_keeps_every_music_folder() {
     let d = scratch("app-music-two");
     let second = d.join("more-music");
@@ -244,13 +272,22 @@ fn app_replaying_setup_keeps_every_music_folder() {
     let folders = t.cfg.music.folders.clone();
     assert_eq!(folders.len(), 2);
     let a = &mut t.app;
-    a.start_tour();
-    while stage(a) != "music" {
-        let code = if stage(a) == "icons" { KeyCode::Char('y') } else { KeyCode::Enter };
-        key(a, code);
-    }
+    first_run(a);
+    walk_to(a, "music");
     key(a, KeyCode::Enter); // keep what it shows
     assert_eq!(a.config.music.folders, folders, "enter on an untouched music page dropped a library folder");
+    // back to the music page and pick another folder: it takes the first one's place, the second stays
+    key(a, KeyCode::BackTab);
+    assert_eq!(stage(a), "music");
+    key_mod(a, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    let other = d.join("other-music");
+    std::fs::create_dir_all(&other).unwrap();
+    let other = other.to_string_lossy().to_string();
+    for c in other.chars() {
+        key(a, KeyCode::Char(c));
+    }
+    key(a, KeyCode::Enter);
+    assert_eq!(a.config.music.folders, vec![other, second]);
 }
 
 // ------------------------------------------------------------------ the tour through the app
@@ -335,20 +372,20 @@ fn app_tour_end_to_end() {
 fn app_welcome_and_tour_clicks() {
     let mut t = new_app("app-clicks", |_| {});
     let a = &mut t.app;
-    a.start_tour();
+    first_run(a);
     let (_, buf) = shot(a, 150, 42);
     let (x, y) = find(&buf, "enter  take the tour").expect("tour button");
     click(a, MouseButton::Left, x + 3, y);
     assert_eq!(stage(a), "theme", "the welcome's tour button starts the setup");
-    a.start_tour();
+    first_run(a);
     let (_, buf) = shot(a, 150, 42);
     let (x, y) = find(&buf, "s  skip").expect("skip button");
     click(a, MouseButton::Left, x + 1, y);
     assert_eq!(stage(a), "off", "skip ends it");
     assert!(a.notices.iter().any(|n| n.text.contains("welcome to oriel")));
 
-    a.start_tour();
-    to_tour(a);
+    a.start_tour(); // a replay: straight to the tour
+    assert_eq!(stage(a), "tour 0");
     let (_, buf) = shot(a, 150, 42);
     let (x, y) = find(&buf, "F10  skip step").expect("skip-step button");
     click(a, MouseButton::Left, x + 1, y);
@@ -363,7 +400,6 @@ fn app_welcome_and_tour_clicks() {
 
 /// The tour box floats over the app, so a click on its text (not a button) shouldn't land in the pane under it.
 #[test]
-#[ignore = "fails: onboard.rs:474 returns is_modal() (false in the tour) for clicks inside the box, so they reach the pane below"]
 fn app_click_on_tour_box_text_stays_in_the_box() {
     let mut t = new_app("app-box-click", |_| {});
     let a = &mut t.app;
@@ -378,11 +414,14 @@ fn app_click_on_tour_box_text_stays_in_the_box() {
     assert!(!started_selection && a.ctx.is_none() && a.ctx_seen == ctx_before, "a click on the tour box's text went to the pane underneath (selection: {started_selection}, menu: {})", a.ctx.is_some());
 }
 
-/// "Replay this tour from the palette (take the tour)": the palette item restarts the welcome, even mid-tour.
+/// "Replay this tour from the palette (take the tour)": the palette item starts the tour over from its first step,
+/// even mid-tour, and goes straight to it (the setup pages are the first run's; replaying them only risks
+/// resetting what you've set since).
 #[test]
 fn app_palette_take_the_tour() {
     let mut t = new_app("app-palette-tour", |_| {});
     let a = &mut t.app;
+    let config = a.config.clone();
     key_mod(a, KeyCode::Char('p'), KeyModifiers::ALT);
     for c in "take the tour".chars() {
         key(a, KeyCode::Char(c));
@@ -390,16 +429,23 @@ fn app_palette_take_the_tour() {
     let (s, _) = shot(a, 150, 42);
     assert!(s.contains("take the tour"), "{s}");
     key(a, KeyCode::Enter);
-    assert_eq!(stage(a), "welcome");
+    assert_eq!(stage(a), "tour 0");
     assert!(a.palette.is_none());
-    // again from inside the tour (the palette is allowed there)
-    to_tour(a);
+    let (s, _) = shot(a, 150, 42);
+    assert!(s.contains("tour · 1/14 · switch apps") && !s.contains("setup ·"), "{s}");
+    // again from inside the tour (the palette is allowed there), a few steps in
+    key(a, KeyCode::F(10));
+    key(a, KeyCode::F(10));
+    settle(a);
+    assert_eq!(stage(a), "tour 2");
     key_mod(a, KeyCode::Char('p'), KeyModifiers::ALT);
     for c in "take the tour".chars() {
         key(a, KeyCode::Char(c));
     }
     key(a, KeyCode::Enter);
-    assert_eq!(stage(a), "welcome", "take the tour mid-tour starts over");
+    settle(a);
+    assert_eq!(stage(a), "tour 0", "take the tour mid-tour starts over");
+    assert_eq!(a.config, config, "replaying the tour changed no setting");
 }
 
 /// The whole app with every onboarding screen over it draws at any size without panicking.
@@ -408,7 +454,7 @@ fn app_draws_onboarding_at_any_size() {
     let mut t = new_app("app-sizes", |_| {});
     let a = &mut t.app;
     let mut fails = vec![];
-    a.start_tour();
+    first_run(a);
     let mut screens = 0;
     loop {
         for (w, h) in [(150u16, 42u16), (80, 24), (60, 16), (40, 12), (20, 6), (8, 3), (1, 1)] {
@@ -443,7 +489,6 @@ fn app_draws_onboarding_at_any_size() {
 /// The icons page says: pick plain text now, "install a Nerd Font and switch back from the palette later". The
 /// palette's switch has to stick like the setup's choice does, or the next launch is back to plain text.
 #[test]
-#[ignore = "fails: app.rs:1034-1038 Cmd::Icons flips ui::NERD but never sets config.plain_icons or saves"]
 fn palette_icon_switch_is_remembered() {
     let mut t = new_app("app-icons", |c| c.plain_icons = false);
     let a = &mut t.app;

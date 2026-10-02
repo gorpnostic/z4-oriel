@@ -218,8 +218,10 @@ fn qa_cli_config_prints_the_config_path() {
     assert_eq!(o.stdout.lines().count(), 1, "{o:?}");
     let p = PathBuf::from(o.stdout.trim());
     assert!(p.is_absolute(), "{}", p.display());
-    assert!(p.ends_with(Path::new("oriel").join("config.toml")), "{}", p.display());
-    assert_eq!(p, crate::config::path(), "the binary and the code disagree on where the config is");
+    // run() gives the binary a profile (ORIEL_DATA_DIR = d), and a profile has its own config.toml: the one its
+    // first-run setup saves to, never the main one
+    assert_eq!(p, d.join("config.toml"), "--config names the profile's config");
+    assert!(crate::config::path().ends_with(Path::new("oriel").join("config.toml")), "without a profile: the main one");
     assert_eq!(names(&d), vec!["tmp"], "--config wrote into the data folder");
 }
 
