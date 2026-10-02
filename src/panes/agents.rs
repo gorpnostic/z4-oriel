@@ -27,6 +27,8 @@ pub mod prompts;
 #[cfg(test)]
 mod research_tests;
 mod review;
+#[cfg(test)]
+mod qa_keys;
 mod roster;
 mod run;
 mod store;

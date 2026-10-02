@@ -14,6 +14,8 @@ mod session;
 mod recall;
 #[cfg(test)]
 mod qa_sizes;
+#[cfg(test)]
+mod qa_keys;
 mod testkit;
 mod theme;
 mod ui;

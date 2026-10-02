@@ -3252,6 +3252,9 @@ fn debounced(tx: Sender<Event>, quiet: Duration) -> Sender<()> {
 }
 
 #[cfg(test)]
+mod qa_keys;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};

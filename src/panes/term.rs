@@ -1091,3 +1091,6 @@ mod tests {
         assert!(t.open_now().is_empty() && t.prompt.is_empty());
     }
 }
+
+#[cfg(test)]
+mod qa_keys;

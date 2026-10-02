@@ -11,6 +11,8 @@ mod md;
 pub mod providers;
 mod review;
 pub(crate) mod store;
+#[cfg(test)]
+mod qa_keys;
 
 /// A diff line's background for a theme (line tint, changed-word tint): the themes app previews with it.
 pub(crate) use activity::band as diff_band;

@@ -11,6 +11,8 @@
 //! thread only swaps in the latest results and draws them.
 
 mod probes;
+#[cfg(test)]
+pub(crate) mod qa_keys;
 mod sampler;
 mod views;
 
