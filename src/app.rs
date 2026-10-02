@@ -4919,3 +4919,7 @@ mod tests {
         assert!(app.term_focused && term_focused());
     }
 }
+
+#[cfg(test)]
+#[path = "qa_sizes_app.rs"]
+mod qa_sizes_app;

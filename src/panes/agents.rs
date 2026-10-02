@@ -34,6 +34,8 @@ mod stream;
 mod templates;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod qa_sizes;
 mod view;
 #[cfg(test)]
 mod workflow_tests;

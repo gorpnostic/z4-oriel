@@ -21,6 +21,8 @@ mod saver;
 mod tests;
 pub(crate) mod usage;
 pub(crate) mod util;
+#[cfg(test)]
+pub(crate) mod qa_sizes;
 
 #[cfg(not(test))]
 use crate::pane::{Action, Place};
