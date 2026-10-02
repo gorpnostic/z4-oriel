@@ -144,7 +144,8 @@ fn put_app(app: &mut App, name: &'static str, p: Box<dyn Pane>) {
     let order = |a: Option<&str>| a.and_then(|n| SIDEBAR.iter().position(|s| s.0 == n)).unwrap_or(usize::MAX);
     let me = order(Some(name));
     let at = app.tabs.iter().position(|t| order(t.app) > me).unwrap_or(app.tabs.len());
-    app.tabs.insert(at, Tab { app: Some(name), name: None, root: Node::Leaf(id), focus: id, zoom: false });
+    let tid = app.tab_id();
+    app.tabs.insert(at, Tab { id: tid, app: Some(name), name: None, root: Node::Leaf(id), focus: id, zoom: false });
     if app.cur >= at {
         app.cur += 1;
     }
@@ -269,7 +270,7 @@ fn qa_sizes_app_resize_with_splits() {
 
 /// Was tab `i` listed in the sidebar on the last frame?
 fn listed(app: &App, i: usize) -> bool {
-    app.side_hits.iter().any(|(_, s)| matches!(s, SideHit::Tab(t) if *t == i))
+    app.side_hits.iter().any(|(_, s)| matches!(s, SideHit::Tab(t) if *t == app.tabs[i].id))
 }
 
 fn click(app: &mut App, kind: MouseEventKind, x: u16, y: u16) {
@@ -333,7 +334,7 @@ fn qa_sizes_app_selection_then_resize() {
         let _ = guard(|| click(&mut app, MouseEventKind::Up(MouseButton::Left), inner.right() - 3, inner.bottom() - 2)).map_err(|e| bad.push(problem("selection", "release", w, h, e)));
         // the "copied" toast covers frames on purpose
         let _ = shot_with(&mut app, "selection copied after resizing", w, h, &mut bad, false);
-        app.notice = None;
+        app.notices.clear();
         let _ = shot(&mut app, "selection, back to full size", 250, 70, &mut bad);
     }
     verdict(bad, KNOWN);
@@ -456,7 +457,7 @@ fn qa_sizes_app_rename_toast_prefix() {
                 bad.push(problem("toast", "frame", w, h, e));
             }
         }
-        app.notice = None;
+        app.notices.clear();
         app.prefix_armed = true;
         let _ = shot_with(&mut app, "prefix hint", w, h, &mut bad, false);
         app.prefix_armed = false;
@@ -546,7 +547,7 @@ fn tabs_sweep(dir: &std::path::Path, theme: &str, bad: &mut Vec<Problem>) {
         for &(w, h) in APP_SIZES {
             for side in [true, false] {
                 app.sidebar = side;
-                app.notice = None;
+                app.notices.clear();
                 let scen = format!("tab '{label}' ({theme}{})", if side { "" } else { ", no sidebar" });
                 let _ = shot(&mut app, &scen, w, h, bad);
             }
@@ -792,7 +793,7 @@ fn qa_sizes_bug_rename_moves_when_a_tab_closes() {
         press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
     }
     let first = at(&app, "first");
-    let (r, _) = *app.side_hits.iter().find(|(_, s)| matches!(s, SideHit::Tab(t) if *t == first)).expect("'first' listed");
+    let (r, _) = *app.side_hits.iter().find(|(_, s)| matches!(s, SideHit::Tab(t) if *t == app.tabs[first].id)).expect("'first' listed");
     click(&mut app, MouseEventKind::Down(MouseButton::Middle), r.x + 3, r.y);
     let b = draw(&mut app, 120, 40).unwrap();
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);

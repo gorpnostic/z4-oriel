@@ -81,7 +81,8 @@ fn ensure_stubs(app: &mut App, env: &Env) {
         let order = |a: Option<&str>| a.and_then(|n| SIDEBAR.iter().position(|s| s.0 == n)).unwrap_or(usize::MAX);
         let me = order(Some(name));
         let at = app.tabs.iter().position(|t| order(t.app) > me).unwrap_or(app.tabs.len());
-        app.tabs.insert(at, Tab { app: Some(name), name: None, root: Node::Leaf(id), focus: id, zoom: false });
+        let tid = app.tab_id();
+        app.tabs.insert(at, Tab { id: tid, app: Some(name), name: None, root: Node::Leaf(id), focus: id, zoom: false });
         if at <= app.cur && app.tabs.len() > 1 {
             app.cur += 1;
         }
@@ -166,7 +167,7 @@ fn vet_key(app: &App, env: &Env, k: &KeyEvent) -> bool {
     }
     if let (Some(p), KeyCode::Enter) = (&app.palette, k.code) {
         let m = App::palette_matches(p);
-        if let Some(Cmd::Open(name, _)) = m.get(p.sel).map(|&i| &p.items[i].1) {
+        if let Some(Cmd::Open(name, _)) = m.get(p.sel).map(|&i| &p.items[i].cmd) {
             if RISKY.contains(name) {
                 return false;
             }
@@ -351,6 +352,7 @@ fn describe(e: &Event) -> String {
         Event::Clipboard(id, got, _) => format!("Clipboard({id}, {got:?})"),
         Event::UpdateAvailable(v) => format!("UpdateAvailable({v})"),
         Event::Alert(k, s) => format!("Alert({k:?}, {s})"),
+        Event::ConfigFileChanged => "ConfigFileChanged".into(),
     }
 }
 
@@ -381,8 +383,8 @@ fn three_tabs() -> (App, Terminal<TestBackend>, Rect, Rect) {
     app.new_tab(Box::new(crate::panes::home::Home::new()));
     let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
     term.draw(|f| app.draw(f)).unwrap();
-    let last = app.tabs.len() - 1;
-    let find = |want: fn(&SideHit, usize) -> bool| app.side_hits.iter().find(|(_, h)| want(h, last)).map(|(r, _)| *r);
+    let last = app.tabs[app.tabs.len() - 1].id;
+    let find = |want: fn(&SideHit, u64) -> bool| app.side_hits.iter().find(|(_, h)| want(h, last)).map(|(r, _)| *r);
     let row = find(|h, l| matches!(h, SideHit::Tab(i) if *i == l)).expect("the last tab's row in the sidebar");
     let x = find(|h, l| matches!(h, SideHit::CloseTab(i) if *i == l)).expect("the last tab's × in the sidebar");
     (app, term, row, x)

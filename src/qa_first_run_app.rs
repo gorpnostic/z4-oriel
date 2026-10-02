@@ -112,7 +112,7 @@ fn app_new_opens_the_startup_choice() {
             assert_eq!(a.panes[&id].title(), title, "startup {startup:?} opens the home screen");
         }
         assert!(a.onboard.is_none(), "no first-run screen under test");
-        assert!(a.notice.is_none() && a.palette.is_none() && !a.quit);
+        assert!(a.notices.is_empty() && a.palette.is_none() && !a.quit);
         assert_eq!(a.theme.name, "ultra");
         let (s, _) = shot(a, 120, 36);
         assert!(s.contains("oriel"), "startup {startup:?} draws:\n{s}");
@@ -178,7 +178,7 @@ fn app_setup_saves_each_choice() {
     assert_eq!(a.tabs.len(), tabs_before, "the setup doesn't open anything: startup applies next launch");
     key(a, KeyCode::F(11));
     assert_eq!(stage(a), "off");
-    assert!(a.notice.as_ref().is_some_and(|n| n.0.contains("welcome to oriel")), "{:?}", a.notice.as_ref().map(|n| &n.0));
+    assert!(a.notices.iter().any(|n| n.text.contains("welcome to oriel")), "{:?}", a.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
 }
 
 /// Esc on the theme page puts back the look you had, and saves nothing.
@@ -326,7 +326,7 @@ fn app_tour_end_to_end() {
     expect(a, 13, "you're set");
     key(a, KeyCode::Enter);
     assert_eq!(stage(a), "off");
-    assert!(a.notice.as_ref().is_some_and(|n| n.0.contains("welcome to oriel")));
+    assert!(a.notices.iter().any(|n| n.text.contains("welcome to oriel")));
 }
 
 /// The welcome's buttons work through App::mouse (their rects come from the last draw), and during the tour a
@@ -345,7 +345,7 @@ fn app_welcome_and_tour_clicks() {
     let (x, y) = find(&buf, "s  skip").expect("skip button");
     click(a, MouseButton::Left, x + 1, y);
     assert_eq!(stage(a), "off", "skip ends it");
-    assert!(a.notice.as_ref().is_some_and(|n| n.0.contains("welcome to oriel")));
+    assert!(a.notices.iter().any(|n| n.text.contains("welcome to oriel")));
 
     a.start_tour();
     to_tour(a);

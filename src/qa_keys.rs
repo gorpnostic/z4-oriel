@@ -731,10 +731,9 @@ mod tests {
         }
         use crate::alerts::{self, Alert, Kind};
         {
-            let mut c = alerts::CENTER.lock().unwrap();
             let kinds = [Kind::AgentDone, Kind::NeedsYou, Kind::Approval, Kind::BuildFailed, Kind::Calendar, Kind::Download, Kind::Memory, Kind::Usage, Kind::Update];
             for i in 0..40 {
-                c.push(Alert {
+                alerts::push(Alert {
                     at: alerts::now() - i * 997,
                     kind: kinds[i as usize % kinds.len()],
                     text: format!("alert {i} {}", if i % 3 == 0 { "中文 🙂 a long one ".repeat(6) } else { String::new() }),
@@ -747,9 +746,8 @@ mod tests {
         mash_pane("alerts", Opts { side: false, ..Default::default() }, |_| panes::alerts::Alerts::new(), |_, ev| {
             // refill now and then so x / c don't leave it empty for the rest of the run
             if matches!(ev, Ev::Key(k) if k.code == KeyCode::F(7)) {
-                let mut c = alerts::CENTER.lock().unwrap();
                 for i in 0..5 {
-                    c.push(Alert { at: alerts::now(), kind: Kind::AgentDone, text: format!("refill {i}"), app: Some("music".into()), read: false, pane: None });
+                    alerts::push(Alert { at: alerts::now(), kind: Kind::AgentDone, text: format!("refill {i}"), app: Some("music".into()), read: false, pane: None });
                 }
             }
             true

@@ -61,7 +61,7 @@ fn start_reply(c: &mut Chat, provider: &str) {
     c.chat.messages.push(store::Msg { role: "user".into(), content: "qa".into(), ..Default::default() });
     c.chat.messages.push(store::Msg { role: "assistant".into(), model: Some(provider.into()), ..Default::default() });
     let steer = providers::steerable(provider).then(|| std::sync::mpsc::channel().0);
-    c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0, steer });
+    c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0, steer, pid: Arc::default(), perms: String::new() });
 }
 
 /// A burst of what a provider sends mid-reply.
@@ -75,7 +75,7 @@ fn events(r: &mut Rng, n: usize) -> Vec<Ev> {
             7 => Ev::Todos((0..r.below(12)).map(|i| store::Todo { text: format!("todo {i} 🙂"), active: if i % 2 == 0 { format!("doing {i}") } else { String::new() }, status: ["pending", "in_progress", "completed", "weird"][i % 4].into(), id: String::new() }).collect()),
             8 => Ev::Usage(r.below(100_000) as u64),
             9 => Ev::Status(["thinking", "", "running tests 中文"][k % 3].into()),
-            10 => Ev::Ask(approve::Ask { tool: ["Bash", "Edit", "Write"][k % 3].into(), label: "Bash".into(), target: "rm -rf nothing".into(), body: vec![agent::line('+', Some(1), "added"), agent::line('-', Some(2), "removed")], reply: std::sync::mpsc::channel().0 }),
+            10 => Ev::Ask(approve::Ask { rule: ["Bash(rm:*)", "Edit", "Write"][k % 3].into(), label: "Bash".into(), target: "rm -rf nothing".into(), body: vec![agent::line('+', Some(1), "added"), agent::line('-', Some(2), "removed")], reply: std::sync::mpsc::channel().0 }),
             11 => Ev::Question(approve::Question {
                 qs: (0..1 + r.below(3))
                     .map(|i| approve::Q { question: format!("which one {i}? 中文"), header: format!("h{i}"), multi: r.pct(40), options: (0..r.below(6)).map(|o| (format!("option {o}"), "desc 🙂".repeat(o))).collect() })

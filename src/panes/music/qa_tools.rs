@@ -13,7 +13,7 @@ fn fake(tracks: Vec<Track>, playlists: Vec<library::Playlist>) -> Music {
     let state = Arc::new(Mutex::new(State::default()));
     let waker = Arc::new(Mutex::new(None));
     let engine = Engine::new(state.clone(), waker.clone(), false);
-    let load = Arc::new(Mutex::new(Load { lib: Some(Lib { tracks, playlists, source: "test".into() }), status: String::new(), done: true, version: 1 }));
+    let load = Arc::new(Mutex::new(Load { lib: Some(Lib { tracks, playlists, source: "test".into() }), status: String::new(), done: true, version: 1, run: 0 }));
     Music::build(state, waker, engine, load)
 }
 

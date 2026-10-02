@@ -104,7 +104,7 @@ fn child_chat_corrupt_files() {
     let mut c = Chat::new(&k.config);
     assert_eq!(c.chats.len(), 1);
     render_all(&mut k, &mut c);
-    c.open_chat(0);
+    c.open_chat(&c.chats[0].id.clone());
     let s = render_all(&mut k, &mut c);
     assert!(s.contains("the good one") || s.contains("hello"), "{s}");
     c.new_chat();
@@ -239,7 +239,7 @@ fn child_chat_odd_tool_bodies() {
     let mut k = kit();
     let mut c = Chat::new(&k.config);
     assert_eq!(c.chats.len(), 1, "the chat loads");
-    c.open_chat(0);
+    c.open_chat(&c.chats[0].id.clone());
     let s = render_all(&mut k, &mut c);
     let bad = controls(&s);
     assert!(bad.is_empty(), "control characters from a saved tool body reached the screen: {bad:?}");
@@ -260,7 +260,7 @@ fn child_chat_empty_tool_body_line() {
     write_chat("empty-line.json", &chat_json("emptyline", "an empty body line", store::now(), vec![user("go"), reply("done", parts)]));
     let mut k = kit();
     let mut c = Chat::new(&k.config);
-    c.open_chat(0);
+    c.open_chat(&c.chats[0].id.clone());
     render_all(&mut k, &mut c);
 }
 
@@ -322,7 +322,7 @@ fn child_chat_nasty_text() {
     let bad = controls(&side);
     assert!(bad.is_empty(), "control characters from chat titles reached the sidebar: {bad:?}\n{side}");
     for i in 0..c.chats.len() {
-        c.open_chat(i);
+        c.open_chat(&c.chats[i].id.clone());
         let s = render_all(&mut k, &mut c);
         let bad = controls(&s);
         assert!(bad.is_empty(), "control characters from a saved chat reached the screen (chat {i}): {bad:?}");
@@ -360,7 +360,7 @@ fn qa_chat_unknown_part_kind() {
 
 fn open_by_id(c: &mut Chat, id: &str) {
     let i = c.chats.iter().position(|x| x.id == id).unwrap();
-    c.open_chat(i);
+    c.open_chat(&c.chats[i].id.clone());
 }
 
 fn delete_open_chat(k: &mut Kit, c: &mut Chat) {
@@ -464,7 +464,7 @@ fn child_chat_many_big_chats() {
     assert_eq!(c.chats.len(), 200);
     let t1 = std::time::Instant::now();
     k.render_side(&mut c, 34, 40);
-    c.open_chat(0);
+    c.open_chat(&c.chats[0].id.clone());
     c.expanded = true;
     k.render(&mut c, 150, 44);
     let draw_ms = t1.elapsed().as_millis();

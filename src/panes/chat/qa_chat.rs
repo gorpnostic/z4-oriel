@@ -66,12 +66,13 @@ fn show(e: &Ev) -> String {
         Ev::Usage(n) => format!("usage {n}"),
         Ev::Status(s) => format!("status {s}"),
         Ev::State(k, v) => format!("state {k}={v}"),
-        Ev::Ask(a) => format!("ask {}", a.tool),
+        Ev::Ask(a) => format!("ask {}", a.rule),
         Ev::Question(q) => format!("question x{}", q.qs.len()),
         Ev::Steered(s) => format!("steered {s}"),
         Ev::Mark(s) => format!("mark {s}"),
         Ev::Done { note } => format!("done {note:?}"),
         Ev::Error(e) => format!("error {e}"),
+        _ => "other".into(),
     }
 }
 
@@ -764,7 +765,7 @@ fn replying(k: &mut Kit, provider: &str, prompt: &str) -> Chat {
     c.chat.messages.push(Msg { role: "user".into(), content: prompt.into(), ..Default::default() });
     c.chat.messages.push(Msg { role: "assistant".into(), model: Some(provider.into()), ..Default::default() });
     let steer = providers::steerable(provider).then(|| channel().0);
-    c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0, steer });
+    c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0, steer, pid: Arc::default(), perms: String::new() });
     c
 }
 
@@ -945,7 +946,7 @@ fn child_tiny_sizes() {
             Ev::Tool(body),
             Ev::Todos(todos),
             Ev::Question(approve::Question { qs: vec![approve::Q { question: "Which one? ".repeat(10), header: "Pick".into(), multi: true, options: vec![("a very long option label indeed".into(), "and a long description".into()), ("b".into(), String::new())] }], reply: qtx }),
-            Ev::Ask(approve::Ask { tool: "Bash".into(), label: "Bash".into(), target: "rm -rf build ".repeat(8), body: (0..9).map(|i| agent::line('>', None, &format!("cmd {i}"))).collect(), reply: atx }),
+            Ev::Ask(approve::Ask { rule: "Bash(rm:*)".into(), label: "Bash".into(), target: "rm -rf build ".repeat(8), body: (0..9).map(|i| agent::line('>', None, &format!("cmd {i}"))).collect(), reply: atx }),
         ],
     );
     for (w, h) in sizes {
@@ -1120,7 +1121,7 @@ fn child_ask_then_done() {
     let mut k = Kit::new();
     let mut c = replying(&mut k, "claude", "clean up");
     let (tx, rx) = channel();
-    let ask = |tool: &str, tx: &std::sync::mpsc::Sender<approve::Decision>| approve::Ask { tool: tool.into(), label: tool.into(), target: "rm -rf build".into(), body: vec![], reply: tx.clone() };
+    let ask = |tool: &str, tx: &std::sync::mpsc::Sender<approve::Decision>| approve::Ask { rule: tool.into(), label: tool.into(), target: "rm -rf build".into(), body: vec![], reply: tx.clone() };
     deliver(&mut k, &mut c, [Ev::Ask(ask("Bash", &tx))]);
     drop(tx);
     deliver(&mut k, &mut c, [Ev::Done { note: None }]);

@@ -454,7 +454,7 @@ fn qa_update_install_to_swaps_and_rolls_back() {
     let u: Value = serde_json::from_str(&std::fs::read_to_string(update_state().join("updated.json")).unwrap()).unwrap();
     assert_eq!((u["from"].as_str(), u["to"].as_str()), (Some("0.0.1"), Some(V)));
     // the first start of the new version says so, once
-    assert_eq!(crate::update::just_updated(), Some(("0.0.1".to_string(), V.to_string())));
+    assert_eq!(crate::update::just_updated(), Some(("0.0.1".to_string(), V.to_string(), false)));
     assert_eq!(crate::update::just_updated(), None);
     // and back
     assert_eq!(crate::update::rollback_to(&exe, V), Ok("0.0.1".to_string()));
@@ -488,7 +488,7 @@ fn qa_update_install_to_refuses_bad_downloads() {
     ];
     for (what, r, want) in cases {
         let e = crate::update::install_to(&r, &exe, "0.0.1", &|_| {}).expect_err(what);
-        assert!(e.contains(want), "{what}: {e}");
+        assert!(e.to_string().contains(want), "{what}: {e}");
         assert_eq!(std::fs::read(&exe).unwrap(), before, "{what}: the binary changed");
         assert_eq!(names(&app), vec![exe_name()], "{what}: something was moved aside");
         assert!(kept().is_empty(), "{what}: a backup was made for an update that never happened: {:?}", kept());
@@ -748,11 +748,11 @@ fn qa_cli_mcp_approve_over_stdio_to_a_live_broker() {
     let a2 = asks.clone();
     let send: Arc<dyn Fn(Ev) + Send + Sync> = Arc::new(move |ev| {
         if let Ev::Ask(a) = ev {
-            a2.lock().unwrap().push(a.tool.clone());
-            let _ = a.reply.send(if a.tool == "Bash" { Decision::Allow } else { Decision::Deny });
+            a2.lock().unwrap().push(a.rule.split('(').next().unwrap_or("").to_string());
+            let _ = a.reply.send(if a.rule.starts_with("Bash") { Decision::Allow } else { Decision::Deny });
         }
     });
-    let b = Broker::start(PathBuf::from("/w"), "ask".into(), send).unwrap();
+    let b = Broker::start(PathBuf::from("/w"), Arc::new(Mutex::new("ask".into())), send).unwrap();
     let input = rpc(&[
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}}}),
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
@@ -809,7 +809,7 @@ fn qa_cli_mcp_approve_denies_when_it_cant_ask() {
     // a live oriel, the wrong token: refused without asking anyone
     let asked = Arc::new(Mutex::new(0));
     let a2 = asked.clone();
-    let b = Broker::start(PathBuf::from("/w"), "ask".into(), Arc::new(move |_ev: Ev| *a2.lock().unwrap() += 1)).unwrap();
+    let b = Broker::start(PathBuf::from("/w"), Arc::new(Mutex::new("ask".into())), Arc::new(move |_ev: Ev| *a2.lock().unwrap() += 1)).unwrap();
     let o = run(&bin(), &["--mcp-approve", &b.port.to_string(), "wrong-token"], In::Bytes(&call), &d, &[], secs(60));
     assert_eq!(deny_msg(&o), "bad token");
     assert_eq!(*asked.lock().unwrap(), 0, "a wrong token reached the chat");

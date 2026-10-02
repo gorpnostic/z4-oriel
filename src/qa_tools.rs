@@ -759,7 +759,7 @@ mod notes {
         let mut p = Notes::open_in(dir.clone(), None);
         assert_eq!(p.title(), "Note 0", "the newest note opens");
         let area = Rect::new(0, 0, 34, 12);
-        let mut side_mouse = |k: &mut Kit, p: &mut Notes, ev: MouseEvent| {
+        let side_mouse = |k: &mut Kit, p: &mut Notes, ev: MouseEvent| {
             let mut actions = vec![];
             let mut cx = Cx { id: 1, theme: &k.theme, config: &k.config, tx: &k.tx, actions: &mut actions, focused: true, time: 1.0 };
             p.side_mouse(ev, area, &mut cx);
@@ -1514,16 +1514,15 @@ mod alerts {
     const OURS: &[&str] = &["qa alert #", "from a pane", "from the calendar", "a new version", "from somewhere odd", "build failed:", "a very long alert", "pick-test "];
 
     fn foreign() -> bool {
-        center::CENTER.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|a| !OURS.iter().any(|p| a.text.starts_with(p)))
+        center::with(|l| l.iter().any(|a| !OURS.iter().any(|p| a.text.starts_with(p))))
     }
 
     fn texts() -> Vec<String> {
-        center::CENTER.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|a| a.text.clone()).collect()
+        center::with(|l| l.iter().map(|a| a.text.clone()).collect())
     }
 
     fn clear() {
-        center::CENTER.clear_poison();
-        center::CENTER.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        center::clear();
     }
 
     /// Another test (the app's own tests push real alerts) can add to the global center at any moment, which
@@ -1742,7 +1741,6 @@ mod sizes {
     #[test]
     fn qa_every_tool_at_every_size() {
         let _g = CENTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        crate::alerts::CENTER.clear_poison(); // a panic elsewhere shouldn't read as the alerts pane failing here
         let themes_dir = scratch("sizes-themes");
         crate::theme::TEST_DIR.with(|t| *t.borrow_mut() = Some(themes_dir));
         let notes_dir = scratch("sizes-notes");

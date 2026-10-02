@@ -349,18 +349,20 @@ fn child_alerts_corrupt() {
     }
     for (i, bytes) in corrupt_json().into_iter().enumerate() {
         std::fs::write(alerts_file(), &bytes).unwrap();
-        let got = alerts::load();
+        alerts::open_at(alerts_file());
+        let got = alerts::with(|a| a.to_vec());
         assert!(got.is_empty(), "case {i}: corrupt alerts.json loads as nothing, got {}", got.len());
     }
     // wrong types and missing fields
     for s in [r#"[{"at":"yesterday","kind":"update","text":"x"}]"#, r#"[{"kind":"update","text":"x"}]"#, r#"[{"at":1,"kind":"update"}]"#, r#"[{"at":1,"kind":7,"text":"x"}]"#] {
         std::fs::write(alerts_file(), s).unwrap();
-        let _ = alerts::load();
+        alerts::open_at(alerts_file());
     }
     // missing folder: save fails quietly
     let _ = std::fs::remove_dir_all(std::path::absolute("target/test-scratch").unwrap());
-    alerts::save(&[]);
-    assert!(alerts::load().is_empty());
+    alerts::clear();
+    alerts::open_at(alerts_file());
+    assert!(alerts::with(|a| a.is_empty()));
 }
 
 #[test]
@@ -382,9 +384,8 @@ fn child_alerts_unknown_kind() {
             {{"at":{now},"kind":"deploy_finished","text":"from a newer oriel"}}]"#
     );
     std::fs::write(alerts_file(), json).unwrap();
-    let loaded = alerts::load();
-    let n = loaded.len();
-    *alerts::CENTER.lock().unwrap() = loaded;
+    alerts::open_at(alerts_file());
+    let n = alerts::with(|a| a.len());
     alerts::push(Alert { at: now, kind: Kind::Calendar, text: "a new one".into(), app: None, read: false, pane: None });
     let disk = std::fs::read_to_string(alerts_file()).unwrap();
     assert!(n >= 2 && disk.contains("first alert"), "loaded {n} of 3 alerts; after one new alert the file holds:\n{disk}");
@@ -411,9 +412,8 @@ fn child_alerts_pane_weird_rows() {
         rows.push(serde_json::json!({"at": at, "kind": kind, "text": s, "app": app}));
     }
     std::fs::write(alerts_file(), serde_json::to_string(&rows).unwrap()).unwrap();
-    let loaded = alerts::load();
-    assert_eq!(loaded.len(), rows.len());
-    *alerts::CENTER.lock().unwrap() = loaded;
+    alerts::open_at(alerts_file());
+    assert_eq!(alerts::with(|a| a.len()), rows.len());
     let mut k = Kit::new();
     let mut p = crate::panes::alerts::Alerts::new();
     for (w, h) in [(160, 50), (120, 30), (40, 10), (10, 3)] {
@@ -595,7 +595,7 @@ fn child_update_state_files() {
     }
     // the real thing: shown once
     std::fs::write(&file, format!(r#"{{"from":"0.1.0 🎉","to":"{v}","at":"not a number","extra":[1,2]}}"#)).unwrap();
-    assert_eq!(update::just_updated(), Some(("0.1.0 🎉".into(), v.into())));
+    assert_eq!(update::just_updated(), Some(("0.1.0 🎉".into(), v.into(), false)));
     assert!(update::just_updated().is_none(), "only once");
     // odd files in the rollback folder
     let prev = dir.join("previous");

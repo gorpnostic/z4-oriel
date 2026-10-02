@@ -29,7 +29,7 @@ pub(crate) fn fake(n: usize, playing: bool) -> Music {
         library::Playlist { id: "p2".into(), name: "empty one".into(), ids: vec![] },
         library::Playlist { id: "p3".into(), name: "ghosts 👻".into(), ids: vec!["gone1".into(), "gone2".into()] },
     ];
-    let load = Arc::new(Mutex::new(Load { lib: Some(Lib { tracks: tracks.clone(), playlists, source: "qa".into() }), status: String::new(), done: true, version: 1 }));
+    let load = Arc::new(Mutex::new(Load { lib: Some(Lib { tracks: tracks.clone(), playlists, source: "qa".into() }), status: String::new(), done: true, version: 1, run: 0 }));
     let mut m = Music::build(state, waker, engine, load);
     if playing && !tracks.is_empty() {
         let t = tracks[n / 2].clone();

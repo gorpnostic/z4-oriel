@@ -192,7 +192,7 @@ fn mark_and_run(k: &mut Kit, p: &mut Agents, ids: &[String], serial: bool) -> St
     assert_eq!(&p.marked, ids, "marked in order");
     let before = p.store.runs.len();
     k.key(p, KeyCode::Enter);
-    assert!(matches!(p.mode, Mode::Batch), "enter with marks opens the run popup");
+    assert!(matches!(p.mode, Mode::Batch(_)), "enter with marks opens the run popup");
     k.key(p, KeyCode::Char(if serial { 's' } else { 'p' }));
     assert_eq!(p.store.runs.len(), before + 1, "a run started: {:?}", k.notices());
     p.store.runs.last().unwrap().id.clone()
@@ -526,7 +526,7 @@ fn qa_deleting_a_marked_task_clears_its_mark() {
     assert!(p.marked.is_empty(), "every marked card is gone, the marks aren't: {:?}", p.marked);
     p.select(&c);
     k.key(&mut p, KeyCode::Enter);
-    assert!(!matches!(p.mode, Mode::Batch), "enter opened 'run 2 tasks together' for tasks that no longer exist");
+    assert!(!matches!(p.mode, Mode::Batch(_)), "enter opened 'run 2 tasks together' for tasks that no longer exist");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -555,7 +555,7 @@ fn qa_marks_do_not_follow_you_to_another_repo() {
     if !p.marked.is_empty() {
         // the hints still offer "run the marked together" here: try it
         k.key(&mut p, KeyCode::Enter);
-        if matches!(p.mode, Mode::Batch) {
+        if matches!(p.mode, Mode::Batch(_)) {
             k.key(&mut p, KeyCode::Char('p'));
         }
         until(&mut k, &mut p, 10_000, "whatever started settles", |p| p.store.runs.iter().all(|r| r.state != store::RunState::Starting));

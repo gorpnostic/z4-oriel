@@ -14,15 +14,16 @@ fn scratch_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
 
 /// Print a file the way a CLI prints its stream, and collect every JSON value `run_cli` hands on.
 fn replay(path: &std::path::Path) -> (Result<(), String>, Vec<Value>) {
+    let pid = AtomicU32::new(0);
     let (exe, args): (&str, Vec<String>) =
         if cfg!(windows) { ("cmd", vec!["/c".into(), "type".into(), path.to_string_lossy().to_string()]) } else { ("cat", vec![path.to_string_lossy().to_string()]) };
     let stop = AtomicBool::new(false);
     let mut got = vec![];
-    let r = run_cli(exe, &args, |_| {}, &std::env::temp_dir(), &stop, |v| {
+    let r = run_cli(exe, &args, |_| {}, &std::env::temp_dir(), &stop, &pid, |v: &Value| {
         got.push(v.clone());
         Ok(())
     });
-    (r, got)
+    (r.map(|_| ()), got)
 }
 
 /// Garbage, half-written JSON, blank lines, CRLF, a 1 MB line and a last line with no newline: the good lines all
@@ -76,6 +77,8 @@ fn qa_chat_cli_transcript_trims_on_a_char_boundary() {
         cfg: AiConfig::default(),
         steer: None,
         effort: String::new(),
+        pid: Arc::default(),
+        since: None,
     };
     let t = transcript(&req);
     assert!(t.ends_with("(New message:)\nthe new one 👋"), "{}", t.chars().rev().take(60).collect::<String>());

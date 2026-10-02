@@ -60,7 +60,7 @@ fn in_mode(k: &Kit, dir: &Path, key: Option<char>, diff: bool) -> Agents {
             f = AWKWARD[1]
         );
         let files = git::parse_diff(&text.repeat(3));
-        p.mode = Mode::Diff(DiffView { id: p.store.tasks[4].id.clone(), data: Some(Ok(git::Diff { files, conflicts: Some(vec![AWKWARD[0].into(), AWKWARD[1].into()]), target: AWKWARD[1].into() })), file: 0, scroll: 0 });
+        p.mode = Mode::Diff(DiffView { id: p.store.tasks[4].id.clone(), data: Some(Ok(git::Diff { files, conflicts: Some(vec![AWKWARD[0].into(), AWKWARD[1].into()]), target: AWKWARD[1].into() })), file: 0, scroll: 0, cursor: 0, typing: None });
     }
     p
 }

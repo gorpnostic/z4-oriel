@@ -961,7 +961,7 @@ fn config_round_trips_through_save_format() {
     c.ai.openai_key = r"sk-test\with\backslashes".into();
     c.ai.ollama_url = "http://192.0.2.1:11434".into();
     c.music.folders = vec![r"D:\Music".into(), "/home/x/Music".into(), r"\\nas\share\songs".into()];
-    c.lead = LeadConfig { agent: "kimi".into(), model: "k2".into(), budget_usd: 0.1, run_budget_usd: 12.35, max_parallel: 5, protocol: "mcp".into(), gate: "cargo test --all".into(), gate_timeout_s: 60, stagger_s: 0 };
+    c.lead = LeadConfig { agent: "kimi".into(), model: "k2".into(), budget_usd: 0.1, run_budget_usd: 12.35, max_parallel: 5, protocol: "mcp".into(), gate: "cargo test --all".into(), gate_timeout_s: 60, stagger_s: 0, ..Default::default() };
     c.roster = vec![
         RosterEntry { name: "codex".into(), agent: "codex".into(), model: String::new(), tier: "cheap".into(), good_at: "refactors, \"tests\"".into(), max_turns: 0, budget_usd: 0.0, enabled: false },
         RosterEntry::default(),
