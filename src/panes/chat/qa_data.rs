@@ -2,8 +2,7 @@
 //! panicking, the pane must render whatever did load, and deleting / saving must stay inside the chats folder.
 //!
 //! store::dir() hangs off data_dir(), so every test that touches disk runs as a child process of this test binary
-//! with ORIEL_DATA_DIR in target/test-scratch/qa-data (see crate::qa_data::run_child). Tests that document a real
-//! bug are `#[ignore = "fails: ..."]`; run them with `cargo test qa_chat -- --ignored`.
+//! with ORIEL_DATA_DIR in target/test-scratch/qa-data (see crate::qa_data::run_child).
 
 use super::*;
 use crate::qa_data::{ReadOnly, child_ok, controls, corrupt_json, is_child, nasty};
@@ -143,7 +142,7 @@ fn child_chat_folder_missing_or_a_file() {
     // an empty chat is never written
     std::fs::remove_file(&d).unwrap();
     let mut empty = store::Chat::new("claude");
-    store::save(&mut empty);
+    store::save(&mut empty).unwrap();
     assert!(!d.join(format!("{}.json", empty.id)).exists());
 }
 
@@ -166,7 +165,6 @@ fn qa_chat_bucket_edges() {
 }
 
 #[test]
-#[ignore = "fails: a chat file with a huge 'updated' (1e300 / -1e300) panics in store::bucket with 'attempt to add with overflow' (debug builds)"]
 fn qa_chat_bucket_huge_timestamps() {
     let now = store::now();
     let _ = store::bucket(1e300, now, 3600); // east of UTC
@@ -192,7 +190,6 @@ fn child_chat_sidebar_huge_timestamps() {
 }
 
 #[test]
-#[ignore = "fails: one chat file with updated = 1e300 or -1e300 crashes the chat sidebar on every start (overflow in store::bucket, debug builds)"]
 fn qa_chat_sidebar_huge_timestamps() {
     child_ok(CHILD_TS, "chat-ts");
 }
@@ -265,7 +262,6 @@ fn child_chat_empty_tool_body_line() {
 }
 
 #[test]
-#[ignore = "fails: a saved tool call whose body has an empty line panics in agent::split_line (byte index 1 out of range) as soon as the chat is opened, release builds too"]
 fn qa_chat_empty_tool_body_line() {
     child_ok(CHILD_EMPTY_BODY, "chat-empty-body");
 }
@@ -351,7 +347,6 @@ fn child_chat_unknown_part_kind() {
 }
 
 #[test]
-#[ignore = "fails: one transcript part of an unknown kind (a newer oriel's, after rollback) hides the whole chat from the list"]
 fn qa_chat_unknown_part_kind() {
     child_ok(CHILD_UNKNOWN_PART, "chat-part");
 }
@@ -386,7 +381,6 @@ fn child_chat_delete_renamed_file() {
 }
 
 #[test]
-#[ignore = "fails: deleting a chat removes <id>.json, so a chat file named anything else says 'chat deleted' and comes back on restart"]
 fn qa_chat_delete_renamed_file() {
     child_ok(CHILD_DEL_NAME, "chat-del-name");
 }
@@ -409,7 +403,6 @@ fn child_chat_delete_id_outside_folder() {
 }
 
 #[test]
-#[ignore = "fails: a chat file's id is used as a path, so deleting a chat with id '../victim' deletes <data dir>/victim.json"]
 fn qa_chat_delete_id_outside_folder() {
     child_ok(CHILD_DEL_TRAVERSAL, "chat-del-traversal");
 }
@@ -437,7 +430,6 @@ fn child_chat_save_readonly_file() {
 }
 
 #[test]
-#[ignore = "fails: when a chat file can't be replaced (read-only), store::save drops every new message silently and leaves <id>.json.tmp behind"]
 fn qa_chat_save_readonly_file() {
     child_ok(CHILD_SAVE_RO, "chat-save-ro");
 }

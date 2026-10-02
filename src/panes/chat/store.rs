@@ -75,6 +75,10 @@ pub enum Part {
     Mark {
         text: String,
     },
+    /// A part this version can't read (a newer oriel's, after a rollback): kept as it was, so the chat still loads
+    /// and saving it doesn't lose the part. Not drawn.
+    #[serde(untagged)]
+    Other(Value),
 }
 
 /// One tool call: "Update src/app.rs · +3 -1", its diff or output, and (for subagents) the calls it made.
@@ -202,27 +206,49 @@ impl Chat {
     }
 }
 
-pub fn save(c: &mut Chat) {
+/// A chat's file name: its id, made safe (an id read from a damaged or planted file can hold anything, `../x`
+/// included, and must never name a file outside the chats folder).
+fn file_name(id: &str) -> String {
+    let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    format!("{}.json", if safe.is_empty() { "chat" } else { &safe })
+}
+
+/// Save a chat (written to a temp file, then swapped in). Err says why it couldn't be, and leaves nothing behind.
+pub fn save(c: &mut Chat) -> Result<(), String> {
     if c.messages.is_empty() {
-        return; // empty chats vanish
+        return Ok(()); // empty chats vanish
     }
     let d = dir();
     let _ = std::fs::create_dir_all(&d);
     c.updated = now();
-    let path = d.join(format!("{}.json", c.id));
-    let tmp = d.join(format!("{}.json.tmp", c.id));
-    if let Ok(s) = serde_json::to_string_pretty(c) {
-        if std::fs::write(&tmp, s).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+    let name = file_name(&c.id);
+    let path = d.join(&name);
+    let tmp = d.join(format!("{name}.tmp"));
+    let s = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, s).map_err(|e| format!("{}: {e}", d.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// Delete chat `id`: every file in the chats folder that holds it, whatever the file is called (a copied or synced
+/// "abc (1).json" too), and nothing outside the folder.
+pub fn delete(id: &str) {
+    #[derive(Deserialize)]
+    struct Id {
+        id: String,
+    }
+    let _ = std::fs::remove_file(dir().join(file_name(id)));
+    for e in std::fs::read_dir(dir()).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "json") && std::fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str::<Id>(&s).ok()).is_some_and(|x| x.id == id) {
+            let _ = std::fs::remove_file(&p);
         }
     }
 }
 
-pub fn delete(id: &str) {
-    let _ = std::fs::remove_file(dir().join(format!("{id}.json")));
-}
-
-/// All chats, newest first.
+/// All chats, newest first (a chat in two files, e.g. a synced copy, once: its newest).
 pub fn load_all() -> Vec<Chat> {
     let mut out: Vec<Chat> = std::fs::read_dir(dir())
         .map(|rd| {
@@ -234,6 +260,8 @@ pub fn load_all() -> Vec<Chat> {
         })
         .unwrap_or_default();
     out.sort_by(|a, b| b.updated.partial_cmp(&a.updated).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|c| seen.insert(c.id.clone()));
     out
 }
 
@@ -244,8 +272,9 @@ pub fn title_from(text: &str) -> String {
 
 /// Sidebar groups: today, yesterday, previous 7 days, older.
 pub fn bucket(ts: f64, now_ts: f64, utc_offset: i64) -> &'static str {
-    let day = |t: f64| ((t as i64 + utc_offset).div_euclid(86400)) as i64;
-    match day(now_ts) - day(ts) {
+    // (a hand-edited file can say 1e300: saturate instead of overflowing)
+    let day = |t: f64| (t as i64).saturating_add(utc_offset).div_euclid(86400);
+    match day(now_ts).saturating_sub(day(ts)) {
         i64::MIN..=0 => "today",
         1 => "yesterday",
         2..=6 => "previous 7 days",

@@ -44,7 +44,6 @@ fn qa_chat_cli_malformed_lines_skipped() {
 /// One line that isn't UTF-8 (a localized shim or hook printing in the ANSI code page) must be skipped like any
 /// other non-JSON line; the lines after it still belong to the run.
 #[test]
-#[ignore = "fails: run_cli breaks out of the read loop on the first non-UTF-8 line (providers.rs:414 `let Ok(line) = line else { break }`), so the rest of the run is lost and the agent is killed"]
 fn qa_chat_cli_non_utf8_line_doesnt_end_the_run() {
     let mut bytes = b"{\"type\":\"system\",\"subtype\":\"init\"}\r\n".to_vec();
     bytes.extend_from_slice(b"Warnung: caf\xe9 \xfcber den Befehl\r\n");

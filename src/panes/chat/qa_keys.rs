@@ -28,7 +28,7 @@ fn demo_chats() {
             }
             c.messages.push(m);
         }
-        store::save(&mut c);
+        store::save(&mut c).expect("seeding a chat");
         // save stamps `updated` with now: put the age back
         if let Ok(s) = std::fs::read_to_string(store::dir().join(format!("{}.json", c.id))) {
             let s = s.replacen(&format!("\"updated\": {}", c.updated), &format!("\"updated\": {}", t - age), 1);

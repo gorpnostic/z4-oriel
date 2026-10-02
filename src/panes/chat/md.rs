@@ -30,31 +30,35 @@ pub fn wrap(spans: Vec<Span<'static>>, width: usize, indent: &str, cont_indent: 
                 let trimmed = word.trim_start().to_string();
                 *word = trimmed;
             }
-            // a single word longer than the line: hard-break it
-            let mut rest = std::mem::take(word);
-            while *used + rest.width() > width && rest.chars().count() > 1 && rest.trim_end().width() > width - cont_indent.width() {
+            // a single word longer than the line: hard-break it. One pass over the word: what's left of it is a
+            // byte offset with its width, char count and trimmed width kept up to date (a streamed base64 blob
+            // is re-wrapped every frame, so this must stay linear)
+            let word = std::mem::take(word);
+            let cont_w = cont_indent.width();
+            let (mut start, mut rest_w, mut rest_n, mut rest_trim_w) = (0usize, word.width(), word.chars().count(), word.trim_end().width());
+            while *used + rest_w > width && rest_n > 1 && rest_trim_w > width.saturating_sub(cont_w) {
                 let room = width.saturating_sub(*used).max(1);
-                let mut head = String::new();
-                let mut hw = 0;
-                let mut chars = rest.chars().peekable();
-                while let Some(&c) = chars.peek() {
+                let (mut end, mut hw, mut n) = (start, 0usize, 0usize);
+                for c in word[start..].chars() {
                     let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
                     if hw + cw > room {
                         break;
                     }
-                    head.push(c);
+                    end += c.len_utf8();
                     hw += cw;
-                    chars.next();
+                    n += 1;
                 }
-                if head.is_empty() {
+                if end == start {
                     break;
                 }
-                cur.push(Span::styled(head, style));
+                cur.push(Span::styled(word[start..end].to_string(), style));
                 out.push(Line::from(std::mem::take(cur)));
                 cur.push(Span::raw(cont_indent.to_string()));
-                *used = cont_indent.width();
-                rest = chars.collect();
+                *used = cont_w;
+                // the trailing spaces are at the end, so the trimmed width loses exactly what was cut (or all of it)
+                (start, rest_w, rest_n, rest_trim_w) = (end, rest_w.saturating_sub(hw), rest_n - n, rest_trim_w.saturating_sub(hw));
             }
+            let rest = word[start..].to_string();
             *used += rest.width();
             cur.push(Span::styled(rest, style));
         };
