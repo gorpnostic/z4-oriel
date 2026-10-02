@@ -110,6 +110,7 @@ Every app lives in the sidebar. Click one, or press its F-key.
 | see or undo what the AI changed | `/diff` (everything this chat changed), `/diff last` (the last turn), `/undo` (put the folder back before the last turn), `/rewind` (pick a turn). Only files change back; the chat stays |
 | make the AI keep going until the tests pass | `/check cargo test` (or any command). After each turn oriel runs it and sends a failure back, until it passes or stops making progress. `/verify` runs it once |
 | carry on in a fresh chat when this one is long | `/handoff`. The AI writes a handoff card and a new chat starts from it; `/handoff codex` hands it to another AI. The box shows how full the context is (`ctx 38%`) |
+| not babysit a usage limit | nothing to do: when Claude Code or Codex stops at your plan's limit, the chat says when it resets and carries on by itself then, like Claude Code does. `esc` cancels |
 | find something from an old session | `alt r`, or `/recall <words>` in chat. `p:<project>`, `ai:codex` and `since:30d` narrow it down |
 | reuse a prompt | `ctrl+r` in chat searches every prompt you've sent. In agents, `ctrl+t` saves and inserts prompts (`/p <name>` in chat) |
 | change a setting | `alt ,` (or `/settings perms` to jump to one). `r` resets a setting to its default |

@@ -7,6 +7,7 @@ mod agent;
 mod ckpt;
 pub mod approve;
 mod inbox;
+mod limit;
 mod md;
 pub mod providers;
 mod review;
@@ -299,6 +300,8 @@ struct Outcome {
     perms: Option<String>,
     /// why this turn has no checkpoint
     ckpt_err: Option<String>,
+    /// it stopped at your plan's usage limit, which resets then (unix seconds)
+    limit: Option<i64>,
 }
 
 /// Answering a set of Claude's questions: which one, the highlighted choice, ticks (several allowed), your own
@@ -518,6 +521,8 @@ pub struct Chat {
     draft: bool,
     /// The sidebar lists only chats from the current chat's folder (ctrl+f).
     this_folder: bool,
+    /// Chats whose AI stopped at your usage limit, and when it resets: they carry on by themselves then.
+    waits: HashMap<String, i64>,
 }
 
 impl Chat {
@@ -626,6 +631,7 @@ impl Chat {
             msg_starts: vec![],
             draft: false,
             this_folder: false,
+            waits: HashMap::new(),
         }
     }
 
@@ -862,6 +868,9 @@ impl Chat {
             drop(run);
             self.chats.insert(0, c);
             self.turn_ended(&id, !(out.failed || out.lost), cx);
+            if let (true, Some(at)) = (out.failed, out.limit) {
+                self.limit_hit(&id, at, cx);
+            }
             if !text.is_empty() && (out.failed || out.lost) {
                 self.info.push(format!("the reply in \"{title}\" failed, so what you queued there wasn't sent: {text}"));
             } else if !text.is_empty() {
@@ -871,12 +880,55 @@ impl Chat {
         }
     }
 
+    /// Chat `id`'s AI stopped at your usage limit: it carries on by itself once the limit resets (esc on that chat's
+    /// empty box, or a message of yours, cancels that).
+    fn limit_hit(&mut self, id: &str, at: i64, cx: &mut Cx) {
+        let now = crate::panes::files::clock::now_secs();
+        if at <= now || at - now > 8 * 86_400 {
+            return; // already over, or nothing to wait for in any sense
+        }
+        self.waits.insert(id.to_string(), at);
+        let title = self.chat_ref(id).map(|c| c.title.clone()).unwrap_or_default();
+        cx.alert(crate::alerts::Kind::Usage, format!("usage limit in \"{title}\": it carries on by itself at {}", limit::say(at + LIMIT_GRACE, now)));
+    }
+
+    /// Chats whose usage limit has reset: carry on where they stopped.
+    fn wake_waits(&mut self, cx: &mut Cx) {
+        let now = crate::panes::files::clock::now_secs();
+        let due: Vec<String> = self.waits.iter().filter(|(_, at)| now >= **at + LIMIT_GRACE).map(|(id, _)| id.clone()).collect();
+        for id in due {
+            self.waits.remove(&id);
+            let busy = (id == self.chat.id && self.stream.is_some()) || self.parked.contains_key(&id);
+            let Some(title) = self.chat_ref(&id).map(|c| c.title.clone()) else { continue };
+            if busy {
+                continue;
+            }
+            cx.alert(crate::alerts::Kind::Usage, format!("your usage limit reset: \"{title}\" carries on"));
+            self.send_to(&id, LIMIT_CONTINUE.into(), cx);
+        }
+    }
+
+    /// The line above the box while this chat waits for its limit to reset.
+    fn limit_line(&self, t: &crate::theme::Theme) -> Option<Line<'static>> {
+        let at = *self.waits.get(&self.chat.id)?;
+        let now = crate::panes::files::clock::now_secs();
+        let go = at + LIMIT_GRACE;
+        Some(Line::from(vec![
+            Span::styled(" ⏸ ", Style::default().fg(t.danger)),
+            Span::styled(format!("You've hit your usage limit · resets {} · ", limit::say(at, now)), ui::muted(t)),
+            Span::styled(format!("continuing automatically at {} (in {})", limit::say(go, now), limit::left(go, now)), Style::default().fg(t.fg)),
+            Span::styled(" · esc", ui::accent(t)),
+            Span::styled(" to cancel", ui::muted(t)),
+        ]))
+    }
+
     /// Send `text` as your next message in chat `id`, on screen or not: a reply running there gets it queued, a
     /// chat in the background starts its reply there.
     fn send_to(&mut self, id: &str, text: String, cx: &mut Cx) {
         if id == self.chat.id {
             return self.send(text, cx);
         }
+        self.waits.remove(id);
         if let Some(run) = self.parked.get_mut(id) {
             run.queue.push(Queued { text, sent: false });
             return;
@@ -1089,6 +1141,7 @@ impl Chat {
     }
 
     fn send(&mut self, text: String, cx: &mut Cx) {
+        self.waits.remove(&self.chat.id); // you've taken over from the limit's auto-continue
         if self.stream.is_some() {
             self.enqueue(text);
             return;
@@ -3259,6 +3312,10 @@ fn exit_of(e: &str) -> String {
 
 /// How the check loop's messages and a handoff's first message start.
 const CHECK_SAYS: &str = "◎ check ";
+/// After a usage limit resets, wait this much longer before carrying on (the reset time is rounded).
+const LIMIT_GRACE: i64 = 30;
+/// What a chat stopped by a usage limit is told once the limit resets.
+const LIMIT_CONTINUE: &str = "continue";
 const HANDOFF_FROM: &str = "Handoff from an earlier session";
 
 /// The check loop's next message after a failure: what failed, the first lines, and what to do.
@@ -3594,6 +3651,7 @@ fn absorb(chat: &mut store::Chat, run: &mut Run, evs: Vec<Ev>, always: Option<&B
                 activity::push_user(m, &text);
             }
             Ev::Mark(text) => activity::push_mark(m, &text),
+            Ev::Limit(at) => out.limit = Some(at),
             Ev::Plan(plan) => {
                 // the plan in full, in the transcript, while you decide
                 activity::push_text(m, "\n\n");
@@ -3649,6 +3707,9 @@ fn absorb(chat: &mut store::Chat, run: &mut Run, evs: Vec<Ev>, always: Option<&B
             }
             Ev::Error(e) => {
                 out.failed = true;
+                if out.limit.is_none() {
+                    out.limit = limit::reset_at(&e, crate::panes::files::clock::now_secs());
+                }
                 activity::settle(&mut m.parts, "stopped");
                 if m.content.trim().is_empty() && m.parts.is_empty() {
                     m.content = format!("⚠ {e}");
@@ -3761,7 +3822,15 @@ impl Pane for Chat {
         Some(SPIN[(started.elapsed().as_millis() / 100) as usize % SPIN.len()].to_string())
     }
     fn tick_every(&self) -> Option<Duration> {
-        (self.stream.is_some() || !self.parked.is_empty()).then(|| Duration::from_millis(100))
+        if self.stream.is_some() || !self.parked.is_empty() {
+            Some(Duration::from_millis(100))
+        } else {
+            (!self.waits.is_empty()).then(|| Duration::from_secs(1))
+        }
+    }
+    /// A chat waiting for its usage limit to reset carries on even while chat isn't on screen.
+    fn ticks_hidden(&self) -> bool {
+        !self.waits.is_empty()
     }
     /// Replies running: the one on screen and the ones in other chats (closing the pane stops them all).
     fn busy(&self) -> usize {
@@ -3823,6 +3892,9 @@ impl Pane for Chat {
     fn poll(&mut self, cx: &mut Cx) {
         use crate::alerts::Kind;
         self.drain_jobs(cx);
+        if !self.waits.is_empty() {
+            self.wake_waits(cx);
+        }
         // ---- the chat on screen
         if let Some(mut run) = self.take_run() {
             let who = providers::label(&self.provider_of()).to_lowercase();
@@ -3877,6 +3949,9 @@ impl Pane for Chat {
             self.persist();
             let id = self.chat.id.clone();
             self.turn_ended(&id, !(out.failed || out.lost), cx);
+            if let (true, Some(at)) = (out.failed, out.limit) {
+                self.limit_hit(&id, at, cx);
+            }
             // anything queued that the agent didn't take mid-reply is the next message
             if out.failed || out.lost {
                 self.unqueue_to_box("the reply failed");
@@ -3925,6 +4000,9 @@ impl Pane for Chat {
             v
         } else {
             let mut v = vec![("enter", "send"), ("ctrl+g", "regenerate"), ("ctrl+r", "past prompts"), ("ctrl+n", "new chat"), ("/", "commands")];
+            if self.input.is_empty() && self.waits.contains_key(&self.chat.id) {
+                v.insert(0, ("esc", "don't carry on"));
+            }
             if self.last_reply().is_some() {
                 v.push(("ctrl+y", "copy"));
             }
@@ -3971,6 +4049,7 @@ impl Pane for Chat {
         // what's pinned above the composer: going back to a checkpoint; while an agent works, an approval prompt,
         // the status line, the todos
         let mut pinned = self.restore_lines(above.width as usize, cx);
+        pinned.extend(self.limit_line(t));
         pinned.extend(self.pinned_lines(above.width as usize, cx));
         if self.scroll > 0 && (self.unseen > 0 || self.stream.is_some()) {
             // scrolled up: say what's arriving below, and how to get back to it
@@ -4432,6 +4511,8 @@ impl Pane for Chat {
                     self.history_from = None;
                 } else if self.stream.is_some() {
                     self.stop();
+                } else if self.waits.remove(&self.chat.id).is_some() {
+                    self.info.push("it won't carry on by itself: send a message when you want it to go on".into());
                 } else {
                     self.info.clear();
                 }
@@ -6962,6 +7043,47 @@ mod tests {
         k.key(&mut c, KeyCode::Enter);
         assert!(k.notices().last().is_some_and(|n| n.starts_with("this chat's agent works in")), "{:?}", k.notices());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Stopped by your usage limit: the chat says when it resets and that it carries on by itself then, esc on the
+    /// empty box cancels that, and once the time comes it sends "continue" (in the background too).
+    #[test]
+    fn chat_usage_limit_carries_on_after_the_reset() {
+        let mut k = Kit::new();
+        let mut c = agent_chat(&k, "claude", "refactor the parser");
+        let _forget = Forget(c.chat.id.clone());
+        let now = crate::panes::files::clock::now_secs();
+        let id = c.chat.id.clone();
+        deliver(&mut k, &mut c, [Ev::Mark("usage limit reached · resets 06:00".into()), Ev::Limit(now + 3600), Ev::Error("You've hit your limit · resets 6am".into())]);
+        assert_eq!(c.waits.get(&id), Some(&(now + 3600)));
+        assert!(k.notices().iter().any(|n| n.contains("usage limit") && n.contains("carries on by itself")), "{:?}", k.notices());
+        let s = k.render_html(&mut c, 120, 30, "target/snap/chat-usage-limit.html");
+        assert!(s.contains("You've hit your usage limit") && s.contains("continuing automatically at") && s.contains("esc to cancel"), "{s}");
+        assert!(c.tick_every().is_some() && c.ticks_hidden(), "it keeps time while chat isn't on screen");
+        // esc on the empty box: it won't carry on
+        k.key(&mut c, KeyCode::Esc);
+        assert!(c.waits.is_empty() && !c.ticks_hidden());
+        assert!(!k.render(&mut c, 120, 30).contains("continuing automatically"));
+        // the error alone (Codex says it in words) is enough too
+        c.chat.messages.push(store::Msg { role: "user".into(), content: "go on".into(), ..Default::default() });
+        c.chat.messages.push(store::Msg { role: "assistant".into(), model: Some("claude".into()), ..Default::default() });
+        c.stream = Some(test_stream(None));
+        deliver(&mut k, &mut c, [Ev::Error("You've hit your usage limit. Try again in 2 hours 5 minutes.".into())]);
+        let at = c.waits.get(&id).copied().unwrap_or_default();
+        assert!(at >= now + 7500 && at <= now + 7510, "{:?}", c.waits);
+        // the time comes: "continue" goes to the chat (tests never start an AI, so it ends at once)
+        c.waits.insert(id.clone(), now - LIMIT_GRACE - 1);
+        k.poll(&mut c);
+        assert!(c.waits.is_empty());
+        let sent: Vec<&str> = c.chat.messages.iter().filter(|m| m.role == "user").map(|m| m.content.as_str()).collect();
+        assert_eq!(sent.last(), Some(&LIMIT_CONTINUE), "{sent:?}");
+        assert!(k.notices().iter().any(|n| n.contains("usage limit reset")), "{:?}", k.notices());
+        // a message of your own while it waits takes over
+        c.stop();
+        c.waits.insert(id.clone(), now + 600);
+        k.typ(&mut c, "actually, stop here");
+        k.key(&mut c, KeyCode::Enter);
+        assert!(c.waits.is_empty());
     }
 }
 

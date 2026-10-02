@@ -92,6 +92,8 @@ pub enum Ev {
     Steered(String),
     /// A marker in the transcript: "conversation compacted", "usage limit reached".
     Mark(String),
+    /// You hit your plan's usage limit; it resets at this time (unix seconds). The reply ends with an error next.
+    Limit(i64),
     /// Claude Code finished planning: the plan, shown in the transcript while you decide (the choice comes as a
     /// Question right after).
     Plan(String),

@@ -842,7 +842,12 @@ impl Claude {
                     format!(" · resets {:02}:{:02}", l.hour, l.min)
                 });
                 match info["status"].as_str() {
-                    Some("rejected") => send(Ev::Mark(format!("usage limit reached{}", resets.unwrap_or_default()))),
+                    Some("rejected") => {
+                        send(Ev::Mark(format!("usage limit reached{}", resets.unwrap_or_default())));
+                        if let Some(at) = info["resetsAt"].as_i64() {
+                            send(Ev::Limit(at));
+                        }
+                    }
                     Some("allowed_warning") => send(Ev::Status(format!("close to your usage limit{}", resets.unwrap_or_default()))),
                     _ => {}
                 }

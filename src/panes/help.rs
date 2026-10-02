@@ -147,6 +147,7 @@ fn topics() -> Vec<Topic> {
             K("pgup / pgdn / wheel", "scroll: scrolled up, what you're reading stays put while the reply goes on below"),
             K("ctrl+end  ·  ctrl+home", "back to the end (end does it too with an empty box) · the top"),
             K("ctrl+o", "expand every tool call (diffs, command output)"),
+            K("usage limit", "when Claude Code or Codex stops at your plan's limit, the box says when it resets and the chat carries on by itself then (it sends \"continue\"), even if chat isn't on screen; esc on the empty box, or a message of your own, cancels that"),
             K("alt v", "attach a screenshot"),
             P("Switching chats never stops a reply: it keeps going in the background, with a spinner by its chat in the list (? when it needs you), and tells you when it needs you or finishes. Closing the pane or quitting oriel stops them all."),
             Gap,
