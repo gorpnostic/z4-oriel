@@ -16,6 +16,8 @@ mod recall;
 mod qa_sizes;
 #[cfg(test)]
 mod qa_keys;
+#[cfg(test)]
+mod qa_first_run;
 mod testkit;
 mod theme;
 mod ui;
