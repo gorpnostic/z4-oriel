@@ -247,7 +247,15 @@ pub fn hint_line(f: &mut Frame, area: Rect, hints: &[(&str, &str)], t: &Theme) -
     }
     let row = Rect { y: area.bottom() - 1, height: 1, ..area };
     let mut spans = vec![Span::raw(" ")];
+    // whole hints only, most important first: one that doesn't fit is left out, not cut off mid-word
+    let mut used = 1;
     for (i, (k, what)) in hints.iter().enumerate() {
+        let sep = if i > 0 { 3 } else { 0 };
+        let w = unicode_width::UnicodeWidthStr::width(*k) + if what.is_empty() { 0 } else { 1 + unicode_width::UnicodeWidthStr::width(*what) };
+        if used + sep + w > row.width as usize {
+            break;
+        }
+        used += sep + w;
         if i > 0 {
             spans.push(Span::styled(" · ", Style::default().fg(t.muted)));
         }

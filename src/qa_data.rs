@@ -159,8 +159,10 @@ fn qa_calendar_corrupt_files_load_empty_and_render() {
         for code in [KeyCode::Char('j'), KeyCode::Char('e'), KeyCode::Char('x'), KeyCode::Char('u'), KeyCode::Char(']'), KeyCode::Char('[')] {
             k.key(&mut c, code);
         }
-        // nothing was changed, so the file must be exactly as it was
-        assert_eq!(std::fs::read(&path).unwrap(), bytes, "case {i}: just looking at a corrupt calendar must not rewrite it");
+        // nothing was changed: the file is exactly as it was, where it was or moved aside to .bad (an unreadable
+        // calendar.json is kept there rather than ever being written over)
+        let kept = std::fs::read(&path).or_else(|_| std::fs::read(d.join(format!("cal-{i}.json.bad"))));
+        assert_eq!(kept.ok().as_deref(), Some(&bytes[..]), "case {i}: just looking at a corrupt calendar must not rewrite it");
     }
 }
 

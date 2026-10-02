@@ -4302,6 +4302,12 @@ mod tests {
         let ob = app.onboard.as_mut().unwrap();
         ob.stage = crate::onboard::Stage::Music { input: String::new(), found: None };
         app.handle(Event::Input(CEvent::Paste(format!("\"{}\"", dir.display()))));
+        // the songs are counted off the UI thread once you stop typing: draw until the count is in
+        let t0 = Instant::now();
+        while app.onboard.as_ref().is_some_and(|o| o.animating()) && t0.elapsed() < Duration::from_secs(5) {
+            screen(&mut app, 150, 42);
+            std::thread::sleep(Duration::from_millis(20));
+        }
         match &app.onboard.as_ref().unwrap().stage {
             crate::onboard::Stage::Music { input, found } => {
                 assert_eq!(input, &dir.display().to_string());

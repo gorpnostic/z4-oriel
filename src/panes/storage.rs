@@ -58,6 +58,7 @@ enum Msg {
     Targets(u64, Vec<Target>),
     Paths(u64, &'static str, Vec<PathBuf>),
     Size { g: u64, id: &'static str, bytes: u64, done: bool },
+    #[cfg_attr(test, allow(dead_code))]
     Cleaned { label: String, freed: u64 },
     Listing { g: u64, rows: Vec<FRow> },
     FSize { g: u64, idx: usize, bytes: u64, done: bool },

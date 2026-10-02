@@ -96,6 +96,7 @@ pub fn dir_size(path: &Path, stop: &AtomicBool, mut big: Option<&mut Vec<(u64, P
 }
 
 /// Refuse anything that looks like a root, a home folder or a drive: cleanup only ever empties deep cache folders.
+#[cfg_attr(test, allow(dead_code))] // only a real clean (never run by tests) deletes
 fn deep_enough(p: &Path) -> bool {
     let home = dirs::home_dir();
     p.is_absolute() && p.components().count() >= 4 && Some(p) != home.as_deref()
@@ -103,6 +104,7 @@ fn deep_enough(p: &Path) -> bool {
 
 /// Delete one entry (recursively for real folders). Links are removed themselves, never what they point at.
 /// Returns the bytes actually freed; files that are in use just stay.
+#[cfg_attr(test, allow(dead_code))] // only a real clean (never run by tests) deletes
 fn delete_entry(p: &Path, md: &Metadata) -> u64 {
     if is_link(md) {
         let _ = fs::remove_file(p).or_else(|_| fs::remove_dir(p));
@@ -134,6 +136,7 @@ fn delete_entry(p: &Path, md: &Metadata) -> u64 {
 }
 
 /// Empty a cache folder, keeping the folder itself. Only call after the user confirmed.
+#[cfg_attr(test, allow(dead_code))] // only a real clean (never run by tests) deletes
 pub fn clear_dir(path: &Path) -> u64 {
     if !deep_enough(path) {
         return 0;
