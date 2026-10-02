@@ -23,7 +23,7 @@ use super::stream::{Entry, Ev};
 use super::{Agents, Msg, Then};
 use crate::pane::Cx;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -277,7 +277,23 @@ impl Agents {
     /// The run shown at the top of the board: the newest open one in this repo.
     pub(super) fn current_run(&self) -> Option<&Run> {
         let key = self.repo_key();
-        self.store.runs.iter().rev().find(|r| r.repo == key && r.state.open())
+        let open = |r: &&Run| r.repo == key && r.state.open();
+        self.run_pick.as_deref().and_then(|id| self.run_ref(id)).filter(open).or_else(|| self.store.runs.iter().rev().find(open))
+    }
+
+    /// This repo's open runs, oldest first (the panel switches between them with [ and ]).
+    pub(super) fn open_runs(&self) -> Vec<&Run> {
+        let key = self.repo_key();
+        self.store.runs.iter().filter(|r| r.repo == key && r.state.open()).collect()
+    }
+
+    /// [ / ] on the run panel: the previous / next open run of this repo.
+    pub(super) fn switch_run(&mut self, step: isize) {
+        let ids: Vec<String> = self.open_runs().iter().map(|r| r.id.clone()).collect();
+        let Some(cur) = self.current_run().map(|r| r.id.clone()) else { return };
+        let Some(i) = ids.iter().position(|id| *id == cur) else { return };
+        let n = ids.len() as isize;
+        self.run_pick = Some(ids[((i as isize + step).rem_euclid(n)) as usize].clone());
     }
 
     /// Lead + every worker of the run.
@@ -587,6 +603,7 @@ impl Agents {
         self.save_config(cx);
         self.remember_gate(gate);
         self.lead_focus = true;
+        self.run_pick = Some(id.clone());
         self.save();
         self.starting.insert(id.clone(), (repo.root.clone(), wt, slug));
         let seen = self.dirty_seen.get(&repo.root.display().to_string()).cloned().unwrap_or_default();
@@ -1476,6 +1493,8 @@ impl Agents {
         self.paused.retain(|_, until| *until > now);
         let runs: Vec<(String, u32)> = self.store.runs.iter().filter(|r| r.state == RunState::Running).map(|r| (r.id.clone(), r.max_parallel.clamp(1, 5))).collect();
         for (run, max) in runs {
+            let prio = self.inherited_priority(&run);
+            let prio_of = |t: &Task| prio.get(&t.id).copied().unwrap_or(t.priority);
             loop {
                 let running = self.store.tasks.iter().filter(|t| t.run == run && t.headless() && matches!(t.status, Status::Running | Status::Blocked)).count() as u32;
                 if running >= max {
@@ -1488,12 +1507,12 @@ impl Agents {
                     .filter(|t| t.run == run && t.status == Status::Todo && t.queued && !self.paused.contains_key(&t.agent) && self.agent_ok(&t.agent))
                     .filter(|t| !self.live.get(&t.id).is_some_and(|l| l.busy) && self.waiting_for(t).is_empty())
                     .collect();
-                // highest priority first, then oldest
-                ready.sort_by_key(|t| (std::cmp::Reverse(t.priority), t.created, t.id.clone()));
+                // highest priority first (what an urgent task waits for counts as urgent), then oldest
+                ready.sort_by_key(|t| (std::cmp::Reverse(prio_of(t)), t.created, t.id.clone()));
                 // only the best priority tier may take the slot: when its model just started a sibling, it waits
                 // out the stagger (a second or so) rather than letting a lower-priority task run ahead of it
-                let top = ready.first().map(|t| t.priority);
-                let pick = ready.iter().take_while(|t| Some(t.priority) == top).find(|t| self.last_start.get(&(t.agent.clone(), t.model.clone())).is_none_or(|s| s.elapsed() >= self.stagger)).map(|t| t.id.clone());
+                let top = ready.first().map(|t| prio_of(t));
+                let pick = ready.iter().take_while(|t| Some(prio_of(t)) == top).find(|t| self.last_start.get(&(t.agent.clone(), t.model.clone())).is_none_or(|s| s.elapsed() >= self.stagger)).map(|t| t.id.clone());
                 let Some(id) = pick else { break };
                 if self.check_budget(&run, cx).is_err() {
                     break;
@@ -1522,6 +1541,32 @@ impl Agents {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The run's open tasks' priorities as the scheduler sees them: a task's own, or that of anything still waiting
+    /// for it (directly or further down the chain), whichever is higher. Otherwise an urgent task's low
+    /// dependency waits behind normal tasks, and the urgent one with it (priority inversion).
+    pub(super) fn inherited_priority(&self, run: &str) -> HashMap<String, i8> {
+        let tasks: Vec<&Task> = self.store.tasks.iter().filter(|t| t.run == run && t.status != Status::Done).collect();
+        let mut prio: HashMap<String, i8> = tasks.iter().map(|t| (t.id.clone(), t.priority)).collect();
+        // priorities only rise and are bounded, so this ends (a cycle included)
+        loop {
+            let mut changed = false;
+            for t in &tasks {
+                let mine = prio.get(&t.id).copied().unwrap_or(t.priority);
+                for d in self.waiting_for(t) {
+                    let Some(x) = self.dep_state(run, &d).filter(|x| x.status != Status::Done) else { continue };
+                    let e = prio.entry(x.id.clone()).or_insert(x.priority);
+                    if *e < mine {
+                        *e = mine;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                return prio;
             }
         }
     }
@@ -2037,9 +2082,9 @@ impl Agents {
                     if t.attempts == 0 && t.redispatches == 0 {
                         rec.first_try += 1;
                     }
-                    rec.tokens += t.tokens;
+                    rec.tokens = rec.tokens.saturating_add(t.tokens);
                     rec.cost_usd += t.cost_usd;
-                    rec.secs += (store::now() - t.started).max(0);
+                    rec.secs = rec.secs.saturating_add(store::now().saturating_sub(t.started).max(0));
                 }
                 let tm = self.task_mut(id).unwrap();
                 tm.status = Status::Done;

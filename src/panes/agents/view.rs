@@ -41,6 +41,12 @@ fn col_color(c: usize, t: &Theme) -> Color {
     }
 }
 
+/// A saved unix time kept to years 1970..=9999 before the calendar math sees it (a hand-edited or newer
+/// tasks.json can hold anything, and the clock's arithmetic overflows past that).
+pub(super) fn sane_ts(t: i64) -> i64 {
+    t.clamp(0, 253_402_300_799)
+}
+
 /// "45s", "4m", "1h 12m", "3d"
 pub fn dur(secs: i64) -> String {
     let s = secs.max(0);
@@ -299,7 +305,8 @@ impl Agents {
             "Each runs in its own worktree with its own AI and model. Finished work is".to_string(),
             if gate.is_empty() { "merged one at a time into a new branch after a conflict check only:".to_string() } else { "merged one at a time into a new branch after a conflict check and".to_string() },
             if gate.is_empty() { "no gate, so nothing builds or tests it (g sets one).".to_string() } else { format!("`{}` on the merged result (a failure goes back to it).", ui::fit(gate, w.saturating_sub(40))) },
-            format!("Budget ${budget:.2} for the run{own}."),
+            // 0 = no cap (budget_left), not "nothing may run"
+            if budget > 0.0 { format!("Budget ${budget:.2} for the run{own}.") } else { format!("No budget cap for the run{own}.") },
             "When they're all in: d reviews, m merges.".to_string(),
         ]
         .into_iter()
@@ -337,6 +344,9 @@ impl Agents {
                 }
                 if r.manual || !r.state.active() {
                     h.push(("S", "save as template"));
+                }
+                if self.open_runs().len() > 1 {
+                    h.push(("[ ]", "other runs"));
                 }
                 h.extend([("↓", "cards"), ("R", "roster")]);
                 return h;
@@ -547,13 +557,13 @@ impl Agents {
         let icon = KINDS.iter().find(|k| k.0 == task.agent).map(|k| k.1).unwrap_or("robot");
         let when = match task.status {
             Status::Todo if task.queued => Span::styled("queued", ui::muted(t)),
-            Status::Todo => Span::styled(format!("added {}", dur(now - task.created)), ui::muted(t)),
-            Status::Running => Span::styled(dur(now - task.started), ui::accent(t)),
+            Status::Todo => Span::styled(format!("added {}", dur(now.saturating_sub(task.created))), ui::muted(t)),
+            Status::Running => Span::styled(dur(now.saturating_sub(task.started)), ui::accent(t)),
             Status::Blocked => Span::styled("BLOCKED", bold(t.danger)),
             Status::Review if task.want_merge && !self.run_accepting(&task.run) => Span::styled("merge on hold", ui::muted(t)),
             Status::Review if task.want_merge => Span::styled("merging", bold(t.shine)),
-            Status::Review => Span::styled(format!("took {}", dur(task.finished - task.started)), ui::muted(t)),
-            Status::Done => Span::styled(format!("{} {}", task.outcome, crate::panes::files::clock::stamp(task.finished).get(0..6).unwrap_or("")), ui::muted(t)),
+            Status::Review => Span::styled(format!("took {}", dur(task.finished.saturating_sub(task.started))), ui::muted(t)),
+            Status::Done => Span::styled(format!("{} {}", task.outcome, crate::panes::files::clock::stamp(sane_ts(task.finished)).get(0..6).unwrap_or("")), ui::muted(t)),
         };
         let mut right = vec![when];
         if task.followups > 0 {
@@ -581,7 +591,7 @@ impl Agents {
         // 3-4: what it's doing / asking / the error, and the numbers
         let stat_spans = |t: &Theme| -> Vec<Span<'static>> {
             let mut v = vec![];
-            if task.added + task.removed > 0 || task.files > 0 {
+            if task.added > 0 || task.removed > 0 || task.files > 0 {
                 v.push(Span::styled(format!("+{}", task.added), Style::default().fg(t.good)));
                 v.push(Span::styled(format!(" −{}", task.removed), Style::default().fg(t.danger)));
                 v.push(Span::styled(format!(" · {} file{}", task.files, if task.files == 1 { "" } else { "s" }), ui::muted(t)));
@@ -666,7 +676,7 @@ impl Agents {
             return vec![Span::styled(if blocking > 0 { format!("● {blocking} blocking") } else { format!("● {on} to send") }, bold(if blocking > 0 { t.danger } else { t.accent }))];
         }
         let hot = task.file_stats.iter().map(|f| f.0.as_str()).chain(task.touched.iter().map(String::as_str)).any(super::plan::is_hotspot);
-        if !task.worktree.is_empty() && (task.added + task.removed > 150 || hot || task.size == "M") {
+        if !task.worktree.is_empty() && (task.added.saturating_add(task.removed) > 150 || hot || task.size == "M") {
             return vec![Span::styled("V 2nd opinion?", Style::default().fg(t.muted))];
         }
         vec![]

@@ -93,7 +93,8 @@ impl Agents {
                 _ => {}
             }
         }
-        if let Some(r) = self.current_run().filter(|r| r.state == RunState::Review) {
+        // every run of this repo that waits for your review (the panel shows one at a time)
+        for r in self.open_runs().into_iter().filter(|r| r.state == RunState::Review) {
             let what = if r.manual { "your tasks are merged" } else { "lead run" };
             let mut o = Open::new(Kind::AgentDone, format!("run:{}", r.id), format!("{what}, ready for review: {}", r.goal));
             o.detail.push(format!("{} merged into {} · ${:.2}", r.merged, r.branch, self.spend(&r.id)));
@@ -130,7 +131,8 @@ impl Agents {
             return true;
         }
         if let Some(id) = key.strip_prefix("run:") {
-            if self.current_run().is_some_and(|r| r.id == id) {
+            if self.open_runs().iter().any(|r| r.id == id) {
+                self.run_pick = Some(id.to_string());
                 self.mode = Mode::Board;
                 self.lead_focus = true;
                 return true;

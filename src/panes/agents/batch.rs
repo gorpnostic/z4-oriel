@@ -58,6 +58,7 @@ impl Agents {
         self.runs_live.insert(id.clone(), RunLive::new());
         self.remember_gate(gate);
         self.lead_focus = true;
+        self.run_pick = Some(id.clone());
         self.save();
         self.starting.insert(id.clone(), (repo.root.clone(), wt, format!("batch-{slug}")));
         let seen = self.dirty_seen.get(&key).cloned().unwrap_or_default();
@@ -135,6 +136,8 @@ impl Agents {
                 r.summary = log.clone();
             }
         }
+        // the alert says "d reviews, m merges": the panel shows this run, even with a newer one still going
+        self.run_pick = Some(run_id.to_string());
         self.save();
         cx.alert(crate::alerts::Kind::AgentDone, alert);
     }
