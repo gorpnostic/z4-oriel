@@ -88,8 +88,10 @@ impl Pane for Home {
         let mut y = top;
         let lh = ui::logo(f, Rect { y, height: area.height.saturating_sub(y - area.y), ..area }, t, cx.time);
         y += lh + 1;
-        let tag = Paragraph::new(Line::from(Span::styled("a window onto everything", ui::muted(t)))).centered();
-        f.render_widget(tag, Rect { x: area.x, y, width: area.width, height: 1 });
+        if y < area.bottom() {
+            let tag = Paragraph::new(Line::from(Span::styled("a window onto everything", ui::muted(t)))).centered();
+            f.render_widget(tag, Rect { x: area.x, y, width: area.width, height: 1 });
+        }
         y += 2;
         // app grid: the key here, and the app's F-key from anywhere
         let cell_w: u16 = 26;
@@ -103,6 +105,11 @@ impl Pane for Home {
             let rect = Rect { x: x0 + c as u16 * cell_w, y: y + r as u16 * gap, width: cell_w, height: 1 };
             if rect.bottom() > area.bottom() {
                 break;
+            }
+            // a pane narrower than a cell: the cell is cut at its right edge
+            let rect = rect.intersection(area);
+            if rect.is_empty() {
+                continue;
             }
             let on = n == self.sel;
             let base = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default() };

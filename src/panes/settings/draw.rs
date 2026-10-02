@@ -36,7 +36,9 @@ impl Settings {
         };
         let mut head = head;
         head.push(Span::styled(if changed > 0 { format!("   ● {changed} changed from the default · saved as you go") } else { "   saved as you go".into() }, ui::muted(t)));
-        f.render_widget(Paragraph::new(Line::from(head)), Rect { y: body.y, height: 1, ..body });
+        if body.height > 0 {
+            f.render_widget(Paragraph::new(Line::from(head)), Rect { y: body.y, height: 1, ..body });
+        }
         // ---- config.toml doesn't parse: say where, and that nothing is saved until it does
         if let (Some(e), true) = (crate::config::broken(), body.height > 1) {
             let banner = format!("⚠ {e} · changes hold until oriel closes, nothing is saved · o opens the file");
@@ -58,7 +60,7 @@ impl Settings {
         }
         self.scroll = self.scroll.min(lines.len().saturating_sub(list_h as usize));
         self.hits.clear();
-        if lines.is_empty() {
+        if lines.is_empty() && top < body.bottom() {
             f.render_widget(Paragraph::new(Span::styled("  nothing matches: esc clears the search", ui::muted(t))), Rect { x: body.x, y: top, width: list_w, height: 1 });
         }
         let cols = self.columns(&lines, &rows, cfg, list_w as usize);

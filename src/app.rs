@@ -162,6 +162,8 @@ struct CtxMenu {
     items: Vec<(String, Cmd)>,
     sel: usize,
     rect: Rect,
+    /// the first item shown: on a screen too short for every item the menu scrolls to keep `sel` in view
+    top: usize,
 }
 
 /// A tab's status dot: the loudest of its panes.
@@ -1360,7 +1362,7 @@ impl App {
 
     fn ctx_open(&mut self, x: u16, y: u16, items: Vec<(String, Cmd)>) {
         self.ctx_seen += 1;
-        self.ctx = Some(CtxMenu { x, y, items, sel: 0, rect: Rect::default() });
+        self.ctx = Some(CtxMenu { x, y, items, sel: 0, rect: Rect::default(), top: 0 });
     }
 
     fn reap(&mut self) {
@@ -2338,13 +2340,13 @@ impl App {
             match m.kind {
                 MouseEventKind::Moved | MouseEventKind::Drag(_) => {
                     if menu.rect.contains(pos) {
-                        menu.sel = (m.row.saturating_sub(menu.rect.y + 1) as usize).min(menu.items.len().saturating_sub(1));
+                        menu.sel = (menu.top + m.row.saturating_sub(menu.rect.y + 1) as usize).min(menu.items.len().saturating_sub(1));
                     }
                     return;
                 }
                 MouseEventKind::Down(_) => {
                     let cmd = if menu.rect.contains(pos) && m.row > menu.rect.y && m.row < menu.rect.bottom() - 1 {
-                        menu.items.get((m.row - menu.rect.y - 1) as usize).map(|x| x.1.clone())
+                        menu.items.get(menu.top + (m.row - menu.rect.y - 1) as usize).map(|x| x.1.clone())
                     } else {
                         None
                     };
@@ -2582,7 +2584,12 @@ impl App {
         let time = self.start.elapsed().as_secs_f64();
         for (id, r) in rects {
             let Some(p) = self.panes.get(&id) else { continue };
+            // the × close button sits on the top border, right of the title (not on a pane squeezed to one row,
+            // where the bottom border and its subtitle share that row, or to none, where it's below the screen)
+            let has_x = closable && r.width > 12 && r.height >= 2;
             let title = format!("{}{}", ui::lead(p.icon()), p.title());
+            // a title that would run under the × is shortened to end before it (" title " from x+1, × at right-5)
+            let title = if has_x { ui::fit(&title, r.width as usize - 8) } else { title };
             let mut sub = p.subtitle();
             if zoom {
                 // the other panes are only hidden: say so
@@ -2604,7 +2611,7 @@ impl App {
                     self.need_hit = Some(b);
                 }
             }
-            if closable && r.width > 12 {
+            if has_x {
                 let b = Rect { x: r.right() - 5, y: r.y, width: 3, height: 1 };
                 let hot = b.contains(self.hover);
                 let style = if hot {
@@ -2672,10 +2679,18 @@ impl App {
             m.rect = r;
             f.render_widget(ratatui::widgets::Clear, r);
             let inner = ui::frame(f, r, "", None, true, &t);
-            for (i, (label, _)) in m.items.iter().enumerate() {
+            // cut down to a short screen: only the items that fit inside the frame, scrolled to the highlighted one
+            let rows = (inner.height as usize).max(1);
+            if m.sel < m.top {
+                m.top = m.sel;
+            } else if m.sel >= m.top + rows {
+                m.top = m.sel + 1 - rows;
+            }
+            m.top = m.top.min(m.items.len().saturating_sub(rows));
+            for (i, (label, _)) in m.items.iter().enumerate().skip(m.top).take(inner.height as usize) {
                 let on = i == m.sel;
                 let st = if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD | Modifier::REVERSED) } else { Style::default() };
-                f.render_widget(Paragraph::new(Span::styled(format!(" {:<width$}", label, width = inner.width.saturating_sub(1) as usize), st)), Rect { y: inner.y + i as u16, height: 1, ..inner });
+                f.render_widget(Paragraph::new(Span::styled(format!(" {:<width$}", label, width = inner.width.saturating_sub(1) as usize), st)), Rect { y: inner.y + (i - m.top) as u16, height: 1, ..inner });
             }
         }
         if let Some(p) = &mut self.palette {
@@ -2685,9 +2700,20 @@ impl App {
         // of view): a small box instead
         let in_sidebar = |id: u64| side_w > 0 && self.side_hits.iter().any(|(_, h)| matches!(h, SideHit::Tab(t) if *t == id));
         if let Some((_, text)) = self.renaming.as_ref().filter(|(id, _)| !in_sidebar(*id)) {
-            let inner = ui::popup(f, area, 48, 4, &format!("{}rename tab", ui::lead("tab")), &t);
-            let line = Line::from(vec![Span::styled(format!(" {text}▏"), Style::default().fg(t.accent).add_modifier(Modifier::BOLD))]);
-            f.render_widget(Paragraph::new(vec![line, Line::styled(" enter ok · esc", ui::muted(&t))]), inner);
+            let title = format!("{}rename tab", ui::lead("tab"));
+            // the end of the name (where you type) stays in view
+            let field = |w: u16| Line::from(vec![Span::styled(format!(" {}▏", ui::fit_tail(text, (w as usize).saturating_sub(2))), Style::default().fg(t.accent).add_modifier(Modifier::BOLD))]);
+            if area.height >= 5 {
+                let inner = ui::popup(f, area, 48, 4, &title, &t);
+                f.render_widget(Paragraph::new(vec![field(inner.width), Line::styled(" enter ok · esc", ui::muted(&t))]), inner);
+            } else {
+                // too short for the popup's margins: a 3-row box at the top, or just the field on a 1-2 row screen
+                let w = 48.min(area.width);
+                let r = Rect { x: area.x + (area.width - w) / 2, y: area.y, width: w, height: area.height.min(3) };
+                f.render_widget(ratatui::widgets::Clear, r);
+                let inner = if r.height >= 3 { ui::frame(f, r, &title, None, true, &t) } else { Rect { height: 1.min(r.height), ..r } };
+                f.render_widget(Paragraph::new(field(inner.width)), inner);
+            }
         }
         if let Some(ob) = &mut self.onboard {
             ob.draw(f, area, &t, self.start.elapsed().as_secs_f64());
@@ -2908,10 +2934,15 @@ impl App {
             let xr = Rect { x: r.right().saturating_sub(2), width: 2, ..r };
             let (glyph, color) = Self::dot_glyph(self.tab_dot(i), time, t);
             if let Some((_, text)) = self.renaming.as_ref().filter(|(rt, _)| *rt == tb.id) {
+                // a name too long for the row keeps its end (and the cursor) in view; the hint goes first
+                let hint = "  enter ok · esc";
+                let room = (r.width as usize).saturating_sub(unicode_width::UnicodeWidthStr::width(glyph) + 1);
+                let tw = unicode_width::UnicodeWidthStr::width(text.as_str());
+                let (shown, hint) = if tw + 1 + hint.len() <= room { (text.clone(), hint) } else { (ui::fit_tail(text, room.saturating_sub(1)), "") };
                 let line = Line::from(vec![
                     Span::styled(format!("{glyph} "), Style::default().fg(color)),
-                    Span::styled(format!("{}{}", text, "▏"), Style::default().fg(t.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
-                    Span::styled("  enter ok · esc", ui::muted(t)),
+                    Span::styled(format!("{shown}▏"), Style::default().fg(t.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+                    Span::styled(hint, ui::muted(t)),
                 ]);
                 f.render_widget(Paragraph::new(line), r);
             } else {
@@ -3097,7 +3128,7 @@ impl App {
                 }
             }
         }
-        if m.is_empty() {
+        if m.is_empty() && inner.height > 2 {
             f.render_widget(Paragraph::new(Span::styled("  nothing matches", ui::muted(t))), Rect { y: inner.y + 2, height: 1, ..inner });
         }
     }

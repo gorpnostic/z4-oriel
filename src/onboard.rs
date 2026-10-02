@@ -872,37 +872,52 @@ impl Onboard {
         }
         let logo = ui::logo_lines();
         let lw = logo[0].chars().count() as u16;
-        let h = 8 + 3 + 5 + 3;
+        // the logo (8 rows and a gap) only when the whole page fits under it; below it the tagline, two lines, the
+        // buttons and a note (9 rows); a shorter screen keeps the buttons in the middle
+        let logo_shown = area.width > lw + 2 && area.height >= 8 + 2 + 9;
+        let h = if logo_shown { 8 + 2 + 9 } else { 9 };
         let y0 = area.y + area.height.saturating_sub(h) / 2;
-        if area.width > lw + 2 {
+        if logo_shown {
             ui::big_logo(f, &logo, area.x + (area.width - lw) / 2, y0, t, time);
         }
-        let mut y = y0 + 10;
         let center = |f: &mut Frame, y: u16, line: Line| {
-            f.render_widget(Paragraph::new(line).centered(), Rect { x: area.x, y, width: area.width, height: 1 });
+            if y < area.bottom() {
+                f.render_widget(Paragraph::new(line).centered(), Rect { x: area.x, y, width: area.width, height: 1 });
+            }
         };
-        center(f, y, Line::styled("a window onto everything", Style::default().fg(t.shine)));
-        y += 2;
-        for l in [
-            "AI chat and coding agents · an orchestrator for many at once · your AI limits",
-            "music · system · files · notes · storage · real terminals, split any way you like",
-        ] {
-            center(f, y, Line::styled(l, ui::muted(t)));
-            y += 1;
-        }
-        y += 2;
+        let tagline = Line::styled("a window onto everything", Style::default().fg(t.shine));
+        let note = Line::styled("takes about a minute · replay it later from the palette", ui::muted(t));
+        let y = if area.height >= 9 {
+            let mut y = if logo_shown { y0 + 10 } else { y0 };
+            center(f, y, tagline);
+            y += 2;
+            for l in [
+                "AI chat and coding agents · an orchestrator for many at once · your AI limits",
+                "music · system · files · notes · storage · real terminals, split any way you like",
+            ] {
+                center(f, y, Line::styled(l, ui::muted(t)));
+                y += 1;
+            }
+            y + 2
+        } else {
+            let y = area.y + area.height / 2;
+            if y > area.y {
+                center(f, y - 1, tagline);
+            }
+            y
+        };
         // two buttons
         let a = " enter  take the tour ";
         let b = " s  skip ";
         let total = (a.chars().count() + 3 + b.chars().count()) as u16;
         let x = area.x + area.width.saturating_sub(total) / 2;
-        let ra = Rect { x, y, width: a.chars().count() as u16, height: 1 };
-        let rb = Rect { x: x + ra.width + 3, y, width: b.chars().count() as u16, height: 1 };
+        let ra = Rect { x, y, width: a.chars().count() as u16, height: 1 }.intersection(area);
+        let rb = Rect { x: x + a.chars().count() as u16 + 3, y, width: b.chars().count() as u16, height: 1 }.intersection(area);
         f.render_widget(Paragraph::new(Span::styled(a, Style::default().fg(t.accent).add_modifier(Modifier::REVERSED | Modifier::BOLD))), ra);
         f.render_widget(Paragraph::new(Span::styled(b, Style::default().fg(t.muted).add_modifier(Modifier::REVERSED))), rb);
         self.hits.push((ra, Btn::Tour));
         self.hits.push((rb, Btn::Skip));
-        center(f, y + 2, Line::styled("takes about a minute · replay it later from the palette", ui::muted(t)));
+        center(f, if area.height >= 9 { y + 2 } else { y + 1 }, note);
     }
 
     fn draw_tour(&mut self, f: &mut Frame, area: Rect, t: &Theme, step: usize) {
@@ -933,8 +948,14 @@ impl Onboard {
         let next = if s.done.is_none() { if step + 1 == STEPS.len() { " enter  finish " } else { " enter  next › " } } else if s.title == HELP_STEP { " skip step › " } else { " F10  skip step › " };
         // in a terminal esc is the program's, so the button is the way out (as is the ×)
         let end = if self.esc_ends { " esc  end tour " } else { " end tour " };
-        let rn = Rect { x: inner.x, y: by, width: next.chars().count() as u16, height: 1 };
-        let re = Rect { x: inner.x + rn.width + 2, y: by, width: end.chars().count() as u16, height: 1 };
+        // a narrow card: shorter labels, and never past its right border
+        let (next, end) = if (next.chars().count() + 2 + end.chars().count()) as u16 <= inner.width {
+            (next, end)
+        } else {
+            (if s.done.is_some() { " skip › " } else if step + 1 == STEPS.len() { " finish " } else { " next › " }, " end ")
+        };
+        let rn = Rect { x: inner.x, y: by, width: next.chars().count() as u16, height: 1 }.intersection(inner);
+        let re = Rect { x: inner.x + next.chars().count() as u16 + 2, y: by, width: end.chars().count() as u16, height: 1 }.intersection(inner);
         f.render_widget(Paragraph::new(Span::styled(next, Style::default().fg(t.accent).add_modifier(Modifier::REVERSED | Modifier::BOLD))), rn);
         f.render_widget(Paragraph::new(Span::styled(end, Style::default().fg(t.muted).add_modifier(Modifier::REVERSED))), re);
         self.hits.push((rn, Btn::Next));

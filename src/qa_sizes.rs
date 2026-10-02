@@ -257,20 +257,10 @@ pub(crate) const AWKWARD: &[&str] = &[
 
 // ------------------------------------------------------------------ known bugs (reported; each has a test below)
 
-/// Pane bugs this sweep found. The sweeps skip exactly these and still fail on anything else.
-pub(crate) const PANE_KNOWN: &[Known] = &[
-    (
-        "calendar: the month grid is at least 28 columns (cw = max(grid_w/7, 4)) and never clipped to the pane, and the month name / weekday row are drawn without a height check: spills right under ~30 columns and below at 4 rows or fewer (panes/calendar.rs:251, 253-258, 273)",
-        |p| p.pane.starts_with("calendar") && p.phase != "side" && outside(p) && (p.w < 30 || p.h <= 4),
-    ),
-    ("calendar sidebar: 'nothing in the next two weeks' is drawn on the row below a 1-row section (panes/calendar.rs:453)", |p| p.pane.starts_with("calendar") && p.phase == "side" && outside(p) && p.h <= 1),
-    (
-        "home: app grid cells are 24 wide and only checked against the bottom (labels spill right under ~16 columns); the tagline has no height check and ui::logo's fallback draws into a 0-row area (panes/home.rs:56-57, 68-69; ui.rs:171)",
-        |p| p.pane.starts_with("home") && outside(p) && (p.w < 24 || p.h <= 2),
-    ),
-    ("themes: the header row is drawn although the body has no rows (panes/themes.rs:148, 159)", |p| p.pane.starts_with("themes") && outside(p) && p.h <= 1),
-    ("music: the now-playing strip gets 0 rows but draws 'nothing playing' anyway (panes/music.rs:825, 833 -> 553-557)", |p| p.pane.starts_with("music") && outside(p) && p.h <= 1),
-];
+/// Pane bugs this sweep found and that aren't fixed yet. The sweeps skip exactly these and still fail on anything
+/// else. (Fixed, each with its test below: calendar's grid/weekday row/sidebar line, home's grid/tagline/logo,
+/// themes' header, music's now-playing strip drawing outside short or narrow panes.)
+pub(crate) const PANE_KNOWN: &[Known] = &[];
 
 /// Render `p` at w x h (or its sidebar section) and fail on a panic or anything drawn outside the rect.
 pub(crate) fn assert_clean(k: &mut Kit, p: &mut dyn Pane, w: u16, h: u16, side: bool) -> String {
@@ -282,7 +272,6 @@ fn empty_calendar(name: &str) -> crate::panes::calendar::Calendar {
 }
 
 #[test]
-#[ignore = "fails: layout::split_rect panics (clamp: min > max) on a split whose area is 1 cell wide or tall (src/layout.rs:143, 148)"]
 fn qa_sizes_bug_split_rect_one_cell() {
     use crate::layout::{Dir, Node};
     for dir in [Dir::Right, Dir::Down] {
@@ -295,35 +284,30 @@ fn qa_sizes_bug_split_rect_one_cell() {
 }
 
 #[test]
-#[ignore = "fails: calendar's month grid is at least 28 columns and isn't clipped: it spills past the right edge of a pane a third of an 80-column screen wide (src/panes/calendar.rs:253-258, 273)"]
 fn qa_sizes_bug_calendar_narrow_spills_right() {
     let mut k = kit();
     assert_clean(&mut k, &mut empty_calendar("cal-narrow"), 24, 30, false);
 }
 
 #[test]
-#[ignore = "fails: calendar draws its weekday row below a 3-row pane (src/panes/calendar.rs:251, 254)"]
 fn qa_sizes_bug_calendar_short_spills_below() {
     let mut k = kit();
     assert_clean(&mut k, &mut empty_calendar("cal-short"), 80, 3, false);
 }
 
 #[test]
-#[ignore = "fails: calendar's sidebar section draws 'nothing in the next two weeks' below a 1-row area (src/panes/calendar.rs:453)"]
 fn qa_sizes_bug_calendar_side_one_row() {
     let mut k = kit();
     assert_clean(&mut k, &mut empty_calendar("cal-side"), 22, 1, true);
 }
 
 #[test]
-#[ignore = "fails: home's app grid cells are 24 wide and only checked against the bottom: labels spill past the right edge of a 12-column pane (src/panes/home.rs:68-69)"]
 fn qa_sizes_bug_home_narrow_spills_right() {
     let mut k = kit();
     assert_clean(&mut k, &mut crate::panes::home::Home::new(), 12, 30, false);
 }
 
 #[test]
-#[ignore = "fails: home draws its tagline below a 2-row pane, and ui::logo's fallback draws into a 0-row one (src/panes/home.rs:56-57, src/ui.rs:171)"]
 fn qa_sizes_bug_home_short_spills_below() {
     let mut k = kit();
     assert_clean(&mut k, &mut crate::panes::home::Home::new(), 80, 2, false);
@@ -331,14 +315,12 @@ fn qa_sizes_bug_home_short_spills_below() {
 }
 
 #[test]
-#[ignore = "fails: themes draws its header row below a 1-row pane (src/panes/themes.rs:148, 159)"]
 fn qa_sizes_bug_themes_one_row() {
     let mut k = kit();
     assert_clean(&mut k, &mut crate::panes::themes::Themes::new(), 80, 1, false);
 }
 
 #[test]
-#[ignore = "fails: music draws 'nothing playing' below a 1-row pane: the now-playing strip gets 0 rows but draws its first line (src/panes/music.rs:825, 833, 553-557)"]
 fn qa_sizes_bug_music_one_row() {
     run_child("qa_sizes::qa_sizes_child_music_one_row", &scratch("music-one-row"));
 }
@@ -356,7 +338,7 @@ fn qa_sizes_child_music_one_row() {
 // ------------------------------------------------------------------ in-process panes (safe to render here)
 
 /// Every name panes::open knows, so a new pane can't be added without this file noticing.
-const OPEN_NAMES: &[&str] = &["terminal", "shell", "ai", "chat", "music", "system", "files", "notes", "calendar", "storage", "agents", "ais", "home", "help", "themes", "alerts", "updates"];
+const OPEN_NAMES: &[&str] = &["terminal", "shell", "ai", "chat", "music", "system", "files", "notes", "calendar", "storage", "agents", "ais", "home", "help", "themes", "alerts", "updates", "settings", "search"];
 
 fn open(name: &'static str) -> impl FnMut(&Kit) -> Box<dyn Pane> {
     move |k: &Kit| crate::panes::open(name, &k.config).unwrap_or_else(|| panic!("panes::open({name}) gave None"))
@@ -463,6 +445,21 @@ fn qa_sizes_updates() {
 fn qa_sizes_alerts() {
     let mut k = kit();
     verdict(sweep("alerts", &mut k, &mut open("alerts"), true, 0), PANE_KNOWN);
+}
+
+#[test]
+fn qa_sizes_settings() {
+    // tests keep it offline (no probes); its music row counts songs in the configured folders: an empty scratch one
+    let mut k = kit();
+    k.config = quiet_config(Some(&scratch("settings-music")));
+    verdict(sweep("settings", &mut k, &mut open("settings"), true, 0), PANE_KNOWN);
+}
+
+#[test]
+fn qa_sizes_search() {
+    // under cfg(test) it indexes an empty scratch folder, never the real ~/.claude or oriel's chats
+    let mut k = kit();
+    verdict(sweep("search", &mut k, &mut open("search"), true, 400), PANE_KNOWN);
 }
 
 #[test]
