@@ -697,6 +697,9 @@ pub struct Agents {
     hung_after: Duration,
     /// The lead panel at the top of the board has the keyboard.
     lead_focus: bool,
+    /// The run the panel shows when this repo has more than one open: the one you switched to ([ ]), started,
+    /// or that just became ready for review. None (or one that's no longer open) = the newest open run.
+    run_pick: Option<String>,
     /// Tasks marked with space, in the order they were marked (enter runs them together).
     marked: Vec<String>,
     /// Tests: run these instead of real workers / leads.
@@ -822,6 +825,7 @@ impl Agents {
             stagger: Duration::from_secs(5),
             hung_after: Duration::from_secs(300),
             lead_focus: false,
+            run_pick: None,
             marked: vec![],
             fake_worker: None,
             fake_lead: None,
@@ -1086,7 +1090,7 @@ impl Agents {
     fn today(&self) -> f64 {
         let now = crate::panes::files::clock::local(store::now());
         let same = |t: i64| {
-            let d = crate::panes::files::clock::local(t);
+            let d = crate::panes::files::clock::local(view::sane_ts(t));
             (d.year, d.month, d.day) == (now.year, now.month, now.day)
         };
         // workers (with what they spent before a retry), plus the leads that orchestrated them
@@ -1451,7 +1455,7 @@ impl Agents {
     fn on_status(&mut self, id: &str, st: StatusFile, cx: &mut Cx) {
         let run_ts = self.live(id).run_ts;
         let Some(t) = self.task(id) else { return };
-        if t.headless() || st.ts + 2 < run_ts || !matches!(t.status, Status::Running | Status::Blocked | Status::Review) {
+        if t.headless() || st.ts.saturating_add(2) < run_ts || !matches!(t.status, Status::Running | Status::Blocked | Status::Review) {
             return;
         }
         let refresh = {
@@ -2097,6 +2101,7 @@ impl Agents {
                     self.deleted = Some((t, Instant::now()));
                 }
                 self.store.tasks.retain(|t| t.id != c.id);
+                self.marked.retain(|m| *m != c.id);
                 self.live.remove(&c.id);
                 let _ = std::fs::remove_file(self.paths.status(&c.id));
             }
@@ -2589,7 +2594,8 @@ impl Agents {
         let budget = match form.budget.text.trim().trim_start_matches('$') {
             "" => 0.0,
             b => match b.parse::<f64>() {
-                Ok(v) if v >= 0.0 => v,
+                // "inf" parses, but JSON can't hold it (it's saved as null)
+                Ok(v) if v.is_finite() && v >= 0.0 => v,
                 _ => {
                     form.err = "the budget is a number of dollars, like 1.5".into();
                     form.field = 6;
@@ -2649,6 +2655,9 @@ impl Agents {
         match k.code {
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.lead_focus = false,
             KeyCode::Up | KeyCode::Char('k') => {}
+            // more than one open run in this repo: switch between them
+            KeyCode::Char('[') => self.switch_run(-1),
+            KeyCode::Char(']') => self.switch_run(1),
             // esc leaves the panel like everywhere else; stopping the run is s (and y)
             KeyCode::Char('s') if run.state.active() => self.mode = Mode::Confirm(Confirm { id: run.id, what: Pending::StopRun }),
             KeyCode::Esc => self.lead_focus = false,
@@ -2753,8 +2762,11 @@ impl Agents {
             KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') => {
                 if let Some(id) = self.selected() {
                     let up = k.code != KeyCode::Char('-');
-                    if let Some(t) = self.task_mut(&id).filter(|t| t.status != Status::Done) {
-                        t.priority = (t.priority + if up { 1 } else { -1 }).clamp(-1, 2);
+                    // priority orders what waits to start: a card that already started has nothing left to wait for
+                    if self.task(&id).is_some_and(|t| t.status.active()) {
+                        cx.notify("it's already started — priority only orders tasks waiting to start");
+                    } else if let Some(t) = self.task_mut(&id).filter(|t| t.status != Status::Done) {
+                        t.priority = t.priority.saturating_add(if up { 1 } else { -1 }).clamp(-1, 2);
                         let name = PRIORITIES.iter().find(|p| p.0 == t.priority).map(|p| p.1).unwrap_or("normal");
                         cx.notify(format!("priority: {name}"));
                     }

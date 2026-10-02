@@ -198,6 +198,17 @@ fn mark_and_run(k: &mut Kit, p: &mut Agents, ids: &[String], serial: bool) -> St
     p.store.runs.last().unwrap().id.clone()
 }
 
+/// Poll until `cond` holds or `ms` runs out (times 4, like `until`: headroom for a loaded machine), without
+/// failing here: the assert after it says what went wrong. For waits on something that should happen; a window in
+/// which nothing may happen keeps its own short loop.
+fn wait_for(k: &mut Kit, p: &mut Agents, ms: u64, cond: impl Fn(&Agents) -> bool) {
+    let deadline = Instant::now() + Duration::from_millis(ms * 4);
+    while Instant::now() < deadline && !cond(p) {
+        k.poll(p);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn run_of(p: &Agents, id: &str) -> store::Run {
     p.run_ref(id).cloned().unwrap_or_else(|| panic!("no run {id}"))
 }
@@ -251,11 +262,7 @@ fn qa_batch_discarding_the_last_open_task_settles_the_run() {
     until(&mut k, &mut p, 15_000, "b discarded", |p| task_of(p, &b).status == Status::Done);
     assert_eq!(task_of(&p, &b).outcome, "discarded");
     assert!(task_of(&p, &b).worktree.is_empty(), "its worktree is gone");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && run_of(&p, &run).state.active() {
-        k.poll(&mut p);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for(&mut k, &mut p, 5000, |p| !run_of(p, &run).state.active());
     let r = run_of(&p, &run);
     assert_eq!(r.state, store::RunState::Review, "every task is merged or discarded, but the run still says {:?}; log: {:?}", r.state, r.log);
     let _ = std::fs::remove_dir_all(&dir);
@@ -279,11 +286,7 @@ fn qa_serial_batch_discarding_the_first_task_does_not_strand_the_rest() {
     assert_eq!(task_of(&p, &b).status, Status::Todo, "the second waits its turn");
     discard_card(&mut k, &mut p, &a);
     until(&mut k, &mut p, 15_000, "the first is discarded", |p| task_of(p, &a).status == Status::Done);
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline && task_of(&p, &b).status == Status::Todo && run_of(&p, &run).state.active() {
-        k.poll(&mut p);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for(&mut k, &mut p, 8000, |p| task_of(p, &b).status != Status::Todo || !run_of(p, &run).state.active());
     let (tb, r) = (task_of(&p, &b), run_of(&p, &run));
     assert!(tb.status != Status::Todo || !r.state.active(), "the second task still waits (queued={}, after {:?}) for a task that was discarded, and the run is {:?} forever", tb.queued, tb.depends_on, r.state);
     let _ = std::fs::remove_dir_all(&dir);
@@ -311,7 +314,10 @@ fn qa_batch_blocked_task_answered_with_a_comment() {
     assert_eq!(ta.questions, vec!["Which colour, red or blue?".to_string()]);
     assert!(k.notices().iter().any(|n| n.contains("is blocked") && n.contains("c answers it")), "{:?}", k.notices());
     assert_eq!(task_of(&p, &b).status, Status::Todo, "b waits for a");
-    assert!(run_of(&p, &run).state.active());
+    // nothing can move until you answer: the run settles for review, naming what it set aside (batch_check)
+    until(&mut k, &mut p, 5000, "the run settles while a is blocked", |p| run_of(p, &run).state == store::RunState::Review);
+    let settled = run_of(&p, &run);
+    assert!(settled.summary.contains("1 blocked") && settled.summary.contains("1 not started"), "{}", settled.summary);
     p.lead_focus = false;
     p.select(&a);
     let board = k.render_html(&mut p, 150, 44, &snap("batch-blocked"));
@@ -322,6 +328,7 @@ fn qa_batch_blocked_task_answered_with_a_comment() {
     k.typ(&mut p, "red please");
     k.key(&mut p, KeyCode::Enter);
     assert_eq!(task_of(&p, &a).status, Status::Running, "the answer sends it back to work");
+    assert!(run_of(&p, &run).state.active(), "and the settled run back to work with it");
     until(&mut k, &mut p, 30_000, "the run is ready", |p| run_of(p, &run).state == store::RunState::Review);
     let r = run_of(&p, &run);
     assert_eq!(r.merged, 2, "{r:?}");
@@ -371,7 +378,7 @@ fn qa_batch_restart_mid_run_then_resume() {
     until(&mut k, &mut p, 30_000, "resumed and finished", |p| run_of(p, &run).state == store::RunState::Review);
     let resumed = w.calls().into_iter().filter(|c| c.task == a).last().unwrap();
     assert_eq!(resumed.resume, session, "the cut-off worker continued its own session");
-    assert!(resumed.prompt.contains("oriel was restarted"), "{}", resumed.prompt);
+    assert!(resumed.prompt.contains("You were interrupted") && resumed.prompt.contains("Continue the task"), "{}", resumed.prompt);
     let r = run_of(&p, &run);
     assert_eq!(r.merged, 2, "{r:?}");
     assert_eq!(sh(&repo, &["show", &format!("{}:long.txt", r.branch)]), "long");
@@ -410,11 +417,7 @@ fn qa_batch_restart_with_merges_queued_resumes_them() {
     assert!(p.lead_focus);
     k.key(&mut p, KeyCode::Char('r'));
     assert!(run_of(&p, &run).state.active(), "resumed");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline && run_of(&p, &run).state != store::RunState::Review {
-        k.poll(&mut p);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for(&mut k, &mut p, 15_000, |p| run_of(p, &run).state == store::RunState::Review);
     let (ta, tb) = (task_of(&p, &a), task_of(&p, &b));
     assert_eq!(run_of(&p, &run).state, store::RunState::Review, "after resume: a {:?} want_merge={} last={:?}; b {:?} last={:?}; queue {:?}", ta.status, ta.want_merge, ta.last, tb.status, tb.last, p.merge_queue);
     let _ = std::fs::remove_dir_all(&dir);
@@ -486,11 +489,7 @@ fn qa_batch_stop_then_resume_starts_the_tasks_that_never_ran() {
     assert!(p.lead_focus);
     k.key(&mut p, KeyCode::Char('r'));
     assert!(run_of(&p, &run).state.active(), "r resumed it");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline && run_of(&p, &run).state != store::RunState::Review {
-        k.poll(&mut p);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for(&mut k, &mut p, 20_000, |p| run_of(p, &run).state == store::RunState::Review);
     let (ta, tb, r) = (task_of(&p, &a), task_of(&p, &b), run_of(&p, &run));
     assert_eq!(r.state, store::RunState::Review, "after s then r: a {:?}/{:?} {:?}; b {:?} queued={} {:?}; {} worker starts for b", ta.status, ta.outcome, ta.last, tb.status, tb.queued, tb.last, w.calls().iter().filter(|c| c.task == b).count());
     assert!(merged(&tb));
@@ -648,13 +647,14 @@ fn qa_serial_batch_against_an_after_link_does_not_deadlock() {
         return; // refused up front: fine
     }
     let run = p.store.runs[0].id.clone();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline && run_of(&p, &run).state.active() {
-        k.poll(&mut p);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // two workers and two merges one after another take ~15 s alone (a debug build, git on Windows) and far longer
+    // next to the rest of the suite: wait long enough that only a real deadlock fails
+    wait_for(&mut k, &mut p, 30_000, |p| !run_of(p, &run).state.active());
     let (ta, tb) = (task_of(&p, &a), task_of(&p, &b));
-    assert!(!run_of(&p, &run).state.active(), "deadlock: A waits for {:?}, B waits for {:?}, nothing ever starts ({} worker calls)", ta.depends_on, tb.depends_on, w.calls().len());
+    assert!(!run_of(&p, &run).state.active(), "deadlock: A waits for {:?}, B waits for {:?}, nothing ever starts ({} worker calls); A {:?} {:?}, B {:?} {:?}; log {:?}", ta.depends_on, tb.depends_on, w.calls().len(), ta.status, ta.last, tb.status, tb.last, run_of(&p, &run).log);
+    // the run took the link's order over the marking order: A first, and both landed
+    assert!(merged(&ta) && merged(&tb), "A {:?} {:?}, B {:?} {:?}", ta.status, ta.last, tb.status, tb.last);
+    assert!(w.first(&a).unwrap() < w.first(&b).unwrap(), "B (after A) started first");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -722,11 +722,7 @@ fn qa_batch_budget_spent_mid_run_settles() {
     assert!(k.notices().iter().any(|n| n.contains("budget")), "{:?}", k.notices());
     let third = p.store.tasks.iter().find(|t| t.run == run && !merged(t)).cloned().unwrap();
     assert_eq!(third.status, Status::Todo, "the third never started");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && run_of(&p, &run).state.active() {
-        k.poll(&mut p);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for(&mut k, &mut p, 5000, |p| !run_of(p, &run).state.active());
     let r = run_of(&p, &run);
     assert!(!r.state.active(), "nothing is running or merging and nothing can start, but the run stays {:?} (m refuses: 'the run is still working'); log: {:?}", r.state, r.log);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1066,7 +1062,8 @@ fn qa_form_add_and_start_waits_for_after() {
     open_form(&mut k, &mut p, "Roof");
     to_field(&mut k, &mut p, 5);
     k.typ(&mut p, "Foundation");
-    to_field(&mut k, &mut p, 7);
+    // the buttons are field 8 now (7 is the acceptance check)
+    to_field(&mut k, &mut p, 8);
     assert!(matches!(&p.mode, Mode::Form(f) if f.button == 1), "add & start is the default");
     k.key(&mut p, KeyCode::Enter);
     let roof = p.store.tasks.iter().find(|t| t.title == "Roof").cloned().expect("saved");

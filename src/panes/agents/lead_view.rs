@@ -137,7 +137,13 @@ impl Agents {
         let focus = self.lead_focus;
         let spin = SPIN[(cx.time * 10.0) as usize % 10];
         let proto = if run.protocol == "mcp" { "MCP tools" } else { "text protocol" };
-        let title = format!("⚑ lead · {}{} · {}", run.agent, if run.model.is_empty() { String::new() } else { format!(" {}", run.model) }, proto);
+        let mut title = format!("⚑ lead · {}{} · {}", run.agent, if run.model.is_empty() { String::new() } else { format!(" {}", run.model) }, proto);
+        // more than one open run here: which one this is ([ ] switch)
+        let open: Vec<String> = self.open_runs().iter().map(|r| r.id.clone()).collect();
+        if open.len() > 1 {
+            let i = open.iter().position(|id| *id == run.id).unwrap_or(0) + 1;
+            title.push_str(&format!(" · run {i} of {} · [ ] switch", open.len()));
+        }
         let feedback = if self.feedback_block(&run).is_none() { "c feedback · " } else { "" };
         let hints = if !focus && !run.held.is_empty() {
             "↑ then enter: its plan waits for you".to_string()
@@ -178,7 +184,7 @@ impl Agents {
             RunState::Merged => ("✓", bold(t.good)),
             _ => ("■", ui::muted(t)),
         };
-        let elapsed = if run.finished > 0 { run.finished - run.created } else { now - run.created };
+        let elapsed = if run.finished > 0 { run.finished.saturating_sub(run.created) } else { now.saturating_sub(run.created) };
         let mut lines = vec![spread(
             vec![Span::styled(format!("{glyph} "), gs), Span::styled(run.goal.lines().next().unwrap_or("").to_string(), bold(t.fg))],
             vec![
@@ -268,7 +274,20 @@ impl Agents {
         let submit = |s: &mut Self, form: LeadForm, cx: &mut Cx| {
             let agent = KINDS[form.agent].0;
             let par = form.parallel.text.trim().parse::<u32>().unwrap_or(3).clamp(1, 5);
-            let budget = form.budget.text.trim().trim_start_matches('$').parse::<f64>().unwrap_or(s.lead_cfg.run_budget_usd).max(0.0);
+            // empty = the default; anything else must be dollars ("inf" parses, but JSON saves it as null)
+            let budget = match form.budget.text.trim().trim_start_matches('$') {
+                "" => s.lead_cfg.run_budget_usd,
+                b => match b.parse::<f64>() {
+                    Ok(v) if v.is_finite() && v >= 0.0 => v,
+                    _ => {
+                        let mut form = form;
+                        form.err = "the budget is a number of dollars, like 8 (0 = no cap)".into();
+                        form.field = 4;
+                        s.mode = Mode::LeadForm(form);
+                        return;
+                    }
+                },
+            };
             match s.start_run(&form.goal.text, agent, &form.model.text, par, budget, &form.gate.text, form.approve, cx) {
                 Ok(_) => {
                     // it replaces a run that never started

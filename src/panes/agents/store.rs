@@ -320,7 +320,50 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 pub fn load(p: &Paths) -> Store {
-    std::fs::read_to_string(p.tasks()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    std::fs::read_to_string(p.tasks()).map(|s| parse(&s)).unwrap_or_default()
+}
+
+/// tasks.json as a Store. One value it can't read (a status from a newer oriel, a number out of range, a field of
+/// the wrong type) costs that field only, not the whole file: the next save would otherwise write back an empty
+/// board over every task, run and record.
+pub fn parse(s: &str) -> Store {
+    if let Ok(st) = serde_json::from_str(s) {
+        return st;
+    }
+    let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(s) else { return Store::default() };
+    let items = |v: Option<Value>| -> Vec<Value> {
+        match v {
+            Some(Value::Array(a)) => a,
+            _ => vec![],
+        }
+    };
+    let tasks = items(obj.remove("tasks"));
+    let runs = items(obj.remove("runs"));
+    let records = obj.remove("records");
+    let mut st: Store = lenient(&Value::Object(obj)).unwrap_or_default();
+    st.tasks = tasks.iter().filter_map(lenient).collect();
+    st.runs = runs.iter().filter_map(lenient).collect();
+    if let Some(Value::Object(m)) = records {
+        st.records = m.iter().filter_map(|(k, v)| lenient(v).map(|r| (k.clone(), r))).collect();
+    }
+    st
+}
+
+/// Read a struct field by field, leaving out (at their defaults) the fields that don't parse.
+fn lenient<T: serde::de::DeserializeOwned + Serialize + Default>(v: &Value) -> Option<T> {
+    if let Ok(t) = serde_json::from_value(v.clone()) {
+        return Some(t);
+    }
+    let Value::Object(obj) = v else { return None };
+    let Ok(Value::Object(mut base)) = serde_json::to_value(T::default()) else { return None };
+    for (k, x) in obj {
+        let mut trial = base.clone();
+        trial.insert(k.clone(), x.clone());
+        if serde_json::from_value::<T>(Value::Object(trial.clone())).is_ok() {
+            base = trial;
+        }
+    }
+    serde_json::from_value(Value::Object(base)).ok()
 }
 
 // ------------------------------------------------------------------ status files
