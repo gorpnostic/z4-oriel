@@ -500,12 +500,23 @@ mod tests {
         apply(&mut k);
         let _ = k.render(&mut p, 150, 40);
         let first = reads();
-        // was: a folder listing and a parse per frame (the rainbow logo redraws 8 times a second)
+        // was: a folder listing and a parse per frame (the rainbow logo redraws 8 times a second). Every frame here
+        // counts as inside the freshness window: on a busy machine 20 debug frames can take longer than it.
         for _ in 0..20 {
+            if let Some(f) = p.files.as_mut() {
+                f.at = std::time::Instant::now();
+            }
             let _ = k.render(&mut p, 150, 40);
             let _ = k.render_side(&mut p, 30, 20);
         }
         assert_eq!(reads(), first, "frames reuse what was read");
+        // once it's older than that, the next frame looks again (an edit made in an editor shows up)
+        if let Some(f) = p.files.as_mut() {
+            f.at = std::time::Instant::now() - FILES_FRESH;
+        }
+        let _ = k.render(&mut p, 150, 40);
+        assert!(reads() > first, "never looks again");
+        let first = reads();
         // a change here looks again
         k.key(&mut p, KeyCode::Right);
         apply(&mut k);

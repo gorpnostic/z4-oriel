@@ -1616,11 +1616,11 @@ pub(crate) mod tests {
         let at = p.sel;
         k.key(&mut p, KeyCode::Char('d'));
         k.key(&mut p, KeyCode::Char('y'));
-        for _ in 0..20 {
-            k.wait_wake(&mut p, 50);
-            if !names(&p).iter().any(|n| n == "done.txt") {
-                break;
-            }
+        // as long as it takes (a busy machine), until it's said and the folder has been read again
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(10) && !(k.notices().iter().any(|n| n.contains("done.txt is in")) && !p.loading && !names(&p).iter().any(|n| n == "done.txt")) {
+            k.wait_wake(&mut p, 20);
+            k.poll(&mut p);
         }
         assert!(!d.join("done.txt").exists());
         assert!(!names(&p).iter().any(|n| n == "done.txt"), "{:?}", names(&p));
