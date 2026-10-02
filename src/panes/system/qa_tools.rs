@@ -198,7 +198,7 @@ fn record_kill(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// k asks about the highlighted process; y must end THAT pid even if a new snapshot re-sorted the table in
+/// x asks about the highlighted process; y must end THAT pid even if a new snapshot re-sorted the table in
 /// between (the sampler replaces it every second or so), and n / esc end nothing.
 #[test]
 fn qa_system_kill_hits_the_pid_it_asked_about() {
@@ -216,7 +216,7 @@ fn qa_system_kill_hits_the_pid_it_asked_about() {
     k.key(&mut p, KeyCode::Char('2'));
     k.key(&mut p, KeyCode::Char('g'));
     let asked = p.selected().map(|x| (x.pid, x.name.clone())).expect("a process is highlighted");
-    k.key(&mut p, KeyCode::Char('k'));
+    k.key(&mut p, KeyCode::Char('x'));
     assert_eq!(p.pending_kill.as_ref().map(|(pid, _)| *pid), Some(asked.0));
     let s = k.render(&mut p, 150, 40);
     assert!(s.contains(&asked.1) && s.contains("y") && s.contains("kill it"), "the question names it:\n{s}");
@@ -230,7 +230,7 @@ fn qa_system_kill_hits_the_pid_it_asked_about() {
     assert!(k.notices().iter().any(|n| n.contains(&format!("pid {}", asked.0))), "{:?}", k.notices());
     // n and esc leave it alone
     for no in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Enter] {
-        k.key(&mut p, KeyCode::Char('k'));
+        k.key(&mut p, KeyCode::Char('x'));
         assert!(p.pending_kill.is_some());
         k.key(&mut p, no);
         assert!(p.pending_kill.is_none());
@@ -262,8 +262,8 @@ fn qa_system_filters_and_kill_with_nothing_selected() {
     assert!(p.rows.is_empty());
     let out = k.render(&mut p, 150, 44);
     k.key(&mut p, KeyCode::Enter);
-    // k with an empty table asks nothing
-    k.key(&mut p, KeyCode::Char('k'));
+    // x with an empty table asks nothing
+    k.key(&mut p, KeyCode::Char('x'));
     assert!(p.pending_kill.is_none(), "{out}");
     k.key(&mut p, KeyCode::Char('y'));
     k.key(&mut p, KeyCode::Esc);
@@ -271,7 +271,7 @@ fn qa_system_filters_and_kill_with_nothing_selected() {
     let mut p = quiet();
     for key in ['1', '2', '4', '5', '6'] {
         k.key(&mut p, KeyCode::Char(key));
-        k.key(&mut p, KeyCode::Char('k'));
+        k.key(&mut p, KeyCode::Char('x'));
         assert!(p.pending_kill.is_none(), "view {key}");
         k.key(&mut p, KeyCode::Char('/'));
         k.typ(&mut p, "x");
@@ -284,6 +284,6 @@ fn qa_system_filters_and_kill_with_nothing_selected() {
     odd_lists(&mut p);
     k.key(&mut p, KeyCode::Char('6'));
     k.key(&mut p, KeyCode::Char('G'));
-    k.key(&mut p, KeyCode::Char('k'));
+    k.key(&mut p, KeyCode::Char('x'));
     assert!(p.pending_kill.is_none(), "pid 4 offered: {:?}", p.pending_kill);
 }

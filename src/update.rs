@@ -131,7 +131,7 @@ struct Checked {
 #[cfg(test)]
 thread_local! {
     /// Tests that install or roll back keep their state in a folder of their own.
-    static TEST_STATE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static TEST_STATE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 fn state_dir() -> PathBuf {

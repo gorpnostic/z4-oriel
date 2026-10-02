@@ -143,7 +143,7 @@ fn qa_music_empty_library_and_empty_playlist() {
     let mut k = Kit::new();
     let mut p = fake(vec![], vec![library::Playlist { id: "e".into(), name: "Empty".into(), ids: vec!["nope".into()] }]);
     let s = k.render(&mut p, 150, 44);
-    assert!(s.contains("no songs found in test") && s.contains("add folders under [music] in config.toml"), "{s}");
+    assert!(s.contains("no songs found in test") && s.contains("add a music folder in settings (alt ,)") && s.contains("R rescans"), "{s}");
     assert_eq!(p.subtitle().as_deref(), Some("0 songs"));
     for code in [KeyCode::Char('j'), KeyCode::Char('k'), KeyCode::Char('G'), KeyCode::PageDown, KeyCode::PageUp, KeyCode::Left, KeyCode::Char('n'), KeyCode::Char('p')] {
         k.key(&mut p, code);
