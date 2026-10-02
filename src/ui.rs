@@ -1,7 +1,7 @@
 //! Shared drawing: the rounded frame with its title set into the border (the nest look), icons, the logo,
 //! and small helpers every pane uses.
 
-use crate::theme::{Theme, rainbow};
+use crate::theme::Theme;
 use ratatui::{
     Frame,
     layout::Rect,

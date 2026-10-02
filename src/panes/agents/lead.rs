@@ -40,6 +40,15 @@ const MAX_TURNS: u32 = 80;
 const MAX_ATTEMPTS: u32 = 2;
 /// What a worker cut off by a stop (or oriel closing) hears when its run carries on.
 const CARRY_ON: &str = "You were interrupted (the run was paused, or oriel restarted). Continue the task where you left off and finish with your report.";
+/// How the merge queue says the tamper scan stopped a merge (the findings follow, one per line).
+const TAMPER: &str = "touched tests:\n";
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the tasks `schedule` gave a slot to, in the order it chose them (the board's decision, whichever
+    /// worker thread then gets going first). Per thread, so parallel tests don't see each other's.
+    pub(super) static SCHEDULED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// Something the lead should hear about.
 pub struct RunEvent {
@@ -359,10 +368,12 @@ impl Agents {
     }
 
     /// The run's tasks still going, or that will start by themselves. A queued task counts only if it can: the run
-    /// is running and has budget left, its agent is installed, and what it waits for is merged or still going.
+    /// is running and has budget left, its agent is installed, and what it waits for is merged or still going. A
+    /// task the tamper scan parked counts too: it's one y away from merging, so the run waits for you.
     pub(super) fn working(&self, run: &str) -> HashSet<String> {
         let tasks = self.run_tasks(run);
-        let mut w: HashSet<String> = tasks.iter().filter(|t| self.in_motion(t)).map(|t| t.id.clone()).collect();
+        let parked = |t: &Task| t.status == Status::Review && !t.tamper.is_empty();
+        let mut w: HashSet<String> = tasks.iter().filter(|t| self.in_motion(t) || parked(t)).map(|t| t.id.clone()).collect();
         if !self.run_accepting(run) || !self.budget_left(run) {
             return w;
         }
@@ -1488,6 +1499,8 @@ impl Agents {
                     break;
                 }
                 let t = self.task(&id).unwrap().clone();
+                #[cfg(test)]
+                SCHEDULED.with(|s| s.borrow_mut().push(id.clone()));
                 self.last_start.insert((t.agent.clone(), t.model.clone()), Instant::now());
                 if t.resume_after_limit && !t.session_id.is_empty() && Path::new(&t.worktree).is_dir() {
                     // paused by a rate limit mid-task: carry on where it stopped, edits and session intact
@@ -1879,6 +1892,21 @@ impl Agents {
 
     // ---------------------------------------------------------------- the merge queue
 
+    /// y on a task the tamper scan parked: its test changes are fine, merge it.
+    pub(super) fn allow_test_changes(&mut self, id: &str, cx: &mut Cx) {
+        if let Some(tm) = self.task_mut(id) {
+            tm.tests_ok = true;
+            tm.tamper.clear();
+            tm.blocked = false;
+            tm.questions.clear();
+        }
+        match self.queue_merge(id) {
+            Ok(_) => cx.notify("you let its test changes through: merging it"),
+            Err(e) => cx.notify(e),
+        }
+        self.save();
+    }
+
     /// Put a finished task in line for the integration branch. Merges run one at a time (pump_merges).
     pub(super) fn queue_merge(&mut self, id: &str) -> Result<String, String> {
         let Some(t) = self.task(id).cloned() else { return Err(format!("no task {id}")) };
@@ -1978,6 +2006,14 @@ impl Agents {
                     }
                     Ok(())
                 };
+                // tests switched off or asserts removed: it waits for your y before anything is merged
+                if !t.tests_ok {
+                    let hits = git::task_diff(Path::new(&t.worktree), &t.base_sha).map(|d| git::tamper_scan(&d)).unwrap_or_default();
+                    if !hits.is_empty() {
+                        send(Msg::RunMerged(id.clone(), Err(git::MergeErr::Failed(format!("{TAMPER}{}", hits.join("\n"))))));
+                        return;
+                    }
+                }
                 let lead = PathBuf::from(&run.worktree);
                 let job = git::MergeJob { repo, wt: Path::new(&t.worktree), branch: &t.branch, integration: &run.branch, title: &t.title, worker: &t.worker, task_id: &t.id, lead_wt: Some(&lead) };
                 let r = git::merge_into(&job, &gate);
@@ -2052,6 +2088,18 @@ impl Agents {
                 }
                 self.record(&t.worker).gate_fails += 1;
                 self.bounce(id, &msg, false, cx);
+            }
+            Err(git::MergeErr::Failed(e)) if e.starts_with(TAMPER) => {
+                let hits: Vec<String> = e[TAMPER.len()..].lines().map(String::from).collect();
+                if let Some(tm) = self.task_mut(id) {
+                    tm.tamper = hits.clone();
+                    tm.want_merge = false;
+                    tm.blocked = true;
+                    tm.questions = vec![format!("it changed tests so they pass more easily ({}): the user decides, y on its card lets it merge", hits.join("; "))];
+                    tm.last = "parked: it touched tests".into();
+                }
+                cx.alert(crate::alerts::Kind::NeedsYou, format!("{} touched tests ({}): y on its card lets it merge", t.title, hits.first().cloned().unwrap_or_default()));
+                self.event(id, "blocked");
             }
             Err(git::MergeErr::Failed(e)) => {
                 if let Some(tm) = self.task_mut(id) {

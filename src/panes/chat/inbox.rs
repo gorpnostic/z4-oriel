@@ -15,7 +15,7 @@ fn qkey(q: &approve::Q) -> String {
 }
 
 fn akey(a: &approve::Ask) -> String {
-    format!("ask:{}:{}", a.tool, a.target)
+    format!("ask:{}:{}", a.label, a.target)
 }
 
 impl Chat {
@@ -110,6 +110,9 @@ impl Chat {
                 let _ = a.reply.send(d);
                 cx.notify(format!("{} {} {}", if d == approve::Decision::Allow { "allowed" } else { "denied" }, a.label, ui::fit(&a.target, 50)));
             }
+            if i == 0 && !self.asks.is_empty() {
+                self.front_changed(); // the next one comes up in the chat: keys typed there get the usual grace
+            }
             return true;
         }
         false
@@ -129,7 +132,7 @@ mod tests {
         c.provider = "claude".into();
         c.chat.provider = Some("claude".into());
         c.chat.title = store::title_from("pick a parser");
-        c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0, steer: None });
+        c.stream = Some(Stream { stop: Arc::default(), inbox: Arc::default(), status: String::new(), started: Instant::now(), tokens: 0, steer: None, pid: Arc::default(), perms: "edits".into() });
         c
     }
 
@@ -147,7 +150,7 @@ mod tests {
         let (qtx, qrx) = std::sync::mpsc::channel();
         c.questions.push_back(approve::Question { qs: vec![q("Which parser?", false, &["nom", "winnow"]), q("Which are Copy?", true, &["i32", "String", "bool"])], reply: qtx });
         let (atx, arx) = std::sync::mpsc::channel();
-        c.asks.push_back(approve::Ask { tool: "Bash".into(), label: "Bash".into(), target: "cargo publish".into(), body: vec![agent::line('>', None, "cargo publish")], reply: atx });
+        c.asks.push_back(approve::Ask { label: "Bash".into(), target: "cargo publish".into(), body: vec![agent::line('>', None, "cargo publish")], rule: "Bash(cargo publish:*)".into(), reply: atx });
         let items = c.open_items();
         assert_eq!(items.len(), 2);
         assert_eq!((items[0].text.as_str(), items[0].options.clone()), ("claude code asks: Which parser?", vec!["nom".to_string(), "winnow".to_string()]));

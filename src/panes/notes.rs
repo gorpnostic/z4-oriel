@@ -11,14 +11,13 @@
 //!
 //! open_in can seed an empty notes folder by copying .md files from another folder (never moving them).
 
-mod editor;
 mod md;
 
 use super::files::clock;
 use crate::pane::{Cx, Pane, Waker};
 use crate::ui;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use editor::Editor;
+use crate::editor::Editor;
 use ratatui::{
     Frame,
     layout::{Position, Rect},

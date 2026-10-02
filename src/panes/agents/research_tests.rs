@@ -520,7 +520,7 @@ fn agents_planner_cards_own_files_and_are_checked() {
     assert_eq!(p.marked.len(), 3, "checked cards are marked to run together");
     assert!(k.notices().last().is_some_and(|n| n.contains("hotspot")), "plan.rs's note comes along: {:?}", k.notices());
     let prompt = hand_prompt(&ui);
-    assert!(prompt.starts_with("do ui\n\nOnly edit files matching: src/ui.rs.") && prompt.ends_with("check it works with: check ui"), "{prompt}");
+    assert!(prompt.starts_with("do ui\n\nOnly edit files matching: src/ui.rs.") && prompt.ends_with("\n\nWhen you're done, run `check ui` from the repo root and make it pass."), "{prompt}");
     p.marked.clear();
     with_cx(&mut k, |cx| p.on_msg(Msg::Plan(here.clone(), Ok(bad)), cx));
     assert!(p.marked.is_empty(), "cards that don't check out aren't marked");

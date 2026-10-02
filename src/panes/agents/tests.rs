@@ -719,3 +719,46 @@ fn agents_snapshots_empty_and_picker() {
     assert!(pk.err.contains("isn't a folder"), "{}", pk.err);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+/// The task form has an acceptance row: what's typed there is the task's acceptance command (the worker is told
+/// to make it pass, and a run's merge gate runs it), and editing the task shows it again.
+#[test]
+fn agents_form_acceptance() {
+    let dir = scratch("form-acceptance");
+    let repo = temp_repo(&dir);
+    let mut k = Kit::new();
+    let mut p = pane(&dir, &repo);
+    k.render(&mut p, 150, 44);
+    until(&mut k, &mut p, 5000, "repo detected", |p| p.repo.is_some());
+    k.key(&mut p, KeyCode::Char('n'));
+    k.typ(&mut p, "Parser");
+    for _ in 0..7 {
+        k.key(&mut p, KeyCode::Tab);
+    }
+    k.typ(&mut p, "cargo test parser");
+    let form = k.render_html(&mut p, 150, 44, "target/snap/agents-form-acceptance.html");
+    assert!(form.contains("acceptance (a command that proves it works)") && form.contains("cargo test parser") && form.contains("add & start"), "{form}");
+    k.key_mod(&mut p, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    assert_eq!(only(&p).acceptance, "cargo test parser");
+    k.key(&mut p, KeyCode::Char('e'));
+    let Mode::Form(f) = &p.mode else { panic!("e edits the task") };
+    assert_eq!(f.acceptance.text, "cargo test parser");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The merge queue's tamper scan: an added #[ignore] / skip / xfail, or a file losing more asserts than it gains,
+/// is flagged; changing an assert, or adding tests, isn't.
+#[test]
+fn agents_tamper_scan() {
+    let diff = "diff --git a/tests/parse.rs b/tests/parse.rs\n--- a/tests/parse.rs\n+++ b/tests/parse.rs\n@@ -3,0 +4 @@\n+#[ignore]\n@@ -9,2 +10,0 @@\n-    assert_eq!(parse(\"1\"), 1);\n-    assert!(ok);\n\
+diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-    assert_eq!(x, 1);\n+    assert_eq!(x, 2);\n\
+diff --git a/web/app.test.js b/web/app.test.js\n--- a/web/app.test.js\n+++ b/web/app.test.js\n@@ -1 +1 @@\n-it('adds', () => {\n+it.skip('adds', () => {\n\
+diff --git a/py/test_x.py b/py/test_x.py\ndeleted file mode 100644\n--- a/py/test_x.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-def test_x():\n-    assert f() == 2\n";
+    let hits = git::tamper_scan(diff);
+    assert_eq!(hits, ["tests/parse.rs: #[ignore added", "tests/parse.rs: 2 asserts removed", "web/app.test.js: it.skip( added", "py/test_x.py: 1 assert removed"], "{hits:?}");
+    let fine = "diff --git a/tests/new.rs b/tests/new.rs\n--- /dev/null\n+++ b/tests/new.rs\n@@ -0,0 +1,2 @@\n+#[test]\n+fn t() { assert!(true); }\n";
+    assert!(git::tamper_scan(fine).is_empty());
+    // a diff without its --- / +++ header lines counts all the same
+    assert_eq!(git::tamper_scan("diff --git a/x.py b/x.py\n@@ -1 +0,0 @@\n-assert a\n"), ["x.py: 1 assert removed"]);
+}

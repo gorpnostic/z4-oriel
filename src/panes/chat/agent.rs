@@ -284,6 +284,7 @@ pub fn label(name: &str) -> String {
         "NotebookEdit" => "Notebook".into(),
         "LS" => "List".into(),
         "AskUserQuestion" => "Asked you".into(),
+        "ExitPlanMode" => "Plan".into(),
         "command_execution" => "Run".into(),
         "file_change" => "Update".into(),
         n if n.starts_with("mcp__") => {
@@ -326,6 +327,8 @@ pub fn target(name: &str, input: &Value, cwd: &Path) -> String {
             let first = input["questions"][0]["header"].as_str().filter(|h| !h.is_empty()).or(input["questions"][0]["question"].as_str()).unwrap_or("");
             if qs > 1 { format!("{first} +{}", qs - 1) } else { first.to_string() }
         }
+        // the plan's own title (the plan itself goes in the transcript when Claude asks you to approve it)
+        "ExitPlanMode" => input["plan"].as_str().unwrap_or("").lines().map(|l| l.trim().trim_start_matches('#').trim()).find(|l| !l.is_empty()).unwrap_or("").to_string(),
         _ => {
             // first short string argument
             for k in ["file_path", "path", "command", "url", "query", "pattern", "description", "name"] {
@@ -385,6 +388,12 @@ fn plural(n: u64, one: &str, many: &str) -> String {
 /// Fill in a finished call from its tool_result (`text`) and Claude Code's structured `tool_use_result`.
 fn finish(t: &mut Tool, text: &str, r: &Value, is_error: bool) {
     t.status = if is_error { "error".into() } else { "done".into() };
+    if is_error && t.name == "ExitPlanMode" {
+        // you asked for changes to the plan: not a failure
+        t.status = "done".into();
+        t.summary = "you asked for changes: it keeps planning".into();
+        return;
+    }
     if is_error {
         let msg = text.replace("<tool_use_error>", "").replace("</tool_use_error>", "");
         let mut lines = msg.trim().lines();
@@ -548,6 +557,8 @@ pub struct Claude {
     denied: u64,
     session: String,
     pub model: String,
+    /// The last turn got to its `result`: a run that ends without one was cut short (a crash, a kill).
+    pub finished: bool,
 }
 
 impl Claude {
@@ -563,6 +574,17 @@ impl Claude {
 
     fn todos_changed(&mut self, send: &mut dyn FnMut(Ev)) {
         send(Ev::Todos(self.todos.clone()));
+    }
+
+    /// A step's input side (fresh, cached and newly cached tokens) is how full the context is.
+    fn context(&mut self, usage: &Value, send: &mut dyn FnMut(Ev)) {
+        let n = |k: &str| usage[k].as_u64().unwrap_or(0);
+        let used = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+        if used > 0 {
+            // past 200k it can only be running with the million-token window, whatever the model's name says
+            let window = if used > 200_000 { context_window(&self.model).max(1_000_000) } else { context_window(&self.model) };
+            send(Ev::Context(used, window));
+        }
     }
 
     fn usage(&mut self, send: &mut dyn FnMut(Ev)) {
@@ -646,6 +668,11 @@ impl Claude {
         }
         let parent = v["parent_tool_use_id"].as_str();
         match v["type"].as_str() {
+            Some("result") => self.finished = true,
+            Some("assistant" | "stream_event") => self.finished = false, // another turn (a queued message) started
+            _ => {}
+        }
+        match v["type"].as_str() {
             Some("system") => match v["subtype"].as_str() {
                 Some("init") => {
                     self.model = v["model"].as_str().unwrap_or("").to_string();
@@ -706,6 +733,7 @@ impl Claude {
                 let key = (parent.unwrap_or("").to_string(), e["index"].as_u64().unwrap_or(0));
                 match e["type"].as_str() {
                     Some("message_start") if parent.is_none() => {
+                        self.context(&e["message"]["usage"], send);
                         self.msg_tokens = e["message"]["usage"]["output_tokens"].as_u64().unwrap_or(0);
                         self.msg_chars = 0;
                         self.think_tokens = 0;
@@ -777,6 +805,9 @@ impl Claude {
                 }
             }
             Some("assistant") => {
+                if parent.is_none() && !self.streamed {
+                    self.context(&v["message"]["usage"], send);
+                }
                 for it in v["message"]["content"].as_array().into_iter().flatten() {
                     match it["type"].as_str() {
                         Some("tool_use") => {
@@ -848,12 +879,19 @@ impl Claude {
                 self.result_tokens += v["usage"]["output_tokens"].as_u64().unwrap_or(0);
                 self.turns += v["num_turns"].as_u64().unwrap_or(0);
                 self.cost = self.cost.max(v["total_cost_usd"].as_f64().unwrap_or(0.0));
-                self.denied += v["permission_denials"].as_array().map(|a| a.len() as u64).unwrap_or(0);
+                // a question you skipped or a plan you sent back isn't something the mode blocked
+                let blocked = |d: &&Value| !matches!(d["tool_name"].as_str(), Some("AskUserQuestion" | "ExitPlanMode"));
+                self.denied += v["permission_denials"].as_array().map(|a| a.iter().filter(blocked).count() as u64).unwrap_or(0);
                 self.usage(send);
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// What the run cost, in dollars (0 until Claude Code says).
+    pub fn cost(&self) -> f64 {
+        self.cost
     }
 
     /// The line under the finished reply: duration · tokens · cost · turns.
@@ -926,6 +964,56 @@ pub struct Codex {
     started: HashMap<String, u64>,
     tokens: u64,
     errors: Vec<String>,
+    /// Got to `turn.completed`: a run that ends without it was cut short.
+    pub finished: bool,
+    /// The thread this run added to (its session log has the context numbers `exec --json` leaves out).
+    pub thread: String,
+}
+
+/// A model's context window: Claude's `[1m]` mode is a million tokens, anything else here 200k.
+pub fn context_window(model: &str) -> u64 {
+    if model.to_lowercase().contains("[1m]") { 1_000_000 } else { 200_000 }
+}
+
+/// Codex's `exec --json` only reports a turn's summed usage, which says nothing about how full the context is.
+/// Its session log does, per step: the last `token_count` event's tokens and `model_context_window`.
+pub fn codex_context(log: &str) -> Option<(u64, u64)> {
+    log.lines().rev().filter(|l| l.contains("token_count")).find_map(|l| {
+        let v: Value = serde_json::from_str(l).ok()?;
+        let info = &v["payload"]["info"];
+        let u = &info["last_token_usage"];
+        let window = info["model_context_window"].as_u64()?;
+        let used = u["total_tokens"].as_u64().filter(|t| *t > 1).unwrap_or_else(|| u["input_tokens"].as_u64().unwrap_or(0) + u["output_tokens"].as_u64().unwrap_or(0));
+        (used > 0 && window > 0).then_some((used, window))
+    })
+}
+
+/// The session log of Codex thread `thread` under `sessions` (`YYYY/MM/DD/rollout-…-<thread>.jsonl`), looking
+/// through the newest days first.
+pub fn codex_log(sessions: &Path, thread: &str) -> Option<PathBuf> {
+    if thread.is_empty() {
+        return None;
+    }
+    let sorted = |d: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(d).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+        v.sort_by(|a, b| b.cmp(a));
+        v
+    };
+    let mut days = 0;
+    for y in sorted(sessions) {
+        for m in sorted(&y) {
+            for d in sorted(&m) {
+                days += 1;
+                if days > 31 {
+                    return None;
+                }
+                if let Some(f) = sorted(&d).into_iter().find(|f| f.file_name().is_some_and(|n| n.to_string_lossy().contains(thread))) {
+                    return Some(f);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `"...pwsh.exe" -Command 'Get-Content x'` / `bash -lc 'ls'` -> the command inside.
@@ -950,6 +1038,7 @@ impl Codex {
         match ty {
             "thread.started" => {
                 if let Some(t) = v["thread_id"].as_str() {
+                    self.thread = t.to_string();
                     send(Ev::State("codex.thread".into(), t.to_string()));
                 }
             }
@@ -1061,6 +1150,7 @@ impl Codex {
                 }
             }
             "turn.completed" => {
+                self.finished = true;
                 self.tokens += v["usage"]["output_tokens"].as_u64().unwrap_or(0);
                 send(Ev::Usage(self.tokens));
             }
@@ -1101,6 +1191,36 @@ mod tests {
         let l = line('+', Some(12), "x\ty\x1b[31m!");
         let (k, n, t) = split_line(&l);
         assert_eq!((k, n, t), ('+', "12", "x    y!"));
+    }
+
+    /// A run only counts as finished once it reached its result: stopping short (a crash mid-turn) is noticed.
+    #[test]
+    fn chat_agent_knows_when_a_turn_finished() {
+        let feed_all = |text: &str, n: usize, p: &mut dyn FnMut(&Value)| text.lines().take(n).for_each(|l| p(&serde_json::from_str(l).unwrap()));
+        let claude = include_str!("fixtures/claude-stream.jsonl");
+        let bash_at = claude.lines().position(|l| l.contains(r#""name": "Bash""#) && l.contains(r#""type": "assistant""#)).unwrap();
+        let mut c = Claude::new(Path::new("C:\\work\\demo"));
+        feed_all(claude, bash_at + 1, &mut |v| c.feed(v, 0, &mut |_| {}).unwrap());
+        assert!(!c.finished, "mid-turn");
+        let mut c = Claude::new(Path::new("C:\\work\\demo"));
+        feed_all(claude, usize::MAX, &mut |v| c.feed(v, 0, &mut |_| {}).unwrap());
+        assert!(c.finished, "ends on its result");
+        let codex = include_str!("fixtures/codex-exec.jsonl");
+        let mut x = Codex::new(Path::new("C:\\work\\demo"));
+        feed_all(codex, codex.lines().count() - 1, &mut |v| x.feed(v, 0, &mut |_| {}).unwrap());
+        assert!(!x.finished);
+        feed_all(codex.lines().last().unwrap(), 1, &mut |v| x.feed(v, 0, &mut |_| {}).unwrap());
+        assert!(x.finished, "turn.completed");
+        // a plan shows as "Plan(its title)"; sending it back isn't an error
+        let mut t = describe("p1", "ExitPlanMode", &serde_json::json!({"plan": "## Refactor the parser\n\n1. split it"}), Path::new("/w"));
+        assert_eq!((t.label.as_str(), t.target.as_str()), ("Plan", "Refactor the parser"));
+        finish(&mut t, "The user wants to keep planning", &Value::Null, true);
+        assert_eq!(t.status, "done");
+        // and neither it nor a skipped question counts as blocked by the mode
+        let mut c = Claude::new(Path::new("/w"));
+        let denials = serde_json::json!({"type": "result", "permission_denials": [{"tool_name": "ExitPlanMode"}, {"tool_name": "AskUserQuestion"}, {"tool_name": "Bash"}]});
+        c.feed(&denials, 0, &mut |_| {}).unwrap();
+        assert!(c.note(Duration::from_secs(1)).contains("1 denied"), "{}", c.note(Duration::from_secs(1)));
     }
 
     #[test]

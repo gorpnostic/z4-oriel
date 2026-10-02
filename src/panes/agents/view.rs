@@ -250,7 +250,7 @@ impl Agents {
         let t = cx.theme;
         let n = self.marked.len();
         let Mode::Batch(v) = &self.mode else { return };
-        let inner = ui::popup(f, area, 80, (n as u16 + 16).min(30), &format!("{}run {n} task{} together", ui::lead("robot"), if n == 1 { "" } else { "s" }), t);
+        let inner = ui::popup(f, area, 80, (n as u16 + 17).min(31), &format!("{}run {n} task{} together", ui::lead("robot"), if n == 1 { "" } else { "s" }), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let mut lines = vec![];
         for (i, id) in self.marked.iter().enumerate() {
@@ -262,11 +262,17 @@ impl Agents {
                 -1 => " ↓ low",
                 _ => "",
             };
-            lines.push(Line::from(vec![
+            let mut row = vec![
                 Span::styled(format!("{:>2}. ", i + 1), bold(t.accent)),
                 Span::styled(ui::fit(&task.title, 40), Style::default().fg(t.fg).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  {} · {model}{pri}", task.agent), ui::muted(t)),
-            ]));
+            ];
+            // how full that agent's plan window is (red past 85%, or while it's rate-limited)
+            if let Some((note, hot)) = self.limit_note(&task.agent) {
+                let note = note.strip_prefix(&format!("{} ", task.agent)).unwrap_or(&note).split(" · resets").next().unwrap_or("").to_string();
+                row.push(Span::styled(format!(" · {note}"), if hot { Style::default().fg(t.danger).add_modifier(Modifier::BOLD) } else { ui::muted(t) }));
+            }
+            lines.push(Line::from(row));
         }
         lines.push(Line::raw(""));
         let par = self.lead_cfg.max_parallel.clamp(1, 5);
@@ -284,13 +290,17 @@ impl Agents {
         draw_input(f, ri, &v.gate, &ph, v.editing, t);
         // what happens, with what actually runs
         let budget = self.lead_cfg.run_budget_usd;
+        // what the tasks' own caps come to, next to the run's budget
+        let own: f64 = self.marked.iter().filter_map(|id| self.task(id)).map(|t| t.budget_usd.max(0.0)).sum();
+        let own = if own > 0.0 { format!(" (their own caps: ${own:.2})") } else { String::new() };
         let gate = v.gate.text.trim();
         let w = inner.width as usize;
         let mut tail: Vec<Line> = [
             "Each runs in its own worktree with its own AI and model. Finished work is".to_string(),
             if gate.is_empty() { "merged one at a time into a new branch after a conflict check only:".to_string() } else { "merged one at a time into a new branch after a conflict check and".to_string() },
             if gate.is_empty() { "no gate, so nothing builds or tests it (g sets one).".to_string() } else { format!("`{}` on the merged result (a failure goes back to it).", ui::fit(gate, w.saturating_sub(40))) },
-            format!("Budget ${budget:.2} for the run. When they're all in: d reviews, m merges."),
+            format!("Budget ${budget:.2} for the run{own}."),
+            "When they're all in: d reviews, m merges.".to_string(),
         ]
         .into_iter()
         .map(|l| Line::from(Span::styled(ui::fit(&l, w), ui::muted(t))))
@@ -618,6 +628,13 @@ impl Agents {
                     }
                     lines.push(spread(left, cost(t), w));
                 }
+                Status::Review if !task.tamper.is_empty() => {
+                    // the tamper scan parked it: a red chip, what it found, and the key that lets it through
+                    let chip = Span::styled(" touched tests ", Style::default().fg(Color::Black).bg(t.danger).add_modifier(Modifier::BOLD));
+                    let what = format!(" {}", task.tamper.join(" · "));
+                    lines.push(Line::from(vec![chip, Span::styled(ui::fit(&what, w.saturating_sub(15)), Style::default().fg(t.danger))]));
+                    lines.push(spread(vec![Span::styled("y", bold(t.accent)), Span::styled(" lets it merge · d diff", ui::muted(t))], cost(t), w));
+                }
                 Status::Review if task.blocked => {
                     let q = task.questions.first().cloned().unwrap_or_else(|| "blocked — needs a decision".into());
                     lines.push(Line::styled(ui::fit(&format!("? {q}"), w), Style::default().fg(t.danger)));
@@ -910,7 +927,7 @@ impl Agents {
         let t = cx.theme;
         let Mode::Form(form) = &self.mode else { return };
         let title = if form.editing.is_some() { "edit task" } else { "new task" };
-        let inner = ui::popup(f, area, 90, 37, &format!("{}{title}", ui::lead("new")), t);
+        let inner = ui::popup(f, area, 90, 40, &format!("{}{title}", ui::lead("new")), t);
         let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
         let repo = self.repo.as_ref().map(|r| format!("{} · a new branch off {}", r.name, r.branch)).unwrap_or_default();
         f.render_widget(Paragraph::new(Span::styled(repo, ui::muted(t))), Rect { height: 1, ..inner });
@@ -925,7 +942,7 @@ impl Agents {
         let r = field(f, "title", 3, 0, &mut y);
         draw_input(f, r, &form.title, "what should it be called?", form.field == 0, t);
         // prompt
-        let ph = (bottom.saturating_sub(y + 21)).clamp(3, 12);
+        let ph = (bottom.saturating_sub(y + 24)).clamp(3, 12);
         let r = field(f, "prompt", ph + 2, 1, &mut y);
         draw_input(f, r, &form.prompt, "what should the agent do? (enter = new line · ↑ earlier prompts · ctrl+t saved prompts)", form.field == 1, t);
         // agent chooser
@@ -979,11 +996,14 @@ impl Agents {
         // budget
         let r = field(f, "budget $ (stops it past this)", 3, 6, &mut y);
         draw_input(f, r, &form.budget, "empty = none (run together: the roster's cap) · kimi tabs can't be capped", form.field == 6, t);
+        // acceptance
+        let r = field(f, "acceptance (a command that proves it works)", 3, 7, &mut y);
+        draw_input(f, r, &form.acceptance, "e.g. cargo test parser · the worker makes it pass; a run's merge gate runs it · empty = none", form.field == 7, t);
         // buttons
         y += 1;
         if y < bottom {
             let btn = |label: &str, on: bool| {
-                if on && form.field == 7 {
+                if on && form.field == 8 {
                     Span::styled(format!(" {label} "), Style::default().fg(Color::Black).bg(t.accent).add_modifier(Modifier::BOLD))
                 } else if on {
                     Span::styled(format!("[{label}]"), bold(t.accent))

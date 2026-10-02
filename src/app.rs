@@ -197,6 +197,29 @@ const CONFIRM_FOR: Duration = Duration::from_secs(4);
 /// How long keys wait behind a ctrl+v clipboard check before they're let through anyway.
 const CLIP_WAIT: Duration = Duration::from_secs(5);
 
+/// oriel's window has the focus (the terminal reports it): panes check it to tell you about things while you're
+/// in another window. Tests get one per thread, so parallel tests that flip it never see each other's.
+#[cfg(not(test))]
+static TERM_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+#[cfg(test)]
+thread_local! {
+    static TERM_FOCUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub fn term_focused() -> bool {
+    #[cfg(not(test))]
+    return TERM_FOCUSED.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    return TERM_FOCUSED.with(|f| f.get());
+}
+
+pub(crate) fn set_term_focused(on: bool) {
+    #[cfg(not(test))]
+    TERM_FOCUSED.store(on, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    TERM_FOCUSED.with(|f| f.set(on));
+}
+
 pub struct App {
     panes: HashMap<PaneId, Box<dyn Pane>>,
     tabs: Vec<Tab>,
@@ -1476,20 +1499,27 @@ impl App {
         self.note_tab();
     }
 
+    /// The terminal window got or lost the focus: the app's own copy (desktop notifications) and the one panes read.
+    fn focus_changed(&mut self, on: bool) {
+        self.term_focused = on;
+        set_term_focused(on);
+    }
+
     fn handle(&mut self, ev: Event) {
         if let (Some(_), Event::Input(e)) = (&self.log, &ev) {
             self.log_line(&format!("{e:?}"));
         }
         // typing or clicking here means you're here, even if the terminal missed telling us (FocusGained)
         if let Event::Input(CEvent::Key(_) | CEvent::Mouse(MouseEvent { kind: MouseEventKind::Down(_), .. })) = &ev {
-            self.term_focused = true;
+            self.focus_changed(true);
         }
         match ev {
             Event::Input(CEvent::Key(k)) if k.kind != KeyEventKind::Release => self.key(k),
             Event::Input(CEvent::Mouse(m)) => self.mouse(m),
             Event::Input(CEvent::Paste(s)) => self.paste(&s),
-            Event::Input(CEvent::FocusGained) => self.term_focused = true,
-            Event::Input(CEvent::FocusLost) => self.term_focused = false,
+            // (before the catch-all below, or they never arrive: raise() then thinks you're always looking)
+            Event::Input(CEvent::FocusGained) => self.focus_changed(true),
+            Event::Input(CEvent::FocusLost) => self.focus_changed(false),
             Event::Input(_) => {}
             Event::Wake(id) => {
                 self.with_pane(id, |p, cx| p.poll(cx));
@@ -4827,5 +4857,18 @@ mod tests {
         let rows = crate::alerts::with_open(|l| l.iter().map(|o| (o.text.clone(), o.detail.clone())).collect::<Vec<_>>());
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0], ("fix tests needs you".to_string(), vec!["waiting for you in its tab".to_string(), String::new(), "Do you want to proceed?".to_string()]));
+    }
+
+    /// The terminal saying oriel's window lost or got the focus reaches the app (and the panes): desktop
+    /// notifications depend on it.
+    #[test]
+    fn app_window_focus() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config::default(), tx);
+        app.handle(Event::Input(CEvent::FocusLost));
+        let lost = (app.term_focused, term_focused());
+        app.handle(Event::Input(CEvent::FocusGained));
+        assert_eq!(lost, (false, false));
+        assert!(app.term_focused && term_focused());
     }
 }

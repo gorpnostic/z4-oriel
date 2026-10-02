@@ -4,6 +4,7 @@ mod alerts;
 mod app;
 mod clip;
 mod config;
+mod editor;
 mod font;
 mod layout;
 mod onboard;
@@ -16,7 +17,10 @@ mod ui;
 mod update;
 
 use crossterm::{
-    event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
 };
 use std::sync::mpsc;
@@ -99,6 +103,24 @@ fn main() -> anyhow::Result<()> {
     while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
         let _ = crossterm::event::read();
     }
+    let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
+    // keep the terminal's own title to put back at exit (terminals with a title stack; others ignore it)
+    let _ = execute!(std::io::stdout(), crossterm::style::Print("\x1b[22;0t"));
+    // terminals with the kitty keyboard protocol can tell shift+enter from enter (a new line in the chat box).
+    // Asked before the input thread starts reading, which would swallow the answer.
+    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(std::io::stdout(), PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)).is_ok();
+    // ratatui's panic hook only undoes raw mode and the alternate screen: turn our modes off too, or a crash leaves
+    // the shell printing mouse and focus escape codes
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if enhanced {
+            let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange, crossterm::terminal::SetTitle(""), crossterm::style::Print("\x1b[23;0t"));
+        prev(info);
+    }));
     let input_tx = tx.clone();
     std::thread::spawn(move || {
         while let Ok(ev) = crossterm::event::read() {
@@ -107,18 +129,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
     });
-
-    let mut terminal = ratatui::init();
-    // ratatui's panic hook only undoes raw mode and the alternate screen: turn our modes off too, or a crash leaves
-    // the shell printing mouse and focus escape codes
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange, crossterm::terminal::SetTitle(""), crossterm::style::Print("\x1b[23;0t"));
-        prev(info);
-    }));
-    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
-    // keep the terminal's own title to put back at exit (terminals with a title stack; others ignore it)
-    let _ = execute!(std::io::stdout(), crossterm::style::Print("\x1b[22;0t"));
     let tour = args.first().map(String::as_str) == Some("--tour");
     let mut app = app::App::with_start(cfg, tx, start);
     if let Some(e) = broken {
@@ -128,6 +138,9 @@ fn main() -> anyhow::Result<()> {
         app.start_tour();
     }
     let res = app.run(&mut terminal, rx);
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     // the title oriel set ("oriel · 1 needs you") goes: empty resets it to the terminal's default, and the pop
     // brings back the one from before where the terminal keeps a stack
     let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange, crossterm::terminal::SetTitle(""), crossterm::style::Print("\x1b[23;0t"));

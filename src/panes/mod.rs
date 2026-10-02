@@ -12,7 +12,6 @@ pub mod music;
 pub mod notes;
 pub mod settings;
 pub mod storage;
-mod stub;
 pub mod system;
 pub mod term;
 pub mod themes;
