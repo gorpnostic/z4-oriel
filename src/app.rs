@@ -4926,5 +4926,6 @@ mod tests {
 #[cfg(test)]
 #[path = "qa_sizes_app.rs"]
 mod qa_sizes_app;
+#[cfg(test)]
 #[path = "qa_first_run_app.rs"]
 mod qa_first_run_app;

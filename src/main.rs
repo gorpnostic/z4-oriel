@@ -80,7 +80,10 @@ fn main() -> anyhow::Result<()> {
                         println!("## {}\n\n{}\n", r.version, r.notes.lines().filter(|l| !l.contains("**Full Changelog**")).collect::<Vec<_>>().join("\n").trim());
                     }
                 }
-                Err(e) => eprintln!("{e}"),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
             }
             return Ok(());
         }
