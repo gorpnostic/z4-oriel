@@ -43,7 +43,9 @@ struct Step {
     title: &'static str,
     body: &'static str,
     keys: &'static str,
-    /// done when this is true (compared with the state when the step began); None = read and press next
+    /// done when this is true, comparing now with `start`: the state when the step began, except that `start.app`
+    /// and `start.tab_named` follow along while the step waits (see `check`), so "open X" means arriving at X, not
+    /// already being there. None = read and press next
     done: Option<fn(&Probe, &Probe) -> bool>,
 }
 
@@ -52,25 +54,25 @@ const STEPS: &[Step] = &[
         title: "switch apps",
         body: "Everything lives in the sidebar: the ai apps on top, the tools below. Open music: press F4, or click it.",
         keys: "F4",
-        done: Some(|now, _| now.app == Some("music")),
+        done: Some(|now, start| now.app == Some("music") && start.app != Some("music")),
     },
     Step {
         title: "chat with any AI",
         body: "F1 is chat. /provider picks the AI (Claude Code, Codex, Ollama\u{2026}), /model its model, /perms what coding agents may do; alt , has every setting. Go back to chat.",
         keys: "F1",
-        done: Some(|now, _| now.app == Some("ai")),
+        done: Some(|now, start| now.app == Some("ai") && start.app != Some("ai")),
     },
     Step {
         title: "your AIs",
         body: "F3 installs and signs in to AI tools with one key each, and shows your plan limits and usage. Have a look.",
         keys: "F3",
-        done: Some(|now, _| now.app == Some("ais")),
+        done: Some(|now, start| now.app == Some("ais") && start.app != Some("ais")),
     },
     Step {
         title: "a team of agents",
         body: "F2 is agents. Press L there, give one goal and pick a lead AI: it splits the work between worker AIs, each in its own copy of the repo, and merges it safely. Open it.",
         keys: "F2",
-        done: Some(|now, _| now.app == Some("agents")),
+        done: Some(|now, start| now.app == Some("agents") && start.app != Some("agents")),
     },
     Step {
         title: "the palette",
@@ -100,7 +102,7 @@ const STEPS: &[Step] = &[
         title: "name the tab",
         body: "Double-click your tab in the sidebar to rename it (or ctrl+space then ,). Type a name, enter.",
         keys: "double-click",
-        done: Some(|now, _| now.tab_named),
+        done: Some(|now, start| now.tab_named && !start.tab_named),
     },
     Step {
         title: "right-click",
@@ -124,7 +126,7 @@ const STEPS: &[Step] = &[
         title: "the help screen",
         body: "F10 (or ? in most apps) opens the guide: every key and command, by topic, starting on the app you're in. Open it.",
         keys: "F10",
-        done: Some(|now, _| now.app == Some("help")),
+        done: Some(|now, start| now.app == Some("help") && start.app != Some("help")),
     },
     Step {
         title: "you're set",
@@ -199,8 +201,10 @@ pub struct Onboard {
     /// the song count under the music field: worked out on a thread a moment after typing stops (a network
     /// drive can take seconds to walk), so typing never waits on the disk
     count_due: Option<(String, Instant)>,
-    counted: Arc<Mutex<Vec<(String, Option<usize>)>>>,
+    counted: Arc<Mutex<Vec<(String, Option<(usize, bool)>)>>>,
     counting: bool,
+    /// the count shown stopped early (a huge folder): it says "N+ songs"
+    count_partial: bool,
     /// esc ends the tour right now (not while a terminal has the keyboard): the card's end button says which
     esc_ends: bool,
     hits: Vec<(Rect, Btn)>,
@@ -212,6 +216,11 @@ pub struct Onboard {
 
 /// Quick count of audio files under a folder (bounded: at most 20k entries, 4 levels down). None = no such folder.
 pub(crate) fn count_audio(dir: &str) -> Option<usize> {
+    count_audio_upto(dir).map(|(n, _)| n)
+}
+
+/// `count_audio`, and whether it gave up early (past 20k entries, so there may be more songs than it found).
+pub(crate) fn count_audio_upto(dir: &str) -> Option<(usize, bool)> {
     let root = std::path::Path::new(dir.trim());
     if !root.is_dir() {
         return None;
@@ -224,7 +233,7 @@ pub(crate) fn count_audio(dir: &str) -> Option<usize> {
         for e in rd.flatten() {
             seen += 1;
             if seen > 20_000 {
-                return Some(n);
+                return Some((n, true));
             }
             let p = e.path();
             // the entry's own type: no extra stat per file
@@ -239,7 +248,7 @@ pub(crate) fn count_audio(dir: &str) -> Option<usize> {
             }
         }
     }
-    Some(n)
+    Some((n, false))
 }
 
 /// Tab-complete a folder path: extend to the longest common prefix of matching sub-folders.
@@ -317,8 +326,13 @@ impl Onboard {
     pub fn new(theme_now: &str, cfg: &crate::config::Config) -> Onboard {
         use crate::panes::chat::providers;
         let themes = theme::names();
-        // tests never probe this machine for AIs (TCP) or read its audio-player library
-        let avail = if cfg!(test) { vec![] } else { providers::available(&cfg.ai) };
+        // tests never probe this machine for AIs (PATH, TCP, env keys) or read its audio-player library: there only
+        // the API keys written in the config count
+        let avail: Vec<&'static str> = if cfg!(test) {
+            [("openai", &cfg.ai.openai_key), ("anthropic", &cfg.ai.anthropic_key)].into_iter().filter(|(_, k)| !k.trim().is_empty()).map(|(id, _)| id).collect()
+        } else {
+            providers::available(&cfg.ai)
+        };
         let ais = providers::PROVIDERS.iter().map(|p| (p.1, avail.contains(&p.0))).collect();
         let music_default = cfg.music.folders.first().cloned().unwrap_or_else(|| dirs::audio_dir().map(|d| d.to_string_lossy().to_string()).unwrap_or_default());
         let notes_default = if cfg.notes_folder.is_empty() { crate::config::data_dir().join("notes").to_string_lossy().to_string() } else { cfg.notes_folder.clone() };
@@ -358,6 +372,7 @@ impl Onboard {
             count_due: None,
             counted: Arc::default(),
             counting: false,
+            count_partial: false,
             esc_ends: true,
             hits: vec![],
             card: Rect::default(),
@@ -385,6 +400,7 @@ impl Onboard {
             count_due: None,
             counted: Arc::default(),
             counting: false,
+            count_partial: false,
             esc_ends: true,
             hits: vec![],
             card: Rect::default(),
@@ -392,10 +408,42 @@ impl Onboard {
         }
     }
 
+    /// The theme page, on the theme in use.
+    fn to_theme(&mut self) {
+        let sel = self.themes.iter().position(|t| *t == self.theme_before).unwrap_or(0);
+        self.stage = Stage::Theme { sel };
+    }
+
     fn to_music(&mut self) {
         let input = self.music_default.clone();
         self.recount(&input, Duration::ZERO);
         self.stage = Stage::Music { input, found: None };
+    }
+
+    /// shift+tab on a setup page: the page before (the welcome, from the theme page). Each page shows what's set
+    /// now, including what you picked on the way here; nothing is saved by going back.
+    fn back(&mut self) -> Out {
+        self.count_due = None;
+        self.counting = false;
+        match self.stage {
+            Stage::Theme { .. } => {
+                self.stage = Stage::Welcome;
+                return Out::Theme(self.theme_before.clone(), false); // drop the preview
+            }
+            Stage::Icons => self.to_theme(),
+            Stage::Music { .. } => self.stage = Stage::Icons,
+            Stage::Notes { .. } => self.to_music(),
+            Stage::Defaults { .. } => self.stage = Stage::Notes { input: self.notes_default.clone() },
+            Stage::Ais => self.stage = Stage::Defaults { row: 0, start: self.start_was, ai: self.ai_was },
+            Stage::Welcome | Stage::Tour { .. } => {}
+        }
+        Out::None
+    }
+
+    /// Tests: what the icons page starts from (the icons in use when the setup opened).
+    #[cfg(test)]
+    pub(crate) fn set_icons_before(&mut self, nerd: bool) {
+        self.nerd_was = nerd;
     }
 
     /// Count the songs under `path` once `after` has passed without another change.
@@ -409,14 +457,15 @@ impl Onboard {
         let Stage::Music { input, found } = &mut self.stage else { return };
         for (p, n) in std::mem::take(&mut *self.counted.lock().unwrap()) {
             if p == *input {
-                *found = n;
+                *found = n.map(|c| c.0);
+                self.count_partial = n.is_some_and(|c| c.1);
                 self.counting = self.count_due.is_some();
             }
         }
         if let Some((p, _)) = self.count_due.take_if(|(_, at)| Instant::now() >= *at) {
             let out = self.counted.clone();
             std::thread::spawn(move || {
-                let n = count_audio(&p);
+                let n = count_audio_upto(&p);
                 out.lock().unwrap().push((p, n));
             });
         }
@@ -440,12 +489,12 @@ impl Onboard {
     /// are ours; F11 still ends it too, though Windows Terminal keeps F11 for fullscreen).
     pub fn key(&mut self, k: KeyEvent, probe: &Probe) -> (bool, Out) {
         let plain = !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if k.code == KeyCode::BackTab && self.is_modal() && !matches!(self.stage, Stage::Welcome) {
+            return (true, self.back());
+        }
         match &mut self.stage {
             Stage::Welcome => match k.code {
-                KeyCode::Enter => {
-                    let sel = self.themes.iter().position(|t| *t == self.theme_before).unwrap_or(0);
-                    self.stage = Stage::Theme { sel };
-                }
+                KeyCode::Enter => self.to_theme(),
                 KeyCode::Char('s') | KeyCode::Esc if plain => return (true, self.finish()),
                 _ => {}
             },
@@ -461,6 +510,7 @@ impl Onboard {
                 KeyCode::Enter => {
                     let t = self.themes[*sel].clone();
                     self.stage = Stage::Icons;
+                    self.theme_before = t.clone(); // what's set now, if you come back to this page
                     return (true, Out::Theme(t, true));
                 }
                 KeyCode::Esc => {
@@ -481,6 +531,7 @@ impl Onboard {
                 if let Some(nerd) = pick {
                     self.to_music();
                     if nerd != self.nerd_was {
+                        self.nerd_was = nerd;
                         return (true, Out::Icons(nerd));
                     }
                 }
@@ -492,6 +543,7 @@ impl Onboard {
                     self.count_due = None;
                     self.counting = false;
                     if !path.is_empty() && path != self.music_default.trim() && std::path::Path::new(&path).is_dir() {
+                        self.music_default = path.clone();
                         return (true, Out::MusicFolder(path));
                     }
                 }
@@ -512,6 +564,7 @@ impl Onboard {
                     let path = input.trim().to_string();
                     self.stage = Stage::Defaults { row: 0, start: self.start_was, ai: self.ai_was };
                     if !path.is_empty() && path != self.notes_default {
+                        self.notes_default = path.clone();
                         return (true, Out::NotesFolder(path));
                     }
                 }
@@ -540,6 +593,7 @@ impl Onboard {
                     // only what you changed: the rest stays as it's saved
                     let startup = if *start != self.start_was { self.starts[*start].0.clone() } else { String::new() };
                     let provider = if *ai != self.ai_was { self.ai_ids.get(*ai).map(|s| s.to_string()).unwrap_or_default() } else { String::new() };
+                    (self.start_was, self.ai_was) = (*start, *ai);
                     self.stage = Stage::Ais;
                     if startup.is_empty() && provider.is_empty() {
                         return (true, Out::None);
@@ -580,13 +634,20 @@ impl Onboard {
         // Explorer's "copy as path" wraps it in quotes
         let text = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(text);
         let clean = |input: &mut String| input.extend(text.chars().filter(|c| !c.is_control()));
-        match &mut self.stage {
-            Stage::Music { input, found } => {
+        let recount = match &mut self.stage {
+            Stage::Music { input, .. } => {
                 clean(input);
-                *found = count_audio(input);
+                Some(input.clone())
             }
-            Stage::Notes { input } => clean(input),
-            _ => {}
+            Stage::Notes { input } => {
+                clean(input);
+                None
+            }
+            _ => None,
+        };
+        // counted on a thread like typed text, never here on the UI thread (a pasted network path can take seconds)
+        if let Some(p) = recount {
+            self.recount(&p, Duration::ZERO);
         }
     }
 
@@ -608,11 +669,16 @@ impl Onboard {
     /// Called after every event batch during the tour: moves on when the step's action happened.
     pub fn check(&mut self, probe: &Probe) -> Out {
         self.esc_ends = probe.esc_ends_tour();
-        if let Stage::Tour { step, start } = &self.stage {
+        if let Stage::Tour { step, start } = &mut self.stage {
             if let Some(done) = STEPS[*step].done {
                 if done(probe, start) {
                     return self.advance(probe);
                 }
+                // "open X" and "name the tab" wait for you to get there from where you are now, so a step that's
+                // already true when it begins (oriel opened on music; skipping step one from chat) is still drawn
+                // and waits to be done
+                start.app = probe.app;
+                start.tab_named = probe.tab_named;
             }
         }
         Out::None
@@ -624,8 +690,7 @@ impl Onboard {
             if let Some(&(_, b)) = self.hits.iter().find(|(r, _)| r.contains(pos)) {
                 return (true, match b {
                     Btn::Tour => {
-                        let sel = self.themes.iter().position(|t| *t == self.theme_before).unwrap_or(0);
-                        self.stage = Stage::Theme { sel };
+                        self.to_theme();
                         Out::None
                     }
                     Btn::Skip | Btn::End => self.finish(),
@@ -664,9 +729,18 @@ impl Onboard {
             Stage::Theme { sel } => {
                 lines.push(Line::styled("It changes as you move. Switch any time with alt p → theme.", ui::muted(t)));
                 lines.push(Line::raw(""));
-                // two columns of themes
+                // two columns of themes; with many theme files the rows scroll to keep the highlighted one in view
                 let half = self.themes.len().div_ceil(2);
-                for r in 0..half {
+                let per_row = (2 * (3 + 3 + 24usize)).div_ceil(body.width.max(1) as usize); // a row wraps when narrow
+                let room = (body.height as usize).saturating_sub(lines.len()) / per_row;
+                let (first, last, more) = if half <= room {
+                    (0, half, false)
+                } else {
+                    let rows = room.saturating_sub(1).max(1); // the last line says what's above and below
+                    let first = (*sel % half).saturating_sub(rows / 2).min(half - rows);
+                    (first, first + rows, true)
+                };
+                for r in first..last {
                     let mut spans = vec![];
                     for c in 0..2 {
                         let i = r + c * half;
@@ -684,6 +758,16 @@ impl Onboard {
                         spans.push(Span::styled(format!("{:<24}", format!("{name}{note}")), if on { Style::default().fg(t.accent).add_modifier(Modifier::BOLD) } else { Style::default() }));
                     }
                     lines.push(Line::from(spans));
+                }
+                if more {
+                    let mut m = vec![];
+                    if first > 0 {
+                        m.push(format!("↑ {first} more"));
+                    }
+                    if last < half {
+                        m.push(format!("↓ {} more", half - last));
+                    }
+                    lines.push(Line::styled(format!("   {}", m.join("   ")), ui::muted(t)));
                 }
                 hints = vec![("↑↓", "choose"), ("enter", "use it"), ("esc", "keep this one")];
             }
@@ -710,7 +794,7 @@ impl Onboard {
                 lines.push(match found {
                     _ if self.counting => Line::styled("  looking for songs…", ui::muted(t)),
                     Some(0) => Line::styled("  no songs found there yet (that's ok)", ui::muted(t)),
-                    Some(n) => Line::styled(format!("  ✓ {n}{} songs found", if *n >= 20_000 { "+" } else { "" }), Style::default().fg(t.good)),
+                    Some(n) => Line::styled(format!("  ✓ {n}{} songs found", if self.count_partial { "+" } else { "" }), Style::default().fg(t.good)),
                     None => Line::styled("  that folder doesn't exist", Style::default().fg(t.danger)),
                 });
                 hints = vec![("type", "a path"), ("tab", "complete"), ("enter", "use it"), ("esc", "skip")];
@@ -775,7 +859,9 @@ impl Onboard {
             _ => hints = vec![],
         }
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
-        let spans: Vec<Span> = hints.iter().flat_map(|(k, w)| ui::key_hint(k, w, t)).collect();
+        // every setup page can go back one (kept short: the icons and notes hints are near 80 columns already)
+        let back = [("⇧tab", "back")];
+        let spans: Vec<Span> = hints.iter().chain(&back).flat_map(|(k, w)| ui::key_hint(k, w, t)).collect();
         f.render_widget(Paragraph::new(Line::from(spans)).centered(), Rect { x: area.x, y: hints_y, width: area.width, height: 1 });
     }
 
@@ -888,22 +974,44 @@ fn page(f: &mut Frame, area: Rect, t: &Theme, time: f64, n: usize, title: &str) 
     (Rect { x: area.x + 2, y, width: area.width.saturating_sub(4), height: hints_y.saturating_sub(y + 1) }, hints_y)
 }
 
-/// A one-line input box (rounded look drawn with text so it wraps with the page).
+/// A one-line input box (rounded look drawn with text so it wraps with the page). A path too long for it shows
+/// its end, where you're typing, with … in front.
 fn field(input: &str, t: &Theme, width: u16) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
     let w = (width as usize).saturating_sub(4).max(20);
-    let shown = crate::ui::fit(input, w - 2);
-    let pad = w.saturating_sub(unicode_width::UnicodeWidthStr::width(shown.as_str()) + 2);
+    // inside the bars: a space, the text, the cursor, then padding up to the corners
+    let shown = fit_end(input, w - 2);
+    let pad = w.saturating_sub(shown.width() + 2);
     vec![
         Line::styled(format!("╭{}╮", "─".repeat(w)), Style::default().fg(t.accent)),
         Line::from(vec![
             Span::styled("│ ", Style::default().fg(t.accent)),
             Span::styled(shown, Style::default().add_modifier(Modifier::BOLD)),
             Span::styled("▏", Style::default().fg(t.accent)),
-            Span::raw(" ".repeat(pad.saturating_sub(1))),
+            Span::raw(" ".repeat(pad)),
             Span::styled("│", Style::default().fg(t.accent)),
         ]),
         Line::styled(format!("╰{}╯", "─".repeat(w)), Style::default().fg(t.accent)),
     ]
+}
+
+/// `s` in at most `w` columns, keeping its end: "…\deep\folder".
+fn fit_end(s: &str, w: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= w {
+        return s.to_string();
+    }
+    let mut used = 1; // the …
+    let mut tail = vec![];
+    for c in s.chars().rev() {
+        let cw = c.width().unwrap_or(0);
+        if used + cw > w {
+            break;
+        }
+        used += cw;
+        tail.push(c);
+    }
+    std::iter::once('…').chain(tail.into_iter().rev()).collect()
 }
 
 #[cfg(test)]

@@ -146,12 +146,34 @@ fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The music page counts songs on a thread a moment after typing stops: draw it (each draw takes in a finished
+/// count) until the count is in, and return that screen.
+fn settle_count(ob: &mut Onboard) -> String {
+    let t0 = std::time::Instant::now();
+    loop {
+        let s = draw(ob, 150, 42).0;
+        if !ob.animating() {
+            return s;
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "the song count never came in:\n{s}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn music_found(ob: &Onboard) -> Option<usize> {
+    match &ob.stage {
+        Stage::Music { found, .. } => *found,
+        _ => panic!("left the music page: {}", stage(ob)),
+    }
+}
+
 // ------------------------------------------------------------------ setup pages
 
-/// Enter all the way through: every page shows, each page's choice comes out, and the tour starts.
+/// Enter all the way through: every page shows, starts from what's set, saves only what changed (enter on an
+/// untouched page saves nothing), and the tour starts.
 #[test]
 fn setup_forward_with_enter_on_every_page() {
-    let (d, cfg, mut ob) = new_ob("forward");
+    let (d, _cfg, mut ob) = new_ob("forward");
     assert_eq!(stage(&ob), "welcome");
     assert!(ob.is_modal() && ob.animating(), "the welcome is modal and animates");
     assert!(draw(&mut ob, 150, 42).0.contains("take the tour"));
@@ -167,26 +189,30 @@ fn setup_forward_with_enter_on_every_page() {
     assert_eq!(stage(&ob), "icons");
     assert!(draw(&mut ob, 150, 42).0.contains("little pictures"));
 
-    assert_eq!(press(&mut ob, KeyCode::Enter), (true, "icons true".into()));
+    // enter keeps the icons in use: nothing to save
+    assert_eq!(press(&mut ob, KeyCode::Enter), (true, "none".into()));
     assert_eq!(stage(&ob), "music");
-    let s = draw(&mut ob, 150, 42).0;
+    assert!(ob.animating(), "the music page redraws until its song count is in");
+    let s = settle_count(&mut ob);
     assert!(s.contains("setup · your music"), "{s}");
     assert!(s.contains("3 songs found"), "a.mp3, b.FLAC and sub/c.ogg count, notes.txt doesn't:\n{s}");
 
-    let music = cfg.music.folders[0].clone();
-    assert_eq!(press(&mut ob, KeyCode::Enter), (true, format!("music {music}")));
+    // the music folder already in the config is kept as is: nothing to save
+    assert_eq!(press(&mut ob, KeyCode::Enter), (true, "none".into()));
     assert_eq!(stage(&ob), "notes");
     let s = draw(&mut ob, 200, 42).0;
     assert!(s.contains("setup · your notes"), "{s}");
 
-    // the default notes folder is kept as is: nothing to save
+    // the notes folder in the config is kept as is: nothing to save
     assert_eq!(press(&mut ob, KeyCode::Enter), (true, "none".into()));
-    assert!(stage(&ob).starts_with("defaults 0 0 0"), "{}", stage(&ob));
-    assert!(draw(&mut ob, 150, 42).0.contains("open oriel on"));
+    // the defaults page starts on what's saved: home (cfg_in; the 4th choice after where you left off, chat and
+    // agents) and the first AI with a key (no provider saved = the first one there is)
+    assert_eq!(stage(&ob), "defaults 0 3 0");
+    let s = squash(&draw(&mut ob, 150, 42).0);
+    assert!(s.contains("open oriel on") && s.contains("home screen"), "{s}");
+    assert!(s.contains("OpenAI-compatible") && s.contains("Anthropic API"), "both AIs with a key are on offer: {s}");
 
-    let avail = crate::panes::chat::providers::available(&cfg.ai);
-    assert!(avail.len() >= 2, "two API keys make at least two AIs available: {avail:?}");
-    assert_eq!(press(&mut ob, KeyCode::Enter), (true, format!("defaults ai {}", avail[0])));
+    assert_eq!(press(&mut ob, KeyCode::Enter), (true, "none".into()), "untouched defaults: nothing to save");
     assert_eq!(stage(&ob), "ais");
     let s = draw(&mut ob, 150, 42).0;
     assert!(s.contains("setup · your AIs") && s.contains("Anthropic API"), "{s}");
@@ -265,17 +291,19 @@ fn theme_page_moves_clamps_and_saves() {
     assert_eq!(stage(&ob), "icons");
 }
 
+/// y / n pick pictures or plain text and move on; only a change from the icons in use is saved, and enter keeps them.
 #[test]
 fn icons_page_yes_no() {
     let (_d, _c, mut ob) = new_ob("icons");
-    ob.stage = Stage::Icons;
-    assert_eq!(press(&mut ob, KeyCode::Char('x')), (true, "none".into()));
-    assert_eq!(stage(&ob), "icons");
-    assert_eq!(press(&mut ob, KeyCode::Char('n')), (true, "icons false".into()));
-    assert_eq!(stage(&ob), "music");
-    ob.stage = Stage::Icons;
-    assert_eq!(press(&mut ob, KeyCode::Char('y')), (true, "icons true".into()));
-    assert_eq!(stage(&ob), "music");
+    for (nerd, code, out) in [(true, KeyCode::Char('n'), "icons false"), (true, KeyCode::Char('y'), "none"), (true, KeyCode::Enter, "none"),
+        (false, KeyCode::Char('y'), "icons true"), (false, KeyCode::Char('n'), "none"), (false, KeyCode::Enter, "none")] {
+        ob.set_icons_before(nerd);
+        ob.stage = Stage::Icons;
+        assert_eq!(press(&mut ob, KeyCode::Char('x')), (true, "none".into()), "other keys do nothing");
+        assert_eq!(stage(&ob), "icons");
+        assert_eq!(press(&mut ob, code), (true, out.into()), "{code:?} with nerd icons {nerd}");
+        assert_eq!(stage(&ob), "music");
+    }
 }
 
 /// Typing on the music page re-counts songs, ctrl+u clears, tab completes a folder, a missing folder is refused.
@@ -286,17 +314,14 @@ fn music_page_typing_counting_and_completion() {
     // start from the full path plus one stray letter so only the scratch folder is ever counted, never a parent
     ob.stage = Stage::Music { input: format!("{music}x"), found: None };
     press(&mut ob, KeyCode::Backspace);
-    match &ob.stage {
-        Stage::Music { input, found } => {
-            assert_eq!(input, &music);
-            assert_eq!(*found, Some(3));
-        }
-        _ => panic!("left the music page"),
-    }
+    assert!(matches!(&ob.stage, Stage::Music { input, .. } if *input == music));
+    settle_count(&mut ob);
+    assert_eq!(music_found(&ob), Some(3));
     // a folder that isn't there
     press(&mut ob, KeyCode::Char('z'));
-    assert!(matches!(&ob.stage, Stage::Music { found: None, .. }));
-    assert!(draw(&mut ob, 150, 42).0.contains("that folder doesn't exist"));
+    let s = settle_count(&mut ob);
+    assert_eq!(music_found(&ob), None);
+    assert!(s.contains("that folder doesn't exist"), "{s}");
     // ctrl+u clears the field
     ob.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), &Probe::default());
     assert!(matches!(&ob.stage, Stage::Music { input, .. } if input.is_empty()));
@@ -307,13 +332,12 @@ fn music_page_typing_counting_and_completion() {
     let sep = std::path::MAIN_SEPARATOR;
     ob.stage = Stage::Music { input: format!("{}{sep}MU", d.display()), found: None };
     press(&mut ob, KeyCode::Tab);
-    match &ob.stage {
-        Stage::Music { input, found } => {
-            assert_eq!(input, &format!("{}{sep}music{sep}", d.display()), "completes case-insensitively and adds the separator");
-            assert_eq!(*found, Some(3));
-        }
-        _ => panic!(),
-    }
+    assert!(
+        matches!(&ob.stage, Stage::Music { input, .. } if *input == format!("{}{sep}music{sep}", d.display())),
+        "completes case-insensitively and adds the separator"
+    );
+    settle_count(&mut ob);
+    assert_eq!(music_found(&ob), Some(3), "the completed folder is counted");
     // two folders sharing a prefix complete to the common part only
     std::fs::create_dir_all(d.join("music").join("rock-old")).unwrap();
     std::fs::create_dir_all(d.join("music").join("rock-new")).unwrap();
@@ -324,9 +348,13 @@ fn music_page_typing_counting_and_completion() {
     ob.stage = Stage::Music { input: format!("{music}-missing"), found: None };
     assert_eq!(press(&mut ob, KeyCode::Enter), (true, "none".into()));
     assert_eq!(stage(&ob), "notes");
-    // surrounding spaces are trimmed off a good folder
+    // the folder in the config, spaces or not, is no change
     ob.stage = Stage::Music { input: format!("  {music}  "), found: None };
-    assert_eq!(press(&mut ob, KeyCode::Enter), (true, format!("music {music}")));
+    assert_eq!(press(&mut ob, KeyCode::Enter), (true, "none".into()), "the config's folder isn't saved again");
+    // surrounding spaces are trimmed off a good folder
+    let sub = format!("{music}{sep}sub");
+    ob.stage = Stage::Music { input: format!("  {sub}  "), found: None };
+    assert_eq!(press(&mut ob, KeyCode::Enter), (true, format!("music {sub}")));
 }
 
 #[test]
@@ -347,13 +375,13 @@ fn notes_page_custom_folder() {
 }
 
 /// The defaults page: both rows cycle and wrap, and every "open oriel on" choice is something the app can open.
+/// cfg_in saves startup = home and has API keys for OpenAI and Anthropic, so the AI row has those two.
 #[test]
 fn defaults_page_rows_cycle_and_wrap() {
     let (_d, cfg, mut ob) = new_ob("defaults");
-    let avail = crate::panes::chat::providers::available(&cfg.ai);
     ob.stage = Stage::Defaults { row: 0, start: 0, ai: 0 };
     press(&mut ob, KeyCode::Left);
-    assert_eq!(stage(&ob), "defaults 0 4 0", "left from the first start choice wraps to the last");
+    assert_eq!(stage(&ob), "defaults 0 5 0", "left from the first start choice wraps to the last");
     press(&mut ob, KeyCode::Char('l'));
     assert_eq!(stage(&ob), "defaults 0 0 0");
     press(&mut ob, KeyCode::Down);
@@ -362,34 +390,42 @@ fn defaults_page_rows_cycle_and_wrap() {
     press(&mut ob, KeyCode::Tab);
     assert_eq!(stage(&ob), "defaults 0 0 1", "tab toggles the row back");
     press(&mut ob, KeyCode::Up);
-    for _ in 0..avail.len() {
+    for _ in 0..2 {
         press(&mut ob, KeyCode::Char('h'));
     }
     assert_eq!(stage(&ob), "defaults 1 0 1", "a full lap of the AI row comes back round");
-    assert_eq!(press(&mut ob, KeyCode::Enter), (true, format!("defaults ai {}", avail[1])));
-    // every start choice
+    let s = squash(&draw(&mut ob, 150, 42).0);
+    assert!(s.contains("where you left off") && s.contains("OpenAI-compatible") && s.contains("Anthropic API"), "{s}");
+    // both differ from what's saved (home, and the first AI): both are sent
+    assert_eq!(press(&mut ob, KeyCode::Enter), (true, "defaults last anthropic".into()));
+    // every start choice, stepping right from the saved one (home), on a fresh page each time
     let mut starts = vec![];
-    for i in 0..5 {
-        ob.stage = Stage::Defaults { row: 0, start: 0, ai: 0 };
+    for i in 0..6 {
+        let mut ob = Onboard::new(&cfg.theme, &cfg);
+        ob.stage = Stage::Defaults { row: 0, start: 3, ai: 0 };
         for _ in 0..i {
             press(&mut ob, KeyCode::Right);
         }
         let (_, o) = press(&mut ob, KeyCode::Enter);
-        starts.push(o.split(' ').nth(1).unwrap().to_string());
+        if i == 0 {
+            assert_eq!(o, "none", "the saved choice is no change");
+            starts.push(cfg.startup.clone());
+        } else {
+            assert_eq!(o.split(' ').nth(2), Some(""), "only the startup changed: {o}");
+            starts.push(o.split(' ').nth(1).unwrap().to_string());
+        }
     }
-    assert_eq!(starts, ["ai", "agents", "home", "terminal", "music"]);
+    assert_eq!(starts, ["home", "terminal", "music", "last", "ai", "agents"]);
     for s in &starts {
-        let ok = crate::app::SIDEBAR.iter().any(|a| a.0 == s) || s == "home";
-        assert!(ok, "startup {s} must be an app App::new can open");
+        // "last" brings back your tabs (chat the first time)
+        let ok = crate::app::SIDEBAR.iter().any(|a| a.0 == s) || s == "home" || s == "last";
+        assert!(ok, "startup {s} must be something App::new can open");
     }
-    let s = draw(&mut ob, 150, 42).0;
-    let _ = s;
 }
 
-/// Replaying the setup (palette → take the tour, `oriel --tour`) and pressing enter through the defaults page
-/// should keep what you chose last time, like the theme page keeps your theme.
+/// The setup over an existing config (a fresh profile, a deleted first-run marker): pressing enter through the
+/// defaults page has to keep what you chose last time, like the theme page keeps your theme.
 #[test]
-#[ignore = "fails: onboard.rs:376-377 (and :382 on esc) always start the defaults page on chat + the first AI, so replaying the setup resets startup/provider"]
 fn defaults_page_preselects_current_config() {
     let d = scratch("defaults-preselect");
     let mut cfg = cfg_in(&d);
@@ -403,14 +439,21 @@ fn defaults_page_preselects_current_config() {
         }
         press(&mut ob, KeyCode::Enter);
     }
-    assert!(stage(&ob).starts_with("defaults"), "{}", stage(&ob));
+    // music is the last start choice; Anthropic the second AI with a key
+    assert_eq!(stage(&ob), "defaults 0 5 1", "the page starts on the saved startup app and AI");
     let (_, out) = press(&mut ob, KeyCode::Enter);
-    assert_eq!(out, "defaults music anthropic", "enter on an untouched defaults page should keep the current startup and AI");
+    assert_eq!(out, "none", "enter on an untouched defaults page keeps the current startup and AI (nothing is overwritten)");
+    // back to it, look around and come back to the same choices: still nothing to save
+    press(&mut ob, KeyCode::BackTab);
+    assert_eq!(stage(&ob), "defaults 0 5 1");
+    for code in [KeyCode::Right, KeyCode::Left, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
+        press(&mut ob, code);
+    }
+    assert_eq!(press(&mut ob, KeyCode::Enter), (true, "none".into()));
 }
 
 /// A setup wizard should let you go back a page (e.g. you pressed enter on the theme page too early).
 #[test]
-#[ignore = "fails: onboard.rs:316-415 has no back key on any setup page; esc means skip-forward, so a wrong enter can only be undone by replaying everything"]
 fn setup_pages_can_go_back() {
     let (_d, _c, mut ob) = new_ob("back");
     let mut went_back = vec![];
@@ -422,6 +465,26 @@ fn setup_pages_can_go_back() {
         }
     }
     assert!(!went_back.is_empty(), "no key goes from icons back to the theme page");
+    // shift+tab walks back through every page to the welcome, saving nothing; the theme page drops its preview
+    ob.stage = Stage::Ais;
+    let themes = crate::theme::names();
+    let theme_page = format!("theme {}", themes.iter().position(|t| t == "ultra").unwrap());
+    for (want, out) in [("defaults 0 3 0", "none"), ("notes", "none"), ("music", "none"), ("icons", "none"), (theme_page.as_str(), "none"), ("welcome", "theme ultra save=false")] {
+        let (used, o) = press(&mut ob, KeyCode::BackTab);
+        assert!(used);
+        assert_eq!((stage(&ob).as_str(), o.as_str()), (want, out));
+    }
+    assert_eq!(press(&mut ob, KeyCode::BackTab), (true, "none".into()), "nothing before the welcome");
+    assert_eq!(stage(&ob), "welcome");
+    // a choice made on the way is what the page shows when you come back to it
+    ob.stage = Stage::Theme { sel: 0 };
+    assert_eq!(press(&mut ob, KeyCode::Enter), (true, format!("theme {} save=true", themes[0])));
+    press(&mut ob, KeyCode::BackTab);
+    assert_eq!(stage(&ob), "theme 0", "back on the theme page, on the theme just picked");
+    assert_eq!(press(&mut ob, KeyCode::Esc), (true, format!("theme {} save=false", themes[0])), "esc keeps the theme just picked");
+    // and the tour's keys are untouched: shift+tab there belongs to the app
+    ob.stage = Stage::Tour { step: 0, start: Probe::default() };
+    assert_eq!(press(&mut ob, KeyCode::BackTab), (false, "none".into()));
 }
 
 // ------------------------------------------------------------------ the tour
@@ -552,20 +615,38 @@ fn tour_skip_end_and_enter_keys() {
 /// The tour's first step says "Open music: press F4". If oriel already shows music when the tour starts
 /// (startup = music, then `oriel --tour`), the step is done before it's ever drawn.
 #[test]
-#[ignore = "fails: onboard.rs:41 (also :47, :89, :113) done() only looks at the current probe, so a step that is already true passes before it is drawn"]
 fn tour_steps_wait_even_if_already_true() {
     let (_d, _c, mut ob) = new_ob("tour-already");
     let on_music = Probe { app: Some("music"), focus: 1, panes_in_tab: 1, ..Default::default() };
     tour_at(&mut ob, 0, &on_music);
     let out = out_str(&ob.check(&on_music));
     assert_eq!((out.as_str(), step(&ob)), ("none", Some(0)), "switch apps completed without pressing anything");
+    // F4 again goes back where you came from, then F4 opens music: that's the step done
+    let on_chat = Probe { app: Some("ai"), ..on_music.clone() };
+    assert_eq!(out_str(&ob.check(&on_chat)), "none");
+    assert_eq!(step(&ob), Some(0));
+    assert_eq!(out_str(&ob.check(&on_music)), "none");
+    assert_eq!(step(&ob), Some(1), "arriving at music does the step");
+    // the same for the other "open it" steps and the tab name: already true waits, getting there moves on
+    for (i, already, other) in [
+        (2, Probe { app: Some("ais"), ..Default::default() }, Probe { app: Some("files"), ..Default::default() }),
+        (3, Probe { app: Some("agents"), ..Default::default() }, Probe { app: None, ..Default::default() }),
+        (8, Probe { tab_named: true, ..Default::default() }, Probe { tab_named: false, ..Default::default() }),
+        (12, Probe { app: Some("help"), ..Default::default() }, Probe { app: Some("music"), ..Default::default() }),
+    ] {
+        tour_at(&mut ob, i, &already);
+        assert_eq!((out_str(&ob.check(&already)).as_str(), step(&ob)), ("none", Some(i)), "step {i} passed by itself");
+        ob.check(&other);
+        assert_eq!(step(&ob), Some(i));
+        ob.check(&already);
+        assert_eq!(step(&ob), Some(i + 1), "step {i}: getting there moves on");
+    }
 }
 
 /// oriel starts on chat by default. Skipping the first step ("switch apps", F10) while you're on chat must not
 /// also skip the second one ("chat with any AI", the only place the tour explains /provider, /model, /perms):
 /// App::run checks the probe right after the skip, and "go back to chat" is already true.
 #[test]
-#[ignore = "fails: onboard.rs:47 step 2's done() is `now.app == ai` with no change since the step began, so it passes the instant step 1 is skipped from chat"]
 fn tour_skipping_step_one_from_chat_keeps_step_two() {
     let (_d, _c, mut ob) = new_ob("tour-skip-chat");
     let on_chat = Probe { app: Some("ai"), focus: 1, panes_in_tab: 1, ..Default::default() };
@@ -625,8 +706,14 @@ fn mouse_tour_buttons() {
     assert_eq!(click(&mut ob, x + 1, y), (true, "finished".into()));
     tour_at(&mut ob, 5, &p);
     let (_, buf) = draw(&mut ob, 150, 42);
-    let (x, y) = find(&buf, "F11  end tour").expect("end button");
+    let (x, y) = find(&buf, "esc  end tour").expect("end button (esc ends the tour; F11 still does too)");
     assert_eq!(click(&mut ob, x + 1, y), (true, "finished".into()));
+    // and the × on the card's frame
+    tour_at(&mut ob, 5, &p);
+    let (_, buf) = draw(&mut ob, 150, 42);
+    let (x, y) = find(&buf, "tour · 6/").expect("card title");
+    let close = (x..buf.area.width).find(|&cx| buf[(cx, y)].symbol() == "×").expect("× on the card");
+    assert_eq!(click(&mut ob, close, y), (true, "finished".into()));
 }
 
 // ------------------------------------------------------------------ drawing
@@ -708,7 +795,6 @@ fn every_page_fits_common_terminal_sizes() {
 /// Theme files you've made join the list on the theme page. However many there are, the one you've moved to
 /// must stay on screen.
 #[test]
-#[ignore = "fails: onboard.rs:504-523 lists every theme in two columns with no scrolling, so past ~24 themes at 80x24 the highlighted row is below the page"]
 fn theme_page_keeps_the_highlight_on_screen() {
     let d = scratch("many-themes");
     let _ = cfg_in(&d);
@@ -801,7 +887,6 @@ fn tour_box_text(buf: &Buffer) -> String {
 /// whatever the path's length. (A path long enough to be cut with … happens to come out square; the usual short
 /// default, e.g. %APPDATA%\oriel\notes, doesn't.)
 #[test]
-#[ignore = "fails: onboard.rs:717-724 field() pads a short path's row one column short, so its right │ sits left of the ╮/╯ corners"]
 fn input_field_box_is_square() {
     let (_d, cfg, mut ob) = new_ob("field-box");
     let mut bad = vec![];
@@ -822,7 +907,6 @@ fn input_field_box_is_square() {
 
 /// Typing a long path: the end you're typing has to stay visible.
 #[test]
-#[ignore = "fails: onboard.rs:716 field() uses ui::fit, which keeps the start of the path and cuts the end, so what you type disappears"]
 fn input_field_shows_the_end_of_a_long_path() {
     let (_d, cfg, mut ob) = new_ob("field-long");
     let long = format!("{}{}END", cfg.notes_folder, "\\deeper".repeat(20));
@@ -834,7 +918,6 @@ fn input_field_shows_the_end_of_a_long_path() {
 /// The music page's song count gives up after 20,000 folder entries. When it does, the count has to say it's
 /// partial ("+"), and a keystroke must not stall the UI thread counting.
 #[test]
-#[ignore = "fails: onboard.rs:190-192 stops at 20,000 entries but :548 only adds + at 20,000 songs; and :368-370 re-walks the folder on the UI thread on every keystroke"]
 fn music_count_is_marked_partial_and_quick() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("test-scratch").join("qa-first-run").join("big-music");
     // 20,100 entries (100 songs), built once and kept between runs
@@ -859,11 +942,9 @@ fn music_count_is_marked_partial_and_quick() {
     let t0 = std::time::Instant::now();
     press(&mut ob, KeyCode::Backspace);
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let found = match &ob.stage {
-        Stage::Music { found, .. } => *found,
-        _ => None,
-    };
-    let (s, _) = draw(&mut ob, 150, 42);
+    // the count runs on a thread a moment after typing stops: wait for it
+    let s = settle_count(&mut ob);
+    let found = music_found(&ob);
     let line = s.lines().find(|l| l.contains("songs found")).unwrap_or("").trim().to_string();
     println!("one keystroke on a 20,100-entry folder: {ms:.0} ms, found {found:?}, shows '{line}'");
     let mut problems = vec![];
@@ -878,13 +959,9 @@ fn music_count_is_marked_partial_and_quick() {
 
 // ------------------------------------------------------------------ config round trips
 
-/// What `config::load` does with a file's text (config.rs:182-186), without touching the real config file.
+/// What `config::load` does with a file's text, without touching the real config file.
 fn parse_like_load(s: &str) -> Config {
-    let mut c: Config = toml::from_str(s).ok().unwrap_or_default();
-    if c.theme.is_empty() {
-        c.theme = if crate::theme::omarchy_dir().is_some() { "omarchy".into() } else { "ultra".into() };
-    }
-    c
+    crate::config::from_text(s)
 }
 
 fn dbg(c: &Config) -> String {
@@ -902,8 +979,9 @@ fn config_defaults_are_sane() {
     assert_eq!(parse_like_load("").theme, default_theme(), "no config file: ultra (omarchy on Omarchy)");
     assert_eq!(c.ai.perms, "edits");
     assert_eq!(c.prefix, "ctrl+space");
-    assert_eq!(c.startup, "ai");
-    assert!(crate::app::SIDEBAR.iter().any(|a| a.0 == c.startup), "the default startup is an app");
+    // where you left off: your tabs come back, and the first time (nothing to bring back) it's chat
+    assert_eq!(c.startup, "last");
+    assert!(crate::app::SIDEBAR.iter().any(|a| a.0 == "ai"), "chat, what \"last\" opens the first time, is an app");
     assert!(!c.plain_icons && c.desktop_notifications);
     assert!(c.ai.provider.is_empty() && c.ai.effort.is_empty() && c.ai.models.is_empty());
     assert!(c.ai.openai_key.is_empty() && c.ai.anthropic_key.is_empty(), "no keys by default");
@@ -928,7 +1006,6 @@ fn config_defaults_are_sane() {
 
 /// A theme name that isn't there (a deleted theme file, a typo, "") falls back to the default look.
 #[test]
-#[ignore = "fails: theme.rs:100 falls back to PALETTES[0] (\"oriel\"), not the documented default \"ultra\""]
 fn unknown_theme_falls_back_to_the_default() {
     let d = scratch("theme-fallback");
     let _ = cfg_in(&d);
@@ -1073,7 +1150,6 @@ fn profile_paths(data_dir: &str, name: &str) -> (String, String, String) {
 /// so a fresh profile runs the setup, and everything the setup saves (theme, icons, music, notes, startup, AI)
 /// has to land in that profile too, not in the main profile's config.toml.
 #[test]
-#[ignore = "fails: config.rs:177 path() ignores ORIEL_DATA_DIR, so a fresh profile's first-run setup overwrites the main config.toml"]
 fn profile_keeps_its_own_config() {
     let prof = scratch("profile-a");
     let (config, marker, data) = profile_paths(&prof.to_string_lossy(), "profile-a-cwd");
@@ -1085,7 +1161,6 @@ fn profile_keeps_its_own_config() {
 /// An empty ORIEL_DATA_DIR (`ORIEL_DATA_DIR= oriel`, or a launcher that sets it to "") must not turn the current
 /// folder into the profile: chats, notes and the first-run marker would be written wherever oriel was started.
 #[test]
-#[ignore = "fails: config.rs:169-172 treats an empty ORIEL_DATA_DIR as the relative path \"\", so data lands in the working folder"]
 fn empty_data_dir_env_is_ignored() {
     let (_config, marker, data) = profile_paths("", "profile-empty-cwd");
     assert!(Path::new(&data).is_absolute() && Path::new(&marker).is_absolute(), "data dir {data:?} / marker {marker:?} are relative to the working folder");
@@ -1095,9 +1170,14 @@ fn empty_data_dir_env_is_ignored() {
 /// load() then hands back pure defaults, and the next save (any theme change, the onboarding) writes those
 /// defaults over the user's file.
 #[test]
-#[ignore = "fails: config.rs:182 load() parses all-or-nothing; one bad value resets every setting (and save() then overwrites the file)"]
 fn config_one_bad_value_keeps_the_rest() {
-    let s = "theme = \"ember\"\nstartup = \"music\"\n\n[ai]\nprovider = \"codex\"\n\n[lead]\nmax_parallel = \"3\"\n";
+    let s = "theme = \"ember\"\nstartup = \"music\"\n\n[ai]\nprovider = \"codex\"\n\n[lead]\nagent = \"kimi\"\nmax_parallel = \"3\"\n";
     let c = parse_like_load(s);
     assert_eq!((c.theme.as_str(), c.startup.as_str(), c.ai.provider.as_str()), ("ember", "music", "codex"), "the good values survive a bad one");
+    assert_eq!((c.lead.agent.as_str(), c.lead.max_parallel), ("kimi", crate::config::LeadConfig::default().max_parallel), "only the bad value takes its default");
+    // and the file isn't saved over while it doesn't parse
+    let p = scratch("bad-value-save").join("config.toml");
+    std::fs::write(&p, s).unwrap();
+    assert!(crate::config::save_to(&p, &c).is_err());
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), s, "the hand-edited file is left alone");
 }

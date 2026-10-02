@@ -238,24 +238,66 @@ pub fn dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("oriel")
 }
 
+/// ORIEL_DATA_DIR, when it says something: a separate profile (demos, screenshots, testing). An empty one is unset,
+/// not the current folder.
+fn profile() -> Option<PathBuf> {
+    std::env::var_os("ORIEL_DATA_DIR").filter(|p| !p.is_empty()).map(PathBuf::from)
+}
+
 /// Where apps keep their data (notes, chats, state).
 pub fn data_dir() -> PathBuf {
-    // ORIEL_DATA_DIR: a separate profile (demos, screenshots, testing) — chats, notes and memory live there
-    let d = match std::env::var_os("ORIEL_DATA_DIR") {
-        Some(p) => PathBuf::from(p),
-        None => dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("oriel"),
-    };
+    // a profile keeps chats, notes, memory and the first-run marker
+    let d = profile().unwrap_or_else(|| dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("oriel"));
     let _ = std::fs::create_dir_all(&d);
     d
 }
 
+/// config.toml: a profile has its own (its first-run setup saves there, not over your main config).
 pub fn path() -> PathBuf {
-    dir().join("config.toml")
+    profile().unwrap_or_else(dir).join("config.toml")
 }
 
-/// The config to run with: config.toml, or the defaults if it's missing or doesn't parse (`load_checked` says why).
+/// The config to run with: config.toml; the defaults if it's missing; if it doesn't parse, every setting in it that
+/// does (`load_checked` says what's wrong).
 pub fn load() -> Config {
-    load_checked().unwrap_or_else(|_| defaults())
+    match std::fs::read_to_string(path()) {
+        Ok(s) => from_text(&s),
+        Err(_) => defaults(),
+    }
+}
+
+/// config.toml's text as the config to run with: all of it, or when a value is wrong (a hand edit like
+/// `max_parallel = "3"`), the rest of it. Text that isn't TOML at all gives the defaults.
+pub fn from_text(s: &str) -> Config {
+    with_theme(migrate(parse(s).ok().or_else(|| salvage(s)).unwrap_or_default()))
+}
+
+/// Every setting in `s` that fits, dropping the ones that don't: top-level values, and values inside a section
+/// ([ai], [lead]...) one by one. None = not TOML.
+fn salvage(s: &str) -> Option<Config> {
+    let all: toml::Table = s.parse().ok()?;
+    let fits = |t: &toml::Table| toml::Value::Table(t.clone()).try_into::<Config>().is_ok();
+    let mut good = toml::Table::new();
+    for (k, v) in all {
+        let mut with = good.clone();
+        with.insert(k.clone(), v.clone());
+        if fits(&with) {
+            good = with;
+        } else if let toml::Value::Table(section) = v {
+            let mut kept = toml::Table::new();
+            for (k2, v2) in section {
+                let mut sec = kept.clone();
+                sec.insert(k2, v2);
+                let mut with = good.clone();
+                with.insert(k.clone(), toml::Value::Table(sec.clone()));
+                if fits(&with) {
+                    kept = sec;
+                }
+            }
+            good.insert(k, toml::Value::Table(kept));
+        }
+    }
+    toml::Value::Table(good).try_into().ok()
 }
 
 /// What a missing config.toml means: the defaults, theme filled in.

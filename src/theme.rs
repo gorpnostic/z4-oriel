@@ -97,7 +97,10 @@ fn builtin(name: &str) -> Theme {
         "terminal" => terminal(),
         "omarchy" => omarchy().unwrap_or_else(terminal),
         _ => {
-            let p = PALETTES.iter().find(|p| p.0 == name).unwrap_or(&PALETTES[0]);
+            let Some(p) = PALETTES.iter().find(|p| p.0 == name) else {
+                // a theme that isn't there (a deleted theme file, a typo, ""): the default look, as in config.toml
+                return if omarchy_dir().is_some() { builtin("omarchy") } else { builtin("ultra") };
+            };
             let c = |s| hex(s).unwrap_or(Color::Reset);
             // borders, hints and secondary text lean grey, so the theme's colour is saved for what matters
             // (the focused pane, selections, code) instead of tinting the whole screen
