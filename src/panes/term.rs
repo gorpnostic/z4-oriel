@@ -25,6 +25,8 @@ pub struct Term {
     killer: Box<dyn ChildKiller + Send + Sync>,
     exited: Arc<AtomicBool>,
     size: (u16, u16), // rows, cols
+    /// Screen rows above the pane's first row: 0 unless the pane is shorter than MIN_ROWS (set by render).
+    top: u16,
     scroll: usize,    // lines scrolled back (0 = live)
     started: bool,
     /// ms since `born` when the program last printed something (set by the reader thread)
@@ -125,6 +127,7 @@ impl Term {
             killer,
             exited: Arc::new(AtomicBool::new(false)),
             size: (24, 80),
+            top: 0,
             scroll: 0,
             started: false,
             last_output: Arc::new(AtomicU64::new(0)),
@@ -258,7 +261,13 @@ impl Term {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
-        if (rows, cols) == self.size || rows == 0 || cols == 0 {
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        // vt100 panics when a line wraps on a screen one row tall (and the reader thread dies holding the parser
+        // lock): the screen and the program get MIN_ROWS, and a shorter pane shows the bottom of it (render)
+        let rows = rows.max(MIN_ROWS);
+        if (rows, cols) == self.size {
             return;
         }
         self.size = (rows, cols);
@@ -267,6 +276,9 @@ impl Term {
         let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
     }
 }
+
+/// The fewest rows the emulated screen gets, whatever the pane's height (vt100 0.16 can't wrap a line on one).
+const MIN_ROWS: u16 = 2;
 
 /// Resize the screen the way real terminals do: when it gets shorter than the cursor row, the top rows scroll
 /// into scrollback so the prompt and the newest output stay on screen (vt100 alone cuts rows off the bottom,
@@ -517,10 +529,13 @@ impl Pane for Term {
         p.screen_mut().set_scrollback(self.scroll);
         self.scroll = p.screen().scrollback(); // clamped to what exists
         let screen = p.screen();
+        // the screen is never shorter than MIN_ROWS: a pane shorter than that shows its bottom rows (the cursor's)
+        let top = screen.size().0.saturating_sub(area.height);
+        self.top = top;
         let buf = f.buffer_mut();
         for row in 0..area.height {
             for col in 0..area.width {
-                let Some(cell) = screen.cell(row, col) else { continue };
+                let Some(cell) = screen.cell(top + row, col) else { continue };
                 if cell.is_wide_continuation() {
                     continue;
                 }
@@ -554,8 +569,8 @@ impl Pane for Term {
         }
         if cx.focused && !screen.hide_cursor() && self.scroll == 0 && failed.is_none() {
             let (r, c) = screen.cursor_position();
-            if r < area.height && c < area.width {
-                f.set_cursor_position(Position { x: area.x + c, y: area.y + r });
+            if r >= top && r - top < area.height && c < area.width {
+                f.set_cursor_position(Position { x: area.x + c, y: area.y + r - top });
             }
         }
     }
@@ -613,7 +628,7 @@ impl Pane for Term {
             (s.mouse_protocol_mode(), s.mouse_protocol_encoding(), s.alternate_screen(), s.application_cursor())
         };
         let col = ev.column.saturating_sub(area.x) + 1;
-        let row = ev.row.saturating_sub(area.y + self.banner_h()) + 1;
+        let row = ev.row.saturating_sub(area.y + self.banner_h()) + self.top + 1;
         if mode == vt100::MouseProtocolMode::None {
             let up = match ev.kind {
                 MouseEventKind::ScrollUp => true,
